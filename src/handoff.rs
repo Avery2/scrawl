@@ -101,16 +101,10 @@ pub fn copy_bundle_to_clipboard(bundle_dir: &Path) -> Result<()> {
     use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString};
     use objc2_foundation::{NSArray, NSData, NSString};
 
-    let directory = resolve_bundle_dir(bundle_dir)?;
+    let (directory, bundle) = load_bundle(bundle_dir)?;
     let image =
-        fs::read(directory.join("contact-sheet.png")).context("Could not read contact sheet")?;
-    let summary = fs::read_to_string(directory.join("summary.md"))
-        .context("Could not read capture summary")?;
-    let summary = format!(
-        "{}\n\nBundle: {}\n",
-        summary.trim_end(),
-        directory.display()
-    );
+        fs::read(directory.join(&bundle.contact_sheet)).context("Could not read contact sheet")?;
+    let summary = crate::sketch::summary_markdown(&bundle, &directory);
     let data = NSData::with_bytes(&image);
     let text = NSString::from_str(&summary);
     let pasteboard = NSPasteboard::generalPasteboard();
@@ -262,12 +256,9 @@ pub fn list_opencode_sessions() -> Result<Vec<OpenCodeSession>> {
     Ok(sessions)
 }
 
-pub fn send_to_opencode(
-    bundle_dir: &Path,
-    bundle: &ScrawlBundle,
-    summary: &str,
-    session_id: Option<&str>,
-) -> Result<String> {
+pub fn send_to_opencode(bundle_dir: &Path, session_id: Option<&str>) -> Result<String> {
+    let (directory, bundle) = load_bundle(bundle_dir)?;
+    let summary = crate::sketch::summary_markdown(&bundle, &directory);
     let session = if let Some(id) = session_id {
         id.to_owned()
     } else if let Some(id) = std::env::var("OPENCODE_SESSION_ID")
@@ -289,13 +280,11 @@ pub fn send_to_opencode(
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
         "Invalid OpenCode session ID"
     );
-    let directory = resolve_bundle_dir(bundle_dir)?;
     let quoted_directory = format!("'{}'", directory.to_string_lossy().replace('\'', "'\\''"));
     let text = format!(
-        "{}\n\nScrawl bundle: {}\n\nOpen the contact sheet at {} and read {} for timestamped transcript, marks, and interactions.\nFor a closer look at any interval, run:\nscrawl frames {} --from <start> --to <end> --fps 4\nReplace <start> and <end> with M:SS.mmm timestamps within this {} ms capture. Inspect the returned PNG files before acting on the feedback.",
+        "{}\n\nOpen the contact sheet at {} and read {} for timestamped transcript, marks, and interactions.\nFor a closer look at any interval, run:\nscrawl frames {} --from <start> --to <end> --fps 4\nReplace <start> and <end> with M:SS.mmm timestamps within this {} ms capture. Inspect the returned PNG files before acting on the feedback.",
         summary.trim_end(),
-        bundle.id,
-        directory.join("contact-sheet.png").display(),
+        directory.join(&bundle.contact_sheet).display(),
         directory.join("scrawl.json").display(),
         quoted_directory,
         bundle.duration_ms,

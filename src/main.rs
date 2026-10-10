@@ -20,7 +20,9 @@ use crate::model::{
     CaptureMode, InteractionEvent, MAX_KEYFRAMES, RgbaFrame, SCALE, ScrawlBundle, Stroke,
     TargetFrame, TargetInfo, TranscriptData, TranscriptSegment, WordTiming, parse_clock_ms,
 };
-use crate::render::{render_annotated_keyframe, render_contact_sheet, render_synthetic_demo_frame};
+use crate::render::{
+    annotate_keyframe_in_place, render_contact_sheet, render_synthetic_demo_frame,
+};
 use crate::sketch::{marks_of, summary_markdown};
 
 #[derive(Parser)]
@@ -182,10 +184,10 @@ pub fn build_bundle_from_parts(
 
     let mut annotated_frames = Vec::with_capacity(selected.len());
     let mut keyframes = Vec::with_capacity(selected.len());
-    for (kf, raw_frame) in selected {
-        let rendered = render_annotated_keyframe(&raw_frame, &kf, &strokes, &marks, &events);
+    for (kf, mut raw_frame) in selected {
+        annotate_keyframe_in_place(&mut raw_frame, &kf, &strokes, &marks, &events);
         keyframes.push(kf.clone());
-        annotated_frames.push((kf, rendered));
+        annotated_frames.push((kf, raw_frame));
     }
 
     let id = bundle_dir
@@ -222,8 +224,8 @@ pub fn build_bundle_from_parts(
     };
 
     let contact_sheet = render_contact_sheet(&bundle, &annotated_frames);
-    let summary = summary_markdown(&bundle, Some(bundle_dir));
-    let written_dir = write_bundle_artifacts(
+    let summary = summary_markdown(&bundle, bundle_dir);
+    write_bundle_artifacts(
         bundle_dir,
         &bundle,
         &annotated_frames,
@@ -231,7 +233,7 @@ pub fn build_bundle_from_parts(
         &summary,
     )?;
 
-    Ok((written_dir, bundle, summary))
+    Ok((bundle_dir.to_path_buf(), bundle, summary))
 }
 
 /// Generates a rich, deterministic multi-frame demo bundle showcasing clicks, circles, arrows, pins, and aligned speech.
@@ -454,12 +456,11 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Inspect { bundle, json } => {
-            let dir = handoff::resolve_bundle_dir(&bundle)?;
-            let (dir, loaded) = handoff::load_bundle(&dir)?;
+            let (dir, loaded) = handoff::load_bundle(&bundle)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&loaded)?);
             } else {
-                print!("{}", summary_markdown(&loaded, Some(&dir)));
+                print!("{}", summary_markdown(&loaded, &dir));
             }
             Ok(())
         }
@@ -469,11 +470,10 @@ fn main() -> Result<()> {
             to,
             fps,
         } => {
-            let dir = handoff::resolve_bundle_dir(&bundle)?;
             let from_ms =
                 parse_clock_ms(&from).with_context(|| format!("invalid --from time: {from}"))?;
             let to_ms = parse_clock_ms(&to).with_context(|| format!("invalid --to time: {to}"))?;
-            let extracted = handoff::extract_frames_range(&dir, from_ms, to_ms, fps)?;
+            let extracted = handoff::extract_frames_range(&bundle, from_ms, to_ms, fps)?;
             for path in extracted {
                 println!("{}", path.display());
             }
@@ -485,14 +485,11 @@ fn main() -> Result<()> {
             clipboard,
         } => {
             let dir = handoff::resolve_bundle_dir(&bundle)?;
-            let (dir, loaded) = handoff::load_bundle(&dir)?;
-            let summary = summary_markdown(&loaded, Some(&dir));
             if clipboard {
                 handoff::copy_bundle_to_clipboard(&dir)?;
                 println!("Copied {} to clipboard", dir.display());
             } else {
-                let target_session =
-                    handoff::send_to_opencode(&dir, &loaded, &summary, session.as_deref())?;
+                let target_session = handoff::send_to_opencode(&dir, session.as_deref())?;
                 println!(
                     "Sent {} to OpenCode session {target_session}",
                     dir.display()
@@ -504,14 +501,11 @@ fn main() -> Result<()> {
             bundle,
             capture_screenshot,
         } => {
-            let initial = if let Ok(dir) = handoff::resolve_bundle_dir(&bundle)
-                && let Ok((dir, loaded)) = handoff::load_bundle(&dir)
-            {
-                let summary = summary_markdown(&loaded, Some(&dir));
-                Some((dir, loaded, summary))
-            } else {
-                generate_demo_bundle(None).ok()
-            };
+            let initial = handoff::load_bundle(&bundle).ok().or_else(|| {
+                generate_demo_bundle(None)
+                    .ok()
+                    .map(|(dir, loaded, _)| (dir, loaded))
+            });
             ui::run_app(initial, false, capture_screenshot);
             Ok(())
         }

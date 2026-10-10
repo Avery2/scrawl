@@ -16,7 +16,7 @@ const MERGE_SILENCE_MS: u64 = 350;
 
 #[derive(Clone, Debug)]
 pub struct RecordedAudio {
-    pub samples_16k: Vec<f32>,
+    pub sample_count: usize,
     pub duration_ms: u64,
     pub speech_islands: Vec<(u64, u64)>,
     pub wav_bytes: Vec<u8>,
@@ -89,11 +89,12 @@ impl AudioRecorder {
                 .lock()
                 .map_err(|_| anyhow!("Microphone buffer lock poisoned"))?,
         );
-        let duration_ms = samples_16k.len() as u64 * 1_000 / SAMPLE_RATE as u64;
+        let sample_count = samples_16k.len();
+        let duration_ms = sample_count as u64 * 1_000 / SAMPLE_RATE as u64;
         let speech_islands = detect_speech_islands(&samples_16k, SAMPLE_RATE);
         let wav_bytes = encode_wav_16k(&samples_16k)?;
         Ok(RecordedAudio {
-            samples_16k,
+            sample_count,
             duration_ms,
             speech_islands,
             wav_bytes,
@@ -322,7 +323,7 @@ struct Discovery {
 
 /// Missing/off microphones and unavailable Hex never prevent saving a bundle.
 pub fn transcribe_with_hex(audio: Option<&RecordedAudio>) -> TranscriptData {
-    let Some(audio) = audio.filter(|audio| !audio.samples_16k.is_empty()) else {
+    let Some(audio) = audio.filter(|audio| audio.sample_count > 0) else {
         return TranscriptData {
             source: "none".into(),
             ..Default::default()
@@ -623,7 +624,7 @@ mod tests {
     #[test]
     fn authoritative_hex_timings_are_preserved() {
         let audio = RecordedAudio {
-            samples_16k: vec![],
+            sample_count: 32_000,
             duration_ms: 2_000,
             speech_islands: vec![(0, 2_000)],
             wav_bytes: vec![],

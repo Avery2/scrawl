@@ -22,12 +22,12 @@ use screencapturekit::prelude::*;
 use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
 
 use crate::capture::{
-    GlobalInputTap, LiveOverlayEvent, ScreenCaptureSession, SharedCaptureTelemetry, ax_element_at,
-    discover_target,
+    LiveOverlayEvent, ScreenCaptureSession, SharedCaptureTelemetry, ax_element_at, discover_target,
+    start_global_input_tap,
 };
 use crate::hex::AudioRecorder;
-use crate::model::{LASER_MS, SCALE, ScrawlBundle, Stroke, format_clock};
-use crate::sketch::{FreehandOptions, freehand_outline, timeline};
+use crate::model::{LASER_MS, SCALE, ScrawlBundle, Stroke, TargetInfo, format_clock};
+use crate::sketch::{FreehandOptions, bounds as points_bounds, freehand_outline, timeline};
 
 const SIDEBAR_BG: u32 = 0x111111;
 const CANVAS_BG: u32 = 0x161616;
@@ -150,12 +150,10 @@ fn newest_ns_window() -> Option<Retained<NSWindow>> {
     windows.lastObject()
 }
 
-fn configure_floating_window(ns_window: &NSWindow, ignores_mouse: bool, status_level: bool) {
+fn configure_floating_window(ns_window: &NSWindow, ignores_mouse: bool) {
     ns_window.setHidesOnDeactivate(false);
     ns_window.setIgnoresMouseEvents(ignores_mouse);
-    if status_level {
-        ns_window.setLevel(NSStatusWindowLevel);
-    }
+    ns_window.setLevel(NSStatusWindowLevel);
     ns_window.setCollectionBehavior(
         NSWindowCollectionBehavior::CanJoinAllSpaces
             | NSWindowCollectionBehavior::FullScreenAuxiliary,
@@ -171,15 +169,20 @@ fn configure_floating_window(ns_window: &NSWindow, ignores_mouse: bool, status_l
     }
 }
 
+struct ActiveRecording {
+    target: TargetInfo,
+    bundle_dir: PathBuf,
+    screen_session: ScreenCaptureSession,
+    audio_recorder: Option<AudioRecorder>,
+}
+
 /// Shared coordinator owned by the GPUI app.
 pub struct ScrawlCoordinator {
     telemetry: Arc<SharedCaptureTelemetry>,
-    screen_session: Option<ScreenCaptureSession>,
-    audio_recorder: Option<AudioRecorder>,
-    active_bundle_dir: Option<PathBuf>,
+    active_recording: Option<ActiveRecording>,
     active_stroke: Option<Stroke>,
     caption: String,
-    review_bundle: Option<(PathBuf, ScrawlBundle, String)>,
+    review_bundle: Option<(PathBuf, ScrawlBundle)>,
     review_status: Option<String>,
     selected_tab: ReviewTab,
     selected_keyframe: usize,
@@ -194,13 +197,11 @@ pub enum ReviewTab {
 impl ScrawlCoordinator {
     fn new(
         telemetry: Arc<SharedCaptureTelemetry>,
-        initial_bundle: Option<(PathBuf, ScrawlBundle, String)>,
+        initial_bundle: Option<(PathBuf, ScrawlBundle)>,
     ) -> Self {
         Self {
             telemetry,
-            screen_session: None,
-            audio_recorder: None,
-            active_bundle_dir: None,
+            active_recording: None,
             active_stroke: None,
             caption: String::new(),
             review_bundle: initial_bundle,
@@ -211,7 +212,7 @@ impl ScrawlCoordinator {
     }
 
     pub fn is_recording(&self) -> bool {
-        self.screen_session.is_some()
+        self.active_recording.is_some()
     }
 
     pub fn is_drawing(&self) -> bool {
@@ -220,11 +221,20 @@ impl ScrawlCoordinator {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    pub fn set_review_bundle(&mut self, bundle: (PathBuf, ScrawlBundle), status: Option<String>) {
+        self.review_bundle = Some(bundle);
+        self.review_status = status;
+        self.selected_tab = ReviewTab::ContactSheet;
+        self.selected_keyframe = 0;
+    }
+
     pub fn toggle_draw_mode(&mut self, cx: &mut Context<Self>) {
         if !self.is_recording() {
             return;
         }
         let next = !self.is_drawing();
+        self.telemetry.finish_active_laser(None);
+        self.active_stroke = None;
         self.telemetry
             .draw_mode
             .store(next, std::sync::atomic::Ordering::Release);
@@ -232,12 +242,22 @@ impl ScrawlCoordinator {
     }
 
     pub fn undo_stroke(&mut self, cx: &mut Context<Self>) {
-        self.telemetry
+        let mut strokes = self
+            .telemetry
             .strokes
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(idx) = strokes.iter().rposition(|s| !s.laser) {
+            strokes.remove(idx);
+        }
+        drop(strokes);
         cx.notify();
+    }
+
+    pub fn request_immediate_frame(&self) {
+        if let Some(ref rec) = self.active_recording {
+            rec.screen_session.request_immediate_frame();
+        }
     }
 
     pub fn start_recording(&mut self, cx: &mut Context<Self>) {
@@ -251,9 +271,14 @@ impl ScrawlCoordinator {
         let video_path = bundle_dir.join("recording.mp4");
 
         self.telemetry.reset_for_session(target.frame);
-        self.audio_recorder = AudioRecorder::start().ok();
-        self.screen_session = Some(ScreenCaptureSession::start(target, Some(video_path)));
-        self.active_bundle_dir = Some(bundle_dir);
+        let audio_recorder = AudioRecorder::start().ok();
+        let screen_session = ScreenCaptureSession::start(target.clone(), Some(video_path));
+        self.active_recording = Some(ActiveRecording {
+            target,
+            bundle_dir,
+            screen_session,
+            audio_recorder,
+        });
         self.active_stroke = None;
         self.caption.clear();
 
@@ -263,41 +288,40 @@ impl ScrawlCoordinator {
     }
 
     pub fn cancel_recording(&mut self, cx: &mut Context<Self>) {
-        if !self.is_recording() {
+        let Some(rec) = self.active_recording.take() else {
             return;
-        }
+        };
         let _ = self.telemetry.finish_session();
-        if let Some(session) = self.screen_session.take() {
-            let _ = session.stop();
-        }
-        if let Some(audio) = self.audio_recorder.take() {
+        let _ = rec.screen_session.stop();
+        if let Some(audio) = rec.audio_recorder {
             let _ = audio.stop();
         }
-        if let Some(dir) = self.active_bundle_dir.take() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        let _ = std::fs::remove_dir_all(rec.bundle_dir);
         self.active_stroke = None;
         cx.defer(close_capture_windows);
         cx.notify();
     }
 
     pub fn finish_recording(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = self.screen_session.take() else {
+        let Some(rec) = self.active_recording.take() else {
             return;
         };
+        if let Some(stroke) = self.active_stroke.take()
+            && stroke.pts.len() >= 3
+        {
+            self.telemetry
+                .strokes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(stroke);
+        }
         let (events, strokes) = self.telemetry.finish_session();
+        let (frames, video_path, duration_ms) = rec.screen_session.stop();
+        let recorded_audio = rec.audio_recorder.and_then(|r| r.stop().ok());
 
-        let bundle_dir = self.active_bundle_dir.take().unwrap_or_else(|| {
-            crate::handoff::default_captures_dir()
-                .join(format!("{}.scrawl", crate::make_bundle_id()))
-        });
-        let target = discover_target(None);
-        let (frames, video_path, duration_ms) = session.stop();
-        let recorded_audio = self.audio_recorder.take().and_then(|r| r.stop().ok());
-
-        if let Ok((dir, bundle, summary)) = crate::finalize_capture_bundle(
-            &bundle_dir,
-            target,
+        if let Ok((dir, bundle, _)) = crate::finalize_capture_bundle(
+            &rec.bundle_dir,
+            rec.target,
             duration_ms,
             frames,
             strokes,
@@ -306,11 +330,11 @@ impl ScrawlCoordinator {
             video_path,
             None,
         ) {
-            let _ = crate::handoff::copy_bundle_to_clipboard(&dir);
-            self.review_bundle = Some((dir, bundle, summary));
-            self.review_status = Some("Copied contact sheet & summary to clipboard".into());
-            self.selected_tab = ReviewTab::ContactSheet;
-            self.selected_keyframe = 0;
+            let status = match crate::handoff::copy_bundle_to_clipboard(&dir) {
+                Ok(()) => "Copied contact sheet & summary to clipboard".into(),
+                Err(e) => format!("Saved bundle (clipboard: {e})"),
+            };
+            self.set_review_bundle((dir, bundle), Some(status));
         }
         let entity = cx.entity().clone();
         cx.defer(move |cx| {
@@ -329,9 +353,9 @@ impl Render for HudPillWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let coord = self.coordinator.read(cx);
         let elapsed_ms = coord
-            .screen_session
+            .active_recording
             .as_ref()
-            .map_or(0, ScreenCaptureSession::elapsed_ms);
+            .map_or(0, |r| r.screen_session.elapsed_ms());
         let drawing = coord.is_drawing();
         let stroke_count = coord
             .telemetry
@@ -571,9 +595,7 @@ impl Render for OverlayCanvasWindow {
                                         laser: false,
                                         pts: vec![sx, sy, 0],
                                     });
-                                    if let Some(ref s) = coord.screen_session {
-                                        s.request_immediate_frame();
-                                    }
+                                    coord.request_immediate_frame();
                                 } else {
                                     coord.active_stroke = Some(Stroke {
                                         t0: t_ms,
@@ -617,15 +639,8 @@ impl Render for OverlayCanvasWindow {
                         c_up.update(cx, |coord, cx| {
                             if let Some(mut stroke) = coord.active_stroke.take() {
                                 if stroke.pts.len() >= 3 {
-                                    let pts = stroke.normalized_points();
-                                    let (mut x0, mut y0, mut x1, mut y1) =
-                                        (1.0_f32, 1.0_f32, 0.0_f32, 0.0_f32);
-                                    for [x, y] in pts {
-                                        x0 = x0.min(x);
-                                        y0 = y0.min(y);
-                                        x1 = x1.max(x);
-                                        y1 = y1.max(y);
-                                    }
+                                    let [x0, y0, x1, y1] =
+                                        points_bounds(&stroke.normalized_points());
                                     let mid_x = f64::from(
                                         f32::from(bounds.origin.x)
                                             + ((x0 + x1) * 0.5) * f32::from(bounds.size.width),
@@ -647,9 +662,7 @@ impl Render for OverlayCanvasWindow {
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                                         .push(stroke);
-                                    if let Some(ref s) = coord.screen_session {
-                                        s.request_immediate_frame();
-                                    }
+                                    coord.request_immediate_frame();
                                 }
                                 cx.notify();
                             }
@@ -706,6 +719,9 @@ fn paint_live_strokes(
             continue;
         }
 
+        if stroke.laser && stroke.t1 < now_ms.saturating_sub(LASER_MS) {
+            continue;
+        }
         let min_t = if stroke.laser {
             now_ms.saturating_sub(LASER_MS)
         } else {
@@ -722,11 +738,10 @@ fn paint_live_strokes(
             continue;
         }
 
-        if stroke.laser {
-            let outer = freehand_outline(
-                &screen_pts,
-                &FreehandOptions {
-                    size: base_size * 0.9,
+        let (base_opts, passes) = if stroke.laser {
+            (
+                FreehandOptions {
+                    size: base_size,
                     thinning: 0.5,
                     smoothing: 0.5,
                     streamline: 0.4,
@@ -734,38 +749,14 @@ fn paint_live_strokes(
                     taper_start: true,
                     taper_end: false,
                 },
-            );
-            paint_polygon(window, &outer, rgba(0xff3b30cc));
-            let inner = freehand_outline(
-                &screen_pts,
-                &FreehandOptions {
-                    size: base_size * 0.35,
-                    thinning: 0.5,
-                    smoothing: 0.5,
-                    streamline: 0.4,
-                    simulate_pressure: false,
-                    taper_start: true,
-                    taper_end: false,
-                },
-            );
-            paint_polygon(window, &inner, rgba(0xffffffff));
+                [
+                    (base_size * 0.9, rgba(0xff3b30cc)),
+                    (base_size * 0.35, rgba(0xffffffff)),
+                ],
+            )
         } else {
-            let halo = freehand_outline(
-                &screen_pts,
-                &FreehandOptions {
-                    size: base_size + 4.0,
-                    thinning: 0.55,
-                    smoothing: 0.6,
-                    streamline: 0.45,
-                    simulate_pressure: true,
-                    taper_start: false,
-                    taper_end: false,
-                },
-            );
-            paint_polygon(window, &halo, rgba(0xffffffc0));
-            let ink = freehand_outline(
-                &screen_pts,
-                &FreehandOptions {
+            (
+                FreehandOptions {
                     size: base_size,
                     thinning: 0.55,
                     smoothing: 0.6,
@@ -774,8 +765,15 @@ fn paint_live_strokes(
                     taper_start: false,
                     taper_end: false,
                 },
-            );
-            paint_polygon(window, &ink, rgba(0xff3b30ff));
+                [
+                    (base_size + 4.0, rgba(0xffffffc0)),
+                    (base_size, rgba(0xff3b30ff)),
+                ],
+            )
+        };
+        for (size, color) in passes {
+            let outline = freehand_outline(&screen_pts, &FreehandOptions { size, ..base_opts });
+            paint_polygon(window, &outline, color);
         }
     }
 }
@@ -805,7 +803,7 @@ pub struct BundleReviewWindow {
     coordinator: Entity<ScrawlCoordinator>,
     cached_sheet_path: Option<PathBuf>,
     cached_sheet_image: Option<Arc<Image>>,
-    cached_frames: Vec<(PathBuf, Arc<Image>)>,
+    cached_frames: Vec<Option<Arc<Image>>>,
 }
 
 impl BundleReviewWindow {
@@ -828,10 +826,9 @@ impl BundleReviewWindow {
             self.cached_frames = bundle
                 .keyframes
                 .iter()
-                .filter_map(|kf| {
-                    let p = dir.join(&kf.file);
-                    let bytes = std::fs::read(&p).ok()?;
-                    Some((p, Arc::new(Image::from_bytes(ImageFormat::Png, bytes))))
+                .map(|kf| {
+                    let bytes = std::fs::read(dir.join(&kf.file)).ok()?;
+                    Some(Arc::new(Image::from_bytes(ImageFormat::Png, bytes)))
                 })
                 .collect();
         }
@@ -845,7 +842,7 @@ impl Render for BundleReviewWindow {
         let tab = self.coordinator.read(cx).selected_tab;
         let selected_kf = self.coordinator.read(cx).selected_keyframe;
 
-        let Some((dir, bundle, summary)) = state else {
+        let Some((dir, bundle)) = state else {
             let c_start = self.coordinator.clone();
             let c_demo = self.coordinator.clone();
             return div()
@@ -883,11 +880,13 @@ impl Render for BundleReviewWindow {
                         .child(
                             action_button("empty-demo", "Load Demo Bundle", false).on_click(
                                 move |_, _, cx| {
-                                    if let Ok(loaded) = crate::generate_demo_bundle(None) {
+                                    if let Ok((dir, bundle, _)) = crate::generate_demo_bundle(None)
+                                    {
                                         c_demo.update(cx, |coord, cx| {
-                                            coord.review_bundle = Some(loaded);
-                                            coord.review_status =
-                                                Some("Generated demo bundle".into());
+                                            coord.set_review_bundle(
+                                                (dir, bundle),
+                                                Some("Generated demo bundle".into()),
+                                            );
                                             cx.notify();
                                         });
                                     }
@@ -914,8 +913,6 @@ impl Render for BundleReviewWindow {
         let c_tab_frames = self.coordinator.clone();
         let copy_dir = dir.clone();
         let send_dir = dir.clone();
-        let send_bundle = bundle.clone();
-        let send_summary = summary.clone();
 
         div()
             .size_full()
@@ -1034,12 +1031,7 @@ impl Render for BundleReviewWindow {
                             .child(
                                 action_button("btn-send", "Send to OpenCode", true).on_click(
                                     move |_, _, cx| {
-                                        let res = crate::handoff::send_to_opencode(
-                                            &send_dir,
-                                            &send_bundle,
-                                            &send_summary,
-                                            None,
-                                        );
+                                        let res = crate::handoff::send_to_opencode(&send_dir, None);
                                         c_send.update(cx, |coord, cx| {
                                             coord.review_status = Some(match res {
                                                 Ok(ses) => format!("Sent to {ses}"),
@@ -1070,7 +1062,7 @@ impl Render for BundleReviewWindow {
                             .child(match tab {
                                 ReviewTab::ContactSheet => self.render_contact_sheet_stage(),
                                 ReviewTab::Keyframes => {
-                                    self.render_keyframes_stage(&bundle, selected_kf, cx)
+                                    self.render_keyframes_stage(&bundle, selected_kf)
                                 }
                             }),
                     )
@@ -1180,19 +1172,14 @@ impl BundleReviewWindow {
         }
     }
 
-    fn render_keyframes_stage(
-        &self,
-        bundle: &ScrawlBundle,
-        selected_kf: usize,
-        _cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_keyframes_stage(&self, bundle: &ScrawlBundle, selected_kf: usize) -> AnyElement {
         let cards = bundle
             .keyframes
             .iter()
             .enumerate()
             .map(|(idx, kf)| {
                 let is_selected = idx == selected_kf;
-                let frame_img = self.cached_frames.get(idx).map(|(_, img)| Arc::clone(img));
+                let frame_img = self.cached_frames.get(idx).and_then(Clone::clone);
                 let c_select = self.coordinator.clone();
                 div()
                     .id(("kf-card", idx))
@@ -1347,7 +1334,7 @@ fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
         move |window, cx| {
             let ns_window = newest_ns_window();
             if let Some(ref w) = ns_window {
-                configure_floating_window(w, true, true);
+                configure_floating_window(w, true);
             }
             let focus = cx.focus_handle();
             window.focus(&focus);
@@ -1388,7 +1375,7 @@ fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
         },
         move |_, cx| {
             if let Some(ns_win) = newest_ns_window() {
-                configure_floating_window(&ns_win, false, true);
+                configure_floating_window(&ns_win, false);
             }
             cx.new(|cx| {
                 cx.observe(&pill_coord, |_, _, cx| cx.notify()).detach();
@@ -1459,14 +1446,14 @@ fn open_review_window(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
 /// Runs the GPUI desktop app, optionally opening an initial `.scrawl` bundle in the Review window
 /// or starting recording immediately.
 pub fn run_app(
-    initial_bundle: Option<(PathBuf, ScrawlBundle, String)>,
+    initial_bundle: Option<(PathBuf, ScrawlBundle)>,
     start_recording_immediately: bool,
     screenshot_out: Option<PathBuf>,
 ) {
     Application::new().run(move |cx: &mut App| {
         let (ui_sender, ui_receiver) = flume::unbounded();
         let telemetry = SharedCaptureTelemetry::new(ui_sender);
-        let _input_tap = GlobalInputTap::start(Arc::clone(&telemetry));
+        start_global_input_tap(Arc::clone(&telemetry));
         let menu_rx = install_status_bar();
 
         let has_initial = initial_bundle.is_some();
@@ -1537,26 +1524,24 @@ pub fn run_app(
                                     });
                                 }
                                 MenuAction::OpenLatest => {
-                                    if let Ok(dir) = crate::handoff::resolve_bundle_dir(
-                                        std::path::Path::new("latest"),
-                                    ) && let Ok((dir, bundle)) =
-                                        crate::handoff::load_bundle(&dir)
+                                    if let Ok((dir, bundle)) =
+                                        crate::handoff::load_bundle(std::path::Path::new("latest"))
                                     {
-                                        let summary =
-                                            crate::sketch::summary_markdown(&bundle, Some(&dir));
                                         loop_coord.update(cx, |coord, cx| {
-                                            coord.review_bundle = Some((dir, bundle, summary));
+                                            coord.set_review_bundle((dir, bundle), None);
                                             cx.notify();
                                         });
                                         open_review_window(&loop_coord, cx);
                                     }
                                 }
                                 MenuAction::RunDemo => {
-                                    if let Ok(loaded) = crate::generate_demo_bundle(None) {
+                                    if let Ok((dir, bundle, _)) = crate::generate_demo_bundle(None)
+                                    {
                                         loop_coord.update(cx, |coord, cx| {
-                                            coord.review_bundle = Some(loaded);
-                                            coord.review_status =
-                                                Some("Generated demo bundle".into());
+                                            coord.set_review_bundle(
+                                                (dir, bundle),
+                                                Some("Generated demo bundle".into()),
+                                            );
                                             cx.notify();
                                         });
                                         open_review_window(&loop_coord, cx);
@@ -1594,17 +1579,18 @@ pub fn run_app(
                             LiveOverlayEvent::ShiftHeld | LiveOverlayEvent::PointerMoved => {
                                 cx.notify();
                             }
+                            LiveOverlayEvent::RequestSnapshot => {
+                                coord.request_immediate_frame();
+                            }
                             LiveOverlayEvent::ActionCaption(text) => {
                                 coord.caption = text;
-                                if let Some(ref s) = coord.screen_session {
-                                    s.request_immediate_frame();
-                                }
+                                coord.request_immediate_frame();
                                 cx.notify();
                             }
                         });
                     }
 
-                    if last_tick.elapsed() >= Duration::from_millis(100) {
+                    if last_tick.elapsed() >= Duration::from_millis(200) {
                         last_tick = Instant::now();
                         if loop_coord.read(cx).is_recording() {
                             loop_coord.update(cx, |_, cx| cx.notify());
@@ -1670,9 +1656,6 @@ fn capture_own_window_screenshot(
         .with_shows_cursor(false);
     let image =
         SCScreenshotManager::capture_image(&filter, &config).map_err(|e| anyhow::anyhow!("{e}"))?;
-    if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     image
         .save(
             out_path

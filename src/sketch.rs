@@ -1,7 +1,7 @@
 use crate::model::*;
 use std::f32::consts::PI;
 
-fn bounds(points: &[[f32; 2]]) -> [f32; 4] {
+pub fn bounds(points: &[[f32; 2]]) -> [f32; 4] {
     let Some(&[x, y]) = points.first() else {
         return [0.0; 4];
     };
@@ -348,7 +348,7 @@ pub fn timeline(bundle: &ScrawlBundle) -> Vec<String> {
     items.into_iter().map(|item| item.1).collect()
 }
 
-pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: Option<&std::path::Path>) -> String {
+pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> String {
     let mut target = bundle
         .target
         .app
@@ -383,10 +383,7 @@ pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: Option<&std::path::Pa
             out.push_str(&format!("  Said: {said}\n"));
         }
     }
-    let path = bundle_dir
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| ".".into());
-    out.push_str(&format!("\nBundle: {path}\n"));
+    out.push_str(&format!("\nBundle: {}\n", bundle_dir.display()));
     out
 }
 
@@ -881,7 +878,7 @@ mod tests {
             video: None,
             audio: None,
         };
-        let summary = summary_markdown(&bundle, Some(std::path::Path::new("/recordings/test")));
+        let summary = summary_markdown(&bundle, std::path::Path::new("/recordings/test"));
         assert!(summary.starts_with("[scrawl 0:14 · App “Window”]"));
         assert!(summary.contains("Note: Simplify it."));
         assert!(summary.contains("Said: This row is too dense."));

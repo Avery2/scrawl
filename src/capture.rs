@@ -152,6 +152,7 @@ pub enum LiveOverlayEvent {
     CancelCapture,
     ShiftHeld,
     PointerMoved,
+    RequestSnapshot,
     ActionCaption(String),
 }
 
@@ -605,7 +606,6 @@ pub struct SharedCaptureTelemetry {
     pub events: Mutex<Vec<InteractionEvent>>,
     pub strokes: Mutex<Vec<Stroke>>,
     pub active_laser: Mutex<Option<Stroke>>,
-    pub last_urgent_ms: AtomicU64,
     pub ui_sender: flume::Sender<LiveOverlayEvent>,
     tap_port: AtomicU64,
     drag_start: Mutex<Option<(u64, f32, f32, Option<String>)>>,
@@ -628,7 +628,6 @@ impl SharedCaptureTelemetry {
             events: Mutex::new(Vec::new()),
             strokes: Mutex::new(Vec::new()),
             active_laser: Mutex::new(None),
-            last_urgent_ms: AtomicU64::new(0),
             ui_sender,
             tap_port: AtomicU64::new(0),
             drag_start: Mutex::new(None),
@@ -656,9 +655,12 @@ impl SharedCaptureTelemetry {
             .active_laser
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .drag_start
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.draw_mode.store(false, Ordering::Release);
         self.shift_held.store(false, Ordering::Release);
-        self.last_urgent_ms.store(0, Ordering::Release);
         self.active.store(true, Ordering::Release);
     }
 
@@ -685,9 +687,7 @@ impl SharedCaptureTelemetry {
         )
     }
 
-    pub fn finish_session(&self) -> (Vec<InteractionEvent>, Vec<Stroke>) {
-        self.active.store(false, Ordering::Release);
-        self.draw_mode.store(false, Ordering::Release);
+    pub fn finish_active_laser(&self, ax_point: Option<(f64, f64)>) {
         if let Some(mut laser) = self
             .active_laser
             .lock()
@@ -695,14 +695,37 @@ impl SharedCaptureTelemetry {
             .take()
             && !laser.pts.is_empty()
         {
-            if let Some(last_dt) = laser.pts.chunks_exact(3).last().map(|c| c[2]) {
-                laser.t1 = laser.t0.saturating_add(last_dt.max(0) as u64);
+            if let Some(last) = laser.pts.chunks_exact(3).last() {
+                let lx = last[0] as f32 / SCALE as f32;
+                let ly = last[1] as f32 / SCALE as f32;
+                laser.t1 = laser.t0.saturating_add(last[2].max(0) as u64);
+                let label = ax_point.and_then(|(x, y)| ax_element_at(x, y).map(|(l, _)| l));
+                laser.on.clone_from(&label);
+                self.events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(InteractionEvent::Point {
+                        t: laser.t1,
+                        x: lx,
+                        y: ly,
+                        label,
+                    });
             }
             self.strokes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(laser);
         }
+    }
+
+    pub fn finish_session(&self) -> (Vec<InteractionEvent>, Vec<Stroke>) {
+        self.active.store(false, Ordering::Release);
+        self.draw_mode.store(false, Ordering::Release);
+        *self
+            .drag_start
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.finish_active_laser(None);
         let events = std::mem::take(
             &mut *self
                 .events
@@ -719,53 +742,45 @@ impl SharedCaptureTelemetry {
     }
 }
 
-pub struct GlobalInputTap {
-    _thread: Option<JoinHandle<()>>,
-}
+pub fn start_global_input_tap(telemetry: Arc<SharedCaptureTelemetry>) {
+    let _ = thread::Builder::new()
+        .name("scrawl-event-tap".into())
+        .spawn(move || {
+            let mask = (1_u64 << EVENT_LEFT_MOUSE_DOWN)
+                | (1_u64 << EVENT_LEFT_MOUSE_UP)
+                | (1_u64 << EVENT_RIGHT_MOUSE_DOWN)
+                | (1_u64 << EVENT_RIGHT_MOUSE_UP)
+                | (1_u64 << EVENT_MOUSE_MOVED)
+                | (1_u64 << EVENT_LEFT_MOUSE_DRAGGED)
+                | (1_u64 << EVENT_RIGHT_MOUSE_DRAGGED)
+                | (1_u64 << EVENT_KEY_DOWN)
+                | (1_u64 << EVENT_FLAGS_CHANGED)
+                | (1_u64 << EVENT_SCROLL_WHEEL);
 
-impl GlobalInputTap {
-    pub fn start(telemetry: Arc<SharedCaptureTelemetry>) -> Self {
-        let thread = thread::Builder::new()
-            .name("scrawl-event-tap".into())
-            .spawn(move || {
-                let mask = (1_u64 << EVENT_LEFT_MOUSE_DOWN)
-                    | (1_u64 << EVENT_LEFT_MOUSE_UP)
-                    | (1_u64 << EVENT_RIGHT_MOUSE_DOWN)
-                    | (1_u64 << EVENT_RIGHT_MOUSE_UP)
-                    | (1_u64 << EVENT_MOUSE_MOVED)
-                    | (1_u64 << EVENT_LEFT_MOUSE_DRAGGED)
-                    | (1_u64 << EVENT_RIGHT_MOUSE_DRAGGED)
-                    | (1_u64 << EVENT_KEY_DOWN)
-                    | (1_u64 << EVENT_FLAGS_CHANGED)
-                    | (1_u64 << EVENT_SCROLL_WHEEL);
-
-                let user_info = Arc::into_raw(Arc::clone(&telemetry))
-                    .cast_mut()
-                    .cast::<c_void>();
-                // tap = 2 (kCGAnnotatedSessionEventTap), options = 1 (kCGEventTapOptionListenOnly)
-                let tap = unsafe { CGEventTapCreate(2, 0, 1, mask, tap_callback, user_info) };
-                if tap.is_null() {
-                    let _ = unsafe { Arc::from_raw(user_info.cast::<SharedCaptureTelemetry>()) };
-                    return;
-                }
-                telemetry.tap_port.store(tap as u64, Ordering::Release);
-                let source = unsafe { CFMachPortCreateRunLoopSource(ptr::null(), tap, 0) };
-                if !source.is_null() {
-                    let run_loop = unsafe { CFRunLoopGetCurrent() };
-                    unsafe {
-                        CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
-                        CGEventTapEnable(tap, true);
-                        CFRunLoopRun();
-                        CFRunLoopRemoveSource(run_loop, source, kCFRunLoopCommonModes);
-                        CFRelease(source);
-                    }
-                }
-                unsafe { CFRelease(tap) };
+            let user_info = Arc::into_raw(Arc::clone(&telemetry))
+                .cast_mut()
+                .cast::<c_void>();
+            // tap = 2 (kCGAnnotatedSessionEventTap), options = 1 (kCGEventTapOptionListenOnly)
+            let tap = unsafe { CGEventTapCreate(2, 0, 1, mask, tap_callback, user_info) };
+            if tap.is_null() {
                 let _ = unsafe { Arc::from_raw(user_info.cast::<SharedCaptureTelemetry>()) };
-            })
-            .ok();
-        Self { _thread: thread }
-    }
+                return;
+            }
+            telemetry.tap_port.store(tap as u64, Ordering::Release);
+            let source = unsafe { CFMachPortCreateRunLoopSource(ptr::null(), tap, 0) };
+            if !source.is_null() {
+                let run_loop = unsafe { CFRunLoopGetCurrent() };
+                unsafe {
+                    CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
+                    CGEventTapEnable(tap, true);
+                    CFRunLoopRun();
+                    CFRunLoopRemoveSource(run_loop, source, kCFRunLoopCommonModes);
+                    CFRelease(source);
+                }
+            }
+            unsafe { CFRelease(tap) };
+            let _ = unsafe { Arc::from_raw(user_info.cast::<SharedCaptureTelemetry>()) };
+        });
 }
 
 unsafe extern "C" fn tap_callback(
@@ -808,6 +823,14 @@ unsafe extern "C" fn tap_callback(
         return event;
     }
 
+    if matches!(
+        event_type,
+        EVENT_MOUSE_MOVED | EVENT_LEFT_MOUSE_DRAGGED | EVENT_RIGHT_MOUSE_DRAGGED
+    ) && (!shift || telemetry.draw_mode.load(Ordering::Acquire))
+    {
+        return event;
+    }
+
     let t_ms = telemetry.elapsed_ms();
     let loc = unsafe { CGEventGetLocation(event) };
     let (nx, ny, fw, fh) = telemetry.normalize_point(loc.x, loc.y);
@@ -817,71 +840,41 @@ unsafe extern "C" fn tap_callback(
             let was_shift = telemetry.shift_held.swap(shift, Ordering::AcqRel);
             if was_shift != shift {
                 let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::ShiftHeld);
-                if !shift {
-                    // Finish active laser path and record a `Point` event at its end.
-                    if let Some(mut laser) = telemetry
-                        .active_laser
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take()
-                        && !laser.pts.is_empty()
-                    {
-                        if let Some(last) = laser.pts.chunks_exact(3).last() {
-                            let lx = last[0] as f32 / SCALE as f32;
-                            let ly = last[1] as f32 / SCALE as f32;
-                            laser.t1 = laser.t0.saturating_add(last[2].max(0) as u64);
-                            let label = ax_element_at(loc.x, loc.y).map(|(l, _)| l);
-                            laser.on.clone_from(&label);
-                            telemetry
-                                .events
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .push(InteractionEvent::Point {
-                                    t: laser.t1,
-                                    x: lx,
-                                    y: ly,
-                                    label,
-                                });
-                        }
-                        telemetry
-                            .strokes
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(laser);
-                    }
-                }
+            }
+            if !shift {
+                telemetry.finish_active_laser(Some((loc.x, loc.y)));
             }
         }
         EVENT_MOUSE_MOVED | EVENT_LEFT_MOUSE_DRAGGED | EVENT_RIGHT_MOUSE_DRAGGED => {
-            if shift && !telemetry.draw_mode.load(Ordering::Acquire) {
-                let mut guard = telemetry
-                    .active_laser
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let stroke = guard.get_or_insert_with(|| Stroke {
-                    t0: t_ms,
-                    t1: t_ms,
-                    fw,
-                    fh,
-                    on: None,
-                    pin: None,
-                    laser: true,
-                    pts: Vec::new(),
-                });
-                let sx = (nx * SCALE as f32).round() as i32;
-                let sy = (ny * SCALE as f32).round() as i32;
-                let dt = t_ms.saturating_sub(stroke.t0) as i32;
-                let should_push = stroke.pts.chunks_exact(3).last().is_none_or(|prev| {
-                    let dx = (sx - prev[0]) as f32 / SCALE as f32 * fw as f32;
-                    let dy = (sy - prev[1]) as f32 / SCALE as f32 * fh as f32;
-                    dx.hypot(dy) >= 1.5
-                });
-                if should_push && stroke.pts.len() / 3 < 1_800 {
-                    stroke.pts.extend_from_slice(&[sx, sy, dt]);
-                    stroke.t1 = t_ms;
-                }
+            telemetry.shift_held.store(true, Ordering::Release);
+            let mut guard = telemetry
+                .active_laser
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stroke = guard.get_or_insert_with(|| Stroke {
+                t0: t_ms,
+                t1: t_ms,
+                fw,
+                fh,
+                on: None,
+                pin: None,
+                laser: true,
+                pts: Vec::new(),
+            });
+            let sx = (nx * SCALE as f32).round() as i32;
+            let sy = (ny * SCALE as f32).round() as i32;
+            let dt = t_ms.saturating_sub(stroke.t0) as i32;
+            let should_push = stroke.pts.chunks_exact(3).last().is_none_or(|prev| {
+                let dx = (sx - prev[0]) as f32 / SCALE as f32 * fw as f32;
+                let dy = (sy - prev[1]) as f32 / SCALE as f32 * fh as f32;
+                dx.hypot(dy) >= 1.5
+            });
+            if should_push && stroke.pts.len() / 3 < 1_800 {
+                stroke.pts.extend_from_slice(&[sx, sy, dt]);
+                stroke.t1 = t_ms;
+                drop(guard);
+                let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::PointerMoved);
             }
-            let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::PointerMoved);
         }
         EVENT_LEFT_MOUSE_DOWN | EVENT_RIGHT_MOUSE_DOWN => {
             if telemetry.draw_mode.load(Ordering::Acquire) {
@@ -913,6 +906,10 @@ unsafe extern "C" fn tap_callback(
                     let _ = telemetry
                         .ui_sender
                         .try_send(LiveOverlayEvent::ActionCaption(format!("Clicked “{l}”")));
+                } else {
+                    let _ = telemetry
+                        .ui_sender
+                        .try_send(LiveOverlayEvent::RequestSnapshot);
                 }
                 telemetry
                     .events
@@ -931,6 +928,9 @@ unsafe extern "C" fn tap_callback(
                         role,
                     });
             } else {
+                let _ = telemetry
+                    .ui_sender
+                    .try_send(LiveOverlayEvent::RequestSnapshot);
                 telemetry
                     .events
                     .lock()
@@ -945,7 +945,6 @@ unsafe extern "C" fn tap_callback(
                         label: start_label,
                     });
             }
-            telemetry.last_urgent_ms.store(t_ms, Ordering::Release);
         }
         EVENT_SCROLL_WHEEL => {
             let dy =
@@ -1055,7 +1054,7 @@ pub fn write_bundle_artifacts(
     annotated_frames: &[(crate::model::Keyframe, RgbaFrame)],
     contact_sheet: &RgbaFrame,
     summary_md: &str,
-) -> Result<PathBuf> {
+) -> Result<()> {
     std::fs::create_dir_all(out_dir.join("frames"))
         .with_context(|| format!("could not create {}", out_dir.display()))?;
     #[cfg(unix)]
@@ -1076,5 +1075,5 @@ pub fn write_bundle_artifacts(
     std::fs::write(out_dir.join("scrawl.json"), manifest_bytes)?;
     std::fs::write(out_dir.join("summary.md"), summary_md.as_bytes())?;
 
-    Ok(out_dir.to_path_buf())
+    Ok(())
 }

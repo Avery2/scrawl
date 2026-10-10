@@ -1,8 +1,6 @@
 //! PNG output and deterministic, CPU-rendered review images.
 use crate::model::*;
 use crate::sketch::{FreehandOptions, freehand_outline};
-#[cfg(test)]
-use std::io::BufReader;
 use std::path::Path;
 
 type Color = [u8; 4];
@@ -38,11 +36,6 @@ pub fn encode_png(frame: &RgbaFrame) -> anyhow::Result<Vec<u8>> {
 pub fn save_png(frame: &RgbaFrame, path: &Path) -> anyhow::Result<()> {
     std::fs::write(path, encode_png(frame)?)?;
     Ok(())
-}
-
-#[cfg(test)]
-pub fn load_png(path: &Path) -> anyhow::Result<RgbaFrame> {
-    decode_png(BufReader::new(std::fs::File::open(path)?))
 }
 
 #[cfg(test)]
@@ -265,6 +258,7 @@ fn line(frame: &mut RgbaFrame, a: [f32; 2], b: [f32; 2], r0: f32, r1: f32, color
     circle(frame, b, r1, color);
 }
 
+#[cfg(test)]
 pub fn render_annotated_keyframe(
     base: &RgbaFrame,
     keyframe: &Keyframe,
@@ -273,11 +267,22 @@ pub fn render_annotated_keyframe(
     events: &[InteractionEvent],
 ) -> RgbaFrame {
     let mut frame = base.clone();
+    annotate_keyframe_in_place(&mut frame, keyframe, strokes, marks, events);
+    frame
+}
+
+pub fn annotate_keyframe_in_place(
+    frame: &mut RgbaFrame,
+    keyframe: &Keyframe,
+    strokes: &[Stroke],
+    marks: &[Mark],
+    events: &[InteractionEvent],
+) {
     frame.t_ms = keyframe.t;
     let w = frame.width as f32;
     let h = frame.height as f32;
     if w == 0.0 || h == 0.0 {
-        return frame;
+        return;
     }
     let size = (w.min(h) * 0.014).max(4.0);
     let active_mark = keyframe
@@ -309,13 +314,7 @@ pub fn render_annotated_keyframe(
                 .collect();
             if let Some(number) = stroke.pin {
                 if let Some(&point) = points.first() {
-                    draw_pin(
-                        &mut frame,
-                        point,
-                        number,
-                        (w / 1280.0).clamp(0.75, 2.5),
-                        alpha,
-                    );
+                    draw_pin(frame, point, number, (w / 1280.0).clamp(0.75, 2.5), alpha);
                 }
             } else if !points.is_empty() {
                 for (diameter, color) in [
@@ -329,13 +328,13 @@ pub fn render_annotated_keyframe(
                             ..Default::default()
                         },
                     );
-                    polygon(&mut frame, &outline, color);
+                    polygon(frame, &outline, color);
                 }
             }
         }
     }
     for stroke in strokes.iter().filter(|s| s.laser) {
-        draw_laser(&mut frame, stroke, keyframe.t);
+        draw_laser(frame, stroke, keyframe.t);
     }
     let click = events
         .iter()
@@ -352,25 +351,24 @@ pub fn render_annotated_keyframe(
         .or(click)
         .filter(|p| p.iter().all(|v| v.is_finite()))
     {
-        draw_cursor(&mut frame, [cx * w, cy * h]);
+        draw_cursor(frame, [cx * w, cy * h]);
     }
     let label = format!("#{} · {}", keyframe.index, format_clock(keyframe.t));
     let badge_w = text_width(&label, 16.0, true) + 45.0;
     rounded(
-        &mut frame,
+        frame,
         [16.0, 16.0, badge_w, 36.0],
         18.0,
         [255, 255, 255, 46],
     );
     rounded(
-        &mut frame,
+        frame,
         [17.0, 17.0, badge_w - 2.0, 34.0],
         17.0,
         [20, 20, 22, 224],
     );
-    circle(&mut frame, [31.0, 34.0], 4.0, RED);
-    draw_text(&mut frame, &label, 43.0, 24.0, 16.0, WHITE, true);
-    frame
+    circle(frame, [31.0, 34.0], 4.0, RED);
+    draw_text(frame, &label, 43.0, 24.0, 16.0, WHITE, true);
 }
 
 fn draw_pin(frame: &mut RgbaFrame, point: [f32; 2], number: u32, scale: f32, alpha: f32) {
@@ -651,27 +649,28 @@ fn blit_scaled(dst: &mut RgbaFrame, src: &RgbaFrame, rect: [f32; 4], radius: f32
         return;
     }
     for py in (y.floor() as i32).max(0)..((y + h).ceil() as i32).min(dst.height as i32) {
+        let sy = ((py as f32 + 0.5 - y) / h * src.height as f32 - 0.5)
+            .clamp(0.0, src.height.saturating_sub(1) as f32);
+        let y0 = sy.floor() as u32;
+        let y1 = (y0 + 1).min(src.height - 1);
+        let fy = sy.fract();
         for px in (x.floor() as i32).max(0)..((x + w).ceil() as i32).min(dst.width as i32) {
             let coverage = (0.5 - rounded_distance(px as f32 + 0.5, py as f32 + 0.5, rect, radius))
                 .clamp(0.0, 1.0);
+            if coverage <= 0.0 {
+                continue;
+            }
             let sx = ((px as f32 + 0.5 - x) / w * src.width as f32 - 0.5)
                 .clamp(0.0, src.width.saturating_sub(1) as f32);
-            let sy = ((py as f32 + 0.5 - y) / h * src.height as f32 - 0.5)
-                .clamp(0.0, src.height.saturating_sub(1) as f32);
             let x0 = sx.floor() as u32;
-            let y0 = sy.floor() as u32;
+            let x1 = (x0 + 1).min(src.width - 1);
             let fx = sx.fract();
-            let fy = sy.fract();
             let mut accum = [0.0f32; 4];
             for (xx, yy, weight) in [
                 (x0, y0, (1.0 - fx) * (1.0 - fy)),
-                ((x0 + 1).min(src.width - 1), y0, fx * (1.0 - fy)),
-                (x0, (y0 + 1).min(src.height - 1), (1.0 - fx) * fy),
-                (
-                    (x0 + 1).min(src.width - 1),
-                    (y0 + 1).min(src.height - 1),
-                    fx * fy,
-                ),
+                (x1, y0, fx * (1.0 - fy)),
+                (x0, y1, (1.0 - fx) * fy),
+                (x1, y1, fx * fy),
             ] {
                 let i = (yy as usize * src.width as usize + xx as usize) * 4;
                 if let Some(p) = src.rgba.get(i..i + 4) {
