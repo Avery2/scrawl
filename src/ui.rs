@@ -22,8 +22,8 @@ use screencapturekit::prelude::*;
 use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
 
 use crate::capture::{
-    LiveOverlayEvent, ScreenCaptureSession, SharedCaptureTelemetry, discover_target,
-    install_global_hotkeys, list_selectable_windows, region_target, scrawl_log,
+    LiveOverlayEvent, ScreenCaptureSession, SharedCaptureTelemetry, current_mouse_screen,
+    discover_target, install_global_hotkeys, list_selectable_windows, region_target, scrawl_log,
     selectable_window_at, set_escape_hotkey_enabled, shortcut_from_key_and_mods,
     start_global_input_tap,
 };
@@ -142,11 +142,10 @@ fn island_content_width(window: &Window, phase: IslandPhase, clock: &str) -> f32
     let inner = match phase {
         IslandPhase::Selecting { .. } => {
             chip_width(window, "Area", FontWeight::MEDIUM)
-                + chip_width(window, "Window", FontWeight::MEDIUM)
                 + chip_width(window, "Full Screen", FontWeight::MEDIUM)
                 + divider
                 + CHIP_H
-                + 4.0 * CHIP_GAP
+                + 3.0 * CHIP_GAP
         }
         IslandPhase::Recording => {
             CHIP_H
@@ -387,6 +386,7 @@ pub struct ScrawlCoordinator {
     windows_loading: bool,
     selection_pointer: Option<[f32; 2]>,
     hovered_window: Option<TargetInfo>,
+    animated_window_rect: Option<[f32; 4]>,
     selection_drag: Option<([f32; 2], [f32; 2])>,
     recording_shortcut_key: bool,
     review_bundle: Option<(PathBuf, ScrawlBundle)>,
@@ -421,6 +421,7 @@ impl ScrawlCoordinator {
             windows_loading: false,
             selection_pointer: None,
             hovered_window: None,
+            animated_window_rect: None,
             selection_drag: None,
             recording_shortcut_key: false,
             review_bundle: initial_bundle,
@@ -462,6 +463,27 @@ impl ScrawlCoordinator {
         if matches!(self.island_phase, IslandPhase::Selecting { .. }) {
             self.island_phase = IslandPhase::Selecting { mode };
             self.selection_drag = None;
+            if let Some(pos) = current_mouse_screen().or(self.selection_pointer) {
+                self.selection_pointer = Some(pos);
+                if mode == SelectionMode::Window {
+                    self.hovered_window = selectable_window_at(
+                        &self.selectable_windows,
+                        f64::from(pos[0]),
+                        f64::from(pos[1]),
+                    )
+                    .cloned();
+                    self.animated_window_rect = self.hovered_window.as_ref().map(|w| {
+                        [
+                            w.frame.x as f32,
+                            w.frame.y as f32,
+                            w.frame.width as f32,
+                            w.frame.height as f32,
+                        ]
+                    });
+                } else {
+                    self.animated_window_rect = None;
+                }
+            }
             cx.notify();
         }
     }
@@ -502,8 +524,6 @@ impl ScrawlCoordinator {
         if changed {
             if matches!(phase, IslandPhase::Dismissing) {
                 self.island_dismissed_from = self.island_phase;
-            } else if !matches!(self.island_phase, IslandPhase::Hidden) {
-                self.island_velocity -= 140.0;
             }
             self.island_phase_since = Instant::now();
         }
@@ -519,6 +539,7 @@ impl ScrawlCoordinator {
         }
         self.selection_drag = None;
         self.hovered_window = None;
+        self.animated_window_rect = None;
         self.set_island_phase(IslandPhase::Dismissing);
         cx.defer(close_picker_window);
         cx.notify();
@@ -541,6 +562,42 @@ impl ScrawlCoordinator {
             && finished_at.elapsed() >= Duration::from_millis(5_000)
         {
             self.set_island_phase(IslandPhase::Dismissing);
+        }
+
+        if let IslandPhase::Selecting { mode } = self.island_phase {
+            if let Some(pos) = current_mouse_screen() {
+                self.selection_pointer = Some(pos);
+                if mode == SelectionMode::Window && !self.windows_loading {
+                    self.hovered_window = selectable_window_at(
+                        &self.selectable_windows,
+                        f64::from(pos[0]),
+                        f64::from(pos[1]),
+                    )
+                    .cloned();
+                }
+            }
+            if mode == SelectionMode::Window
+                && let Some(ref win) = self.hovered_window
+            {
+                let target_rect = [
+                    win.frame.x as f32,
+                    win.frame.y as f32,
+                    win.frame.width as f32,
+                    win.frame.height as f32,
+                ];
+                let blend = (28.0 * dt).min(1.0);
+                self.animated_window_rect = Some(match self.animated_window_rect {
+                    Some(cur) => [
+                        cur[0] + (target_rect[0] - cur[0]) * blend,
+                        cur[1] + (target_rect[1] - cur[1]) * blend,
+                        cur[2] + (target_rect[2] - cur[2]) * blend,
+                        cur[3] + (target_rect[3] - cur[3]) * blend,
+                    ],
+                    None => target_rect,
+                });
+            } else {
+                self.animated_window_rect = None;
+            }
         }
 
         // `island_target_width` is the measured intrinsic width of the visible content, written
@@ -579,7 +636,8 @@ impl ScrawlCoordinator {
         self.recording_shortcut_key = false;
         self.selectable_windows.clear();
         self.hovered_window = None;
-        self.selection_pointer = None;
+        self.animated_window_rect = None;
+        self.selection_pointer = current_mouse_screen();
         self.selection_generation += 1;
         self.windows_loading = true;
         let generation = self.selection_generation;
@@ -594,10 +652,26 @@ impl ScrawlCoordinator {
                     return;
                 }
                 coord.windows_loading = false;
-                coord.hovered_window = coord
-                    .selection_pointer
+                let ptr = current_mouse_screen().or(coord.selection_pointer);
+                coord.selection_pointer = ptr;
+                coord.hovered_window = ptr
                     .and_then(|[x, y]| selectable_window_at(&windows, f64::from(x), f64::from(y)))
                     .cloned();
+                if matches!(
+                    coord.island_phase,
+                    IslandPhase::Selecting {
+                        mode: SelectionMode::Window
+                    }
+                ) {
+                    coord.animated_window_rect = coord.hovered_window.as_ref().map(|w| {
+                        [
+                            w.frame.x as f32,
+                            w.frame.y as f32,
+                            w.frame.width as f32,
+                            w.frame.height as f32,
+                        ]
+                    });
+                }
                 coord.selectable_windows = windows;
                 start_metric("picker_ready_ms", started);
                 cx.notify();
@@ -650,6 +724,7 @@ impl ScrawlCoordinator {
         self.recording_shortcut_key = false;
         self.selection_drag = None;
         self.hovered_window = None;
+        self.animated_window_rect = None;
         let id = crate::make_bundle_id();
         let root = std::env::var_os("SCRAWL_BENCH_START")
             .map(PathBuf::from)
@@ -658,6 +733,7 @@ impl ScrawlCoordinator {
         let _ = std::fs::create_dir_all(&bundle_dir);
         let video_path = bundle_dir.join("recording.mp4");
 
+        self.telemetry.set_capture_mode(target.mode);
         self.telemetry.reset_for_session(target.frame);
         set_escape_hotkey_enabled(true);
         let stage = Instant::now();
@@ -798,11 +874,11 @@ impl Render for HudPillWindow {
         self.coordinator
             .update(cx, |coord, _| coord.island_target_width = target_width);
 
-        // New content fades in once the capsule has started morphing toward its width.
+        // Smoothly cross-fade capsule contents without a blank gap between phases.
         let content_alpha = if matches!(phase, IslandPhase::Dismissing) {
             1.0
         } else {
-            ease_out_cubic((phase_age - 0.04) / 0.2)
+            0.38 + 0.62 * ease_out_cubic(phase_age / 0.14)
         };
 
         let c_undo = self.coordinator.clone();
@@ -811,7 +887,6 @@ impl Render for HudPillWindow {
         let c_inspect = self.coordinator.clone();
         let c_dismiss = self.coordinator.clone();
         let c_mode_area = self.coordinator.clone();
-        let c_mode_win = self.coordinator.clone();
         let c_full = self.coordinator.clone();
         let c_sel_cancel = self.coordinator.clone();
 
@@ -830,15 +905,6 @@ impl Render for HudPillWindow {
                         move |_, _, cx| {
                             c_mode_area.update(cx, |coord, cx| {
                                 coord.set_selection_mode(SelectionMode::Area, cx);
-                            });
-                        },
-                    ),
-                )
-                .child(
-                    mode_chip("sel-window", "Window", mode == SelectionMode::Window).on_click(
-                        move |_, _, cx| {
-                            c_mode_win.update(cx, |coord, cx| {
-                                coord.set_selection_mode(SelectionMode::Window, cx);
                             });
                         },
                     ),
@@ -1113,6 +1179,58 @@ fn mode_chip(id: &'static str, label: &'static str, active: bool) -> gpui::State
         .child(label)
 }
 
+/// CleanShot-style floating camera cursor rendered at `(x, y)` in `SelectionMode::Window`.
+fn camera_cursor_badge(x: f32, y: f32) -> Div {
+    div()
+        .absolute()
+        .left(px(x - 20.0))
+        .top(px(y - 20.0))
+        .size(px(40.0))
+        .rounded_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .bg(rgba(0x161619eb))
+        .border_1()
+        .border_color(rgba(0xffffff38))
+        .shadow(vec![BoxShadow {
+            color: gpui::hsla(0.0, 0.0, 0.0, 0.45),
+            offset: point(px(0.0), px(3.0)),
+            blur_radius: px(10.0),
+            spread_radius: px(0.0),
+        }])
+        .child(
+            // Top viewfinder hump
+            div()
+                .w(px(9.0))
+                .h(px(2.5))
+                .rounded_t(px(1.5))
+                .bg(rgb(0xf5f5f7)),
+        )
+        .child(
+            // Camera body + lens
+            div()
+                .w(px(21.0))
+                .h(px(14.5))
+                .rounded(px(3.5))
+                .bg(rgb(0xf5f5f7))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .size(px(9.0))
+                        .rounded_full()
+                        .bg(rgb(0x161619))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(div().size(px(4.5)).rounded_full().bg(rgb(0xf5f5f7))),
+                ),
+        )
+}
+
 pub struct TargetPickerWindow {
     coordinator: Entity<ScrawlCoordinator>,
     focus: FocusHandle,
@@ -1127,6 +1245,9 @@ impl Render for TargetPickerWindow {
         };
         let drag = coord.selection_drag;
         let hovered = coord.hovered_window.clone();
+        let anim_rect = coord.animated_window_rect;
+        let pointer = coord.selection_pointer;
+        let picker_fade = ease_out_cubic(coord.island_phase_since.elapsed().as_secs_f32() / 0.12);
 
         let c_down = self.coordinator.clone();
         let c_move = self.coordinator.clone();
@@ -1165,15 +1286,13 @@ impl Render for TargetPickerWindow {
                         t.frame.height.round() as i32
                     ),
                 };
-                (
-                    [
-                        t.frame.x as f32 - origin[0],
-                        t.frame.y as f32 - origin[1],
-                        t.frame.width as f32,
-                        t.frame.height as f32,
-                    ],
-                    title,
-                )
+                let [rx, ry, rw, rh] = anim_rect.unwrap_or([
+                    t.frame.x as f32,
+                    t.frame.y as f32,
+                    t.frame.width as f32,
+                    t.frame.height as f32,
+                ]);
+                ([rx - origin[0], ry - origin[1], rw, rh], title)
             }),
         }
         .map(|(rect, label)| (clip_rect(rect, screen), label));
@@ -1193,14 +1312,17 @@ impl Render for TargetPickerWindow {
             )
         });
 
-        let dim = rgba(0x00000052);
+        let dim = with_alpha(0x000000, 0.32 * picker_fade);
         let mut root = div()
             .id("scrawl-target-picker")
             .track_focus(&self.focus)
             .size_full()
             .relative()
             .when(highlight.is_none(), |d| d.bg(dim))
-            .cursor_crosshair();
+            .when(mode == SelectionMode::Area, |d| d.cursor_crosshair())
+            .when(mode == SelectionMode::Window, |d| {
+                d.cursor(gpui::CursorStyle::None)
+            });
 
         if let Some(([x, y, w, h], _)) = highlight {
             // Dim everything around the selection so the target itself stays untouched.
@@ -1242,6 +1364,14 @@ impl Render for TargetPickerWindow {
                     .border_2()
                     .border_color(rgba(0x5b7cfaee)),
             });
+        }
+
+        if mode == SelectionMode::Window
+            && let Some([px_screen, py_screen]) = pointer
+        {
+            let cx_local = px_screen - origin[0];
+            let cy_local = py_screen - origin[1];
+            root = root.child(camera_cursor_badge(cx_local, cy_local));
         }
 
         root.when_some(badge, |d, ([bx, by], text_w, label)| {

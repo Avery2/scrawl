@@ -1209,6 +1209,7 @@ fn capture_sck_frame(
 pub struct SharedCaptureTelemetry {
     pub active: AtomicBool,
     pub shift_held: AtomicBool,
+    pub capture_mode: AtomicU64,
     pub shortcut: Mutex<ShortcutConfig>,
     pub started_at: Mutex<Instant>,
     pub target_frame: Mutex<TargetFrame>,
@@ -1229,6 +1230,7 @@ impl SharedCaptureTelemetry {
         Arc::new(Self {
             active: AtomicBool::new(false),
             shift_held: AtomicBool::new(false),
+            capture_mode: AtomicU64::new(0),
             shortcut: Mutex::new(ShortcutConfig::load()),
             started_at: Mutex::new(Instant::now()),
             target_frame: Mutex::new(TargetFrame {
@@ -1298,6 +1300,15 @@ impl SharedCaptureTelemetry {
         let is_s_key = keycode == s_code || keycode == KEY_S;
         let builtin_s = is_s_key && alt && ((shift && (ctrl || cmd)) || (ctrl && cmd));
         custom_match || builtin_s
+    }
+
+    pub fn set_capture_mode(&self, mode: CaptureMode) {
+        let code = match mode {
+            CaptureMode::Display => 0,
+            CaptureMode::Region => 1,
+            CaptureMode::Window => 2,
+        };
+        self.capture_mode.store(code, Ordering::Release);
     }
 
     pub fn reset_for_session(&self, frame: TargetFrame) {
@@ -1649,6 +1660,10 @@ fn current_mouse_location() -> Option<CGPoint> {
     let loc = unsafe { CGEventGetLocation(ev) };
     unsafe { CFRelease(ev.cast()) };
     Some(loc)
+}
+
+pub fn current_mouse_screen() -> Option<[f32; 2]> {
+    current_mouse_location().map(|p| [p.x as f32, p.y as f32])
 }
 
 /// 120Hz global HID & session state poller so shortcuts, Shift-laser (`⇧` + move), and

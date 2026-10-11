@@ -127,25 +127,50 @@ fragment float4 laser_fragment(
 
     float4 out = float4(0.0);
 
-    // 0. If constrained to a window or area, softly dim outside the capture box and draw a 1.5px border.
+    // Smooth 280ms transition from the picker's dim/border state into active recording.
+    float t_intro = clamp(u.now_sec / 0.28, 0.0, 1.0);
+    float intro_ease = 1.0 - pow(1.0 - t_intro, 3.0);
+    float intro_fade = 1.0 - intro_ease;
+
     if (u.constrain_rect > 0.5) {
+        bool is_window = u._pad1 > 1.5;
+        float corner_r = is_window ? 10.0 : 2.0;
         float2 box_min = u.target_rect.xy;
         float2 box_max = u.target_rect.xy + u.target_rect.zw;
         float2 box_center = (box_min + box_max) * 0.5;
-        float2 half_size = (box_max - box_min) * 0.5;
+        float2 half_size = max((box_max - box_min) * 0.5 - float2(corner_r), float2(0.0));
         float2 q = abs(p - box_center) - half_size;
-        float sdf = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
-        if (sdf > 0.0) {
-            float dim_a = smoothstep(0.0, 1.5, sdf) * 0.28;
-            out.rgb = float3(0.0);
-            out.a = dim_a;
-            float border_a = (1.0 - smoothstep(0.2, 1.8, abs(sdf - 1.0))) * 0.55;
+        float sdf = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - corner_r;
+
+        // Inside the selected window, dissolve the picker's blue window highlight tint over 280ms.
+        if (sdf <= 0.0 && is_window && intro_fade > 0.002) {
+            float fill_a = 0.13 * intro_fade;
+            out.rgb = float3(0.23, 0.36, 0.96);
+            out.a = fill_a;
+        }
+        // Outside the target rect, smoothly settle from the picker dim (0.32) to recording dim (0.20).
+        if (sdf > -1.5) {
+            float dim_target = mix(0.32, 0.20, intro_ease);
+            float dim_a = smoothstep(-0.5, 1.0, sdf) * dim_target;
+            if (dim_a > 0.001) {
+                out.rgb = out.rgb * (1.0 - dim_a);
+                out.a = dim_a + out.a * (1.0 - dim_a);
+            }
+            float3 picker_border = is_window ? float3(0.36, 0.49, 0.98) : float3(1.0, 1.0, 1.0);
+            float3 rec_border = float3(1.0, 1.0, 1.0);
+            float3 border_col = mix(picker_border, rec_border, intro_ease);
+            float border_alpha_peak = mix(is_window ? 0.92 : 0.88, 0.32, intro_ease);
+            float border_half_w = mix(is_window ? 1.1 : 0.7, 0.65, intro_ease);
+            float border_a = (1.0 - smoothstep(border_half_w - 0.35, border_half_w + 0.55, abs(sdf - 0.6))) * border_alpha_peak;
             if (border_a > 0.001) {
-                float3 border_col = float3(0.35, 0.52, 1.0);
                 out.rgb = border_col * border_a + out.rgb * (1.0 - border_a);
                 out.a = border_a + out.a * (1.0 - border_a);
             }
         }
+    } else if (intro_fade > 0.002) {
+        // Full-screen recording: smoothly dissolve the picker's 0.32 backdrop instead of snapping.
+        out.rgb = float3(0.0);
+        out.a = 0.32 * intro_fade;
     }
 
     // 1. Composite persistent ink (white halo + red fill)

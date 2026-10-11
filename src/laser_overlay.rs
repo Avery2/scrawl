@@ -389,6 +389,7 @@ impl SharedMetalOverlay {
             attachment.set_store_action(MTLStoreAction::Store);
 
             let is_constrained = tw < renderer.width - 8.0 || th < renderer.height - 8.0;
+            let mode_code = self.telemetry.capture_mode.load(Ordering::Acquire) as f32;
             let uniforms = LaserUniforms {
                 resolution: [
                     renderer.width * renderer.scale,
@@ -410,7 +411,7 @@ impl SharedMetalOverlay {
                     pins.len().min(MAX_PINS) as u32
                 },
                 constrain_rect: if is_constrained { 1.0 } else { 0.0 },
-                _pad1: 0.0,
+                _pad1: mode_code,
                 target_rect: [tx, ty, tw, th],
             };
 
