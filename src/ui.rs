@@ -1417,13 +1417,6 @@ impl BundleReviewWindow {
 
 impl Render for BundleReviewWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(mtm) = MainThreadMarker::new() {
-            for ns_win in NSApplication::sharedApplication(mtm).windows() {
-                if ns_win.frame().size.width >= 600.0 {
-                    sync_full_size_content_view(&ns_win);
-                }
-            }
-        }
         let stage_w = (f32::from(window.bounds().size.width) - 320.0 - 44.0).max(320.0);
         let coord_read = self.coordinator.read(cx);
         let state = coord_read.review_bundle.clone();
@@ -1431,12 +1424,6 @@ impl Render for BundleReviewWindow {
         let tab = coord_read.selected_tab;
         let selected_kf = coord_read.selected_keyframe;
         let shortcut_label = coord_read.shortcut_label();
-        let recording_key = coord_read.recording_shortcut_key;
-        let (shortcut_chip_label, shortcut_hint) = if recording_key {
-            ("Press shortcut…", None)
-        } else {
-            ("Shortcut", Some(shortcut_label.clone()))
-        };
 
         let Some((dir, bundle)) = state else {
             let c_start = self.coordinator.clone();
@@ -1497,8 +1484,6 @@ impl Render for BundleReviewWindow {
         };
         let timeline = timeline(&bundle);
 
-        let c_record = self.coordinator.clone();
-        let c_shortcut = self.coordinator.clone();
         let c_keydown = self.coordinator.clone();
         let c_copy = self.coordinator.clone();
         let c_send = self.coordinator.clone();
@@ -1506,36 +1491,18 @@ impl Render for BundleReviewWindow {
         let c_tab_frames = self.coordinator.clone();
         let copy_dir = dir.clone();
         let send_dir = dir.clone();
-        let focus = self.focus.clone();
 
         div()
             .id("scrawl-review-root")
             .track_focus(&self.focus)
-            .on_key_down(move |event: &KeyDownEvent, _, cx| {
-                c_keydown.update(cx, |coord, cx| {
-                    let key = event.keystroke.key.as_str();
-                    let mods = event.keystroke.modifiers;
-                    if coord.recording_shortcut_key {
-                        if key == "escape" {
-                            coord.recording_shortcut_key = false;
-                            cx.notify();
-                            return;
-                        }
-                        if let Some(cfg) = shortcut_from_key_and_mods(
-                            key,
-                            mods.platform,
-                            mods.control,
-                            mods.alt,
-                            mods.shift,
-                        ) {
-                            let new_label = cfg.label.clone();
-                            update_global_shortcut(&coord.telemetry, cfg);
-                            coord.recording_shortcut_key = false;
-                            coord.review_status = Some(format!("Shortcut: {new_label}"));
-                            cx.notify();
-                        }
-                        return;
-                    }
+            .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                let key = event.keystroke.key.as_str();
+                let mods = event.keystroke.modifiers;
+                if key == "escape" || (mods.platform && key.eq_ignore_ascii_case("w")) {
+                    window.remove_window();
+                    return;
+                }
+                c_keydown.update(cx, |coord, _cx| {
                     if let Some(cfg) = shortcut_from_key_and_mods(
                         key,
                         mods.platform,
@@ -1560,15 +1527,20 @@ impl Render for BundleReviewWindow {
             .text_color(rgb(TEXT_COLOR))
             .child(
                 div()
-                    .h(px(52.0))
-                    .px_4()
+                    .h(px(48.0))
+                    .pl(px(78.0))
+                    .pr_4()
                     .flex_none()
                     .flex()
                     .items_center()
+                    .justify_between()
                     .gap_4()
                     .bg(rgb(SIDEBAR_BG))
                     .border_b_1()
                     .border_color(rgb(LINE_COLOR))
+                    .on_mouse_down(MouseButton::Left, |_, window, _| {
+                        window.start_window_move();
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -1576,13 +1548,6 @@ impl Render for BundleReviewWindow {
                             .flex()
                             .items_center()
                             .gap_3()
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(13.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Scrawl"),
-                            )
                             .child(
                                 // Segmented control: R_outer 8 = R_tab 6 + border 1 + pad 1.
                                 div()
@@ -1652,27 +1617,6 @@ impl Render for BundleReviewWindow {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(
-                                hint_button(
-                                    "btn-shortcut",
-                                    shortcut_chip_label,
-                                    shortcut_hint,
-                                    recording_key,
-                                )
-                                .on_click(move |_, window, cx| {
-                                    window.focus(&focus);
-                                    c_shortcut.update(cx, |coord, cx| {
-                                        coord.recording_shortcut_key =
-                                            !coord.recording_shortcut_key;
-                                        cx.notify();
-                                    });
-                                }),
-                            )
-                            .child(action_button("btn-record", "Record", false).on_click(
-                                move |_, _, cx| {
-                                    c_record.update(cx, |coord, cx| coord.start_recording(cx));
-                                },
-                            ))
                             .child(
                                 action_button("btn-reveal", "Show in Finder", false).on_click(
                                     move |_, _, cx| {
@@ -2220,7 +2164,11 @@ fn open_review_window(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
     let _ = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: None,
+            titlebar: Some(gpui::TitlebarOptions {
+                title: None,
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(16.0), px(16.0))),
+            }),
             focus: true,
             show: true,
             kind: WindowKind::Normal,
@@ -2229,9 +2177,6 @@ fn open_review_window(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
             ..Default::default()
         },
         move |window, cx| {
-            if let Some(ns_win) = newest_ns_window() {
-                sync_full_size_content_view(&ns_win);
-            }
             let focus = cx.focus_handle();
             window.focus(&focus);
             cx.new(|cx| {

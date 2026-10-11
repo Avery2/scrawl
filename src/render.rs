@@ -323,7 +323,7 @@ pub fn annotate_keyframe_in_place(
     if w == 0.0 || h == 0.0 {
         return;
     }
-    let size = (w.min(h) * 0.009).clamp(5.5, 8.5);
+    let size = (w.min(h) * 0.0065).clamp(4.2, 6.0);
     let active_mark = keyframe
         .mark_id
         .as_ref()
@@ -356,20 +356,14 @@ pub fn annotate_keyframe_in_place(
                     draw_pin(frame, point, number, (w / 1280.0).clamp(0.75, 2.5), alpha);
                 }
             } else if !points.is_empty() {
-                for (diameter, color) in [
-                    (size * 1.45, opacity([255, 28, 42, 255], 0.22 * alpha)),
-                    (size, opacity(RED, alpha)),
-                    (size * 0.24, opacity([255, 246, 246, 255], 0.85 * alpha)),
-                ] {
-                    let outline = freehand_outline(
-                        &points,
-                        &FreehandOptions {
-                            size: diameter,
-                            ..Default::default()
-                        },
-                    );
-                    polygon(frame, &outline, color);
-                }
+                let outline = freehand_outline(
+                    &points,
+                    &FreehandOptions {
+                        size,
+                        ..Default::default()
+                    },
+                );
+                polygon(frame, &outline, opacity(RED, alpha));
             }
         }
     }

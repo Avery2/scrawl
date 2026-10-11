@@ -94,18 +94,11 @@ fragment float4 laser_fragment(
                 laser_glow_cov = max(laser_glow_cov, glow);
             }
         } else {
-            // Persistent Shift-drawn stroke: full-length optical laser beam.
-            float glow_sigma = 6.2;
-            if (d < glow_sigma * 3.0) {
-                float pw = clamp(w, 0.55, 1.15);
-                float body_r = 2.55 * pw;
-                float core_r = 0.92 * pw;
-                float body = smoothstep(body_r + 0.85, max(0.0, body_r - 0.85), d);
-                float core = smoothstep(core_r + 0.75, max(0.0, core_r - 0.75), d) * 0.88;
-                float glow = exp(-(d * d) / (glow_sigma * glow_sigma)) * 0.92;
-                laser_body_cov = max(laser_body_cov, body);
-                laser_core_cov = max(laser_core_cov, core);
-                laser_glow_cov = max(laser_glow_cov, glow);
+            // Simple tldraw-style thin red marker stroke (~4.5px wide, smooth anti-aliased edge).
+            float r = 2.25 * clamp(w, 0.55, 1.15);
+            if (d < r + 2.0) {
+                float fill = smoothstep(r + 0.70, max(0.0, r - 0.70), d);
+                ink_red_cov = max(ink_red_cov, fill);
             }
         }
     }
@@ -116,24 +109,19 @@ fragment float4 laser_fragment(
         PinMarker pin = pins[i];
         float d = length(p - pin.pos);
         if (d < pin.radius + 3.5) {
-            float halo = smoothstep(pin.radius + 2.4, pin.radius + 1.1, d);
+            float halo = smoothstep(pin.radius + 2.0, pin.radius + 0.8, d);
             float fill = smoothstep(pin.radius + 0.75, pin.radius - 0.75, d);
             ink_halo_cov = max(ink_halo_cov, halo);
             ink_red_cov = max(ink_red_cov, fill);
         }
     }
 
-    // Active laser diode pinpoint at the cursor tip.
+    // Subtle red marker dot at the cursor tip while Shift is held.
     if (u.tip_active > 0.01) {
         float d_tip = length(p - u.tip_pos);
-        if (d_tip < 22.0) {
-            float pulse = 0.96 + 0.04 * sin(u.now_sec * 24.0);
-            float tip_body = smoothstep(2.9, 1.2, d_tip) * u.tip_active;
-            float tip_core = smoothstep(1.5, 0.3, d_tip) * u.tip_active;
-            float tip_glow = exp(-(d_tip * d_tip) / (6.4 * 6.4 * pulse)) * u.tip_active;
-            laser_body_cov = max(laser_body_cov, tip_body);
-            laser_core_cov = max(laser_core_cov, tip_core);
-            laser_glow_cov = max(laser_glow_cov, tip_glow);
+        if (d_tip < 5.0) {
+            float tip_fill = smoothstep(2.6, 1.4, d_tip) * u.tip_active;
+            ink_red_cov = max(ink_red_cov, tip_fill);
         }
     }
 
