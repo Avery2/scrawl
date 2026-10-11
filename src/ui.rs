@@ -402,6 +402,7 @@ impl ScrawlCoordinator {
     }
 
     pub fn cancel_recording(&mut self, cx: &mut Context<Self>) {
+        scrawl_log("cancel_recording invoked");
         set_escape_hotkey_enabled(false);
         let Some(rec) = self.active_recording.take() else {
             self.dismiss_island(cx);

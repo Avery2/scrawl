@@ -49,7 +49,6 @@ const FLAG_COMMAND: u64 = 1 << 20;
 
 const KEY_S: u16 = 1;
 const KEY_Z: u16 = 6;
-const KEY_ESCAPE: u16 = 53;
 
 // Carbon HIToolbox global hotkey constants (requires zero TCC permissions).
 pub const CARBON_CMD_KEY: u32 = 1 << 8;
@@ -64,8 +63,6 @@ const HOTKEY_SIG: u32 = u32::from_be_bytes(*b"SCRW");
 const HOTKEY_ID_TOGGLE: u32 = 1;
 const HOTKEY_ID_ESCAPE: u32 = 2;
 const HOTKEY_ID_ALT1: u32 = 3;
-const HOTKEY_ID_ALT2: u32 = 4;
-const HOTKEY_ID_ALT3: u32 = 5;
 
 #[repr(C, packed(2))]
 #[derive(Clone, Copy)]
@@ -604,46 +601,9 @@ pub fn update_global_shortcut(telemetry: &SharedCaptureTelemetry, config: Shortc
     }
 }
 
-/// Registers or unregisters `Escape` globally so pressing `Esc` in any app cancels an active recording.
-pub fn set_escape_hotkey_enabled(enabled: bool) {
-    let Some(state_mutex) = CARBON_HOTKEYS.get() else {
-        return;
-    };
-    let mut state = state_mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if state.escape_ref != 0 {
-        unsafe { UnregisterEventHotKey(state.escape_ref as *mut c_void) };
-        state.escape_ref = 0;
-    }
-    if enabled {
-        let mut new_ref: *mut c_void = ptr::null_mut();
-        let target = unsafe {
-            let a = GetApplicationEventTarget();
-            if !a.is_null() {
-                a
-            } else {
-                GetEventDispatcherTarget()
-            }
-        };
-        let status = unsafe {
-            RegisterEventHotKey(
-                u32::from(KEY_ESCAPE),
-                0,
-                EventHotKeyID {
-                    signature: HOTKEY_SIG,
-                    id: HOTKEY_ID_ESCAPE,
-                },
-                target,
-                0,
-                &raw mut new_ref,
-            )
-        };
-        if status == 0 && !new_ref.is_null() {
-            state.escape_ref = new_ref as usize;
-        }
-    }
-}
+/// No-op: do not register a global Escape hotkey because Karabiner maps CapsLock (Control)
+/// with `to_if_alone: escape`, which would cancel recordings when releasing Control.
+pub fn set_escape_hotkey_enabled(_enabled: bool) {}
 
 pub fn shortcut_from_key_and_mods(
     key: &str,
