@@ -64,14 +64,6 @@ fn nearest_frame(frames: &[&RgbaFrame], t: u64) -> usize {
     }
 }
 
-fn interval_distance(t: u64, start: u64, end: u64) -> u64 {
-    if t < start {
-        start - t
-    } else {
-        t.saturating_sub(end.max(start))
-    }
-}
-
 fn midpoint(start: u64, end: u64) -> u64 {
     start + end.saturating_sub(start) / 2
 }

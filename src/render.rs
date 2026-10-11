@@ -843,10 +843,12 @@ pub fn render_synthetic_demo_frame(width: u32, height: u32, t_ms: u64, phase: u3
     out
 }
 
+#[cfg(test)]
 fn wrap_text(text: &str, size: f32, width: f32, bold: bool) -> Vec<String> {
     wrap_text_indented(text, size, width, width, bold)
 }
 
+#[cfg(test)]
 fn wrap_text_indented(
     text: &str,
     size: f32,

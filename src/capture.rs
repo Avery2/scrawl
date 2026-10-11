@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,11 +23,7 @@ const MAX_RETAINED_FRAMES: usize = 300;
 const FRAME_SAMPLE_INTERVAL: Duration = Duration::from_millis(220);
 
 type CfTypeRef = *const c_void;
-type CfStringRef = *const c_void;
-type AxUiElementRef = *const c_void;
 type EventRef = *mut c_void;
-
-const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
 const EVENT_LEFT_MOUSE_DOWN: u32 = 1;
 const EVENT_LEFT_MOUSE_UP: u32 = 2;
@@ -146,21 +142,6 @@ type EventTapCallback = unsafe extern "C" fn(
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
-    fn AXUIElementCreateApplication(pid: i32) -> AxUiElementRef;
-    fn AXUIElementCreateSystemWide() -> AxUiElementRef;
-    fn AXUIElementCopyElementAtPosition(
-        application: AxUiElementRef,
-        x: f32,
-        y: f32,
-        element: *mut AxUiElementRef,
-    ) -> i32;
-    fn AXUIElementCopyAttributeValue(
-        element: AxUiElementRef,
-        attribute: CfStringRef,
-        value: *mut CfTypeRef,
-    ) -> i32;
-    fn AXUIElementSetMessagingTimeout(element: AxUiElementRef, timeout_in_seconds: f32) -> i32;
-
     fn CGEventTapCreate(
         tap: u32,
         place: u32,
@@ -184,21 +165,6 @@ unsafe extern "C" {
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
-    fn CFGetTypeID(value: CfTypeRef) -> usize;
-    fn CFStringGetTypeID() -> usize;
-    fn CFStringGetLength(value: CfStringRef) -> isize;
-    fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
-    fn CFStringGetCString(
-        value: CfStringRef,
-        buffer: *mut c_char,
-        buffer_size: isize,
-        encoding: u32,
-    ) -> bool;
-    fn CFStringCreateWithCString(
-        allocator: *const c_void,
-        string: *const c_char,
-        encoding: u32,
-    ) -> CfStringRef;
     fn CFMachPortCreateRunLoopSource(
         allocator: *const c_void,
         port: *mut c_void,
@@ -210,16 +176,6 @@ unsafe extern "C" {
     fn CFRunLoopRun();
     fn CFRelease(value: CfTypeRef);
     static kCFRunLoopCommonModes: *const c_void;
-}
-
-struct CfObject(CfTypeRef);
-
-impl Drop for CfObject {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { CFRelease(self.0) };
-        }
-    }
 }
 
 /// Live UI events emitted by the global input monitor to drive Scrawl's HUD & Review windows.
@@ -699,125 +655,6 @@ pub fn shortcut_from_key_and_mods(
     })
 }
 
-/// Inspects the accessibility element at screen coordinates `(x, y)` in global points.
-/// Queries the topmost normal (`window_layer == 0`) window's application directly so
-/// Scrawl's own transparent overlay window never intercepts hit-testing.
-pub fn ax_element_at(x: f64, y: f64) -> Option<(String, Option<String>)> {
-    let our_pid = std::process::id() as i32;
-    let hit_window = topmost_normal_window_at(x, y);
-    let root = if let Some((pid, _, _)) = hit_window.as_ref()
-        && *pid != our_pid
-    {
-        unsafe { AXUIElementCreateApplication(*pid) }
-    } else {
-        unsafe { AXUIElementCreateSystemWide() }
-    };
-    if root.is_null() {
-        return hit_window.and_then(|(_, title, app)| title.or(app).map(|l| (l, None)));
-    }
-    let root = CfObject(root);
-    let _ = unsafe { AXUIElementSetMessagingTimeout(root.0, 0.08) };
-
-    let mut element: AxUiElementRef = ptr::null();
-    let status =
-        unsafe { AXUIElementCopyElementAtPosition(root.0, x as f32, y as f32, &mut element) };
-    if status != 0 || element.is_null() {
-        return hit_window.and_then(|(_, title, app)| {
-            title
-                .or(app)
-                .filter(|l| !l.eq_ignore_ascii_case("scrawl"))
-                .map(|l| (l, None))
-        });
-    }
-    let mut current = CfObject(element);
-    let _ = unsafe { AXUIElementSetMessagingTimeout(current.0, 0.08) };
-
-    let role = copy_ax_string(&current, c"AXRole");
-    let subrole = copy_ax_string(&current, c"AXSubrole");
-    if role.as_deref() == Some("AXSecureTextField")
-        || subrole.as_deref() == Some("AXSecureTextField")
-    {
-        return Some(("Secure Text Field".into(), role));
-    }
-
-    for _ in 0..4 {
-        let cur_role = copy_ax_string(&current, c"AXRole");
-        let cur_subrole = copy_ax_string(&current, c"AXSubrole");
-        let is_secure = cur_role.as_deref() == Some("AXSecureTextField")
-            || cur_subrole.as_deref() == Some("AXSecureTextField");
-
-        for attr in [c"AXTitle", c"AXDescription", c"AXIdentifier"] {
-            if let Some(val) = copy_ax_string(&current, attr) {
-                let cleaned = clean_label(&val);
-                if !cleaned.is_empty() && !cleaned.eq_ignore_ascii_case("scrawl") {
-                    return Some((cleaned, role));
-                }
-            }
-        }
-        if !is_secure
-            && cur_role.as_deref() != Some("AXTextArea")
-            && cur_role.as_deref() != Some("AXTextField")
-            && let Some(val) = copy_ax_string(&current, c"AXValue")
-        {
-            let cleaned = clean_label(&val);
-            if !cleaned.is_empty() && cleaned.len() <= 48 && !cleaned.eq_ignore_ascii_case("scrawl")
-            {
-                return Some((cleaned, role));
-            }
-        }
-
-        let Some(parent) = copy_ax_object(&current, c"AXParent") else {
-            break;
-        };
-        let _ = unsafe { AXUIElementSetMessagingTimeout(parent.0, 0.08) };
-        current = parent;
-    }
-
-    if let Some((_, title, app)) = hit_window
-        && let Some(fallback) = title.or(app).filter(|l| !l.eq_ignore_ascii_case("scrawl"))
-    {
-        return Some((fallback, role));
-    }
-
-    role.clone()
-        .map(|r| (r.trim_start_matches("AX").to_string(), Some(r)))
-}
-
-fn topmost_normal_window_at(x: f64, y: f64) -> Option<(i32, Option<String>, Option<String>)> {
-    let content = SCShareableContent::get().ok()?;
-    let our_pid = std::process::id() as i32;
-    for win in content.windows() {
-        if !win.is_on_screen() || win.window_layer() != 0 {
-            continue;
-        }
-        let Some(owner) = win.owning_application() else {
-            continue;
-        };
-        let pid = owner.process_id();
-        // Skip Scrawl's own windows so pointing/drawing over the desktop hits the underlying app.
-        if pid == our_pid {
-            continue;
-        }
-        let frame = win.frame();
-        if frame.size.width < 48.0 || frame.size.height < 48.0 {
-            continue;
-        }
-        if x >= frame.origin.x
-            && x <= frame.origin.x + frame.size.width
-            && y >= frame.origin.y
-            && y <= frame.origin.y + frame.size.height
-        {
-            let title = win
-                .title()
-                .map(|t| clean_label(&t))
-                .filter(|t| !t.is_empty());
-            let app = Some(clean_label(&owner.application_name())).filter(|a| !a.is_empty());
-            return Some((pid, title, app));
-        }
-    }
-    None
-}
-
 fn clean_label(input: &str) -> String {
     let squashed = input.split_whitespace().collect::<Vec<_>>().join(" ");
     let trimmed = squashed.trim();
@@ -827,50 +664,6 @@ fn clean_label(input: &str) -> String {
     } else {
         trimmed.to_string()
     }
-}
-
-fn copy_ax_object(element: &CfObject, attr: &CStr) -> Option<CfObject> {
-    let cf_attr =
-        unsafe { CFStringCreateWithCString(ptr::null(), attr.as_ptr(), CF_STRING_ENCODING_UTF8) };
-    if cf_attr.is_null() {
-        return None;
-    }
-    let cf_attr = CfObject(cf_attr);
-    let mut value: CfTypeRef = ptr::null();
-    let status = unsafe { AXUIElementCopyAttributeValue(element.0, cf_attr.0, &mut value) };
-    if status == 0 && !value.is_null() {
-        Some(CfObject(value))
-    } else {
-        None
-    }
-}
-
-fn copy_ax_string(element: &CfObject, attr: &CStr) -> Option<String> {
-    let obj = copy_ax_object(element, attr)?;
-    if unsafe { CFGetTypeID(obj.0) } != unsafe { CFStringGetTypeID() } {
-        return None;
-    }
-    let length = unsafe { CFStringGetLength(obj.0) };
-    if length <= 0 || length > 512 {
-        return None;
-    }
-    let capacity =
-        unsafe { CFStringGetMaximumSizeForEncoding(length, CF_STRING_ENCODING_UTF8) } + 1;
-    let mut bytes = vec![0_u8; capacity as usize];
-    let ok = unsafe {
-        CFStringGetCString(
-            obj.0,
-            bytes.as_mut_ptr().cast(),
-            capacity,
-            CF_STRING_ENCODING_UTF8,
-        )
-    };
-    if !ok {
-        return None;
-    }
-    let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    bytes.truncate(nul);
-    String::from_utf8(bytes).ok()
 }
 
 /// Discovers the current capture target (either a specific window/app or the main display).
@@ -1977,7 +1770,7 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
             }
         } else if prev_shift_ink {
             telemetry.shift_held.store(false, Ordering::Release);
-            if let Some(mut stroke) = telemetry
+            if let Some(stroke) = telemetry
                 .live_ink
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)

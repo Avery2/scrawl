@@ -25,7 +25,7 @@ use crate::capture::{
     LiveOverlayEvent, ScreenCaptureSession, SharedCaptureTelemetry, discover_target,
     install_global_hotkeys, list_selectable_windows, region_target, scrawl_log,
     selectable_window_at, set_escape_hotkey_enabled, shortcut_from_key_and_mods,
-    start_global_input_tap, update_global_shortcut,
+    start_global_input_tap,
 };
 use crate::hex::AudioRecorder;
 use crate::laser_overlay::MetalLaserOverlay;
