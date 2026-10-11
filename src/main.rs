@@ -2,6 +2,7 @@ mod capture;
 mod handoff;
 mod hex;
 mod keyframes;
+mod laser_overlay;
 mod model;
 mod render;
 mod sketch;
@@ -437,7 +438,11 @@ fn main() -> Result<()> {
             std::fs::create_dir_all(&bundle_dir)?;
             let video_path = bundle_dir.join("recording.mp4");
             let audio = AudioRecorder::start().ok();
-            let session = ScreenCaptureSession::start(target.clone(), Some(video_path));
+            let session = ScreenCaptureSession::start(
+                target.clone(),
+                Some(video_path),
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            );
             std::thread::sleep(Duration::from_secs(duration.max(1)));
             let (frames, video_out, elapsed_ms) = session.stop();
             let recorded_audio = audio.and_then(|a| a.stop().ok());

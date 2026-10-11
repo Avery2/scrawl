@@ -96,6 +96,10 @@ unsafe extern "C" {
         user_info: *mut c_void,
     ) -> *mut c_void;
     fn CGEventTapEnable(tap: *mut c_void, enable: bool);
+    fn CGEventCreate(source: *const c_void) -> EventRef;
+    fn CGEventSourceFlagsState(state_id: u32) -> u64;
+    fn CGEventSourceKeyState(state_id: u32, key: u16) -> bool;
+    fn CGEventSourceButtonState(state_id: u32, button: u32) -> bool;
     fn CGEventGetFlags(event: EventRef) -> u64;
     fn CGEventGetLocation(event: EventRef) -> CGPoint;
     fn CGEventGetIntegerValueField(event: EventRef, field: u32) -> i64;
@@ -152,7 +156,6 @@ pub enum LiveOverlayEvent {
     UndoStroke,
     CancelCapture,
     ShiftHeld,
-    PointerMoved,
     RequestSnapshot,
     ActionCaption(String),
 }
@@ -444,14 +447,22 @@ pub struct ScreenCaptureSession {
 }
 
 impl ScreenCaptureSession {
-    pub fn start(target: TargetInfo, video_output_path: Option<PathBuf>) -> Self {
+    pub fn start(
+        target: TargetInfo,
+        video_output_path: Option<PathBuf>,
+        excluded_window_ids: Arc<Mutex<Vec<u32>>>,
+    ) -> Self {
         let started_at = Instant::now();
         let stopping = Arc::new(AtomicBool::new(false));
         let urgent_snapshot = Arc::new(AtomicBool::new(true));
         let frames = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RETAINED_FRAMES)));
 
+        let initial_excluded = excluded_window_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let (stream, recording_output, video_path, mut filter_and_config) =
-            setup_sck_capture(&target, video_output_path);
+            setup_sck_capture(&target, video_output_path, &initial_excluded);
 
         let thread_stopping = Arc::clone(&stopping);
         let thread_urgent = Arc::clone(&urgent_snapshot);
@@ -464,14 +475,16 @@ impl ScreenCaptureSession {
                     .checked_sub(FRAME_SAMPLE_INTERVAL)
                     .unwrap_or_else(Instant::now);
                 let mut phase = 0_u32;
-                let mut refreshed_overlay_exclusion = false;
+                let mut last_excluded_len = initial_excluded.len();
                 while !thread_stopping.load(Ordering::Acquire) {
-                    if !refreshed_overlay_exclusion
-                        && started_at.elapsed() >= Duration::from_millis(120)
-                    {
-                        refreshed_overlay_exclusion = true;
+                    let cur_excluded = excluded_window_ids
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    if cur_excluded.len() != last_excluded_len {
+                        last_excluded_len = cur_excluded.len();
                         if let Some((new_filter, new_cfg)) =
-                            build_sck_filter_and_config(&sampler_target)
+                            build_sck_filter_and_config(&sampler_target, &cur_excluded)
                         {
                             filter_and_config = Some((new_filter, new_cfg));
                         }
@@ -553,6 +566,7 @@ impl ScreenCaptureSession {
 
 fn build_sck_filter_and_config(
     target: &TargetInfo,
+    excluded_window_ids: &[u32],
 ) -> Option<(SCContentFilter, SCStreamConfiguration)> {
     let content = SCShareableContent::get().ok()?;
     let our_pid = std::process::id() as i32;
@@ -570,16 +584,18 @@ fn build_sck_filter_and_config(
         .find(|d| d.display_id() == target.display_id)
         .or_else(|| content.displays().into_iter().next())
     {
-        // Exclude only Scrawl's floating overlay/HUD panels (window_layer != 0)
-        // so Scrawl's normal Review window (window_layer == 0) remains visible in captures.
+        // Exclude Scrawl's floating HUD pill and Metal overlay windows by explicit window ID
+        // (and any non-layer-0 Scrawl panels), while keeping Scrawl's normal Review window visible.
         let excluded_overlays: Vec<SCWindow> = content
             .windows()
             .into_iter()
             .filter(|w| {
-                w.owning_application()
-                    .as_ref()
-                    .is_some_and(|a| a.process_id() == our_pid)
-                    && w.window_layer() != 0
+                excluded_window_ids.contains(&w.window_id())
+                    || (w
+                        .owning_application()
+                        .as_ref()
+                        .is_some_and(|a| a.process_id() == our_pid)
+                        && w.window_layer() != 0)
             })
             .collect();
         let excluded_refs: Vec<&SCWindow> = excluded_overlays.iter().collect();
@@ -606,13 +622,14 @@ fn build_sck_filter_and_config(
 fn setup_sck_capture(
     target: &TargetInfo,
     video_output_path: Option<PathBuf>,
+    excluded_window_ids: &[u32],
 ) -> (
     Option<SCStream>,
     Option<SCRecordingOutput>,
     Option<PathBuf>,
     Option<(SCContentFilter, SCStreamConfiguration)>,
 ) {
-    let Some((filter, config)) = build_sck_filter_and_config(target) else {
+    let Some((filter, config)) = build_sck_filter_and_config(target, excluded_window_ids) else {
         return (None, None, None, None);
     };
 
@@ -657,16 +674,19 @@ fn capture_sck_frame(
     Some(RgbaFrame::new(t_ms, width, height, rgba))
 }
 
-/// Shared state collected by the global `CGEventTap` during an active capture session.
+/// Shared state collected by the global input monitor during an active capture session.
 pub struct SharedCaptureTelemetry {
     pub active: AtomicBool,
     pub draw_mode: AtomicBool,
     pub shift_held: AtomicBool,
     pub started_at: Mutex<Instant>,
     pub target_frame: Mutex<TargetFrame>,
+    pub pointer_screen: Mutex<[f32; 2]>,
     pub events: Mutex<Vec<InteractionEvent>>,
     pub strokes: Mutex<Vec<Stroke>>,
     pub active_laser: Mutex<Option<Stroke>>,
+    pub live_ink: Mutex<Option<Stroke>>,
+    pub excluded_window_ids: Arc<Mutex<Vec<u32>>>,
     pub ui_sender: flume::Sender<LiveOverlayEvent>,
     tap_port: AtomicU64,
     drag_start: Mutex<Option<(u64, f32, f32, Option<String>)>>,
@@ -686,9 +706,12 @@ impl SharedCaptureTelemetry {
                 height: 900.0,
                 scale: 2.0,
             }),
+            pointer_screen: Mutex::new([0.0, 0.0]),
             events: Mutex::new(Vec::new()),
             strokes: Mutex::new(Vec::new()),
             active_laser: Mutex::new(None),
+            live_ink: Mutex::new(None),
+            excluded_window_ids: Arc::new(Mutex::new(Vec::new())),
             ui_sender,
             tap_port: AtomicU64::new(0),
             drag_start: Mutex::new(None),
@@ -717,9 +740,17 @@ impl SharedCaptureTelemetry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         *self
+            .live_ink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
             .drag_start
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.excluded_window_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.draw_mode.store(false, Ordering::Release);
         self.shift_held.store(false, Ordering::Release);
         self.active.store(true, Ordering::Release);
@@ -779,6 +810,42 @@ impl SharedCaptureTelemetry {
         }
     }
 
+    pub fn record_laser_point(&self, screen_x: f64, screen_y: f64) {
+        *self
+            .pointer_screen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            [screen_x as f32, screen_y as f32];
+        let t_ms = self.elapsed_ms();
+        let (nx, ny, fw, fh) = self.normalize_point(screen_x, screen_y);
+        let mut guard = self
+            .active_laser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stroke = guard.get_or_insert_with(|| Stroke {
+            t0: t_ms,
+            t1: t_ms,
+            fw,
+            fh,
+            on: None,
+            pin: None,
+            laser: true,
+            pts: Vec::new(),
+        });
+        let sx = (nx * SCALE as f32).round() as i32;
+        let sy = (ny * SCALE as f32).round() as i32;
+        let dt = t_ms.saturating_sub(stroke.t0) as i32;
+        let should_push = stroke.pts.chunks_exact(3).last().is_none_or(|prev| {
+            let dx = (sx - prev[0]) as f32 / SCALE as f32 * fw as f32;
+            let dy = (sy - prev[1]) as f32 / SCALE as f32 * fh as f32;
+            dx.hypot(dy) >= 1.2 || (dt - prev[2]) >= 16
+        });
+        if should_push && stroke.pts.len() / 3 < 1_800 {
+            stroke.pts.extend_from_slice(&[sx, sy, dt]);
+            stroke.t1 = t_ms;
+        }
+    }
+
     pub fn finish_session(&self) -> (Vec<InteractionEvent>, Vec<Stroke>) {
         self.active.store(false, Ordering::Release);
         self.draw_mode.store(false, Ordering::Release);
@@ -787,6 +854,18 @@ impl SharedCaptureTelemetry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.finish_active_laser(None);
+        if let Some(ink) = self
+            .live_ink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            && ink.pts.len() >= 3
+        {
+            self.strokes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(ink);
+        }
         let events = std::mem::take(
             &mut *self
                 .events
@@ -804,6 +883,11 @@ impl SharedCaptureTelemetry {
 }
 
 pub fn start_global_input_tap(telemetry: Arc<SharedCaptureTelemetry>) {
+    let hid_telemetry = Arc::clone(&telemetry);
+    let _ = thread::Builder::new()
+        .name("scrawl-hid-poller".into())
+        .spawn(move || run_global_hid_poller(hid_telemetry));
+
     let _ = thread::Builder::new()
         .name("scrawl-event-tap".into())
         .spawn(move || {
@@ -908,34 +992,7 @@ unsafe extern "C" fn tap_callback(
         }
         EVENT_MOUSE_MOVED | EVENT_LEFT_MOUSE_DRAGGED | EVENT_RIGHT_MOUSE_DRAGGED => {
             telemetry.shift_held.store(true, Ordering::Release);
-            let mut guard = telemetry
-                .active_laser
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let stroke = guard.get_or_insert_with(|| Stroke {
-                t0: t_ms,
-                t1: t_ms,
-                fw,
-                fh,
-                on: None,
-                pin: None,
-                laser: true,
-                pts: Vec::new(),
-            });
-            let sx = (nx * SCALE as f32).round() as i32;
-            let sy = (ny * SCALE as f32).round() as i32;
-            let dt = t_ms.saturating_sub(stroke.t0) as i32;
-            let should_push = stroke.pts.chunks_exact(3).last().is_none_or(|prev| {
-                let dx = (sx - prev[0]) as f32 / SCALE as f32 * fw as f32;
-                let dy = (sy - prev[1]) as f32 / SCALE as f32 * fh as f32;
-                dx.hypot(dy) >= 1.5
-            });
-            if should_push && stroke.pts.len() / 3 < 1_800 {
-                stroke.pts.extend_from_slice(&[sx, sy, dt]);
-                stroke.t1 = t_ms;
-                drop(guard);
-                let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::PointerMoved);
-            }
+            telemetry.record_laser_point(loc.x, loc.y);
         }
         EVENT_LEFT_MOUSE_DOWN | EVENT_RIGHT_MOUSE_DOWN => {
             if telemetry.draw_mode.load(Ordering::Acquire) {
@@ -1077,6 +1134,146 @@ unsafe extern "C" fn tap_callback(
     }
 
     event
+}
+
+fn current_mouse_location() -> Option<CGPoint> {
+    let ev = unsafe { CGEventCreate(ptr::null()) };
+    if ev.is_null() {
+        return None;
+    }
+    let loc = unsafe { CGEventGetLocation(ev) };
+    unsafe { CFRelease(ev.cast()) };
+    Some(loc)
+}
+
+/// 120Hz global HID state poller so Shift-laser (`⇧` + move), Shift-drag ink (`⇧` + drag),
+/// and shortcuts work across all apps even when Scrawl is in the background.
+fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
+    let mut prev_shortcut = false;
+    let mut prev_shift_laser = false;
+    let mut prev_shift_ink = false;
+    let mut prev_undo = false;
+    loop {
+        thread::sleep(Duration::from_millis(8));
+        // HID_SYSTEM_STATE = 1
+        let flags = unsafe { CGEventSourceFlagsState(1) };
+        let cmd = (flags & FLAG_COMMAND) != 0;
+        let ctrl = (flags & FLAG_CONTROL) != 0;
+        let alt = (flags & FLAG_ALTERNATE) != 0;
+        let shift = (flags & FLAG_SHIFT) != 0;
+        let key_s = unsafe { CGEventSourceKeyState(1, KEY_S) };
+        let key_z = unsafe { CGEventSourceKeyState(1, KEY_Z) };
+
+        let shortcut_now = ctrl && alt && cmd && key_s;
+        if shortcut_now && !prev_shortcut {
+            let _ = telemetry
+                .ui_sender
+                .try_send(LiveOverlayEvent::ToggleCaptureShortcut);
+        }
+        prev_shortcut = shortcut_now;
+
+        if !telemetry.active.load(Ordering::Acquire) {
+            prev_shift_laser = false;
+            prev_shift_ink = false;
+            prev_undo = false;
+            continue;
+        }
+
+        let undo_now = cmd && !ctrl && !alt && !shift && key_z;
+        if undo_now && !prev_undo {
+            let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::UndoStroke);
+        }
+        prev_undo = undo_now;
+
+        let Some(loc) = current_mouse_location() else {
+            continue;
+        };
+        *telemetry
+            .pointer_screen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = [loc.x as f32, loc.y as f32];
+
+        let drawing = telemetry.draw_mode.load(Ordering::Acquire);
+        let left_down = unsafe { CGEventSourceButtonState(1, 0) };
+        let pure_shift = shift && !cmd && !ctrl && !alt;
+
+        if !drawing {
+            // Hold Shift + drag = draw persistent ink in any app; Hold Shift + move = optical laser
+            let shift_ink = pure_shift && left_down;
+            let shift_laser = pure_shift && !left_down;
+
+            if shift_ink {
+                if prev_shift_laser {
+                    telemetry.finish_active_laser(None);
+                }
+                telemetry.shift_held.store(false, Ordering::Release);
+                let t_ms = telemetry.elapsed_ms();
+                let (nx, ny, fw, fh) = telemetry.normalize_point(loc.x, loc.y);
+                let sx = (nx * SCALE as f32).round() as i32;
+                let sy = (ny * SCALE as f32).round() as i32;
+                let mut guard = telemetry
+                    .live_ink
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let stroke = guard.get_or_insert_with(|| Stroke {
+                    t0: t_ms,
+                    t1: t_ms,
+                    fw,
+                    fh,
+                    on: None,
+                    pin: None,
+                    laser: false,
+                    pts: Vec::new(),
+                });
+                let dt = t_ms.saturating_sub(stroke.t0) as i32;
+                let should_push = stroke.pts.chunks_exact(3).last().is_none_or(|prev| {
+                    let dx = (sx - prev[0]) as f32 / SCALE as f32 * fw as f32;
+                    let dy = (sy - prev[1]) as f32 / SCALE as f32 * fh as f32;
+                    dx.hypot(dy) >= 1.5
+                });
+                if should_push && stroke.pts.len() / 3 < 2_000 {
+                    stroke.pts.extend_from_slice(&[sx, sy, dt]);
+                    stroke.t1 = t_ms;
+                }
+            } else if prev_shift_ink {
+                if let Some(mut stroke) = telemetry
+                    .live_ink
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    && stroke.pts.len() >= 3
+                {
+                    stroke.on = ax_element_at(loc.x, loc.y).map(|(l, _)| l);
+                    telemetry
+                        .strokes
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(stroke);
+                    let _ = telemetry
+                        .ui_sender
+                        .try_send(LiveOverlayEvent::RequestSnapshot);
+                }
+            }
+
+            if shift_laser {
+                telemetry.shift_held.store(true, Ordering::Release);
+                telemetry.record_laser_point(loc.x, loc.y);
+            } else if prev_shift_laser && !shift_ink {
+                telemetry.shift_held.store(false, Ordering::Release);
+                telemetry.finish_active_laser(Some((loc.x, loc.y)));
+                let _ = telemetry
+                    .ui_sender
+                    .try_send(LiveOverlayEvent::RequestSnapshot);
+            }
+
+            prev_shift_ink = shift_ink;
+            prev_shift_laser = shift_laser;
+        } else {
+            telemetry.shift_held.store(false, Ordering::Release);
+            prev_shift_laser = false;
+            prev_shift_ink = false;
+        }
+    }
 }
 
 fn shortcut_key_name(keycode: u16) -> Option<&'static str> {

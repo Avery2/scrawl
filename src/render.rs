@@ -412,13 +412,12 @@ fn draw_laser(frame: &mut RgbaFrame, stroke: &Stroke, time: u64) {
         return;
     }
     let points = smooth_laser_points(&raw_points);
-    // Optical laser trail: wide crimson bloom tapering to an incandescent white-pink core.
+    // Subtle, realistic optical laser trail: soft atmospheric scatter + delicate ruby beam + incandescent core.
     for (radius, alpha, power, color) in [
-        (16.0, 0.06, 1.1, [255, 18, 36, 255]),
-        (10.0, 0.14, 1.2, [255, 32, 44, 255]),
-        (5.6, 0.34, 1.3, RED),
-        (2.8, 0.92, 1.4, RED),
-        (1.15, 0.98, 1.6, [255, 245, 245, 255]),
+        (7.5, 0.08, 1.1, [255, 22, 38, 255]),
+        (4.2, 0.22, 1.2, [255, 36, 48, 255]),
+        (2.1, 0.78, 1.3, RED),
+        (0.95, 0.92, 1.5, [255, 245, 245, 255]),
     ] {
         if points.len() == 1 {
             circle(
@@ -431,22 +430,21 @@ fn draw_laser(frame: &mut RgbaFrame, stroke: &Stroke, time: u64) {
         for pair in points.windows(2) {
             let (a, fa) = pair[0];
             let (b, fb) = pair[1];
-            let w0 = radius * (0.12 + 0.88 * fa.powf(0.75));
-            let w1 = radius * (0.12 + 0.88 * fb.powf(0.75));
+            let w0 = radius * (0.10 + 0.90 * fa.powf(0.75));
+            let w1 = radius * (0.10 + 0.90 * fb.powf(0.75));
             let seg_alpha = alpha * ((fa + fb) * 0.5).powf(power);
             line(frame, a, b, w0, w1, opacity(color, seg_alpha));
         }
     }
-    // Glowing laser diode head at the tip of the beam.
+    // Subtle pinpoint diode head at the tip of the beam.
     if let Some(&(tip, tip_age)) = points.last()
-        && tip_age > 0.25
+        && tip_age > 0.20
     {
         for (r, a, col) in [
-            (20.0, 0.10 * tip_age, [255, 16, 32, 255]),
-            (13.0, 0.22 * tip_age, [255, 28, 42, 255]),
-            (8.0, 0.48 * tip_age, RED),
-            (4.8, 0.95 * tip_age, RED),
-            (2.3, tip_age, WHITE),
+            (9.5, 0.14 * tip_age, [255, 20, 36, 255]),
+            (5.5, 0.34 * tip_age, [255, 36, 48, 255]),
+            (3.0, 0.88 * tip_age, RED),
+            (1.5, tip_age, WHITE),
         ] {
             circle(frame, tip, r, opacity(col, a));
         }

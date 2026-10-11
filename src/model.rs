@@ -10,7 +10,7 @@ pub const MARK_GAP_MS: u64 = 1_200;
 pub const MAX_MARK_STROKES: usize = 6;
 
 /// How long a laser trail remains visible on screen (ms).
-pub const LASER_MS: u64 = 1_000;
+pub const LASER_MS: u64 = 420;
 
 /// Maximum keyframes selected for a contact sheet.
 pub const MAX_KEYFRAMES: usize = 6;

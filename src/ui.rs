@@ -5,10 +5,9 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Application, Bounds, Context, Div, Entity, FocusHandle, FontWeight, Image,
-    ImageFormat, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    PathBuilder, Pixels, Point, Render, SharedString, Size, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowKind, WindowOptions, canvas, div, img, point, prelude::*, px, rgb, rgba,
-    size,
+    ImageFormat, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
+    Point, Render, SharedString, Size, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowKind, WindowOptions, div, img, point, prelude::*, px, rgb, rgba, size,
 };
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
@@ -26,10 +25,9 @@ use crate::capture::{
     start_global_input_tap,
 };
 use crate::hex::AudioRecorder;
-use crate::model::{LASER_MS, SCALE, ScrawlBundle, Stroke, TargetFrame, TargetInfo, format_clock};
-use crate::sketch::{
-    FreehandOptions, bounds as points_bounds, freehand_outline, smooth_laser_points, timeline,
-};
+use crate::laser_overlay::MetalLaserOverlay;
+use crate::model::{SCALE, ScrawlBundle, Stroke, TargetInfo, format_clock};
+use crate::sketch::{bounds as points_bounds, timeline};
 
 const SIDEBAR_BG: u32 = 0x111111;
 const CANVAS_BG: u32 = 0x161616;
@@ -206,6 +204,7 @@ struct ActiveRecording {
     bundle_dir: PathBuf,
     screen_session: ScreenCaptureSession,
     audio_recorder: Option<AudioRecorder>,
+    _metal_overlay: Option<MetalLaserOverlay>,
 }
 
 /// Shared coordinator owned by the GPUI app.
@@ -266,6 +265,11 @@ impl ScrawlCoordinator {
         }
         let next = !self.is_drawing();
         self.telemetry.finish_active_laser(None);
+        *self
+            .telemetry
+            .live_ink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.active_stroke = None;
         self.telemetry
             .draw_mode
@@ -303,13 +307,26 @@ impl ScrawlCoordinator {
         let video_path = bundle_dir.join("recording.mp4");
 
         self.telemetry.reset_for_session(target.frame);
+        let metal_overlay = MetalLaserOverlay::open(Arc::clone(&self.telemetry)).ok();
+        if let Some(ref overlay) = metal_overlay {
+            self.telemetry
+                .excluded_window_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(overlay.window_number());
+        }
         let audio_recorder = AudioRecorder::start().ok();
-        let screen_session = ScreenCaptureSession::start(target.clone(), Some(video_path));
+        let screen_session = ScreenCaptureSession::start(
+            target.clone(),
+            Some(video_path),
+            Arc::clone(&self.telemetry.excluded_window_ids),
+        );
         self.active_recording = Some(ActiveRecording {
             target,
             bundle_dir,
             screen_session,
             audio_recorder,
+            _metal_overlay: metal_overlay,
         });
         self.active_stroke = None;
         self.caption.clear();
@@ -402,7 +419,7 @@ impl Render for HudPillWindow {
         } else if drawing {
             "Drawing ink · Shift-click pin · D to interact".into()
         } else {
-            "Hold Shift to laser · D to draw".into()
+            "Hold ⇧ laser · ⇧-drag or D to draw".into()
         };
 
         let c_draw = self.coordinator.clone();
@@ -464,25 +481,16 @@ impl Render for HudPillWindow {
                             c_draw.update(cx, |coord, cx| coord.toggle_draw_mode(cx));
                         }),
                     )
-                    .child(
-                        pill_chip(
-                            "hud-undo",
-                            &format!(
-                                "↶ {}",
-                                if stroke_count > 0 {
-                                    stroke_count.to_string()
-                                } else {
-                                    String::new()
-                                }
-                            ),
-                            false,
+                    .when(stroke_count > 0, |d| {
+                        d.child(
+                            pill_chip("hud-undo", &format!("Undo ({stroke_count})"), false)
+                                .on_click(move |_, _, cx| {
+                                    c_undo.update(cx, |coord, cx| coord.undo_stroke(cx));
+                                }),
                         )
-                        .on_click(move |_, _, cx| {
-                            c_undo.update(cx, |coord, cx| coord.undo_stroke(cx));
-                        }),
-                    )
+                    })
                     .child(
-                        pill_chip("hud-cancel", "✕", false).on_click(move |_, _, cx| {
+                        pill_chip("hud-cancel", "Cancel", false).on_click(move |_, _, cx| {
                             c_cancel.update(cx, |coord, cx| coord.cancel_recording(cx));
                         }),
                     )
@@ -550,29 +558,6 @@ impl Render for OverlayCanvasWindow {
             ns_win.setIgnoresMouseEvents(!drawing);
             sync_full_size_content_view(ns_win);
         }
-        let now_ms = coord.telemetry.elapsed_ms();
-        let target_frame = *coord
-            .telemetry
-            .target_frame
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut strokes = coord
-            .telemetry
-            .strokes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(ref laser) = *coord
-            .telemetry
-            .active_laser
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
-            strokes.push(laser.clone());
-        }
-        if let Some(ref active) = coord.active_stroke {
-            strokes.push(active.clone());
-        }
 
         let c_down = self.coordinator.clone();
         let c_move = self.coordinator.clone();
@@ -633,7 +618,7 @@ impl Render for OverlayCanvasWindow {
                                     });
                                     coord.request_immediate_frame();
                                 } else {
-                                    coord.active_stroke = Some(Stroke {
+                                    let stroke = Stroke {
                                         t0: t_ms,
                                         t1: t_ms,
                                         fw,
@@ -642,7 +627,14 @@ impl Render for OverlayCanvasWindow {
                                         pin: None,
                                         laser: false,
                                         pts: vec![sx, sy, 0],
-                                    });
+                                    };
+                                    *coord
+                                        .telemetry
+                                        .live_ink
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        Some(stroke.clone());
+                                    coord.active_stroke = Some(stroke);
                                 }
                                 cx.notify();
                             });
@@ -667,6 +659,12 @@ impl Render for OverlayCanvasWindow {
                                 let dt = t_ms.saturating_sub(stroke.t0) as i32;
                                 stroke.pts.extend_from_slice(&[sx, sy, dt]);
                                 stroke.t1 = t_ms;
+                                *coord
+                                    .telemetry
+                                    .live_ink
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(stroke.clone());
                                 cx.notify();
                             }
                         });
@@ -674,6 +672,11 @@ impl Render for OverlayCanvasWindow {
                     .on_mouse_up(MouseButton::Left, move |_, _window, cx| {
                         let ns_win_up = ns_win_up.clone();
                         c_up.update(cx, |coord, cx| {
+                            *coord
+                                .telemetry
+                                .live_ink
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                             if let Some(mut stroke) = coord.active_stroke.take() {
                                 if stroke.pts.len() >= 3 {
                                     let tf = *coord
@@ -719,152 +722,7 @@ impl Render for OverlayCanvasWindow {
                     });
                 }
             })
-            .child(
-                canvas(
-                    move |bounds, _, _| bounds,
-                    move |_bounds, _, window, _| {
-                        paint_live_strokes(target_frame, &strokes, now_ms, window);
-                    },
-                )
-                .size_full(),
-            )
     }
-}
-
-fn paint_live_strokes(
-    target_frame: TargetFrame,
-    strokes: &[Stroke],
-    now_ms: u64,
-    window: &mut Window,
-) {
-    let win_bounds = window.bounds();
-    let win_ox = f32::from(win_bounds.origin.x);
-    let win_oy = f32::from(win_bounds.origin.y);
-    let tx = target_frame.x as f32;
-    let ty = target_frame.y as f32;
-    let tw = (target_frame.width as f32).max(1.0);
-    let th = (target_frame.height as f32).max(1.0);
-    let base_size = (tw.min(th) * 0.012).max(5.0);
-    let to_local =
-        |nx: f32, ny: f32| -> [f32; 2] { [(tx + nx * tw) - win_ox, (ty + ny * th) - win_oy] };
-
-    for stroke in strokes {
-        if let Some(pin) = stroke.pin {
-            if let Some([nx, ny]) = stroke.normalized_points().first().copied() {
-                let [cx, cy] = to_local(nx, ny);
-                paint_circle(window, cx, cy, 13.0, rgba(0xffffffdd));
-                paint_circle(window, cx, cy, 11.0, rgba(0xff3b30ff));
-                let _ = pin;
-            }
-            continue;
-        }
-
-        if stroke.laser && stroke.t1 < now_ms.saturating_sub(LASER_MS) {
-            continue;
-        }
-        if stroke.laser {
-            let min_t = now_ms.saturating_sub(LASER_MS);
-            let raw_timed: Vec<([f32; 2], f32)> = stroke
-                .timed_points()
-                .into_iter()
-                .filter(|&(_, _, t)| t >= min_t && t <= now_ms.saturating_add(50))
-                .map(|(nx, ny, t)| {
-                    let age =
-                        1.0 - (now_ms.saturating_sub(t) as f32 / LASER_MS as f32).clamp(0.0, 1.0);
-                    (to_local(nx, ny), age)
-                })
-                .collect();
-            if raw_timed.is_empty() {
-                continue;
-            }
-            let smoothed = smooth_laser_points(&raw_timed);
-            let screen_pts: Vec<[f32; 2]> = smoothed.iter().map(|&(pt, _)| pt).collect();
-            if screen_pts.len() >= 2 {
-                let laser_base = FreehandOptions {
-                    size: base_size,
-                    thinning: 0.45,
-                    smoothing: 0.65,
-                    streamline: 0.55,
-                    simulate_pressure: false,
-                    taper_start: true,
-                    taper_end: false,
-                };
-                // 4-layer GPU optical laser beam: wide crimson bloom -> mid corona -> ruby core -> white-hot filament
-                for (size, color) in [
-                    (base_size * 1.65, rgba(0xff14241a)),
-                    (base_size * 1.05, rgba(0xff243042)),
-                    (base_size * 0.58, rgba(0xff3b30dc)),
-                    (base_size * 0.22, rgba(0xfff5f5f5)),
-                ] {
-                    let outline =
-                        freehand_outline(&screen_pts, &FreehandOptions { size, ..laser_base });
-                    paint_polygon(window, &outline, color);
-                }
-            }
-            // Glowing optical diode tip at the head of the laser beam
-            if let Some(&(tip, tip_age)) = smoothed.last()
-                && tip_age > 0.15
-            {
-                let pulse = 1.0 + 0.08 * (now_ms as f32 * 0.025).sin();
-                for (r, color) in [
-                    (20.0 * pulse * tip_age, rgba(0xff102018)),
-                    (13.5 * pulse * tip_age, rgba(0xff1e2c34)),
-                    (8.5 * tip_age, rgba(0xff323878)),
-                    (5.0 * tip_age, rgba(0xff3b30f2)),
-                    (2.4 * tip_age, rgba(0xffffffff)),
-                ] {
-                    paint_circle(window, tip[0], tip[1], r, color);
-                }
-            }
-            continue;
-        }
-
-        let screen_pts: Vec<[f32; 2]> = stroke
-            .normalized_points()
-            .into_iter()
-            .map(|[nx, ny]| to_local(nx, ny))
-            .collect();
-        if screen_pts.len() < 2 {
-            continue;
-        }
-        let ink_base = FreehandOptions {
-            size: base_size,
-            thinning: 0.55,
-            smoothing: 0.6,
-            streamline: 0.45,
-            simulate_pressure: true,
-            taper_start: false,
-            taper_end: false,
-        };
-        for (size, color) in [
-            (base_size + 4.0, rgba(0xffffffc0)),
-            (base_size, rgba(0xff3b30ff)),
-        ] {
-            let outline = freehand_outline(&screen_pts, &FreehandOptions { size, ..ink_base });
-            paint_polygon(window, &outline, color);
-        }
-    }
-}
-
-fn paint_polygon(window: &mut Window, pts: &[[f32; 2]], color: gpui::Rgba) {
-    if pts.len() < 3 {
-        return;
-    }
-    let gpui_pts: Vec<Point<Pixels>> = pts.iter().map(|&[x, y]| point(px(x), px(y))).collect();
-    let mut builder = PathBuilder::fill();
-    builder.add_polygon(&gpui_pts, true);
-    if let Ok(path) = builder.build() {
-        window.paint_path(path, color);
-    }
-}
-
-fn paint_circle(window: &mut Window, cx: f32, cy: f32, radius: f32, color: gpui::Rgba) {
-    let mut pts = Vec::with_capacity(24);
-    for i in 0..24 {
-        let angle = (i as f32 / 24.0) * std::f32::consts::TAU;
-        pts.push([cx + radius * angle.cos(), cy + radius * angle.sin()]);
-    }
-    paint_polygon(window, &pts, color);
 }
 
 pub struct BundleReviewWindow {
@@ -1418,6 +1276,16 @@ fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
             let ns_window = newest_ns_window();
             if let Some(ref w) = ns_window {
                 configure_floating_window(w, true, true);
+                let num = w.windowNumber().max(0) as u32;
+                if num > 0 {
+                    overlay_coord
+                        .read(cx)
+                        .telemetry
+                        .excluded_window_ids
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(num);
+                }
             }
             let focus = cx.focus_handle();
             window.focus(&focus);
@@ -1432,12 +1300,12 @@ fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
         },
     ) {}
 
-    // 2. Compact floating HUD pill at top-center
-    let pill_size: Size<Pixels> = size(px(520.0), px(44.0));
+    // 2. Compact floating HUD pill positioned cleanly below the 37pt macOS menu bar
+    let pill_size: Size<Pixels> = size(px(540.0), px(44.0));
     let pill_bounds = Bounds {
         origin: point(
             (display_bounds.size.width - pill_size.width) * 0.5,
-            px(18.0),
+            px(54.0),
         ),
         size: pill_size,
     };
@@ -1459,6 +1327,16 @@ fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
         move |_, cx| {
             if let Some(ns_win) = newest_ns_window() {
                 configure_floating_window(&ns_win, false, false);
+                let num = ns_win.windowNumber().max(0) as u32;
+                if num > 0 {
+                    pill_coord
+                        .read(cx)
+                        .telemetry
+                        .excluded_window_ids
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(num);
+                }
             }
             cx.new(|cx| {
                 cx.observe(&pill_coord, |_, _, cx| cx.notify()).detach();
@@ -1651,11 +1529,12 @@ pub fn run_app(
                                     coord.cancel_recording(cx);
                                 }
                             }
-                            LiveOverlayEvent::ShiftHeld | LiveOverlayEvent::PointerMoved => {
+                            LiveOverlayEvent::ShiftHeld => {
                                 cx.notify();
                             }
                             LiveOverlayEvent::RequestSnapshot => {
                                 coord.request_immediate_frame();
+                                cx.notify();
                             }
                             LiveOverlayEvent::ActionCaption(text) => {
                                 coord.caption = text;
