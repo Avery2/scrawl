@@ -1022,21 +1022,116 @@ pub fn list_selectable_windows() -> Vec<TargetInfo> {
         .collect()
 }
 
-/// Builds a `CaptureMode::Region` target for a user-drawn screen rectangle `(x, y, width, height)`.
-pub fn region_target(x: f64, y: f64, width: f64, height: f64) -> TargetInfo {
+pub fn selectable_window_at(windows: &[TargetInfo], x: f64, y: f64) -> Option<&TargetInfo> {
+    windows.iter().find(|window| {
+        let f = window.frame;
+        x >= f.x && x <= f.x + f.width && y >= f.y && y <= f.y + f.height
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_stop_joins_worker_before_collecting_its_final_media() {
+        let stopping = Arc::new(AtomicBool::new(false));
+        let frames = Arc::new(Mutex::new(VecDeque::new()));
+        let worker_stopping = Arc::clone(&stopping);
+        let worker_frames = Arc::clone(&frames);
+        let path = std::env::temp_dir().join(crate::make_bundle_id());
+        let worker_path = path.clone();
+        let worker = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !worker_stopping.load(Ordering::Acquire) && Instant::now() < deadline {
+                thread::yield_now();
+            }
+            assert!(worker_stopping.load(Ordering::Acquire));
+            worker_frames
+                .lock()
+                .unwrap()
+                .push_back(RgbaFrame::new(42, 1, 1, vec![1, 2, 3, 255]));
+            std::fs::write(&worker_path, b"finalized media").unwrap();
+            Some(worker_path)
+        });
+        let session = ScreenCaptureSession {
+            started_at: Instant::now(),
+            stopping,
+            urgent_snapshot: Arc::new(AtomicBool::new(false)),
+            frames,
+            sampler_thread: Some(worker),
+        };
+        let (frames, video, _) = session.stop();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].t_ms, 42);
+        assert_eq!(frames[0].rgba, vec![1, 2, 3, 255]);
+        assert_eq!(video.as_ref(), Some(&path));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cached_window_hit_preserves_front_to_back_order_and_screen_coordinates() {
+        let window = |id, x, y| TargetInfo {
+            mode: CaptureMode::Window,
+            app: Some(format!("App {id}")),
+            bundle_id: None,
+            window_title: Some(format!("Window {id}")),
+            window_id: Some(id),
+            display_id: 1,
+            frame: TargetFrame {
+                x,
+                y,
+                width: 200.0,
+                height: 100.0,
+                scale: 2.0,
+            },
+        };
+        let windows = [window(1, -100.0, 20.0), window(2, 0.0, 0.0)];
+        assert_eq!(
+            selectable_window_at(&windows, 50.0, 50.0)
+                .unwrap()
+                .window_id,
+            Some(1)
+        );
+        assert_eq!(
+            selectable_window_at(&windows, 150.0, 50.0)
+                .unwrap()
+                .window_id,
+            Some(2)
+        );
+        assert_eq!(
+            selectable_window_at(&windows, -100.0, 20.0)
+                .unwrap()
+                .window_id,
+            Some(1)
+        );
+        assert!(selectable_window_at(&windows, -101.0, 50.0).is_none());
+        assert!(selectable_window_at(&[], 0.0, 0.0).is_none());
+    }
+}
+
+/// Resolves region metadata from the picker's snapshot, without another SCK query.
+pub fn region_target(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    windows: &[TargetInfo],
+) -> TargetInfo {
     let mid_x = x + width * 0.5;
     let mid_y = y + height * 0.5;
-    let hit = topmost_normal_window_at(mid_x, mid_y);
+    let hit = selectable_window_at(windows, mid_x, mid_y);
     let frontmost = frontmost_app_info();
     let display_id = unsafe { CGMainDisplayID() };
     TargetInfo {
         mode: CaptureMode::Region,
         app: hit
-            .as_ref()
-            .and_then(|(_, _, app)| app.clone())
+            .and_then(|window| window.app.clone())
             .or_else(|| frontmost.as_ref().map(|(_, name, _)| name.clone())),
-        bundle_id: frontmost.and_then(|(_, _, bid)| bid),
-        window_title: hit.and_then(|(_, title, _)| title),
+        bundle_id: hit
+            .and_then(|window| window.bundle_id.clone())
+            .or_else(|| frontmost.and_then(|(_, _, bid)| bid)),
+        window_title: hit.and_then(|window| window.window_title.clone()),
         window_id: None,
         display_id,
         frame: TargetFrame {
@@ -1068,10 +1163,7 @@ pub struct ScreenCaptureSession {
     stopping: Arc<AtomicBool>,
     urgent_snapshot: Arc<AtomicBool>,
     frames: Arc<Mutex<VecDeque<RgbaFrame>>>,
-    sampler_thread: Option<JoinHandle<()>>,
-    stream: Option<SCStream>,
-    recording_output: Option<SCRecordingOutput>,
-    video_path: Option<PathBuf>,
+    sampler_thread: Option<JoinHandle<Option<PathBuf>>>,
 }
 
 impl ScreenCaptureSession {
@@ -1085,13 +1177,6 @@ impl ScreenCaptureSession {
         let urgent_snapshot = Arc::new(AtomicBool::new(true));
         let frames = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RETAINED_FRAMES)));
 
-        let initial_excluded = excluded_window_ids
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let (stream, recording_output, video_path, mut filter_and_config) =
-            setup_sck_capture(&target, video_output_path, &initial_excluded);
-
         let thread_stopping = Arc::clone(&stopping);
         let thread_urgent = Arc::clone(&urgent_snapshot);
         let thread_frames = Arc::clone(&frames);
@@ -1099,6 +1184,15 @@ impl ScreenCaptureSession {
         let sampler_thread = thread::Builder::new()
             .name("scrawl-frame-sampler".into())
             .spawn(move || {
+                let initial_excluded = excluded_window_ids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                // Keep SCK initialization, capture and teardown on the owning worker.
+                // stop() joins even if it arrives while setup is still in progress.
+                let (stream, recording_output, video_path, mut filter_and_config) =
+                    setup_sck_capture(&sampler_target, video_output_path, &initial_excluded);
+                crate::ui::start_metric("sck_ready_ms", started_at);
                 let mut last_sample = Instant::now()
                     .checked_sub(FRAME_SAMPLE_INTERVAL)
                     .unwrap_or_else(Instant::now);
@@ -1141,6 +1235,13 @@ impl ScreenCaptureSession {
                     }
                     thread::sleep(Duration::from_millis(30));
                 }
+                if let Some(stream) = stream {
+                    let _ = stream.stop_capture();
+                    if let Some(ref output) = recording_output {
+                        let _ = stream.remove_recording_output(output);
+                    }
+                }
+                video_path
             })
             .ok();
 
@@ -1150,9 +1251,6 @@ impl ScreenCaptureSession {
             urgent_snapshot,
             frames,
             sampler_thread,
-            stream,
-            recording_output,
-            video_path,
         }
     }
 
@@ -1167,15 +1265,11 @@ impl ScreenCaptureSession {
     pub fn stop(mut self) -> (Vec<RgbaFrame>, Option<PathBuf>, u64) {
         let duration_ms = self.elapsed_ms();
         self.stopping.store(true, Ordering::Release);
-        if let Some(handle) = self.sampler_thread.take() {
-            let _ = handle.join();
-        }
-        if let Some(stream) = self.stream.take() {
-            let _ = stream.stop_capture();
-            if let Some(ref output) = self.recording_output {
-                let _ = stream.remove_recording_output(output);
-            }
-        }
+        let video_path = self
+            .sampler_thread
+            .take()
+            .and_then(|handle| handle.join().ok())
+            .flatten();
         let mut collected: Vec<RgbaFrame> = self
             .frames
             .lock()
@@ -1185,10 +1279,18 @@ impl ScreenCaptureSession {
         if collected.is_empty() {
             collected.push(crate::render::render_synthetic_demo_frame(1280, 800, 0, 0));
         }
-        let valid_video = self
-            .video_path
-            .filter(|path| path.exists() && path.metadata().is_ok_and(|m| m.len() > 0));
+        let valid_video =
+            video_path.filter(|path| path.exists() && path.metadata().is_ok_and(|m| m.len() > 0));
         (collected, valid_video, duration_ms.max(100))
+    }
+}
+
+impl Drop for ScreenCaptureSession {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        if let Some(handle) = self.sampler_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 

@@ -24,8 +24,8 @@ use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
 use crate::capture::{
     LiveOverlayEvent, ScreenCaptureSession, SharedCaptureTelemetry, discover_target,
     install_global_hotkeys, list_selectable_windows, region_target, scrawl_log,
-    set_escape_hotkey_enabled, shortcut_from_key_and_mods, start_global_input_tap,
-    update_global_shortcut,
+    selectable_window_at, set_escape_hotkey_enabled, shortcut_from_key_and_mods,
+    start_global_input_tap, update_global_shortcut,
 };
 use crate::hex::AudioRecorder;
 use crate::laser_overlay::MetalLaserOverlay;
@@ -383,6 +383,9 @@ pub struct ScrawlCoordinator {
     island_velocity: f32,
     island_opacity: f32,
     selectable_windows: Vec<TargetInfo>,
+    selection_generation: u64,
+    windows_loading: bool,
+    selection_pointer: Option<[f32; 2]>,
     hovered_window: Option<TargetInfo>,
     selection_drag: Option<([f32; 2], [f32; 2])>,
     recording_shortcut_key: bool,
@@ -414,6 +417,9 @@ impl ScrawlCoordinator {
             island_velocity: 0.0,
             island_opacity: 0.0,
             selectable_windows: Vec::new(),
+            selection_generation: 0,
+            windows_loading: false,
+            selection_pointer: None,
             hovered_window: None,
             selection_drag: None,
             recording_shortcut_key: false,
@@ -569,9 +575,35 @@ impl ScrawlCoordinator {
             return;
         }
         scrawl_log("begin_target_selection invoked");
+        let started = Instant::now();
         self.recording_shortcut_key = false;
-        self.selectable_windows = list_selectable_windows();
-        self.hovered_window = self.selectable_windows.first().cloned();
+        self.selectable_windows.clear();
+        self.hovered_window = None;
+        self.selection_pointer = None;
+        self.selection_generation += 1;
+        self.windows_loading = true;
+        let generation = self.selection_generation;
+        cx.spawn(async move |entity, cx| {
+            let windows = cx
+                .background_executor()
+                .spawn(async { list_selectable_windows() })
+                .await;
+            let _ = entity.update(cx, |coord, cx| {
+                // A previous picker request must not overwrite a reopened picker or recording.
+                if coord.selection_generation != generation || !coord.is_selecting() {
+                    return;
+                }
+                coord.windows_loading = false;
+                coord.hovered_window = coord
+                    .selection_pointer
+                    .and_then(|[x, y]| selectable_window_at(&windows, f64::from(x), f64::from(y)))
+                    .cloned();
+                coord.selectable_windows = windows;
+                start_metric("picker_ready_ms", started);
+                cx.notify();
+            });
+        })
+        .detach();
         self.selection_drag = None;
         if matches!(
             self.island_phase,
@@ -591,8 +623,10 @@ impl ScrawlCoordinator {
         cx.defer(move |cx| {
             close_review_window(cx);
             open_picker_windows(&entity, cx);
+            start_metric("picker_open_ms", started);
         });
         cx.notify();
+        start_metric("picker_prep_ms", started);
     }
 
     pub fn start_recording_full_screen(&mut self, cx: &mut Context<Self>) {
@@ -608,6 +642,7 @@ impl ScrawlCoordinator {
         if self.is_recording() {
             return;
         }
+        let started = Instant::now();
         scrawl_log(format!(
             "start_recording_with_target invoked: mode={:?} frame={:?}",
             target.mode, target.frame
@@ -616,13 +651,20 @@ impl ScrawlCoordinator {
         self.selection_drag = None;
         self.hovered_window = None;
         let id = crate::make_bundle_id();
-        let bundle_dir = crate::handoff::default_captures_dir().join(format!("{id}.scrawl"));
+        let root = std::env::var_os("SCRAWL_BENCH_START")
+            .map(PathBuf::from)
+            .unwrap_or_else(crate::handoff::default_captures_dir);
+        let bundle_dir = root.join(format!("{id}.scrawl"));
         let _ = std::fs::create_dir_all(&bundle_dir);
         let video_path = bundle_dir.join("recording.mp4");
 
         self.telemetry.reset_for_session(target.frame);
         set_escape_hotkey_enabled(true);
-        let metal_overlay = MetalLaserOverlay::open(Arc::clone(&self.telemetry)).ok();
+        let stage = Instant::now();
+        let metal_overlay = MetalLaserOverlay::open(Arc::clone(&self.telemetry))
+            .map_err(|error| scrawl_log(format!("Metal overlay failed: {error}")))
+            .ok();
+        start_metric("metal_open_ms", stage);
         if let Some(ref overlay) = metal_overlay {
             self.telemetry
                 .excluded_window_ids
@@ -630,12 +672,16 @@ impl ScrawlCoordinator {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(overlay.window_number());
         }
+        let stage = Instant::now();
         let audio_recorder = AudioRecorder::start().ok();
+        start_metric("audio_start_ms", stage);
+        let stage = Instant::now();
         let screen_session = ScreenCaptureSession::start(
             target.clone(),
             Some(video_path),
             Arc::clone(&self.telemetry.excluded_window_ids),
         );
+        start_metric("sck_start_ms", stage);
         self.active_recording = Some(ActiveRecording {
             target,
             bundle_dir,
@@ -656,6 +702,7 @@ impl ScrawlCoordinator {
             ensure_hud_pill_open(&entity, cx);
         });
         cx.notify();
+        start_metric("recording_start_ms", started);
     }
 
     pub fn cancel_recording(&mut self, cx: &mut Context<Self>) {
@@ -1250,7 +1297,16 @@ impl Render for TargetPickerWindow {
                             cx.notify();
                         }
                         SelectionMode::Window => {
-                            if let Some(target) = coord.hovered_window.clone() {
+                            if coord.windows_loading {
+                                return;
+                            }
+                            if let Some(target) = selectable_window_at(
+                                &coord.selectable_windows,
+                                f64::from(sx),
+                                f64::from(sy),
+                            )
+                            .cloned()
+                            {
                                 coord.start_recording_with_target(target, cx);
                             } else {
                                 coord.start_recording_full_screen(cx);
@@ -1265,6 +1321,7 @@ impl Render for TargetPickerWindow {
             let sx = f32::from(win_bounds.origin.x) + f32::from(event.position.x);
             let sy = f32::from(win_bounds.origin.y) + f32::from(event.position.y);
             c_move.update(cx, |coord, cx| {
+                coord.selection_pointer = Some([sx, sy]);
                 let cur_mode = match coord.island_phase {
                     IslandPhase::Selecting { mode } => mode,
                     _ => return,
@@ -1313,7 +1370,7 @@ impl Render for TargetPickerWindow {
                         let w = f64::from((start[0] - sx).abs());
                         let h = f64::from((start[1] - sy).abs());
                         if w >= 36.0 && h >= 36.0 {
-                            let target = region_target(x, y, w, h);
+                            let target = region_target(x, y, w, h, &coord.selectable_windows);
                             coord.start_recording_with_target(target, cx);
                         } else {
                             cx.notify();
@@ -2185,6 +2242,64 @@ fn open_review_window(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
             })
         },
     );
+}
+
+pub(crate) fn start_metric(name: &str, started: Instant) {
+    if std::env::var_os("SCRAWL_BENCH_START").is_some() {
+        eprintln!(
+            "START_METRIC {name}={:.6}",
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
+    }
+}
+
+/// Real startup paths, without registering hotkeys or publishing personal captures.
+pub fn run_start_benchmark() {
+    Application::new().run(|cx: &mut App| {
+        let quick_stop = std::env::var("SCRAWL_BENCH_QUICK_STOP").as_deref() == Ok("1");
+        let (sender, _receiver) = flume::unbounded();
+        let telemetry = SharedCaptureTelemetry::new(sender);
+        let coordinator = cx.new(|_| ScrawlCoordinator::new(telemetry, None));
+        cx.spawn(async move |cx| {
+            for run in 0..8 {
+                coordinator.update(cx, |coord, cx| coord.begin_target_selection(cx)).unwrap();
+                // Allow deferred picker creation and async discovery to settle.
+                cx.background_executor().timer(Duration::from_millis(600)).await;
+                coordinator.update(cx, |coord, cx| {
+                    let stage = Instant::now();
+                    assert!(!coord.windows_loading, "Picker discovery did not finish");
+                    let target = region_target(100.0, 100.0, 480.0, 320.0, &coord.selectable_windows);
+                    start_metric("target_discovery_ms", stage);
+                    coord.start_recording_with_target(target, cx);
+                }).unwrap();
+                if !quick_stop {
+                    cx.background_executor().timer(Duration::from_millis(1_500)).await;
+                }
+                coordinator.update(cx, |coord, cx| {
+                    let rec = coord.active_recording.take().expect("Recording did not start");
+                    assert!(rec._metal_overlay.is_some(), "Metal overlay failed");
+                    coord.telemetry.finish_session();
+                    let ((frames, video, duration), audio) = std::thread::scope(|scope| {
+                        let screen = scope.spawn(|| rec.screen_session.stop());
+                        let audio = rec.audio_recorder.expect("Microphone failed to start").stop().expect("Microphone failed to stop");
+                        (screen.join().unwrap(), audio)
+                    });
+                    if !quick_stop {
+                        assert!(video.is_some(), "MP4 missing");
+                        assert!(audio.sample_count > 0, "Microphone returned no samples");
+                        assert!(frames.iter().any(|f| f.width == 960 && f.height == 640), "No real SCK frames (synthetic fallback only)");
+                    }
+                    let wav = hound::WavReader::new(std::io::Cursor::new(&audio.wav_bytes)).unwrap();
+                    assert_eq!(wav.duration() as usize, audio.sample_count);
+                    std::fs::write(rec.bundle_dir.join("audio.wav"), &audio.wav_bytes).unwrap();
+                    println!("START_RUN {}", serde_json::json!({"run": run, "frames": frames.len(), "first_frame_ms": frames[0].t_ms, "audio_samples": audio.sample_count, "duration_ms": duration}));
+                    coord.set_island_phase(IslandPhase::Hidden);
+                    close_capture_windows(cx);
+                }).unwrap();
+            }
+            cx.update(|cx| cx.quit()).unwrap();
+        }).detach();
+    });
 }
 
 /// Runs the GPUI desktop app, optionally opening an initial `.scrawl` bundle in the Review window

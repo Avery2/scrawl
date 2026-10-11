@@ -23,13 +23,46 @@ pub struct RecordedAudio {
 }
 
 pub struct AudioRecorder {
-    stream: cpal::Stream,
+    worker: Option<std::thread::JoinHandle<Result<()>>>,
+    stop_sender: Option<std::sync::mpsc::Sender<()>>,
     samples: Arc<Mutex<Vec<f32>>>,
     error: Arc<Mutex<Option<String>>>,
 }
 
 impl AudioRecorder {
     pub fn start() -> Result<Self> {
+        let started = std::time::Instant::now();
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let error = Arc::new(Mutex::new(None));
+        let (stop_sender, stop_receiver) = std::sync::mpsc::channel();
+        let worker_samples = Arc::clone(&samples);
+        let worker_error = Arc::clone(&error);
+        let worker = std::thread::Builder::new()
+            .name("scrawl-audio".into())
+            .spawn(move || {
+                let stream =
+                    Self::open_stream(worker_samples, worker_error).inspect_err(|error| {
+                        crate::capture::scrawl_log(format!("Microphone startup failed: {error:#}"));
+                    })?;
+                crate::ui::start_metric("audio_ready_ms", started);
+                // Stream never crosses threads. Disconnect also stops abandoned recorders.
+                let _ = stop_receiver.recv();
+                drop(stream);
+                Ok(())
+            })
+            .context("Could not spawn microphone worker")?;
+        Ok(Self {
+            worker: Some(worker),
+            stop_sender: Some(stop_sender),
+            samples,
+            error,
+        })
+    }
+
+    fn open_stream(
+        samples: Arc<Mutex<Vec<f32>>>,
+        error: Arc<Mutex<Option<String>>>,
+    ) -> Result<cpal::Stream> {
         let device = cpal::default_host()
             .default_input_device()
             .context("No microphone is available")?;
@@ -39,8 +72,6 @@ impl AudioRecorder {
             config.channels > 0 && config.sample_rate > 0,
             "Invalid microphone format"
         );
-        let samples = Arc::new(Mutex::new(Vec::new()));
-        let error = Arc::new(Mutex::new(None));
         macro_rules! stream {
             ($ty:ty) => {
                 input_stream::<$ty>(&device, config, samples.clone(), error.clone())?
@@ -62,22 +93,25 @@ impl AudioRecorder {
             format => bail!("Unsupported microphone format: {format}"),
         };
         stream.play().context("Could not start microphone")?;
-        Ok(Self {
-            stream,
-            samples,
-            error,
-        })
+        Ok(stream)
     }
 
-    pub fn stop(self) -> Result<RecordedAudio> {
-        let Self {
-            stream,
-            samples,
-            error,
-        } = self;
-        // Drop joins/stops the input callback before taking its final buffer.
-        drop(stream);
-        if let Some(error) = error
+    fn join_worker(&mut self) -> Result<()> {
+        self.stop_sender.take();
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| anyhow!("Microphone worker panicked"))??;
+        }
+        Ok(())
+    }
+
+    pub fn stop(mut self) -> Result<RecordedAudio> {
+        // Joining drops the stream and stops its callback before taking the buffer,
+        // including a stop requested while the device was still being initialized.
+        self.join_worker()?;
+        if let Some(error) = self
+            .error
             .lock()
             .map_err(|_| anyhow!("Microphone error lock poisoned"))?
             .take()
@@ -85,7 +119,8 @@ impl AudioRecorder {
             bail!("Microphone capture failed: {error}");
         }
         let samples_16k = std::mem::take(
-            &mut *samples
+            &mut *self
+                .samples
                 .lock()
                 .map_err(|_| anyhow!("Microphone buffer lock poisoned"))?,
         );
@@ -99,6 +134,12 @@ impl AudioRecorder {
             speech_islands,
             wav_bytes,
         })
+    }
+}
+
+impl Drop for AudioRecorder {
+    fn drop(&mut self) {
+        let _ = self.join_worker();
     }
 }
 
@@ -548,6 +589,54 @@ fn request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_joins_worker_before_reading_its_last_samples() {
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&samples);
+        let (stop_sender, stop_receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            // Model a final callback flushed while the worker drops its stream.
+            assert!(matches!(
+                stop_receiver.recv_timeout(Duration::from_secs(2)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            ));
+            output.lock().unwrap().extend([0.1, 0.2, 0.3]);
+            Ok(())
+        });
+        let audio = AudioRecorder {
+            worker: Some(worker),
+            stop_sender: Some(stop_sender),
+            samples,
+            error: Arc::new(Mutex::new(None)),
+        }
+        .stop()
+        .unwrap();
+        assert_eq!(audio.sample_count, 3);
+        assert_eq!(
+            hound::WavReader::new(Cursor::new(audio.wav_bytes))
+                .unwrap()
+                .duration(),
+            3
+        );
+    }
+
+    #[test]
+    fn stop_propagates_background_initialization_failure() {
+        let recorder = AudioRecorder {
+            worker: Some(std::thread::spawn(|| bail!("device unavailable"))),
+            stop_sender: None,
+            samples: Arc::new(Mutex::new(Vec::new())),
+            error: Arc::new(Mutex::new(None)),
+        };
+        assert!(
+            recorder
+                .stop()
+                .unwrap_err()
+                .to_string()
+                .contains("device unavailable")
+        );
+    }
 
     #[test]
     fn speech_islands_merge_only_short_silences() {

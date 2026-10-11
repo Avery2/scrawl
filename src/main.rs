@@ -428,6 +428,10 @@ pub fn generate_demo_bundle(out: Option<PathBuf>) -> Result<(PathBuf, ScrawlBund
 }
 
 fn main() -> Result<()> {
+    if std::env::var_os("SCRAWL_BENCH_START").is_some() {
+        ui::run_start_benchmark();
+        return Ok(());
+    }
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::App { record: false }) {
         Command::App { record } => {
