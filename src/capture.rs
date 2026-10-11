@@ -1994,13 +1994,27 @@ pub fn write_bundle_artifacts(
         let _ = std::fs::set_permissions(out_dir, std::fs::Permissions::from_mode(0o700));
     }
 
-    for (kf, frame) in annotated_frames {
-        let frame_path = out_dir.join(&kf.file);
-        crate::render::save_png(frame, &frame_path)?;
-    }
-
-    let sheet_path = out_dir.join(&bundle.contact_sheet);
-    crate::render::save_png(contact_sheet, &sheet_path)?;
+    // Two frame workers plus the calling thread keep CPU and encoder memory bounded.
+    thread::scope(|scope| -> Result<()> {
+        let workers: Vec<_> = annotated_frames
+            .chunks(annotated_frames.len().div_ceil(2).max(1))
+            .map(|frames| {
+                scope.spawn(move || -> Result<()> {
+                    for (kf, frame) in frames {
+                        crate::render::save_png(frame, &out_dir.join(&kf.file))?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        crate::render::save_png(contact_sheet, &out_dir.join(&bundle.contact_sheet))?;
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("PNG encoding worker panicked"))??;
+        }
+        Ok(())
+    })?;
 
     let manifest_bytes = serde_json::to_vec_pretty(bundle)?;
     std::fs::write(out_dir.join("scrawl.json"), manifest_bytes)?;

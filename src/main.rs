@@ -174,6 +174,8 @@ pub fn build_bundle_from_parts(
     note: Option<String>,
 ) -> Result<(PathBuf, ScrawlBundle, String)> {
     let mut marks = marks_of(&strokes);
+    let bench = std::env::var_os("SCRAWL_BENCH").is_some();
+    let started = std::time::Instant::now();
     let selected = select_keyframes(
         &frames,
         &strokes,
@@ -182,6 +184,7 @@ pub fn build_bundle_from_parts(
         &transcript,
         MAX_KEYFRAMES,
     );
+    let selected_at = std::time::Instant::now();
 
     let mut annotated_frames = Vec::with_capacity(selected.len());
     let mut keyframes = Vec::with_capacity(selected.len());
@@ -190,6 +193,7 @@ pub fn build_bundle_from_parts(
         keyframes.push(kf.clone());
         annotated_frames.push((kf, raw_frame));
     }
+    let annotated_at = std::time::Instant::now();
 
     let id = bundle_dir
         .file_stem()
@@ -225,6 +229,7 @@ pub fn build_bundle_from_parts(
     };
 
     let contact_sheet = render_contact_sheet(&bundle, &annotated_frames);
+    let rendered_at = std::time::Instant::now();
     let summary = summary_markdown(&bundle, bundle_dir);
     write_bundle_artifacts(
         bundle_dir,
@@ -233,6 +238,18 @@ pub fn build_bundle_from_parts(
         &contact_sheet,
         &summary,
     )?;
+    if bench {
+        let finished = std::time::Instant::now();
+        for (name, elapsed) in [
+            ("selection_ms", selected_at - started),
+            ("annotation_ms", annotated_at - selected_at),
+            ("contact_sheet_ms", rendered_at - annotated_at),
+            ("artifacts_ms", finished - rendered_at),
+            ("pipeline_ms", finished - started),
+        ] {
+            eprintln!("BENCH {name}={:.3}", elapsed.as_secs_f64() * 1000.0);
+        }
+    }
 
     Ok((bundle_dir.to_path_buf(), bundle, summary))
 }
@@ -514,5 +531,43 @@ fn main() -> Result<()> {
             ui::run_app(initial, false, capture_screenshot);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artifact_failures_do_not_publish_a_manifest() {
+        let root = std::env::temp_dir().join(make_bundle_id());
+        let (_, mut bundle, _) = generate_demo_bundle(Some(root.join("demo.scrawl"))).unwrap();
+        let frame = RgbaFrame::new(0, 1, 1, vec![20, 30, 40, 255]);
+        let mut key = bundle.keyframes[0].clone();
+        key.file = "frames/missing/frame.png".into();
+        let frame_failure = root.join("frame-failure.scrawl");
+        assert!(
+            write_bundle_artifacts(
+                &frame_failure,
+                &bundle,
+                &[(key, frame.clone())],
+                &frame,
+                "summary"
+            )
+            .is_err()
+        );
+        assert!(!frame_failure.join("scrawl.json").exists());
+
+        bundle.contact_sheet = "missing/contact-sheet.png".into();
+        let sheet_failure = root.join("sheet-failure.scrawl");
+        assert!(write_bundle_artifacts(&sheet_failure, &bundle, &[], &frame, "summary").is_err());
+        assert!(!sheet_failure.join("scrawl.json").exists());
+
+        bundle.contact_sheet = "contact-sheet.png".into();
+        let empty_frames = root.join("empty-frames.scrawl");
+        write_bundle_artifacts(&empty_frames, &bundle, &[], &frame, "summary").unwrap();
+        assert!(empty_frames.join("scrawl.json").exists());
+        assert!(empty_frames.join("contact-sheet.png").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

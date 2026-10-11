@@ -26,6 +26,8 @@ pub fn encode_png(frame: &RgbaFrame) -> anyhow::Result<Vec<u8>> {
         let mut encoder = png::Encoder::new(&mut bytes, frame.width, frame.height);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        encoder.set_filter(png::Filter::Sub);
         let mut writer = encoder.write_header()?;
         writer.write_image_data(&frame.rgba)?;
         writer.finish()?;
@@ -123,9 +125,35 @@ fn rounded(frame: &mut RgbaFrame, rect: [f32; 4], radius: f32, color: Color) {
     if w <= 0.0 || h <= 0.0 {
         return;
     }
+    let left = (x.floor() as i32 - 1).max(0);
+    let right = ((x + w).ceil() as i32 + 1).min(frame.width as i32);
+    if left >= right {
+        return;
+    }
+    let r = radius.max(0.0).min(w * 0.5).min(h * 0.5);
     for py in (y.floor() as i32 - 1).max(0)..((y + h).ceil() as i32 + 1).min(frame.height as i32) {
-        for px in (x.floor() as i32 - 1).max(0)..((x + w).ceil() as i32 + 1).min(frame.width as i32)
+        // Only fully covered, opaque pixels can bypass source-over. Keep the
+        // original distance/coverage calculation on all antialiased edges.
+        let (start, end) =
+            if color[3] == 255 && py >= y.ceil() as i32 && py < (y + h).floor() as i32 {
+                let inset = if py >= (y + r).ceil() as i32 && py < (y + h - r).floor() as i32 {
+                    0.0
+                } else {
+                    r
+                };
+                let start = ((x + inset).ceil() as i32).clamp(left, right);
+                let end = ((x + w - inset).floor() as i32).clamp(start, right);
+                (start, end)
+            } else {
+                (left, left)
+            };
+        let row = py as usize * frame.width as usize * 4;
+        for pixel in
+            frame.rgba[row + start as usize * 4..row + end as usize * 4].chunks_exact_mut(4)
         {
+            pixel.copy_from_slice(&color);
+        }
+        for px in (left..start).chain(end..right) {
             let coverage = (0.5 - rounded_distance(px as f32 + 0.5, py as f32 + 0.5, rect, radius))
                 .clamp(0.0, 1.0);
             blend(frame, px, py, color, coverage);
@@ -1256,6 +1284,43 @@ mod tests {
             contact_sheet: "contact-sheet.png".into(),
             video: None,
             audio: None,
+        }
+    }
+
+    #[test]
+    fn opaque_rounded_spans_match_source_over_edges_and_clipping() {
+        for rect in [
+            [0.0, 0.0, 32.0, 24.0],
+            [-4.25, -2.5, 21.75, 16.25],
+            [8.75, 5.25, 31.5, 24.75],
+            [2.25, 3.75, 0.5, 1.25],
+            [-50.0, 0.0, 5.0, 5.0],
+            [40.0, 0.0, 5.0, 5.0],
+        ] {
+            for radius in [0.0, 0.25, 2.5, 10.0, 100.0] {
+                for alpha in [0, 127, 255] {
+                    let color = [59, 130, 243, alpha];
+                    let mut expected = solid(32, 24, [90, 60, 30, 137]);
+                    let mut actual = expected.clone();
+                    rounded(&mut actual, rect, radius, color);
+                    let [x, y, w, h] = rect;
+                    for py in (y.floor() as i32 - 1).max(0)..((y + h).ceil() as i32 + 1).min(24) {
+                        for px in (x.floor() as i32 - 1).max(0)..((x + w).ceil() as i32 + 1).min(32)
+                        {
+                            let r = radius.max(0.0).min(w * 0.5).min(h * 0.5);
+                            let qx = (px as f32 + 0.5 - x - w * 0.5).abs() - w * 0.5 + r;
+                            let qy = (py as f32 + 0.5 - y - h * 0.5).abs() - h * 0.5 + r;
+                            let distance = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r;
+                            let coverage = (0.5 - distance).clamp(0.0, 1.0);
+                            blend(&mut expected, px, py, color, coverage);
+                        }
+                    }
+                    assert_eq!(
+                        actual.rgba, expected.rgba,
+                        "rect={rect:?} radius={radius} alpha={alpha}"
+                    );
+                }
+            }
         }
     }
 
