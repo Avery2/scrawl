@@ -59,8 +59,8 @@ const CHIP_GAP: f32 = 2.0;
 const DIVIDER_MX: f32 = 6.0;
 const LEAD_TRAIL: f32 = 8.0;
 const HUD_TEXT: f32 = 13.0;
-const PILL_WINDOW_W: f32 = 440.0;
-const PILL_WINDOW_H: f32 = 48.0;
+const PILL_WINDOW_W: f32 = 520.0;
+const PILL_WINDOW_H: f32 = 84.0;
 
 #[derive(Clone, Copy, Debug)]
 struct Spring {
@@ -69,8 +69,13 @@ struct Spring {
 }
 
 const ISLAND_SPRING: Spring = Spring {
-    response: 0.42,
-    damping_ratio: 0.78,
+    response: 0.34,
+    damping_ratio: 0.68,
+};
+
+const ISLAND_HEIGHT_SPRING: Spring = Spring {
+    response: 0.28,
+    damping_ratio: 0.62,
 };
 
 /// Advances a damped spring with fixed 4ms sub-steps so long frames stay stable.
@@ -375,11 +380,16 @@ pub struct ScrawlCoordinator {
     telemetry: Arc<SharedCaptureTelemetry>,
     active_recording: Option<ActiveRecording>,
     island_phase: IslandPhase,
+    island_prev_phase: IslandPhase,
     island_phase_since: Instant,
     island_dismissed_from: IslandPhase,
     island_width: f32,
     island_target_width: f32,
     island_velocity: f32,
+    island_height: f32,
+    island_height_velocity: f32,
+    island_y: f32,
+    island_y_velocity: f32,
     island_opacity: f32,
     selectable_windows: Vec<TargetInfo>,
     selection_generation: u64,
@@ -410,11 +420,16 @@ impl ScrawlCoordinator {
             telemetry,
             active_recording: None,
             island_phase: IslandPhase::Hidden,
+            island_prev_phase: IslandPhase::Hidden,
             island_phase_since: Instant::now(),
             island_dismissed_from: IslandPhase::Hidden,
-            island_width: 220.0,
-            island_target_width: 220.0,
+            island_width: 64.0,
+            island_target_width: 210.0,
             island_velocity: 0.0,
+            island_height: 22.0,
+            island_height_velocity: 0.0,
+            island_y: -14.0,
+            island_y_velocity: 0.0,
             island_opacity: 0.0,
             selectable_windows: Vec::new(),
             selection_generation: 0,
@@ -460,7 +475,12 @@ impl ScrawlCoordinator {
     }
 
     pub fn set_selection_mode(&mut self, mode: SelectionMode, cx: &mut Context<Self>) {
-        if matches!(self.island_phase, IslandPhase::Selecting { .. }) {
+        if let IslandPhase::Selecting { mode: prev_mode } = self.island_phase {
+            if prev_mode != mode {
+                // Crisp tactile Dynamic Island micro-pulse when Space toggles camera/crosshair mode.
+                self.island_velocity += 210.0;
+                self.island_height_velocity += 75.0;
+            }
             self.island_phase = IslandPhase::Selecting { mode };
             self.selection_drag = None;
             if let Some(pos) = current_mouse_screen().or(self.selection_pointer) {
@@ -522,8 +542,22 @@ impl ScrawlCoordinator {
     fn set_island_phase(&mut self, phase: IslandPhase) {
         let changed = std::mem::discriminant(&self.island_phase) != std::mem::discriminant(&phase);
         if changed {
+            self.island_prev_phase = self.island_phase;
             if matches!(phase, IslandPhase::Dismissing) {
                 self.island_dismissed_from = self.island_phase;
+                self.island_velocity = -420.0;
+                self.island_height_velocity = -160.0;
+                self.island_y_velocity = -90.0;
+            } else if matches!(self.island_phase, IslandPhase::Hidden) {
+                self.island_velocity = 340.0;
+                self.island_height_velocity = 160.0;
+                self.island_y_velocity = 110.0;
+            } else {
+                // Dynamic Island squish-and-bloom impulse: pinch inward & compress vertically,
+                // then spring outward past target width/height before settling.
+                self.island_velocity = -720.0;
+                self.island_height_velocity = -240.0;
+                self.island_y_velocity = -55.0;
             }
             self.island_phase_since = Instant::now();
         }
@@ -601,11 +635,11 @@ impl ScrawlCoordinator {
         }
 
         // `island_target_width` is the measured intrinsic width of the visible content, written
-        // by `HudPillWindow::render`; dismissal contracts toward ~80% while fading out.
-        let (target_w, target_opacity, fade_rate) = match self.island_phase {
+        // by `HudPillWindow::render`; dismissal contracts toward a compact seed pill while fading out.
+        let (target_w, target_h, target_y, target_opacity, fade_rate) = match self.island_phase {
             IslandPhase::Hidden => return,
-            IslandPhase::Dismissing => (self.island_target_width * 0.8, 0.0, 12.0),
-            _ => (self.island_target_width, 1.0, 16.0),
+            IslandPhase::Dismissing => (56.0, 22.0, -12.0, 0.0, 14.0),
+            _ => (self.island_target_width, ISLAND_H, 0.0, 1.0, 18.0),
         };
 
         let (width, velocity) = spring_step(
@@ -615,8 +649,26 @@ impl ScrawlCoordinator {
             dt,
             ISLAND_SPRING,
         );
-        self.island_width = width.clamp(ISLAND_H, PILL_WINDOW_W - 8.0);
+        let (height, h_vel) = spring_step(
+            self.island_height,
+            self.island_height_velocity,
+            target_h,
+            dt,
+            ISLAND_HEIGHT_SPRING,
+        );
+        let (y_off, y_vel) = spring_step(
+            self.island_y,
+            self.island_y_velocity,
+            target_y,
+            dt,
+            ISLAND_HEIGHT_SPRING,
+        );
+        self.island_width = width.clamp(44.0, PILL_WINDOW_W - 16.0);
         self.island_velocity = velocity;
+        self.island_height = height.clamp(18.0, 54.0);
+        self.island_height_velocity = h_vel;
+        self.island_y = y_off.clamp(-20.0, 16.0);
+        self.island_y_velocity = y_vel;
         self.island_opacity += (target_opacity - self.island_opacity) * (fade_rate * dt).min(1.0);
 
         if matches!(self.island_phase, IslandPhase::Dismissing) && self.island_opacity < 0.04 {
@@ -683,9 +735,13 @@ impl ScrawlCoordinator {
             self.island_phase,
             IslandPhase::Hidden | IslandPhase::Dismissing
         ) {
-            // Bloom out of a compact capsule; a visible island morphs from its current width.
-            self.island_width = (self.island_target_width * 0.62).max(ISLAND_H * 3.0);
+            // Bloom out of a compact Dynamic Island seed pill tucked near the top bar.
+            self.island_width = 64.0;
             self.island_velocity = 0.0;
+            self.island_height = 22.0;
+            self.island_height_velocity = 0.0;
+            self.island_y = -14.0;
+            self.island_y_velocity = 0.0;
             self.island_opacity = 0.0;
             self.island_phase = IslandPhase::Hidden;
         }
@@ -766,8 +822,12 @@ impl ScrawlCoordinator {
             _metal_overlay: metal_overlay,
         });
         if matches!(self.island_phase, IslandPhase::Hidden) {
-            self.island_width = (self.island_target_width * 0.62).max(ISLAND_H * 3.0);
+            self.island_width = 64.0;
             self.island_velocity = 0.0;
+            self.island_height = 22.0;
+            self.island_height_velocity = 0.0;
+            self.island_y = -14.0;
+            self.island_y_velocity = 0.0;
         }
         self.set_island_phase(IslandPhase::Recording);
 
@@ -849,12 +909,15 @@ impl Render for HudPillWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let coord = self.coordinator.read(cx);
         let phase = coord.island_phase;
+        let prev_phase = coord.island_prev_phase;
         let content_phase = match phase {
             IslandPhase::Dismissing => coord.island_dismissed_from,
             other => other,
         };
         let phase_age = coord.island_phase_since.elapsed().as_secs_f32();
         let width = coord.island_width;
+        let height = coord.island_height;
+        let y_off = coord.island_y;
         let opacity = coord.island_opacity.clamp(0.0, 1.0);
         let elapsed_ms = coord
             .active_recording
@@ -874,11 +937,26 @@ impl Render for HudPillWindow {
         self.coordinator
             .update(cx, |coord, _| coord.island_target_width = target_width);
 
-        // Smoothly cross-fade capsule contents without a blank gap between phases.
-        let content_alpha = if matches!(phase, IslandPhase::Dismissing) {
-            1.0
+        // Dynamic Island blur + scale transition:
+        // - During 0..95ms, outgoing content scales down & blurs out into a frosted glow.
+        // - During 35..240ms, incoming content scales up from 0.74x -> 1.0x and sharpens out of the blur.
+        let t_in = ease_out_cubic(((phase_age - 0.03) / 0.21).clamp(0.0, 1.0));
+        let scale_in = if matches!(phase, IslandPhase::Dismissing) {
+            0.78 + 0.22 * opacity
         } else {
-            0.38 + 0.62 * ease_out_cubic(phase_age / 0.14)
+            0.74 + 0.26 * t_in
+        };
+        let content_alpha = if matches!(phase, IslandPhase::Dismissing) {
+            opacity
+        } else {
+            t_in
+        };
+        let blur_wave = if matches!(phase, IslandPhase::Dismissing) {
+            (1.0 - opacity).clamp(0.0, 1.0)
+        } else if phase_age < 0.24 {
+            (std::f32::consts::PI * (phase_age / 0.24).clamp(0.0, 1.0)).sin()
+        } else {
+            0.0
         };
 
         let c_undo = self.coordinator.clone();
@@ -890,11 +968,13 @@ impl Render for HudPillWindow {
         let c_full = self.coordinator.clone();
         let c_sel_cancel = self.coordinator.clone();
 
+        let dynamic_gap = (CHIP_GAP * scale_in - (1.0 - scale_in) * 14.0).max(-6.0);
         let row = div()
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(CHIP_GAP))
+            .gap(px(dynamic_gap))
+            .text_size(px(HUD_TEXT * scale_in))
             .whitespace_nowrap()
             .opacity(content_alpha);
 
@@ -1043,6 +1123,16 @@ impl Render for HudPillWindow {
         };
 
         let is_completed = matches!(content_phase, IslandPhase::Completed { .. });
+        let outgoing_alpha = if phase_age < 0.11
+            && !matches!(prev_phase, IslandPhase::Hidden | IslandPhase::Dismissing)
+        {
+            (1.0 - phase_age / 0.11).clamp(0.0, 1.0).powi(2)
+        } else {
+            0.0
+        };
+        let scale_out = (1.0 - 0.34 * (phase_age / 0.11).clamp(0.0, 1.0)).max(0.60);
+        let radius = (height * 0.5).max(9.0);
+
         div()
             .size_full()
             .flex()
@@ -1051,12 +1141,14 @@ impl Render for HudPillWindow {
             .opacity(opacity)
             .child(
                 div()
+                    .mt(px(y_off))
                     .w(px(width))
-                    .h(px(ISLAND_H))
+                    .h(px(height))
                     .flex_none()
                     .p(px(ISLAND_PAD))
-                    .rounded(px(ISLAND_RADIUS))
+                    .rounded(px(radius))
                     .overflow_hidden()
+                    .relative()
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1064,13 +1156,64 @@ impl Render for HudPillWindow {
                     .border_1()
                     .border_color(if is_completed {
                         rgba(0x69d89f4d)
+                    } else if blur_wave > 0.05 {
+                        with_alpha(0xffffff, 0.10 + 0.22 * blur_wave)
                     } else {
                         rgba(0xffffff1a)
                     })
+                    .shadow(vec![
+                        BoxShadow {
+                            color: gpui::hsla(0.0, 0.0, 0.0, 0.42),
+                            offset: point(px(0.0), px(6.0)),
+                            blur_radius: px(16.0 + 10.0 * blur_wave),
+                            spread_radius: px(0.0),
+                        },
+                        BoxShadow {
+                            color: if is_completed {
+                                gpui::hsla(0.41, 0.60, 0.62, 0.28 * blur_wave)
+                            } else {
+                                gpui::hsla(0.62, 0.85, 0.65, 0.26 * blur_wave)
+                            },
+                            offset: point(px(0.0), px(0.0)),
+                            blur_radius: px(22.0 * blur_wave),
+                            spread_radius: px(2.0 * blur_wave),
+                        },
+                    ])
                     .text_color(rgb(TEXT_COLOR))
                     .text_size(px(HUD_TEXT))
                     .whitespace_nowrap()
-                    .child(capsule_content),
+                    .when(outgoing_alpha > 0.01, |d| {
+                        // Outgoing content compresses and dissolves into the center waist.
+                        let ghost_label = match prev_phase {
+                            IslandPhase::Selecting { .. } => "Area   Full Screen",
+                            IslandPhase::Recording => "● 0:00   Undo   Cancel   Finish",
+                            IslandPhase::Completed { .. } => "✓ Copied   Inspect",
+                            IslandPhase::Hidden | IslandPhase::Dismissing => "",
+                        };
+                        d.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .opacity(outgoing_alpha * 0.75)
+                                .text_size(px(HUD_TEXT * scale_out))
+                                .text_color(rgb(TEXT_SOFT))
+                                .child(ghost_label),
+                        )
+                    })
+                    .child(capsule_content)
+                    .when(blur_wave > 0.02, |d| {
+                        // Frosted Dynamic Island blur-bloom veil across the pinch transition.
+                        d.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .rounded(px(radius))
+                                .bg(with_alpha(0xffffff, 0.11 * blur_wave)),
+                        )
+                    }),
             )
     }
 }
@@ -2264,7 +2407,7 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
     let pill_bounds = Bounds {
         origin: point(
             (display_bounds.size.width - pill_size.width) * 0.5,
-            px(50.0),
+            px(34.0),
         ),
         size: pill_size,
     };
@@ -2498,7 +2641,7 @@ pub fn run_app(
             let mut last_frame = Instant::now();
             loop {
                 cx.background_executor()
-                    .timer(Duration::from_millis(16))
+                    .timer(Duration::from_millis(8))
                     .await;
                 let dt = last_frame.elapsed().as_secs_f32();
                 last_frame = Instant::now();
