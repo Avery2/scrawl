@@ -111,6 +111,26 @@ unsafe extern "C" {
         actual_size: *mut usize,
         data: *mut c_void,
     ) -> i32;
+    fn TISCopyCurrentKeyboardLayoutInputSource() -> *const c_void;
+    fn TISCopyCurrentASCIICapableKeyboardLayoutInputSource() -> *const c_void;
+    static kTISPropertyUnicodeKeyLayoutData: *const c_void;
+    fn TISGetInputSourceProperty(
+        input_source: *const c_void,
+        property_key: *const c_void,
+    ) -> *const c_void;
+    fn UCKeyTranslate(
+        layout: *const u8,
+        key_code: u16,
+        key_action: u16,
+        modifier_state: u32,
+        keyboard_type: u32,
+        options: isize,
+        dead_key_state: *mut u32,
+        max_length: isize,
+        actual_length: *mut isize,
+        output: *mut u16,
+    ) -> i32;
+    fn LMGetKbdType() -> u8;
 }
 
 #[repr(C)]
@@ -167,6 +187,7 @@ unsafe extern "C" {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
+    fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
     fn CFGetTypeID(value: CfTypeRef) -> usize;
     fn CFStringGetTypeID() -> usize;
     fn CFStringGetLength(value: CfStringRef) -> isize;
@@ -214,6 +235,90 @@ pub enum LiveOverlayEvent {
     RequestSnapshot,
 }
 
+static LAYOUT_KEY_CODES: std::sync::OnceLock<std::collections::HashMap<char, u16>> =
+    std::sync::OnceLock::new();
+
+fn translate_keycode(layout: *const u8, key_code: u16) -> Option<char> {
+    if layout.is_null() {
+        return None;
+    }
+    let mut dead_key_state = 0_u32;
+    let mut output = [0_u16; 4];
+    let mut length = 0_isize;
+    let status = unsafe {
+        UCKeyTranslate(
+            layout,
+            key_code,
+            3, // kUCKeyActionDisplay
+            0,
+            u32::from(LMGetKbdType()),
+            0,
+            &raw mut dead_key_state,
+            output.len() as isize,
+            &raw mut length,
+            output.as_mut_ptr(),
+        )
+    };
+    if status == 0 && length > 0 {
+        String::from_utf16(&output[..length as usize])
+            .ok()?
+            .chars()
+            .next()
+            .map(|c| c.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Builds the active keyboard layout character -> virtual keycode map (e.g. Dvorak `'s' -> 41`, `'z' -> 44`).
+/// Must be called on the main thread during startup before background threads query it.
+pub fn init_keyboard_layout_map() -> &'static std::collections::HashMap<char, u16> {
+    LAYOUT_KEY_CODES.get_or_init(|| {
+        let mut map = std::collections::HashMap::new();
+        for source in unsafe {
+            [
+                TISCopyCurrentKeyboardLayoutInputSource(),
+                TISCopyCurrentASCIICapableKeyboardLayoutInputSource(),
+            ]
+        } {
+            if source.is_null() {
+                continue;
+            }
+            let data =
+                unsafe { TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) };
+            if !data.is_null() {
+                let bytes = unsafe { CFDataGetBytePtr(data) };
+                for code in 0..128_u16 {
+                    if let Some(ch) = translate_keycode(bytes, code) {
+                        map.entry(ch).or_insert(code);
+                    }
+                }
+            }
+            unsafe { CFRelease(source) };
+        }
+        scrawl_log(format!(
+            "keyboard layout resolved: 's'={:?} 'z'={:?}",
+            map.get(&'s'),
+            map.get(&'z')
+        ));
+        map
+    })
+}
+
+pub fn key_code_for_char(ch: char) -> Option<u16> {
+    init_keyboard_layout_map()
+        .get(&ch.to_ascii_lowercase())
+        .copied()
+}
+
+pub fn layout_s_keycode() -> u16 {
+    key_code_for_char('s').unwrap_or(KEY_S)
+}
+
+pub fn layout_z_keycode() -> u16 {
+    key_code_for_char('z').unwrap_or(KEY_Z)
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ShortcutConfig {
     pub key_code: u32,
@@ -224,7 +329,7 @@ pub struct ShortcutConfig {
 impl Default for ShortcutConfig {
     fn default() -> Self {
         Self {
-            key_code: u32::from(KEY_S),
+            key_code: u32::from(layout_s_keycode()),
             carbon_modifiers: CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
             label: "⌃⌥⇧S".into(),
         }
@@ -240,10 +345,14 @@ impl ShortcutConfig {
     }
 
     pub fn load() -> Self {
-        std::fs::read_to_string(Self::config_path())
+        let mut cfg: Self = std::fs::read_to_string(Self::config_path())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if cfg.label.ends_with('S') && cfg.key_code == u32::from(KEY_S) {
+            cfg.key_code = u32::from(layout_s_keycode());
+        }
+        cfg
     }
 
     pub fn save(&self) {
@@ -315,15 +424,14 @@ unsafe extern "C" fn carbon_hotkey_handler(
     if status == 0 && sig == HOTKEY_SIG {
         let telemetry = unsafe { &*user_data.cast::<SharedCaptureTelemetry>() };
         match id {
-            HOTKEY_ID_TOGGLE | HOTKEY_ID_ALT1 | HOTKEY_ID_ALT2 | HOTKEY_ID_ALT3 => {
-                telemetry.emit_toggle_shortcut();
-            }
             HOTKEY_ID_ESCAPE => {
                 let _ = telemetry
                     .ui_sender
                     .try_send(LiveOverlayEvent::CancelCapture);
             }
-            _ => {}
+            _ => {
+                telemetry.emit_toggle_shortcut();
+            }
         }
     }
     0
@@ -332,6 +440,8 @@ unsafe extern "C" fn carbon_hotkey_handler(
 /// Installs Carbon `RegisterEventHotKey` on both `GetEventDispatcherTarget()` and
 /// `GetApplicationEventTarget()`. Works system-wide across all apps with zero TCC permissions.
 pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
+    let _ = init_keyboard_layout_map();
+    let s_code = u32::from(layout_s_keycode());
     let state_mutex = CARBON_HOTKEYS.get_or_init(|| {
         let spec = EventTypeSpec {
             event_class: K_EVENT_CLASS_KEYBOARD,
@@ -345,7 +455,7 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
             let dispatcher = GetEventDispatcherTarget();
             let app_target = GetApplicationEventTarget();
             scrawl_log(format!(
-                "install_global_hotkeys: dispatcher={dispatcher:p} app_target={app_target:p}"
+                "install_global_hotkeys: dispatcher={dispatcher:p} app_target={app_target:p} s_code={s_code}"
             ));
             if !dispatcher.is_null() {
                 let rc = InstallEventHandler(
@@ -374,38 +484,61 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
                     "InstallEventHandler(app_target) -> rc={rc} handler_ref={app_handler_ref:p}"
                 ));
             }
-            // Also register convenient built-in chords: ⌃⌥⇧S, ⌃⌥⌘S, and ⌘⇧S
             let target = if !app_target.is_null() {
                 app_target
             } else {
                 dispatcher
             };
-            for (id, mods, name) in [
-                (
-                    HOTKEY_ID_ALT2,
-                    CARBON_CMD_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
-                    "⌘⌥⇧S",
-                ),
-                (
-                    HOTKEY_ID_ALT3,
-                    CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_CMD_KEY,
-                    "⌃⌥⌘S",
-                ),
-            ] {
+            let mut next_alt_id = HOTKEY_ID_ALT1;
+            let mut codes = vec![s_code];
+            if s_code != u32::from(KEY_S) {
+                codes.push(u32::from(KEY_S));
+            }
+            for &code in &codes {
+                for (mods, name) in [
+                    (
+                        CARBON_CMD_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
+                        "⌘⌥⇧S",
+                    ),
+                    (
+                        CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_CMD_KEY,
+                        "⌃⌥⌘S",
+                    ),
+                ] {
+                    let mut r: *mut c_void = ptr::null_mut();
+                    let rc = RegisterEventHotKey(
+                        code,
+                        mods,
+                        EventHotKeyID {
+                            signature: HOTKEY_SIG,
+                            id: next_alt_id,
+                        },
+                        target,
+                        0,
+                        &raw mut r,
+                    );
+                    scrawl_log(format!(
+                        "RegisterEventHotKey({name}, code={code}, mods={mods}) -> rc={rc} ref={r:p}"
+                    ));
+                    next_alt_id += 1;
+                }
+            }
+            if s_code != u32::from(KEY_S) {
                 let mut r: *mut c_void = ptr::null_mut();
+                let mods = CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY;
                 let rc = RegisterEventHotKey(
                     u32::from(KEY_S),
                     mods,
                     EventHotKeyID {
                         signature: HOTKEY_SIG,
-                        id,
+                        id: next_alt_id,
                     },
                     target,
                     0,
                     &raw mut r,
                 );
                 scrawl_log(format!(
-                    "RegisterEventHotKey({name}, mods={mods}) -> rc={rc} ref={r:p}"
+                    "RegisterEventHotKey(⌃⌥⇧S-ansi, code=1, mods={mods}) -> rc={rc} ref={r:p}"
                 ));
             }
         }
@@ -486,11 +619,11 @@ pub fn set_escape_hotkey_enabled(enabled: bool) {
     if enabled {
         let mut new_ref: *mut c_void = ptr::null_mut();
         let target = unsafe {
-            let d = GetEventDispatcherTarget();
-            if !d.is_null() {
-                d
+            let a = GetApplicationEventTarget();
+            if !a.is_null() {
+                a
             } else {
-                GetApplicationEventTarget()
+                GetEventDispatcherTarget()
             }
         };
         let status = unsafe {
@@ -519,57 +652,67 @@ pub fn shortcut_from_key_and_mods(
     alt: bool,
     shift: bool,
 ) -> Option<ShortcutConfig> {
-    let (key_code, key_label) = match key.to_ascii_lowercase().as_str() {
-        "a" => (0, "A"),
-        "s" => (1, "S"),
-        "d" => (2, "D"),
-        "f" => (3, "F"),
-        "h" => (4, "H"),
-        "g" => (5, "G"),
-        "z" => (6, "Z"),
-        "x" => (7, "X"),
-        "c" => (8, "C"),
-        "v" => (9, "V"),
-        "b" => (11, "B"),
-        "q" => (12, "Q"),
-        "w" => (13, "W"),
-        "e" => (14, "E"),
-        "r" => (15, "R"),
-        "y" => (16, "Y"),
-        "t" => (17, "T"),
-        "1" => (18, "1"),
-        "2" => (19, "2"),
-        "3" => (20, "3"),
-        "4" => (21, "4"),
-        "6" => (22, "6"),
-        "5" => (23, "5"),
-        "9" => (25, "9"),
-        "7" => (26, "7"),
-        "8" => (28, "8"),
-        "0" => (29, "0"),
-        "o" => (31, "O"),
-        "u" => (32, "U"),
-        "i" => (34, "I"),
-        "p" => (35, "P"),
-        "l" => (37, "L"),
-        "j" => (38, "J"),
-        "k" => (40, "K"),
-        "n" => (45, "N"),
-        "m" => (46, "M"),
-        "space" | " " => (49, "Space"),
-        "f1" => (122, "F1"),
-        "f2" => (120, "F2"),
-        "f3" => (99, "F3"),
-        "f4" => (118, "F4"),
-        "f5" => (96, "F5"),
-        "f6" => (97, "F6"),
-        "f7" => (98, "F7"),
-        "f8" => (100, "F8"),
-        "f9" => (101, "F9"),
-        "f10" => (109, "F10"),
-        "f11" => (103, "F11"),
-        "f12" => (111, "F12"),
-        _ => return None,
+    let lower = key.to_ascii_lowercase();
+    let (key_code, key_label): (u32, String) = if lower.chars().count() == 1
+        && let Some(ch) = lower.chars().next()
+        && ch.is_ascii_alphanumeric()
+        && let Some(code) = key_code_for_char(ch)
+    {
+        (u32::from(code), ch.to_ascii_uppercase().to_string())
+    } else {
+        let (code, lbl) = match lower.as_str() {
+            "a" => (0, "A"),
+            "s" => (u32::from(layout_s_keycode()), "S"),
+            "d" => (2, "D"),
+            "f" => (3, "F"),
+            "h" => (4, "H"),
+            "g" => (5, "G"),
+            "z" => (u32::from(layout_z_keycode()), "Z"),
+            "x" => (7, "X"),
+            "c" => (8, "C"),
+            "v" => (9, "V"),
+            "b" => (11, "B"),
+            "q" => (12, "Q"),
+            "w" => (13, "W"),
+            "e" => (14, "E"),
+            "r" => (15, "R"),
+            "y" => (16, "Y"),
+            "t" => (17, "T"),
+            "1" => (18, "1"),
+            "2" => (19, "2"),
+            "3" => (20, "3"),
+            "4" => (21, "4"),
+            "6" => (22, "6"),
+            "5" => (23, "5"),
+            "9" => (25, "9"),
+            "7" => (26, "7"),
+            "8" => (28, "8"),
+            "0" => (29, "0"),
+            "o" => (31, "O"),
+            "u" => (32, "U"),
+            "i" => (34, "I"),
+            "p" => (35, "P"),
+            "l" => (37, "L"),
+            "j" => (38, "J"),
+            "k" => (40, "K"),
+            "n" => (45, "N"),
+            "m" => (46, "M"),
+            "space" | " " => (49, "Space"),
+            "f1" => (122, "F1"),
+            "f2" => (120, "F2"),
+            "f3" => (99, "F3"),
+            "f4" => (118, "F4"),
+            "f5" => (96, "F5"),
+            "f6" => (97, "F6"),
+            "f7" => (98, "F7"),
+            "f8" => (100, "F8"),
+            "f9" => (101, "F9"),
+            "f10" => (109, "F10"),
+            "f11" => (103, "F11"),
+            "f12" => (111, "F12"),
+            _ => return None,
+        };
+        (code, lbl.to_string())
     };
     let is_fn_key = key_label.starts_with('F') && key_label.len() >= 2;
     if !cmd && !ctrl && !alt && !is_fn_key {
@@ -593,7 +736,7 @@ pub fn shortcut_from_key_and_mods(
         carbon_modifiers |= CARBON_CMD_KEY;
         label.push('⌘');
     }
-    label.push_str(key_label);
+    label.push_str(&key_label);
     Some(ShortcutConfig {
         key_code,
         carbon_modifiers,
@@ -1215,8 +1358,10 @@ impl SharedCaptureTelemetry {
             && alt == want_alt
             && shift == want_shift;
         // Support ⌃⌥⇧S, ⌘⌥⇧S (when Karabiner maps physical left_control -> left_command),
-        // and ⌃⌥⌘S even when COMBINED_SESSION_STATE (0) | HID_SYSTEM_STATE (1) sets both ctrl & cmd.
-        let builtin_s = keycode == KEY_S && alt && ((shift && (ctrl || cmd)) || (ctrl && cmd));
+        // and ⌃⌥⌘S on both the active layout's 's' key (41 on Dvorak) and ANSI 's' (1).
+        let s_code = layout_s_keycode();
+        let is_s_key = keycode == s_code || keycode == KEY_S;
+        let builtin_s = is_s_key && alt && ((shift && (ctrl || cmd)) || (ctrl && cmd));
         custom_match || builtin_s
     }
 
@@ -1555,7 +1700,7 @@ unsafe extern "C" fn tap_callback(
         EVENT_KEY_DOWN => {
             let keycode =
                 unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_KEYCODE) } as u16;
-            if cmd && keycode == KEY_Z {
+            if cmd && (keycode == layout_z_keycode() || keycode == KEY_Z) {
                 let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::UndoStroke);
             } else if cmd || ctrl {
                 // Only log modifier-chord shortcuts, never ordinary typing or secrets.
@@ -1627,17 +1772,23 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
         let mod_mask =
             (u8::from(cmd) << 3) | (u8::from(ctrl) << 2) | (u8::from(alt) << 1) | u8::from(shift);
 
+        let s_code = layout_s_keycode();
+        let z_code = layout_z_keycode();
         let cfg_keycode = telemetry
             .shortcut
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .key_code as u16;
-        let key_s = unsafe { CGEventSourceKeyState(0, KEY_S) || CGEventSourceKeyState(1, KEY_S) };
-        let key_cfg = if cfg_keycode == KEY_S {
+        let key_s = unsafe {
+            CGEventSourceKeyState(1, s_code)
+                || CGEventSourceKeyState(0, s_code)
+                || CGEventSourceKeyState(1, KEY_S)
+        };
+        let key_cfg = if cfg_keycode == s_code {
             key_s
         } else {
             unsafe {
-                CGEventSourceKeyState(0, cfg_keycode) || CGEventSourceKeyState(1, cfg_keycode)
+                CGEventSourceKeyState(1, cfg_keycode) || CGEventSourceKeyState(0, cfg_keycode)
             }
         };
         let key_state = (mod_mask, key_s, key_cfg);
@@ -1649,7 +1800,7 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
         }
         let shortcut_now = (key_cfg
             && telemetry.matches_shortcut(cfg_keycode, cmd, ctrl, alt, shift))
-            || (key_s && telemetry.matches_shortcut(KEY_S, cmd, ctrl, alt, shift));
+            || (key_s && telemetry.matches_shortcut(s_code, cmd, ctrl, alt, shift));
         if shortcut_now && !prev_shortcut {
             telemetry.emit_toggle_shortcut();
         }
@@ -1662,7 +1813,11 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
             continue;
         }
 
-        let key_z = unsafe { CGEventSourceKeyState(0, KEY_Z) || CGEventSourceKeyState(1, KEY_Z) };
+        let key_z = unsafe {
+            CGEventSourceKeyState(1, z_code)
+                || CGEventSourceKeyState(0, z_code)
+                || CGEventSourceKeyState(1, KEY_Z)
+        };
         let undo_now = cmd && !ctrl && !alt && !shift && key_z;
         if undo_now && !prev_undo {
             let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::UndoStroke);
