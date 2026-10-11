@@ -35,6 +35,39 @@ fn thumbnail_diff(a: &[f32; THUMB_PIXELS], b: &[f32; THUMB_PIXELS]) -> f32 {
     (a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f32>() / THUMB_PIXELS as f32).clamp(0.0, 1.0)
 }
 
+/// Combines global luma diff with localized `8×6`-block diff (using the 2nd-highest block
+/// so a single moving cursor block never false-triggers, while sidebar hover states,
+/// dropdowns, and tooltips across ≥2 blocks register as visual transitions).
+fn scene_transition_diff(a: &[f32; THUMB_PIXELS], b: &[f32; THUMB_PIXELS]) -> f32 {
+    let global = thumbnail_diff(a, b);
+    const COLS: usize = 8;
+    const ROWS: usize = 6;
+    const BW: usize = THUMB_WIDTH / COLS;
+    const BH: usize = THUMB_HEIGHT / ROWS;
+    let mut best1 = 0.0_f32;
+    let mut best2 = 0.0_f32;
+    for by in 0..ROWS {
+        for bx in 0..COLS {
+            let mut sum = 0.0_f32;
+            for y in (by * BH)..((by + 1) * BH) {
+                let row = y * THUMB_WIDTH;
+                for x in (bx * BW)..((bx + 1) * BW) {
+                    let idx = row + x;
+                    sum += (a[idx] - b[idx]).abs();
+                }
+            }
+            let block_diff = sum / (BW * BH) as f32;
+            if block_diff > best1 {
+                best2 = best1;
+                best1 = block_diff;
+            } else if block_diff > best2 {
+                best2 = block_diff;
+            }
+        }
+    }
+    global.max((best2 * 1.4).clamp(0.0, 1.0))
+}
+
 #[cfg(test)]
 pub fn luma_diff(a: &RgbaFrame, b: &RgbaFrame) -> f32 {
     thumbnail_diff(&luma_thumbnail(a), &luma_thumbnail(b))
@@ -170,7 +203,7 @@ pub fn select_keyframes(
     let thumbnails: Vec<_> = frames.iter().map(|frame| luma_thumbnail(frame)).collect();
     let deltas: Vec<_> = thumbnails
         .windows(2)
-        .map(|pair| thumbnail_diff(&pair[0], &pair[1]))
+        .map(|pair| scene_transition_diff(&pair[0], &pair[1]))
         .collect();
     let mut candidates = Vec::new();
     for (i, mark) in marks.iter().enumerate() {

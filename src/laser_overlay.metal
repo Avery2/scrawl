@@ -94,10 +94,10 @@ fragment float4 laser_fragment(
                 laser_glow_cov = max(laser_glow_cov, glow);
             }
         } else {
-            // Simple tldraw-style thin red marker stroke (~4.5px wide, smooth anti-aliased edge).
+            // Simple tldraw-style thin red marker stroke (~4.5px wide, smooth anti-aliased edge, fades out after release).
             float r = 2.25 * clamp(w, 0.55, 1.15);
             if (d < r + 2.0) {
-                float fill = smoothstep(r + 0.70, max(0.0, r - 0.70), d);
+                float fill = smoothstep(r + 0.70, max(0.0, r - 0.70), d) * clamp(seg.width, 0.0, 1.0);
                 ink_red_cov = max(ink_red_cov, fill);
             }
         }

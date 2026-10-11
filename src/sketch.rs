@@ -35,10 +35,23 @@ pub fn shape_of(stroke: &Stroke) -> Shape {
     let (w, h) = (b[2] - b[0], b[3] - b[1]);
     let big = w.max(h);
     let len: f32 = points.windows(2).map(|p| distance(p[0], p[1])).sum();
-    let chord = distance(first, *points.last().unwrap());
+    let last = *points.last().unwrap();
+    let chord = distance(first, last);
+    let shoelace = points
+        .windows(2)
+        .map(|p| p[0][0] * p[1][1] - p[1][0] * p[0][1])
+        .sum::<f32>()
+        + last[0] * first[1]
+        - first[0] * last[1];
+    let enclosed_area = 0.5 * shoelace.abs();
     if w.hypot(h) < 14.0 {
         Shape::Tap
-    } else if chord < 0.35 * big && len > 1.85 * big && w.min(h) > 0.2 * big {
+    } else if chord < 0.35 * big
+        && len > 2.0 * big
+        && w.min(h) >= 18.0
+        && w.min(h) > 0.42 * big
+        && enclosed_area > 0.32 * w * h
+    {
         Shape::Circle
     } else if chord > 0.88 * len {
         if w > 2.5 * h {

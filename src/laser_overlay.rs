@@ -275,34 +275,38 @@ impl SharedMetalOverlay {
         let th = (target_frame.height as f32).max(1.0);
         let to_screen = |nx: f32, ny: f32| -> [f32; 2] { [tx + nx * tw, ty + ny * th] };
 
-        let mut strokes = self
+        let committed_strokes = self
             .telemetry
             .strokes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if let Some(ref active_laser) = *self
+        let active_laser = self
             .telemetry
             .active_laser
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
-            strokes.push(active_laser.clone());
-        }
-        if let Some(ref active_ink) = *self
+            .clone();
+        let active_ink = self
             .telemetry
             .live_ink
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
-            strokes.push(active_ink.clone());
+            .clone();
+
+        let mut strokes: Vec<(crate::model::Stroke, bool)> =
+            committed_strokes.into_iter().map(|s| (s, false)).collect();
+        if let Some(laser) = active_laser {
+            strokes.push((laser, true));
+        }
+        if let Some(ink) = active_ink {
+            strokes.push((ink, true));
         }
 
         let mut segments = Vec::with_capacity(256);
         let mut pins = Vec::new();
-        let ink_width = (tw.min(th) * 0.0085).clamp(4.5, 10.0);
 
-        for stroke in &strokes {
+        for (stroke, is_live) in &strokes {
             if stroke.pin.is_some() {
                 if let Some([nx, ny]) = stroke.normalized_points().first().copied()
                     && pins.len() < MAX_PINS
@@ -337,6 +341,20 @@ impl SharedMetalOverlay {
                     });
                 }
             } else {
+                // Keep live Shift strokes at 100% while held, then hold for 650ms and fade out over 650ms.
+                let fade_alpha = if *is_live {
+                    1.0
+                } else {
+                    let age_ms = now_ms.saturating_sub(stroke.t1);
+                    if age_ms >= 1_300 {
+                        continue;
+                    } else if age_ms <= 650 {
+                        1.0
+                    } else {
+                        let t = ((age_ms - 650) as f32 / 650.0).clamp(0.0, 1.0);
+                        (1.0 - t) * (1.0 - t)
+                    }
+                };
                 let pts: Vec<[f32; 2]> = stroke
                     .normalized_points()
                     .into_iter()
@@ -353,7 +371,7 @@ impl SharedMetalOverlay {
                         w0: pair[0].1,
                         w1: pair[1].1,
                         kind: 1.0,
-                        width: ink_width,
+                        width: fade_alpha,
                     });
                 }
             }

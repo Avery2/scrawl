@@ -381,24 +381,41 @@ pub fn annotate_keyframe_in_place(
     {
         let show_ripple = keyframe.reason == KeyframeReason::Click
             || (click.is_some() && keyframe.reason != KeyframeReason::Laser);
-        draw_cursor(frame, [cx * w, cy * h], show_ripple);
+        if show_ripple {
+            draw_click_ripple(frame, [cx * w, cy * h]);
+        }
     }
     let label = format!("#{} · {}", keyframe.index, format_clock(keyframe.t));
-    let badge_w = text_width(&label, 16.0, true) + 45.0;
+    let font_size = 12.5_f32;
+    let badge_h = 24.0_f32;
+    let badge_r = badge_h * 0.5;
+    let badge_w = text_width(&label, font_size, true) + 30.0;
+    // Place badge in top-right by default so top-left sidebar/toolbar items stay visible,
+    // flipping to top-left only if the click/focus point is in the top-right corner.
+    let focus_top_right = keyframe
+        .cursor
+        .or(click)
+        .is_some_and(|[cx, cy]| cx > 0.65 && cy < 0.22);
+    let bx = if focus_top_right {
+        8.0
+    } else {
+        (w - badge_w - 8.0).max(8.0)
+    };
+    let by = 8.0_f32;
     rounded(
         frame,
-        [16.0, 16.0, badge_w, 36.0],
-        18.0,
+        [bx, by, badge_w, badge_h],
+        badge_r,
         [255, 255, 255, 46],
     );
     rounded(
         frame,
-        [17.0, 17.0, badge_w - 2.0, 34.0],
-        17.0,
+        [bx + 1.0, by + 1.0, badge_w - 2.0, badge_h - 2.0],
+        badge_r - 1.0,
         [20, 20, 22, 224],
     );
-    circle(frame, [31.0, 34.0], 4.0, RED);
-    draw_text(frame, &label, 43.0, 24.0, 16.0, WHITE, true);
+    circle(frame, [bx + 11.0, by + badge_r], 3.2, RED);
+    draw_text(frame, &label, bx + 20.0, by + 5.5, font_size, WHITE, true);
 }
 
 fn draw_pin(frame: &mut RgbaFrame, point: [f32; 2], number: u32, scale: f32, alpha: f32) {
@@ -472,33 +489,10 @@ fn draw_laser(frame: &mut RgbaFrame, stroke: &Stroke, time: u64) {
     }
 }
 
-fn draw_cursor(frame: &mut RgbaFrame, p: [f32; 2], show_ripple: bool) {
-    if show_ripple {
-        circle(frame, p, 19.0, [0, 136, 255, 77]);
-        ring(frame, p, 20.0, 2.0, WHITE);
-        ring(frame, p, 23.0, 2.0, [0, 136, 255, 255]);
-    }
-    let arrow = [
-        [0.0, 0.0],
-        [0.0, 27.0],
-        [6.5, 20.5],
-        [12.0, 32.0],
-        [17.0, 29.5],
-        [11.5, 18.5],
-        [21.0, 18.5],
-    ];
-    let outer: Vec<_> = arrow.iter().map(|q| [p[0] + q[0], p[1] + q[1]]).collect();
-    for i in 0..outer.len() {
-        line(
-            frame,
-            outer[i],
-            outer[(i + 1) % outer.len()],
-            1.25,
-            1.25,
-            WHITE,
-        );
-    }
-    polygon(frame, &outer, [18, 18, 20, 255]);
+fn draw_click_ripple(frame: &mut RgbaFrame, p: [f32; 2]) {
+    circle(frame, p, 14.0, [0, 136, 255, 68]);
+    ring(frame, p, 15.0, 1.75, WHITE);
+    ring(frame, p, 17.5, 1.75, [0, 136, 255, 235]);
 }
 
 pub fn render_contact_sheet(
