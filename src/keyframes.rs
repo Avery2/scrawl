@@ -242,31 +242,6 @@ pub fn select_keyframes(
     if let Some((frame, diff)) = transition {
         candidates.push(scene_candidate(frame, diff));
     }
-    for segment in &transcript.segments {
-        if segment.text.trim().is_empty() {
-            continue;
-        }
-        let nearby_mark = marks.iter().any(|mark| {
-            segment.t0 <= mark.t1.saturating_add(SPEECH_WINDOW_MS)
-                && mark.t0 <= segment.t1.saturating_add(SPEECH_WINDOW_MS)
-        });
-        let nearby_click = events.iter().any(|event| match event {
-            InteractionEvent::Click { t, .. } | InteractionEvent::Drag { t, .. } => {
-                interval_distance(*t, segment.t0, segment.t1) <= SPEECH_WINDOW_MS
-            }
-            _ => false,
-        });
-        if !nearby_mark && !nearby_click {
-            candidates.push(Candidate {
-                frame: nearest_frame(&frames, midpoint(segment.t0, segment.t1)),
-                score: 25.0,
-                reason: KeyframeReason::Speech,
-                mark: None,
-                event: "speech".into(),
-                cursor: None,
-            });
-        }
-    }
     if candidates.is_empty() {
         candidates.push(Candidate {
             frame: frames.len() / 2,
@@ -496,6 +471,7 @@ mod tests {
     #[test]
     fn segment_only_transcript_is_assigned_once() {
         let frames = vec![frame(1000, 0), frame(5000, 0)];
+        let events = vec![click(1000), click(5000)];
         let transcript = TranscriptData {
             segments: vec![
                 TranscriptSegment {
@@ -511,15 +487,20 @@ mod tests {
             ],
             ..Default::default()
         };
-        let selected = select_keyframes(&frames, &[], &mut [], &[], &transcript, MAX_KEYFRAMES);
+        let selected = select_keyframes(&frames, &[], &mut [], &events, &transcript, MAX_KEYFRAMES);
         assert_eq!(selected.len(), 2);
-        assert!(
-            selected
-                .iter()
-                .all(|(k, _)| k.reason == KeyframeReason::Speech)
-        );
         assert_eq!(selected[0].0.said.as_deref(), Some("First thought."));
         assert_eq!(selected[1].0.said.as_deref(), Some("Second thought."));
+
+        // Speech alone over a static screen should not cut extra keyframes.
+        let static_speech =
+            select_keyframes(&frames, &[], &mut [], &[], &transcript, MAX_KEYFRAMES);
+        assert_eq!(static_speech.len(), 1);
+        assert_eq!(static_speech[0].0.reason, KeyframeReason::Initial);
+        assert_eq!(
+            static_speech[0].0.said.as_deref(),
+            Some("First thought. Second thought.")
+        );
     }
 
     #[test]

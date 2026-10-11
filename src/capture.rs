@@ -1552,6 +1552,17 @@ impl SharedCaptureTelemetry {
             .as_millis() as u64
     }
 
+    pub fn contains_screen_point(&self, screen_x: f64, screen_y: f64) -> bool {
+        let frame = *self
+            .target_frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        screen_x >= frame.x
+            && screen_x <= frame.x + frame.width
+            && screen_y >= frame.y
+            && screen_y <= frame.y + frame.height
+    }
+
     pub fn normalize_point(&self, screen_x: f64, screen_y: f64) -> (f32, f32, u32, u32) {
         let frame = *self
             .target_frame
@@ -1567,7 +1578,7 @@ impl SharedCaptureTelemetry {
         )
     }
 
-    pub fn finish_active_laser(&self, ax_point: Option<(f64, f64)>) {
+    pub fn finish_active_laser(&self, _ax_point: Option<(f64, f64)>) {
         if let Some(mut laser) = self
             .active_laser
             .lock()
@@ -1579,8 +1590,6 @@ impl SharedCaptureTelemetry {
                 let lx = last[0] as f32 / SCALE as f32;
                 let ly = last[1] as f32 / SCALE as f32;
                 laser.t1 = laser.t0.saturating_add(last[2].max(0) as u64);
-                let label = ax_point.and_then(|(x, y)| ax_element_at(x, y).map(|(l, _)| l));
-                laser.on.clone_from(&label);
                 self.events
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1588,7 +1597,7 @@ impl SharedCaptureTelemetry {
                         t: laser.t1,
                         x: lx,
                         y: ly,
-                        label,
+                        label: None,
                     });
             }
             self.strokes
@@ -1720,31 +1729,28 @@ unsafe extern "C" fn tap_callback(
 
     match event_type {
         EVENT_LEFT_MOUSE_DOWN | EVENT_RIGHT_MOUSE_DOWN => {
-            if pure_shift {
+            if pure_shift || !telemetry.contains_screen_point(loc.x, loc.y) {
                 return event;
             }
-            let label_and_role = ax_element_at(loc.x, loc.y);
-            let label = label_and_role.as_ref().map(|(l, _)| l.clone());
             *telemetry
                 .drag_start
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((t_ms, nx, ny, label));
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((t_ms, nx, ny, None));
         }
         EVENT_LEFT_MOUSE_UP | EVENT_RIGHT_MOUSE_UP => {
             if pure_shift {
                 return event;
             }
-            let start = telemetry
+            let Some((t0, x0, y0, start_label)) = telemetry
                 .drag_start
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            let (t0, x0, y0, start_label) = start.unwrap_or((t_ms, nx, ny, None));
+                .take()
+            else {
+                return event;
+            };
             let dist_px = ((nx - x0) * fw as f32).hypot((ny - y0) * fh as f32);
             if dist_px < 12.0 {
-                let (label, role) = ax_element_at(loc.x, loc.y)
-                    .map(|(l, r)| (Some(l), r))
-                    .unwrap_or((start_label, None));
                 let _ = telemetry
                     .ui_sender
                     .try_send(LiveOverlayEvent::RequestSnapshot);
@@ -1761,8 +1767,8 @@ unsafe extern "C" fn tap_callback(
                         } else {
                             "left".into()
                         }),
-                        label,
-                        role,
+                        label: start_label,
+                        role: None,
                     });
             } else {
                 let _ = telemetry
@@ -1990,16 +1996,6 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
                     .fold(0.0_f32, f32::max);
                 // Ignore stationary Shift taps (e.g. typing a capital letter without moving the mouse).
                 if max_span_px >= 6.0 {
-                    let tf = *telemetry
-                        .target_frame
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let [x0, y0, x1, y1] = crate::sketch::bounds(&stroke.normalized_points());
-                    let mid_x = tf.x + f64::from((x0 + x1) * 0.5) * tf.width;
-                    let mid_y = tf.y + f64::from((y0 + y1) * 0.5) * tf.height;
-                    stroke.on = ax_element_at(mid_x, mid_y)
-                        .or_else(|| ax_element_at(loc.x, loc.y))
-                        .map(|(l, _)| l);
                     telemetry
                         .strokes
                         .lock()

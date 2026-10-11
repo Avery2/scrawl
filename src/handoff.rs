@@ -98,25 +98,19 @@ pub fn load_bundle(bundle_dir: &Path) -> Result<(PathBuf, ScrawlBundle)> {
 
 #[cfg(target_os = "macos")]
 pub fn copy_bundle_to_clipboard(bundle_dir: &Path) -> Result<()> {
-    use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString};
-    use objc2_foundation::{NSArray, NSData, NSString};
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+    use objc2_foundation::{NSArray, NSString};
 
     let (directory, bundle) = load_bundle(bundle_dir)?;
-    let image =
-        fs::read(directory.join(&bundle.contact_sheet)).context("Could not read contact sheet")?;
     let summary = crate::sketch::summary_markdown(&bundle, &directory);
-    let data = NSData::with_bytes(&image);
     let text = NSString::from_str(&summary);
     let pasteboard = NSPasteboard::generalPasteboard();
-    // These AppKit constants are immutable; no owner is needed for eagerly supplied data.
+    // Copy plain text only so Cmd-V pastes the transcript and local image paths
+    // consistently across terminals (Ghostty/OpenCode TUI) and GUI apps (OpenCode Desktop).
     unsafe {
-        let types = NSArray::from_slice(&[NSPasteboardTypePNG, NSPasteboardTypeString]);
+        let types = NSArray::from_slice(&[NSPasteboardTypeString]);
         pasteboard.clearContents();
         pasteboard.declareTypes_owner(&types, None);
-        ensure!(
-            pasteboard.setData_forType(Some(&data), NSPasteboardTypePNG),
-            "Could not copy contact sheet"
-        );
         ensure!(
             pasteboard.setString_forType(&text, NSPasteboardTypeString),
             "Could not copy capture summary"

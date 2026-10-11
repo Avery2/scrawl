@@ -328,43 +328,37 @@ pub fn annotate_keyframe_in_place(
         .mark_id
         .as_ref()
         .and_then(|id| marks.iter().find(|m| &m.id == id));
-    // Historical marks go underneath the active mark, regardless of input ordering.
-    for active_pass in [false, true] {
-        for (index, stroke) in strokes.iter().enumerate() {
-            if stroke.laser {
-                continue;
+    for (index, stroke) in strokes.iter().enumerate() {
+        if stroke.laser {
+            continue;
+        }
+        let belongs = active_mark.is_some_and(|m| m.strokes.contains(&index));
+        let active = belongs
+            || (keyframe.mark_id.is_none()
+                && stroke.t0 <= keyframe.t
+                && keyframe.t.saturating_sub(stroke.t1) <= MARK_GAP_MS);
+        if !active {
+            continue;
+        }
+        let points: Vec<[f32; 2]> = stroke
+            .timed_points()
+            .into_iter()
+            .filter(|&(_, _, t)| belongs || t <= keyframe.t)
+            .map(|(x, y, _)| [x * w, y * h])
+            .collect();
+        if let Some(number) = stroke.pin {
+            if let Some(&point) = points.first() {
+                draw_pin(frame, point, number, (w / 1280.0).clamp(0.75, 2.5), 1.0);
             }
-            let belongs = active_mark.is_some_and(|m| m.strokes.contains(&index));
-            if !belongs && stroke.t0 > keyframe.t {
-                continue;
-            }
-            let active = belongs
-                || (keyframe.mark_id.is_none()
-                    && keyframe.t.saturating_sub(stroke.t1) <= MARK_GAP_MS);
-            if active != active_pass {
-                continue;
-            }
-            let alpha = if active { 1.0 } else { 0.35 };
-            let points: Vec<[f32; 2]> = stroke
-                .timed_points()
-                .into_iter()
-                .filter(|&(_, _, t)| belongs || t <= keyframe.t)
-                .map(|(x, y, _)| [x * w, y * h])
-                .collect();
-            if let Some(number) = stroke.pin {
-                if let Some(&point) = points.first() {
-                    draw_pin(frame, point, number, (w / 1280.0).clamp(0.75, 2.5), alpha);
-                }
-            } else if !points.is_empty() {
-                let outline = freehand_outline(
-                    &points,
-                    &FreehandOptions {
-                        size,
-                        ..Default::default()
-                    },
-                );
-                polygon(frame, &outline, opacity(RED, alpha));
-            }
+        } else if !points.is_empty() {
+            let outline = freehand_outline(
+                &points,
+                &FreehandOptions {
+                    size,
+                    ..Default::default()
+                },
+            );
+            polygon(frame, &outline, RED);
         }
     }
     for stroke in strokes.iter().filter(|s| s.laser) {
