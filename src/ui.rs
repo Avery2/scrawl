@@ -13,8 +13,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{DefinedClass, MainThreadOnly, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSStatusWindowLevel, NSWindow,
-    NSWindowButton, NSWindowCollectionBehavior,
+    NSApplication, NSColor, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSStatusWindowLevel,
+    NSWindow, NSWindowButton, NSWindowCollectionBehavior,
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSString};
 use screencapturekit::prelude::*;
@@ -185,12 +185,27 @@ fn sync_full_size_content_view(ns_window: &NSWindow) {
 fn configure_floating_window(ns_window: &NSWindow, ignores_mouse: bool) {
     ns_window.setHidesOnDeactivate(false);
     ns_window.setIgnoresMouseEvents(ignores_mouse);
+    ns_window.setOpaque(false);
+    ns_window.setBackgroundColor(Some(&NSColor::clearColor()));
+    ns_window.setHasShadow(false);
     ns_window.setLevel(NSStatusWindowLevel + 1);
     ns_window.setCollectionBehavior(
         NSWindowCollectionBehavior::CanJoinAllSpaces
             | NSWindowCollectionBehavior::FullScreenAuxiliary,
     );
     sync_full_size_content_view(ns_window);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum IslandPhase {
+    Hidden,
+    Recording,
+    Completed {
+        finished_at: Instant,
+        frame_count: usize,
+        duration_ms: u64,
+    },
+    Dismissing,
 }
 
 struct ActiveRecording {
@@ -205,6 +220,10 @@ struct ActiveRecording {
 pub struct ScrawlCoordinator {
     telemetry: Arc<SharedCaptureTelemetry>,
     active_recording: Option<ActiveRecording>,
+    island_phase: IslandPhase,
+    island_width: f32,
+    island_velocity: f32,
+    island_opacity: f32,
     recording_shortcut_key: bool,
     review_bundle: Option<(PathBuf, ScrawlBundle)>,
     review_status: Option<String>,
@@ -226,6 +245,10 @@ impl ScrawlCoordinator {
         Self {
             telemetry,
             active_recording: None,
+            island_phase: IslandPhase::Hidden,
+            island_width: 220.0,
+            island_velocity: 0.0,
+            island_opacity: 0.0,
             recording_shortcut_key: false,
             review_bundle: initial_bundle,
             review_status: None,
@@ -236,6 +259,10 @@ impl ScrawlCoordinator {
 
     pub fn is_recording(&self) -> bool {
         self.active_recording.is_some()
+    }
+
+    pub fn is_island_visible(&self) -> bool {
+        !matches!(self.island_phase, IslandPhase::Hidden)
     }
 
     pub fn shortcut_label(&self) -> String {
@@ -273,6 +300,59 @@ impl ScrawlCoordinator {
         }
     }
 
+    pub fn dismiss_island(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.island_phase,
+            IslandPhase::Hidden | IslandPhase::Dismissing
+        ) {
+            return;
+        }
+        self.island_phase = IslandPhase::Dismissing;
+        cx.notify();
+    }
+
+    pub fn inspect_completed_bundle(&mut self, cx: &mut Context<Self>) {
+        self.island_phase = IslandPhase::Hidden;
+        self.island_opacity = 0.0;
+        let entity = cx.entity().clone();
+        cx.defer(move |cx| {
+            close_capture_windows(cx);
+            open_review_window(&entity, cx);
+        });
+        cx.notify();
+    }
+
+    pub fn step_island(&mut self, dt_sec: f32, cx: &mut Context<Self>) {
+        let dt = dt_sec.clamp(0.001, 0.05);
+        if let IslandPhase::Completed { finished_at, .. } = self.island_phase
+            && finished_at.elapsed() >= Duration::from_millis(5_000)
+        {
+            self.island_phase = IslandPhase::Dismissing;
+        }
+
+        let (target_w, target_opacity) = match self.island_phase {
+            IslandPhase::Hidden => return,
+            IslandPhase::Recording => (328.0, 1.0),
+            IslandPhase::Completed { .. } => (356.0, 1.0),
+            IslandPhase::Dismissing => (188.0, 0.0),
+        };
+
+        // Critically-damped / slightly underdamped Dynamic Island spring
+        let stiffness = 290.0_f32;
+        let damping = 24.0_f32;
+        let accel = (target_w - self.island_width) * stiffness - self.island_velocity * damping;
+        self.island_velocity += accel * dt;
+        self.island_width = (self.island_width + self.island_velocity * dt).clamp(160.0, 410.0);
+        self.island_opacity += (target_opacity - self.island_opacity) * (14.0 * dt).min(1.0);
+
+        if matches!(self.island_phase, IslandPhase::Dismissing) && self.island_opacity < 0.04 {
+            self.island_phase = IslandPhase::Hidden;
+            self.island_opacity = 0.0;
+            cx.defer(close_capture_windows);
+        }
+        cx.notify();
+    }
+
     pub fn start_recording(&mut self, cx: &mut Context<Self>) {
         if self.is_recording() {
             return;
@@ -307,15 +387,23 @@ impl ScrawlCoordinator {
             audio_recorder,
             _metal_overlay: metal_overlay,
         });
+        self.island_phase = IslandPhase::Recording;
+        self.island_width = 216.0;
+        self.island_velocity = 420.0;
+        self.island_opacity = 0.35;
 
         let entity = cx.entity().clone();
-        cx.defer(move |cx| open_capture_windows(&entity, cx));
+        cx.defer(move |cx| {
+            close_review_window(cx);
+            open_capture_windows(&entity, cx);
+        });
         cx.notify();
     }
 
     pub fn cancel_recording(&mut self, cx: &mut Context<Self>) {
         set_escape_hotkey_enabled(false);
         let Some(rec) = self.active_recording.take() else {
+            self.dismiss_island(cx);
             return;
         };
         let _ = self.telemetry.finish_session();
@@ -324,6 +412,8 @@ impl ScrawlCoordinator {
             let _ = audio.stop();
         }
         let _ = std::fs::remove_dir_all(rec.bundle_dir);
+        self.island_phase = IslandPhase::Hidden;
+        self.island_opacity = 0.0;
         cx.defer(close_capture_windows);
         cx.notify();
     }
@@ -337,6 +427,7 @@ impl ScrawlCoordinator {
         let (frames, video_path, duration_ms) = rec.screen_session.stop();
         let recorded_audio = rec.audio_recorder.and_then(|r| r.stop().ok());
 
+        let mut frame_count = 1;
         if let Ok((dir, bundle, _)) = crate::finalize_capture_bundle(
             &rec.bundle_dir,
             rec.target,
@@ -348,17 +439,18 @@ impl ScrawlCoordinator {
             video_path,
             None,
         ) {
-            let status = match crate::handoff::copy_bundle_to_clipboard(&dir) {
-                Ok(()) => "Copied contact sheet & summary to clipboard".into(),
-                Err(e) => format!("Saved bundle (clipboard: {e})"),
-            };
-            self.set_review_bundle((dir, bundle), Some(status));
+            frame_count = bundle.keyframes.len();
+            let _ = crate::handoff::copy_bundle_to_clipboard(&dir);
+            self.set_review_bundle((dir, bundle), None);
         }
-        let entity = cx.entity().clone();
-        cx.defer(move |cx| {
-            close_capture_windows(cx);
-            open_review_window(&entity, cx);
-        });
+        // Morph the floating HUD pill Dynamic Island-style into the "Copied" state
+        // without opening the full Review window unless the user clicks "Inspect".
+        self.island_phase = IslandPhase::Completed {
+            finished_at: Instant::now(),
+            frame_count,
+            duration_ms,
+        };
+        self.island_velocity = -340.0;
         cx.notify();
     }
 }
@@ -370,6 +462,9 @@ pub struct HudPillWindow {
 impl Render for HudPillWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let coord = self.coordinator.read(cx);
+        let phase = coord.island_phase;
+        let width = coord.island_width;
+        let opacity = coord.island_opacity.clamp(0.0, 1.0);
         let elapsed_ms = coord
             .active_recording
             .as_ref()
@@ -383,80 +478,190 @@ impl Render for HudPillWindow {
             .filter(|s| !s.laser)
             .count();
 
+        let is_completed = matches!(phase, IslandPhase::Completed { .. });
         let c_undo = self.coordinator.clone();
         let c_cancel = self.coordinator.clone();
         let c_finish = self.coordinator.clone();
+        let c_inspect = self.coordinator.clone();
+        let c_dismiss = self.coordinator.clone();
+
+        let capsule_content = match phase {
+            IslandPhase::Completed {
+                frame_count,
+                duration_ms,
+                ..
+            } => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .whitespace_nowrap()
+                .child(
+                    div()
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap_2()
+                        .whitespace_nowrap()
+                        .on_mouse_down(MouseButton::Left, |_, window, _| {
+                            window.start_window_move();
+                        })
+                        .child(
+                            div()
+                                .size(px(20.0))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(rgba(0x34c7592e))
+                                .text_color(rgb(POSITIVE_COLOR))
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::BOLD)
+                                .child("✓"),
+                        )
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(TEXT_COLOR))
+                                .whitespace_nowrap()
+                                .child("Copied"),
+                        )
+                        .child(
+                            div()
+                                .text_color(rgb(MUTED_COLOR))
+                                .whitespace_nowrap()
+                                .child(format!(
+                                    "· {} · {} {}",
+                                    format_clock(duration_ms),
+                                    frame_count,
+                                    if frame_count == 1 { "frame" } else { "frames" }
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap_1p5()
+                        .whitespace_nowrap()
+                        .child(
+                            div()
+                                .id("hud-inspect")
+                                .h(px(28.0))
+                                .px_3()
+                                .rounded(px(14.0))
+                                .flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .whitespace_nowrap()
+                                .bg(rgb(ACCENT_COLOR))
+                                .text_color(rgb(TEXT_COLOR))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(0x4b6bff)))
+                                .child("Inspect")
+                                .on_click(move |_, _, cx| {
+                                    c_inspect
+                                        .update(cx, |coord, cx| coord.inspect_completed_bundle(cx));
+                                }),
+                        )
+                        .child(
+                            pill_chip("hud-dismiss", "✕", true).on_click(move |_, _, cx| {
+                                c_dismiss.update(cx, |coord, cx| coord.dismiss_island(cx));
+                            }),
+                        ),
+                ),
+            _ => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .whitespace_nowrap()
+                .child(
+                    div()
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap_2()
+                        .whitespace_nowrap()
+                        .on_mouse_down(MouseButton::Left, |_, window, _| {
+                            window.start_window_move();
+                        })
+                        .child(div().size(px(8.0)).rounded_full().bg(rgb(INK_RED)))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .whitespace_nowrap()
+                                .child(format_clock(elapsed_ms)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap_1p5()
+                        .whitespace_nowrap()
+                        .child(pill_chip("hud-undo", "Undo", stroke_count > 0).when(
+                            stroke_count > 0,
+                            |d| {
+                                d.on_click(move |_, _, cx| {
+                                    c_undo.update(cx, |coord, cx| coord.undo_stroke(cx));
+                                })
+                            },
+                        ))
+                        .child(
+                            pill_chip("hud-cancel", "Cancel", true).on_click(move |_, _, cx| {
+                                c_cancel.update(cx, |coord, cx| coord.cancel_recording(cx));
+                            }),
+                        )
+                        .child(
+                            div()
+                                .id("hud-done")
+                                .h(px(28.0))
+                                .px_3()
+                                .rounded(px(14.0))
+                                .flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .whitespace_nowrap()
+                                .bg(rgb(ACCENT_COLOR))
+                                .text_color(rgb(TEXT_COLOR))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .cursor_pointer()
+                                .child("Finish")
+                                .on_click(move |_, _, cx| {
+                                    c_finish.update(cx, |coord, cx| coord.finish_recording(cx));
+                                }),
+                        ),
+                ),
+        };
 
         div()
             .size_full()
             .flex()
             .items_center()
-            .justify_between()
-            .px_3()
-            .rounded(px(21.0))
-            .bg(rgba(0x161616ee))
-            .border_1()
-            .border_color(rgb(LINE_COLOR))
-            .text_color(rgb(TEXT_COLOR))
-            .text_size(px(12.5))
-            .whitespace_nowrap()
+            .justify_center()
+            .opacity(opacity)
             .child(
                 div()
-                    .flex()
-                    .flex_shrink_0()
-                    .items_center()
-                    .gap_2()
-                    .whitespace_nowrap()
-                    .on_mouse_down(MouseButton::Left, |_, window, _| {
-                        window.start_window_move();
+                    .w(px(width))
+                    .h(px(42.0))
+                    .px_3()
+                    .rounded(px(21.0))
+                    .overflow_hidden()
+                    .bg(rgba(0x111113f4))
+                    .border_1()
+                    .border_color(if is_completed {
+                        rgba(0x69d89f66)
+                    } else {
+                        rgb(LINE_COLOR)
                     })
-                    .child(div().size(px(8.0)).rounded_full().bg(rgb(INK_RED)))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .whitespace_nowrap()
-                            .child(format_clock(elapsed_ms)),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_shrink_0()
-                    .items_center()
-                    .gap_1p5()
+                    .text_color(rgb(TEXT_COLOR))
+                    .text_size(px(12.5))
                     .whitespace_nowrap()
-                    .child(pill_chip("hud-undo", "Undo", stroke_count > 0).when(
-                        stroke_count > 0,
-                        |d| {
-                            d.on_click(move |_, _, cx| {
-                                c_undo.update(cx, |coord, cx| coord.undo_stroke(cx));
-                            })
-                        },
-                    ))
-                    .child(
-                        pill_chip("hud-cancel", "Cancel", true).on_click(move |_, _, cx| {
-                            c_cancel.update(cx, |coord, cx| coord.cancel_recording(cx));
-                        }),
-                    )
-                    .child(
-                        div()
-                            .id("hud-done")
-                            .h(px(28.0))
-                            .px_3()
-                            .rounded(px(14.0))
-                            .flex()
-                            .flex_shrink_0()
-                            .items_center()
-                            .whitespace_nowrap()
-                            .bg(rgb(ACCENT_COLOR))
-                            .text_color(rgb(TEXT_COLOR))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .cursor_pointer()
-                            .child("Finish")
-                            .on_click(move |_, _, cx| {
-                                c_finish.update(cx, |coord, cx| coord.finish_recording(cx));
-                            }),
-                    ),
+                    .child(capsule_content),
             )
     }
 }
@@ -621,28 +826,43 @@ impl Render for BundleReviewWindow {
             .track_focus(&self.focus)
             .on_key_down(move |event: &KeyDownEvent, _, cx| {
                 c_keydown.update(cx, |coord, cx| {
-                    if !coord.recording_shortcut_key {
-                        return;
-                    }
                     let key = event.keystroke.key.as_str();
-                    if key == "escape" {
-                        coord.recording_shortcut_key = false;
-                        cx.notify();
+                    let mods = event.keystroke.modifiers;
+                    if coord.recording_shortcut_key {
+                        if key == "escape" {
+                            coord.recording_shortcut_key = false;
+                            cx.notify();
+                            return;
+                        }
+                        if let Some(cfg) = shortcut_from_key_and_mods(
+                            key,
+                            mods.platform,
+                            mods.control,
+                            mods.alt,
+                            mods.shift,
+                        ) {
+                            let new_label = cfg.label.clone();
+                            update_global_shortcut(&coord.telemetry, cfg);
+                            coord.recording_shortcut_key = false;
+                            coord.review_status = Some(format!("Shortcut: {new_label}"));
+                            cx.notify();
+                        }
                         return;
                     }
-                    let mods = event.keystroke.modifiers;
                     if let Some(cfg) = shortcut_from_key_and_mods(
                         key,
                         mods.platform,
                         mods.control,
                         mods.alt,
                         mods.shift,
+                    ) && coord.telemetry.matches_shortcut(
+                        cfg.key_code as u16,
+                        mods.platform,
+                        mods.control,
+                        mods.alt,
+                        mods.shift,
                     ) {
-                        let new_label = cfg.label.clone();
-                        update_global_shortcut(&coord.telemetry, cfg);
-                        coord.recording_shortcut_key = false;
-                        coord.review_status = Some(format!("Shortcut set to {new_label}"));
-                        cx.notify();
+                        coord.telemetry.emit_toggle_shortcut();
                     }
                 });
             })
@@ -733,15 +953,6 @@ impl Render for BundleReviewWindow {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .when_some(status, |d, msg| {
-                                d.child(
-                                    div()
-                                        .text_size(px(12.0))
-                                        .text_color(rgb(POSITIVE_COLOR))
-                                        .mr_2()
-                                        .child(msg),
-                                )
-                            })
                             .child(
                                 action_button("btn-shortcut", &shortcut_chip_label, recording_key)
                                     .on_click(move |_, window, cx| {
@@ -767,27 +978,32 @@ impl Render for BundleReviewWindow {
                                             .arg(&send_dir)
                                             .spawn();
                                         c_send.update(cx, |coord, cx| {
-                                            coord.review_status =
-                                                Some("Opened bundle folder".into());
+                                            coord.review_status = Some("Opened in Finder".into());
                                             cx.notify();
                                         });
                                     },
                                 ),
                             )
                             .child(
-                                action_button("btn-copy", "Copy to Clipboard", true).on_click(
-                                    move |_, _, cx| {
-                                        let res =
-                                            crate::handoff::copy_bundle_to_clipboard(&copy_dir);
-                                        c_copy.update(cx, |coord, cx| {
-                                            coord.review_status = Some(match res {
-                                                Ok(()) => "Copied — press ⌘V in OpenCode".into(),
-                                                Err(e) => format!("Copy failed: {e}"),
-                                            });
-                                            cx.notify();
-                                        });
+                                action_button(
+                                    "btn-copy",
+                                    if status.as_deref() == Some("Copied ✓") {
+                                        "Copied ✓"
+                                    } else {
+                                        "Copy to Clipboard"
                                     },
-                                ),
+                                    true,
+                                )
+                                .on_click(move |_, _, cx| {
+                                    let res = crate::handoff::copy_bundle_to_clipboard(&copy_dir);
+                                    c_copy.update(cx, |coord, cx| {
+                                        coord.review_status = Some(match res {
+                                            Ok(()) => "Copied ✓".into(),
+                                            Err(e) => format!("Copy failed: {e}"),
+                                        });
+                                        cx.notify();
+                                    });
+                                }),
                             ),
                     ),
             )
@@ -1065,12 +1281,12 @@ fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
     );
     let display_id = display.as_ref().map(|d| d.id());
 
-    // Compact, single-line floating HUD pill positioned cleanly below the 37pt macOS menu bar
-    let pill_size: Size<Pixels> = size(px(328.0), px(42.0));
+    // Transparent 420×48 Dynamic Island host positioned cleanly below the 37pt macOS menu bar
+    let pill_size: Size<Pixels> = size(px(420.0), px(48.0));
     let pill_bounds = Bounds {
         origin: point(
             (display_bounds.size.width - pill_size.width) * 0.5,
-            px(54.0),
+            px(50.0),
         ),
         size: pill_size,
     };
@@ -1086,7 +1302,7 @@ fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
             is_movable: true,
             is_resizable: false,
             is_minimizable: false,
-            window_background: WindowBackgroundAppearance::Blurred,
+            window_background: WindowBackgroundAppearance::Transparent,
             ..Default::default()
         },
         move |_, cx| {
@@ -1116,6 +1332,14 @@ fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
 fn close_capture_windows(cx: &mut App) {
     for handle in cx.windows() {
         if handle.downcast::<HudPillWindow>().is_some() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+    }
+}
+
+fn close_review_window(cx: &mut App) {
+    for handle in cx.windows() {
+        if handle.downcast::<BundleReviewWindow>().is_some() {
             let _ = handle.update(cx, |_, window, _| window.remove_window());
         }
     }
@@ -1178,7 +1402,7 @@ pub fn run_app(
         let has_initial = initial_bundle.is_some();
         let coordinator = cx.new(|_| ScrawlCoordinator::new(telemetry, initial_bundle));
 
-        if has_initial || !start_recording_immediately {
+        if has_initial {
             open_review_window(&coordinator, cx);
         }
         if start_recording_immediately {
@@ -1223,11 +1447,13 @@ pub fn run_app(
 
         let loop_coord = coordinator.clone();
         cx.spawn(async move |cx| {
-            let mut last_tick = Instant::now();
+            let mut last_frame = Instant::now();
             loop {
                 cx.background_executor()
-                    .timer(Duration::from_millis(32))
+                    .timer(Duration::from_millis(16))
                     .await;
+                let dt = last_frame.elapsed().as_secs_f32();
+                last_frame = Instant::now();
                 let mut should_quit = false;
                 let _ = cx.update(|cx| {
                     if let Some(ref rx) = menu_rx {
@@ -1295,11 +1521,8 @@ pub fn run_app(
                         });
                     }
 
-                    if last_tick.elapsed() >= Duration::from_millis(200) {
-                        last_tick = Instant::now();
-                        if loop_coord.read(cx).is_recording() {
-                            loop_coord.update(cx, |_, cx| cx.notify());
-                        }
+                    if loop_coord.read(cx).is_island_visible() {
+                        loop_coord.update(cx, |coord, cx| coord.step_island(dt, cx));
                     }
                 });
                 if should_quit {
