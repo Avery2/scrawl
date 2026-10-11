@@ -365,7 +365,6 @@ impl ShortcutConfig {
 
 struct CarbonHotKeyState {
     toggle_ref: usize,
-    escape_ref: usize,
 }
 
 static CARBON_HOTKEYS: std::sync::OnceLock<Mutex<CarbonHotKeyState>> = std::sync::OnceLock::new();
@@ -539,10 +538,7 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
                 ));
             }
         }
-        Mutex::new(CarbonHotKeyState {
-            toggle_ref: 0,
-            escape_ref: 0,
-        })
+        Mutex::new(CarbonHotKeyState { toggle_ref: 0 })
     });
     let shortcut = telemetry
         .shortcut
@@ -977,6 +973,83 @@ pub fn discover_target(window_query: Option<&str>) -> TargetInfo {
     }
 }
 
+/// Lists all on-screen normal (`window_layer == 0`) windows in front-to-back order for the Window picker.
+pub fn list_selectable_windows() -> Vec<TargetInfo> {
+    let Ok(content) = SCShareableContent::get() else {
+        return Vec::new();
+    };
+    let our_pid = std::process::id() as i32;
+    let display_id = content
+        .displays()
+        .first()
+        .map(|d| d.display_id())
+        .unwrap_or_else(|| unsafe { CGMainDisplayID() });
+
+    content
+        .windows()
+        .into_iter()
+        .filter(|w| {
+            let f = w.frame();
+            w.is_on_screen()
+                && w.window_layer() == 0
+                && f.size.width >= 80.0
+                && f.size.height >= 80.0
+                && w.owning_application()
+                    .as_ref()
+                    .is_some_and(|a| a.process_id() != our_pid)
+        })
+        .map(|w| {
+            let f = w.frame();
+            let owner = w.owning_application();
+            TargetInfo {
+                mode: CaptureMode::Window,
+                app: owner
+                    .as_ref()
+                    .map(|a| clean_label(&a.application_name()))
+                    .filter(|s| !s.is_empty()),
+                bundle_id: owner.as_ref().map(|a| a.bundle_identifier()),
+                window_title: w.title().map(|t| clean_label(&t)).filter(|t| !t.is_empty()),
+                window_id: Some(w.window_id()),
+                display_id,
+                frame: TargetFrame {
+                    x: f.origin.x,
+                    y: f.origin.y,
+                    width: f.size.width.max(1.0),
+                    height: f.size.height.max(1.0),
+                    scale: 2.0,
+                },
+            }
+        })
+        .collect()
+}
+
+/// Builds a `CaptureMode::Region` target for a user-drawn screen rectangle `(x, y, width, height)`.
+pub fn region_target(x: f64, y: f64, width: f64, height: f64) -> TargetInfo {
+    let mid_x = x + width * 0.5;
+    let mid_y = y + height * 0.5;
+    let hit = topmost_normal_window_at(mid_x, mid_y);
+    let frontmost = frontmost_app_info();
+    let display_id = unsafe { CGMainDisplayID() };
+    TargetInfo {
+        mode: CaptureMode::Region,
+        app: hit
+            .as_ref()
+            .and_then(|(_, _, app)| app.clone())
+            .or_else(|| frontmost.as_ref().map(|(_, name, _)| name.clone())),
+        bundle_id: frontmost.and_then(|(_, _, bid)| bid),
+        window_title: hit.and_then(|(_, title, _)| title),
+        window_id: None,
+        display_id,
+        frame: TargetFrame {
+            x,
+            y,
+            width: width.max(32.0),
+            height: height.max(32.0),
+            scale: 2.0,
+        },
+    }
+}
+
 fn frontmost_app_info() -> Option<(i32, String, Option<String>)> {
     use objc2_app_kit::NSWorkspace;
     let workspace = NSWorkspace::sharedWorkspace();
@@ -1164,14 +1237,22 @@ fn build_sck_filter_and_config(
         None
     }?;
 
-    let aspect = (target.frame.height / target.frame.width.max(1.0)).clamp(0.3, 2.5);
-    let capture_width = 1280_u32;
-    let capture_height = ((capture_width as f64 * aspect).round() as u32).max(360) & !1;
+    let aspect = (target.frame.height / target.frame.width.max(1.0)).clamp(0.25, 3.0);
+    let capture_width = (target.frame.width * 2.0).round().clamp(320.0, 1280.0) as u32 & !1;
+    let capture_height = ((capture_width as f64 * aspect).round() as u32).max(200) & !1;
 
-    let config = SCStreamConfiguration::new()
+    let mut config = SCStreamConfiguration::new()
         .with_width(capture_width)
         .with_height(capture_height)
         .with_shows_cursor(true);
+    if target.mode == CaptureMode::Region {
+        config.set_source_rect(CGRect::new(
+            target.frame.x,
+            target.frame.y,
+            target.frame.width.max(32.0),
+            target.frame.height.max(32.0),
+        ));
+    }
     Some((filter, config))
 }
 

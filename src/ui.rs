@@ -5,16 +5,16 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Application, Bounds, Context, Div, Entity, FocusHandle, FontWeight, Image,
-    ImageFormat, IntoElement, KeyDownEvent, MouseButton, Pixels, Point, Render, SharedString, Size,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, img, point,
-    prelude::*, px, rgb, rgba, size,
+    ImageFormat, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, SharedString, Size, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowKind, WindowOptions, div, img, point, prelude::*, px, rgb, rgba, size,
 };
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{DefinedClass, MainThreadOnly, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSColor, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSStatusWindowLevel,
-    NSWindow, NSWindowButton, NSWindowCollectionBehavior,
+    NSWindow, NSWindowButton, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSString};
 use screencapturekit::prelude::*;
@@ -22,8 +22,9 @@ use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
 
 use crate::capture::{
     LiveOverlayEvent, ScreenCaptureSession, SharedCaptureTelemetry, discover_target,
-    install_global_hotkeys, scrawl_log, set_escape_hotkey_enabled, shortcut_from_key_and_mods,
-    start_global_input_tap, update_global_shortcut,
+    install_global_hotkeys, list_selectable_windows, region_target, scrawl_log,
+    set_escape_hotkey_enabled, shortcut_from_key_and_mods, start_global_input_tap,
+    update_global_shortcut,
 };
 use crate::hex::AudioRecorder;
 use crate::laser_overlay::MetalLaserOverlay;
@@ -182,13 +183,13 @@ fn sync_full_size_content_view(ns_window: &NSWindow) {
     }
 }
 
-fn configure_floating_window(ns_window: &NSWindow, ignores_mouse: bool) {
+fn configure_floating_window(ns_window: &NSWindow, ignores_mouse: bool, level_offset: isize) {
     ns_window.setHidesOnDeactivate(false);
     ns_window.setIgnoresMouseEvents(ignores_mouse);
     ns_window.setOpaque(false);
     ns_window.setBackgroundColor(Some(&NSColor::clearColor()));
     ns_window.setHasShadow(false);
-    ns_window.setLevel(NSStatusWindowLevel + 1);
+    ns_window.setLevel(NSStatusWindowLevel + level_offset);
     ns_window.setCollectionBehavior(
         NSWindowCollectionBehavior::CanJoinAllSpaces
             | NSWindowCollectionBehavior::FullScreenAuxiliary,
@@ -196,9 +197,18 @@ fn configure_floating_window(ns_window: &NSWindow, ignores_mouse: bool) {
     sync_full_size_content_view(ns_window);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectionMode {
+    Area,
+    Window,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IslandPhase {
     Hidden,
+    Selecting {
+        mode: SelectionMode,
+    },
     Recording,
     Completed {
         finished_at: Instant,
@@ -224,6 +234,9 @@ pub struct ScrawlCoordinator {
     island_width: f32,
     island_velocity: f32,
     island_opacity: f32,
+    selectable_windows: Vec<TargetInfo>,
+    hovered_window: Option<TargetInfo>,
+    selection_drag: Option<([f32; 2], [f32; 2])>,
     recording_shortcut_key: bool,
     review_bundle: Option<(PathBuf, ScrawlBundle)>,
     review_status: Option<String>,
@@ -249,6 +262,9 @@ impl ScrawlCoordinator {
             island_width: 220.0,
             island_velocity: 0.0,
             island_opacity: 0.0,
+            selectable_windows: Vec::new(),
+            hovered_window: None,
+            selection_drag: None,
             recording_shortcut_key: false,
             review_bundle: initial_bundle,
             review_status: None,
@@ -259,6 +275,10 @@ impl ScrawlCoordinator {
 
     pub fn is_recording(&self) -> bool {
         self.active_recording.is_some()
+    }
+
+    pub fn is_selecting(&self) -> bool {
+        matches!(self.island_phase, IslandPhase::Selecting { .. })
     }
 
     pub fn is_island_visible(&self) -> bool {
@@ -279,6 +299,24 @@ impl ScrawlCoordinator {
         self.review_status = status;
         self.selected_tab = ReviewTab::ContactSheet;
         self.selected_keyframe = 0;
+    }
+
+    pub fn set_selection_mode(&mut self, mode: SelectionMode, cx: &mut Context<Self>) {
+        if matches!(self.island_phase, IslandPhase::Selecting { .. }) {
+            self.island_phase = IslandPhase::Selecting { mode };
+            self.selection_drag = None;
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_selection_mode(&mut self, cx: &mut Context<Self>) {
+        if let IslandPhase::Selecting { mode } = self.island_phase {
+            let next = match mode {
+                SelectionMode::Area => SelectionMode::Window,
+                SelectionMode::Window => SelectionMode::Area,
+            };
+            self.set_selection_mode(next, cx);
+        }
     }
 
     pub fn undo_stroke(&mut self, cx: &mut Context<Self>) {
@@ -307,7 +345,10 @@ impl ScrawlCoordinator {
         ) {
             return;
         }
+        self.selection_drag = None;
+        self.hovered_window = None;
         self.island_phase = IslandPhase::Dismissing;
+        cx.defer(close_picker_window);
         cx.notify();
     }
 
@@ -332,6 +373,7 @@ impl ScrawlCoordinator {
 
         let (target_w, target_opacity) = match self.island_phase {
             IslandPhase::Hidden => return,
+            IslandPhase::Selecting { .. } => (376.0, 1.0),
             IslandPhase::Recording => (328.0, 1.0),
             IslandPhase::Completed { .. } => (356.0, 1.0),
             IslandPhase::Dismissing => (188.0, 0.0),
@@ -342,7 +384,7 @@ impl ScrawlCoordinator {
         let damping = 24.0_f32;
         let accel = (target_w - self.island_width) * stiffness - self.island_velocity * damping;
         self.island_velocity += accel * dt;
-        self.island_width = (self.island_width + self.island_velocity * dt).clamp(160.0, 410.0);
+        self.island_width = (self.island_width + self.island_velocity * dt).clamp(160.0, 416.0);
         self.island_opacity += (target_opacity - self.island_opacity) * (14.0 * dt).min(1.0);
 
         if matches!(self.island_phase, IslandPhase::Dismissing) && self.island_opacity < 0.04 {
@@ -353,13 +395,50 @@ impl ScrawlCoordinator {
         cx.notify();
     }
 
-    pub fn start_recording(&mut self, cx: &mut Context<Self>) {
+    pub fn begin_target_selection(&mut self, cx: &mut Context<Self>) {
         if self.is_recording() {
             return;
         }
-        scrawl_log("start_recording invoked");
+        scrawl_log("begin_target_selection invoked");
         self.recording_shortcut_key = false;
+        self.selectable_windows = list_selectable_windows();
+        self.hovered_window = self.selectable_windows.first().cloned();
+        self.selection_drag = None;
+        self.island_phase = IslandPhase::Selecting {
+            mode: SelectionMode::Area,
+        };
+        self.island_width = 236.0;
+        self.island_velocity = 440.0;
+        self.island_opacity = 0.40;
+
+        let entity = cx.entity().clone();
+        cx.defer(move |cx| {
+            close_review_window(cx);
+            open_picker_windows(&entity, cx);
+        });
+        cx.notify();
+    }
+
+    pub fn start_recording_full_screen(&mut self, cx: &mut Context<Self>) {
         let target = discover_target(None);
+        self.start_recording_with_target(target, cx);
+    }
+
+    pub fn start_recording(&mut self, cx: &mut Context<Self>) {
+        self.begin_target_selection(cx);
+    }
+
+    pub fn start_recording_with_target(&mut self, target: TargetInfo, cx: &mut Context<Self>) {
+        if self.is_recording() {
+            return;
+        }
+        scrawl_log(format!(
+            "start_recording_with_target invoked: mode={:?} frame={:?}",
+            target.mode, target.frame
+        ));
+        self.recording_shortcut_key = false;
+        self.selection_drag = None;
+        self.hovered_window = None;
         let id = crate::make_bundle_id();
         let bundle_dir = crate::handoff::default_captures_dir().join(format!("{id}.scrawl"));
         let _ = std::fs::create_dir_all(&bundle_dir);
@@ -389,14 +468,14 @@ impl ScrawlCoordinator {
             _metal_overlay: metal_overlay,
         });
         self.island_phase = IslandPhase::Recording;
-        self.island_width = 216.0;
-        self.island_velocity = 420.0;
-        self.island_opacity = 0.35;
+        self.island_velocity = -280.0;
+        self.island_opacity = 1.0;
 
         let entity = cx.entity().clone();
         cx.defer(move |cx| {
             close_review_window(cx);
-            open_capture_windows(&entity, cx);
+            close_picker_window(cx);
+            ensure_hud_pill_open(&entity, cx);
         });
         cx.notify();
     }
@@ -487,8 +566,55 @@ impl Render for HudPillWindow {
         let c_finish = self.coordinator.clone();
         let c_inspect = self.coordinator.clone();
         let c_dismiss = self.coordinator.clone();
+        let c_mode_area = self.coordinator.clone();
+        let c_mode_win = self.coordinator.clone();
+        let c_full = self.coordinator.clone();
+        let c_sel_cancel = self.coordinator.clone();
 
         let capsule_content = match phase {
+            IslandPhase::Selecting { mode } => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .whitespace_nowrap()
+                .child(
+                    div()
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap_1p5()
+                        .whitespace_nowrap()
+                        .child(
+                            mode_chip("sel-area", "⬚ Area", mode == SelectionMode::Area).on_click(
+                                move |_, _, cx| {
+                                    c_mode_area.update(cx, |coord, cx| {
+                                        coord.set_selection_mode(SelectionMode::Area, cx);
+                                    });
+                                },
+                            ),
+                        )
+                        .child(
+                            mode_chip("sel-window", "▢ Window", mode == SelectionMode::Window)
+                                .on_click(move |_, _, cx| {
+                                    c_mode_win.update(cx, |coord, cx| {
+                                        coord.set_selection_mode(SelectionMode::Window, cx);
+                                    });
+                                }),
+                        )
+                        .child(pill_chip("sel-fullscreen", "▣ Full Screen", true).on_click(
+                            move |_, _, cx| {
+                                c_full.update(cx, |coord, cx| {
+                                    coord.start_recording_full_screen(cx);
+                                });
+                            },
+                        )),
+                )
+                .child(
+                    pill_chip("sel-cancel", "✕", true).on_click(move |_, _, cx| {
+                        c_sel_cancel.update(cx, |coord, cx| coord.cancel_recording(cx));
+                    }),
+                ),
             IslandPhase::Completed {
                 frame_count,
                 duration_ms,
@@ -691,6 +817,245 @@ fn pill_chip(id: &'static str, label: &'static str, enabled: bool) -> gpui::Stat
             d.cursor_pointer().hover(|s| s.bg(rgb(SURFACE_HOVER)))
         })
         .child(label)
+}
+
+fn mode_chip(id: &'static str, label: &'static str, active: bool) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .h(px(28.0))
+        .px_2p5()
+        .rounded(px(14.0))
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .whitespace_nowrap()
+        .border_1()
+        .border_color(if active {
+            rgb(ACCENT_COLOR)
+        } else {
+            rgb(LINE_COLOR)
+        })
+        .bg(if active {
+            rgb(ACCENT_COLOR)
+        } else {
+            rgb(SURFACE_BG)
+        })
+        .text_color(if active {
+            rgb(TEXT_COLOR)
+        } else {
+            rgb(TEXT_SOFT)
+        })
+        .font_weight(if active {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::NORMAL
+        })
+        .cursor_pointer()
+        .hover(|s| {
+            s.bg(if active {
+                rgb(0x4b6bff)
+            } else {
+                rgb(SURFACE_HOVER)
+            })
+        })
+        .child(label)
+}
+
+pub struct TargetPickerWindow {
+    coordinator: Entity<ScrawlCoordinator>,
+    focus: FocusHandle,
+}
+
+impl Render for TargetPickerWindow {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let coord = self.coordinator.read(cx);
+        let mode = match coord.island_phase {
+            IslandPhase::Selecting { mode } => mode,
+            _ => SelectionMode::Area,
+        };
+        let drag = coord.selection_drag;
+        let hovered = coord.hovered_window.clone();
+
+        let c_down = self.coordinator.clone();
+        let c_move = self.coordinator.clone();
+        let c_up = self.coordinator.clone();
+        let c_key = self.coordinator.clone();
+
+        let highlight_box: Option<(f32, f32, f32, f32, String)> = match mode {
+            SelectionMode::Area => drag.map(|(a, b)| {
+                let x = a[0].min(b[0]);
+                let y = a[1].min(b[1]);
+                let w = (a[0] - b[0]).abs().max(2.0);
+                let h = (a[1] - b[1]).abs().max(2.0);
+                (
+                    x,
+                    y,
+                    w,
+                    h,
+                    format!("{} × {}", w.round() as i32, h.round() as i32),
+                )
+            }),
+            SelectionMode::Window => hovered.map(|t| {
+                let title = match (&t.app, &t.window_title) {
+                    (Some(app), Some(win)) if !win.is_empty() && win != app => {
+                        format!("{app} — {win}")
+                    }
+                    (Some(app), _) => app.clone(),
+                    _ => format!(
+                        "{} × {}",
+                        t.frame.width.round() as i32,
+                        t.frame.height.round() as i32
+                    ),
+                };
+                (
+                    t.frame.x as f32,
+                    t.frame.y as f32,
+                    t.frame.width as f32,
+                    t.frame.height as f32,
+                    title,
+                )
+            }),
+        };
+
+        div()
+            .id("scrawl-target-picker")
+            .track_focus(&self.focus)
+            .size_full()
+            .relative()
+            .bg(rgba(0x00000038))
+            .cursor_crosshair()
+            .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                let key = event.keystroke.key.as_str();
+                if key == "space" || key == " " {
+                    c_key.update(cx, |coord, cx| coord.toggle_selection_mode(cx));
+                } else if key == "escape" {
+                    c_key.update(cx, |coord, cx| coord.cancel_recording(cx));
+                } else if key == "enter" || key.eq_ignore_ascii_case("s") {
+                    c_key.update(cx, |coord, cx| coord.start_recording_full_screen(cx));
+                }
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                move |event: &MouseDownEvent, window, cx| {
+                    let win_bounds = window.bounds();
+                    let sx = f32::from(win_bounds.origin.x) + f32::from(event.position.x);
+                    let sy = f32::from(win_bounds.origin.y) + f32::from(event.position.y);
+                    c_down.update(cx, |coord, cx| {
+                        let cur_mode = match coord.island_phase {
+                            IslandPhase::Selecting { mode } => mode,
+                            _ => return,
+                        };
+                        match cur_mode {
+                            SelectionMode::Area => {
+                                coord.selection_drag = Some(([sx, sy], [sx, sy]));
+                                cx.notify();
+                            }
+                            SelectionMode::Window => {
+                                if let Some(target) = coord.hovered_window.clone() {
+                                    coord.start_recording_with_target(target, cx);
+                                } else {
+                                    coord.start_recording_full_screen(cx);
+                                }
+                            }
+                        }
+                    });
+                },
+            )
+            .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
+                let win_bounds = window.bounds();
+                let sx = f32::from(win_bounds.origin.x) + f32::from(event.position.x);
+                let sy = f32::from(win_bounds.origin.y) + f32::from(event.position.y);
+                c_move.update(cx, |coord, cx| {
+                    let cur_mode = match coord.island_phase {
+                        IslandPhase::Selecting { mode } => mode,
+                        _ => return,
+                    };
+                    match cur_mode {
+                        SelectionMode::Area => {
+                            if event.dragging()
+                                && let Some((start, _)) = coord.selection_drag
+                            {
+                                coord.selection_drag = Some((start, [sx, sy]));
+                                cx.notify();
+                            }
+                        }
+                        SelectionMode::Window => {
+                            let found = coord
+                                .selectable_windows
+                                .iter()
+                                .find(|w| {
+                                    let f = w.frame;
+                                    f64::from(sx) >= f.x
+                                        && f64::from(sx) <= f.x + f.width
+                                        && f64::from(sy) >= f.y
+                                        && f64::from(sy) <= f.y + f.height
+                                })
+                                .cloned();
+                            if coord.hovered_window.as_ref().and_then(|w| w.window_id)
+                                != found.as_ref().and_then(|w| w.window_id)
+                            {
+                                coord.hovered_window = found;
+                                cx.notify();
+                            }
+                        }
+                    }
+                });
+            })
+            .on_mouse_up(
+                MouseButton::Left,
+                move |event: &MouseUpEvent, window, cx| {
+                    let win_bounds = window.bounds();
+                    let sx = f32::from(win_bounds.origin.x) + f32::from(event.position.x);
+                    let sy = f32::from(win_bounds.origin.y) + f32::from(event.position.y);
+                    c_up.update(cx, |coord, cx| {
+                        if let Some((start, _)) = coord.selection_drag.take() {
+                            let x = f64::from(start[0].min(sx));
+                            let y = f64::from(start[1].min(sy));
+                            let w = f64::from((start[0] - sx).abs());
+                            let h = f64::from((start[1] - sy).abs());
+                            if w >= 36.0 && h >= 36.0 {
+                                let target = region_target(x, y, w, h);
+                                coord.start_recording_with_target(target, cx);
+                            } else {
+                                cx.notify();
+                            }
+                        }
+                    });
+                },
+            )
+            .when_some(highlight_box, |d, (x, y, w, h, badge)| {
+                d.child(
+                    div()
+                        .absolute()
+                        .left(px(x))
+                        .top(px(y))
+                        .w(px(w))
+                        .h(px(h))
+                        .rounded(px(8.0))
+                        .bg(rgba(0x3b5cf61c))
+                        .border_2()
+                        .border_color(rgb(ACCENT_COLOR))
+                        .flex()
+                        .items_end()
+                        .justify_end()
+                        .p_2()
+                        .child(
+                            div()
+                                .px_2()
+                                .py_0p5()
+                                .rounded(px(6.0))
+                                .bg(rgba(0x111113e8))
+                                .border_1()
+                                .border_color(rgb(LINE_COLOR))
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(TEXT_COLOR))
+                                .whitespace_nowrap()
+                                .child(badge),
+                        ),
+                )
+            })
+    }
 }
 
 pub struct BundleReviewWindow {
@@ -1272,8 +1637,8 @@ fn action_button(id: &'static str, label: &str, primary: bool) -> gpui::Stateful
         .child(SharedString::from(label.to_string()))
 }
 
-fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
-    close_capture_windows(cx);
+fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
+    close_picker_window(cx);
     let display = cx.primary_display();
     let display_bounds = display.as_ref().map_or_else(
         || Bounds {
@@ -1284,8 +1649,78 @@ fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
     );
     let display_id = display.as_ref().map(|d| d.id());
 
-    // Transparent 420×48 Dynamic Island host positioned cleanly below the 37pt macOS menu bar
-    let pill_size: Size<Pixels> = size(px(420.0), px(48.0));
+    let picker_coord = coord_entity.clone();
+    let _ = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: Point::default(),
+                size: display_bounds.size,
+            })),
+            display_id,
+            titlebar: None,
+            focus: true,
+            show: true,
+            kind: WindowKind::PopUp,
+            is_movable: false,
+            is_resizable: false,
+            is_minimizable: false,
+            window_background: WindowBackgroundAppearance::Transparent,
+            ..Default::default()
+        },
+        move |window, cx| {
+            if let Some(ns_win) = newest_ns_window() {
+                ns_win.setStyleMask(
+                    NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
+                );
+                if let Some(screen) = ns_win.screen() {
+                    ns_win.setFrame_display(screen.frame(), true);
+                }
+                configure_floating_window(&ns_win, false, 1);
+                let num = ns_win.windowNumber().max(0) as u32;
+                if num > 0 {
+                    picker_coord
+                        .read(cx)
+                        .telemetry
+                        .excluded_window_ids
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(num);
+                }
+            }
+            let focus = cx.focus_handle();
+            window.focus(&focus);
+            cx.new(|cx| {
+                cx.observe(&picker_coord, |_, _, cx| cx.notify()).detach();
+                TargetPickerWindow {
+                    coordinator: picker_coord,
+                    focus,
+                }
+            })
+        },
+    );
+
+    ensure_hud_pill_open(coord_entity, cx);
+}
+
+fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
+    for handle in cx.windows() {
+        if let Some(pill) = handle.downcast::<HudPillWindow>() {
+            let _ = pill.update(cx, |_, _, cx| cx.notify());
+            return;
+        }
+    }
+    let display = cx.primary_display();
+    let display_bounds = display.as_ref().map_or_else(
+        || Bounds {
+            origin: Point::default(),
+            size: size(px(1440.0), px(900.0)),
+        },
+        |d| d.bounds(),
+    );
+    let display_id = display.as_ref().map(|d| d.id());
+
+    // Transparent 430×48 Dynamic Island host positioned cleanly below the 37pt macOS menu bar
+    let pill_size: Size<Pixels> = size(px(430.0), px(48.0));
     let pill_bounds = Bounds {
         origin: point(
             (display_bounds.size.width - pill_size.width) * 0.5,
@@ -1310,7 +1745,7 @@ fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
         },
         move |_, cx| {
             if let Some(ns_win) = newest_ns_window() {
-                configure_floating_window(&ns_win, false);
+                configure_floating_window(&ns_win, false, 2);
                 let num = ns_win.windowNumber().max(0) as u32;
                 if num > 0 {
                     pill_coord
@@ -1332,9 +1767,19 @@ fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
     );
 }
 
+fn close_picker_window(cx: &mut App) {
+    for handle in cx.windows() {
+        if handle.downcast::<TargetPickerWindow>().is_some() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+    }
+}
+
 fn close_capture_windows(cx: &mut App) {
     for handle in cx.windows() {
-        if handle.downcast::<HudPillWindow>().is_some() {
+        if handle.downcast::<HudPillWindow>().is_some()
+            || handle.downcast::<TargetPickerWindow>().is_some()
+        {
             let _ = handle.update(cx, |_, window, _| window.remove_window());
         }
     }
@@ -1467,8 +1912,10 @@ pub fn run_app(
                                     loop_coord.update(cx, |coord, cx| {
                                         if coord.is_recording() {
                                             coord.finish_recording(cx);
+                                        } else if coord.is_selecting() {
+                                            coord.start_recording_full_screen(cx);
                                         } else {
-                                            coord.start_recording(cx);
+                                            coord.begin_target_selection(cx);
                                         }
                                     });
                                 }
@@ -1508,8 +1955,10 @@ pub fn run_app(
                             LiveOverlayEvent::ToggleCaptureShortcut => {
                                 if coord.is_recording() {
                                     coord.finish_recording(cx);
+                                } else if coord.is_selecting() {
+                                    coord.start_recording_full_screen(cx);
                                 } else {
-                                    coord.start_recording(cx);
+                                    coord.begin_target_selection(cx);
                                 }
                             }
                             LiveOverlayEvent::UndoStroke => {

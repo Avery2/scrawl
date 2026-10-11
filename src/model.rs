@@ -85,6 +85,7 @@ pub struct TargetInfo {
 pub enum CaptureMode {
     Display,
     Window,
+    Region,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

@@ -38,8 +38,9 @@ struct LaserUniforms {
     tip_pos: [f32; 2],
     segment_count: u32,
     pin_count: u32,
-    _pad0: u32,
-    _pad1: u32,
+    constrain_rect: f32,
+    _pad1: f32,
+    target_rect: [f32; 4],
 }
 
 #[repr(C)]
@@ -387,6 +388,7 @@ impl SharedMetalOverlay {
             attachment.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0));
             attachment.set_store_action(MTLStoreAction::Store);
 
+            let is_constrained = tw < renderer.width - 8.0 || th < renderer.height - 8.0;
             let uniforms = LaserUniforms {
                 resolution: [
                     renderer.width * renderer.scale,
@@ -407,8 +409,9 @@ impl SharedMetalOverlay {
                 } else {
                     pins.len().min(MAX_PINS) as u32
                 },
-                _pad0: 0,
-                _pad1: 0,
+                constrain_rect: if is_constrained { 1.0 } else { 0.0 },
+                _pad1: 0.0,
+                target_rect: [tx, ty, tw, th],
             };
 
             let cmd = renderer.command_queue.new_command_buffer();

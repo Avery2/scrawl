@@ -10,8 +10,9 @@ struct LaserUniforms {
     float2 tip_pos;
     uint segment_count;
     uint pin_count;
-    uint _pad0;
-    uint _pad1;
+    float constrain_rect;
+    float _pad1;
+    float4 target_rect;
 };
 
 // Each segment connects A -> B in logical screen points.
@@ -132,6 +133,27 @@ fragment float4 laser_fragment(
     }
 
     float4 out = float4(0.0);
+
+    // 0. If constrained to a window or area, softly dim outside the capture box and draw a 1.5px border.
+    if (u.constrain_rect > 0.5) {
+        float2 box_min = u.target_rect.xy;
+        float2 box_max = u.target_rect.xy + u.target_rect.zw;
+        float2 box_center = (box_min + box_max) * 0.5;
+        float2 half_size = (box_max - box_min) * 0.5;
+        float2 q = abs(p - box_center) - half_size;
+        float sdf = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
+        if (sdf > 0.0) {
+            float dim_a = smoothstep(0.0, 1.5, sdf) * 0.28;
+            out.rgb = float3(0.0);
+            out.a = dim_a;
+            float border_a = (1.0 - smoothstep(0.2, 1.8, abs(sdf - 1.0))) * 0.55;
+            if (border_a > 0.001) {
+                float3 border_col = float3(0.35, 0.52, 1.0);
+                out.rgb = border_col * border_a + out.rgb * (1.0 - border_a);
+                out.a = border_a + out.a * (1.0 - border_a);
+            }
+        }
+    }
 
     // 1. Composite persistent ink (white halo + red fill)
     if (ink_halo_cov > 0.001) {
