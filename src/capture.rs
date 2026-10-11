@@ -33,11 +33,7 @@ const EVENT_LEFT_MOUSE_DOWN: u32 = 1;
 const EVENT_LEFT_MOUSE_UP: u32 = 2;
 const EVENT_RIGHT_MOUSE_DOWN: u32 = 3;
 const EVENT_RIGHT_MOUSE_UP: u32 = 4;
-const EVENT_MOUSE_MOVED: u32 = 5;
-const EVENT_LEFT_MOUSE_DRAGGED: u32 = 6;
-const EVENT_RIGHT_MOUSE_DRAGGED: u32 = 7;
 const EVENT_KEY_DOWN: u32 = 10;
-const EVENT_FLAGS_CHANGED: u32 = 12;
 const EVENT_SCROLL_WHEEL: u32 = 22;
 const EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = u32::MAX - 1;
 const EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = u32::MAX;
@@ -52,9 +48,66 @@ const FLAG_ALTERNATE: u64 = 1 << 19;
 const FLAG_COMMAND: u64 = 1 << 20;
 
 const KEY_S: u16 = 1;
-const KEY_D: u16 = 2;
 const KEY_Z: u16 = 6;
 const KEY_ESCAPE: u16 = 53;
+
+// Carbon HIToolbox global hotkey constants (requires zero TCC permissions).
+pub const CARBON_CMD_KEY: u32 = 1 << 8;
+pub const CARBON_SHIFT_KEY: u32 = 1 << 9;
+pub const CARBON_OPTION_KEY: u32 = 1 << 11;
+pub const CARBON_CONTROL_KEY: u32 = 1 << 12;
+const K_EVENT_CLASS_KEYBOARD: u32 = u32::from_be_bytes(*b"keyb");
+const K_EVENT_HOT_KEY_PRESSED: u32 = 5;
+const K_EVENT_PARAM_DIRECT_OBJECT: u32 = u32::from_be_bytes(*b"----");
+const TYPE_EVENT_HOT_KEY_ID: u32 = u32::from_be_bytes(*b"hkid");
+const HOTKEY_SIG: u32 = u32::from_be_bytes(*b"SCRW");
+const HOTKEY_ID_TOGGLE: u32 = 1;
+const HOTKEY_ID_ESCAPE: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct EventTypeSpec {
+    event_class: u32,
+    event_kind: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct EventHotKeyID {
+    signature: u32,
+    id: u32,
+}
+
+#[link(name = "Carbon", kind = "framework")]
+unsafe extern "C" {
+    fn GetApplicationEventTarget() -> *mut c_void;
+    fn InstallEventHandler(
+        target: *mut c_void,
+        handler: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32,
+        num_types: u32,
+        list: *const EventTypeSpec,
+        user_data: *mut c_void,
+        out_ref: *mut *mut c_void,
+    ) -> i32;
+    fn RegisterEventHotKey(
+        hot_key_code: u32,
+        hot_key_modifiers: u32,
+        hot_key_id: EventHotKeyID,
+        target: *mut c_void,
+        options: u32,
+        out_ref: *mut *mut c_void,
+    ) -> i32;
+    fn UnregisterEventHotKey(hot_key: *mut c_void) -> i32;
+    fn GetEventParameter(
+        event: *mut c_void,
+        name: u32,
+        desired_type: u32,
+        actual_type: *mut u32,
+        buffer_size: u32,
+        actual_size: *mut u32,
+        data: *mut c_void,
+    ) -> i32;
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -148,16 +201,299 @@ impl Drop for CfObject {
     }
 }
 
-/// Live UI events emitted by the global input tap to drive the GPUI overlay & HUD pill.
+/// Live UI events emitted by the global input monitor to drive Scrawl's HUD & Review windows.
 #[derive(Clone, Debug)]
 pub enum LiveOverlayEvent {
     ToggleCaptureShortcut,
-    ToggleDrawMode,
     UndoStroke,
     CancelCapture,
-    ShiftHeld,
     RequestSnapshot,
-    ActionCaption(String),
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ShortcutConfig {
+    pub key_code: u32,
+    pub carbon_modifiers: u32,
+    pub label: String,
+}
+
+impl Default for ShortcutConfig {
+    fn default() -> Self {
+        Self {
+            key_code: u32::from(KEY_S),
+            carbon_modifiers: CARBON_OPTION_KEY,
+            label: "⌥S".into(),
+        }
+    }
+}
+
+impl ShortcutConfig {
+    fn config_path() -> PathBuf {
+        crate::handoff::default_captures_dir()
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+            .join("config.json")
+    }
+
+    pub fn load() -> Self {
+        std::fs::read_to_string(Self::config_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let path = Self::config_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(self) {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+}
+
+struct CarbonHotKeyState {
+    toggle_ref: usize,
+    escape_ref: usize,
+}
+
+static CARBON_HOTKEYS: std::sync::OnceLock<Mutex<CarbonHotKeyState>> = std::sync::OnceLock::new();
+
+unsafe extern "C" fn carbon_hotkey_handler(
+    _next_handler: *mut c_void,
+    event: *mut c_void,
+    user_data: *mut c_void,
+) -> i32 {
+    if event.is_null() || user_data.is_null() {
+        return -1;
+    }
+    let mut hotkey_id = EventHotKeyID {
+        signature: 0,
+        id: 0,
+    };
+    let status = unsafe {
+        GetEventParameter(
+            event,
+            K_EVENT_PARAM_DIRECT_OBJECT,
+            TYPE_EVENT_HOT_KEY_ID,
+            ptr::null_mut(),
+            std::mem::size_of::<EventHotKeyID>() as u32,
+            ptr::null_mut(),
+            (&raw mut hotkey_id).cast(),
+        )
+    };
+    if status == 0 && hotkey_id.signature == HOTKEY_SIG {
+        let telemetry = unsafe { &*user_data.cast::<SharedCaptureTelemetry>() };
+        match hotkey_id.id {
+            HOTKEY_ID_TOGGLE => {
+                let _ = telemetry
+                    .ui_sender
+                    .try_send(LiveOverlayEvent::ToggleCaptureShortcut);
+            }
+            HOTKEY_ID_ESCAPE => {
+                let _ = telemetry
+                    .ui_sender
+                    .try_send(LiveOverlayEvent::CancelCapture);
+            }
+            _ => {}
+        }
+    }
+    0
+}
+
+/// Installs Carbon `RegisterEventHotKey` on the main application event target.
+/// Works system-wide across all apps with zero TCC permissions.
+pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
+    let state_mutex = CARBON_HOTKEYS.get_or_init(|| {
+        let spec = EventTypeSpec {
+            event_class: K_EVENT_CLASS_KEYBOARD,
+            event_kind: K_EVENT_HOT_KEY_PRESSED,
+        };
+        let user_data = Arc::into_raw(Arc::clone(telemetry))
+            .cast_mut()
+            .cast::<c_void>();
+        let mut handler_ref: *mut c_void = ptr::null_mut();
+        unsafe {
+            InstallEventHandler(
+                GetApplicationEventTarget(),
+                carbon_hotkey_handler,
+                1,
+                &raw const spec,
+                user_data,
+                &raw mut handler_ref,
+            );
+        }
+        Mutex::new(CarbonHotKeyState {
+            toggle_ref: 0,
+            escape_ref: 0,
+        })
+    });
+    let shortcut = telemetry
+        .shortcut
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let _ = state_mutex;
+    update_global_shortcut(telemetry, shortcut);
+}
+
+pub fn update_global_shortcut(telemetry: &SharedCaptureTelemetry, config: ShortcutConfig) {
+    config.save();
+    *telemetry
+        .shortcut
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = config.clone();
+
+    let Some(state_mutex) = CARBON_HOTKEYS.get() else {
+        return;
+    };
+    let mut state = state_mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.toggle_ref != 0 {
+        unsafe { UnregisterEventHotKey(state.toggle_ref as *mut c_void) };
+        state.toggle_ref = 0;
+    }
+    let mut new_ref: *mut c_void = ptr::null_mut();
+    let status = unsafe {
+        RegisterEventHotKey(
+            config.key_code,
+            config.carbon_modifiers,
+            EventHotKeyID {
+                signature: HOTKEY_SIG,
+                id: HOTKEY_ID_TOGGLE,
+            },
+            GetApplicationEventTarget(),
+            0,
+            &raw mut new_ref,
+        )
+    };
+    if status == 0 && !new_ref.is_null() {
+        state.toggle_ref = new_ref as usize;
+    }
+}
+
+/// Registers or unregisters `Escape` globally so pressing `Esc` in any app cancels an active recording.
+pub fn set_escape_hotkey_enabled(enabled: bool) {
+    let Some(state_mutex) = CARBON_HOTKEYS.get() else {
+        return;
+    };
+    let mut state = state_mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.escape_ref != 0 {
+        unsafe { UnregisterEventHotKey(state.escape_ref as *mut c_void) };
+        state.escape_ref = 0;
+    }
+    if enabled {
+        let mut new_ref: *mut c_void = ptr::null_mut();
+        let status = unsafe {
+            RegisterEventHotKey(
+                u32::from(KEY_ESCAPE),
+                0,
+                EventHotKeyID {
+                    signature: HOTKEY_SIG,
+                    id: HOTKEY_ID_ESCAPE,
+                },
+                GetApplicationEventTarget(),
+                0,
+                &raw mut new_ref,
+            )
+        };
+        if status == 0 && !new_ref.is_null() {
+            state.escape_ref = new_ref as usize;
+        }
+    }
+}
+
+pub fn shortcut_from_key_and_mods(
+    key: &str,
+    cmd: bool,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+) -> Option<ShortcutConfig> {
+    let (key_code, key_label) = match key.to_ascii_lowercase().as_str() {
+        "a" => (0, "A"),
+        "s" => (1, "S"),
+        "d" => (2, "D"),
+        "f" => (3, "F"),
+        "h" => (4, "H"),
+        "g" => (5, "G"),
+        "z" => (6, "Z"),
+        "x" => (7, "X"),
+        "c" => (8, "C"),
+        "v" => (9, "V"),
+        "b" => (11, "B"),
+        "q" => (12, "Q"),
+        "w" => (13, "W"),
+        "e" => (14, "E"),
+        "r" => (15, "R"),
+        "y" => (16, "Y"),
+        "t" => (17, "T"),
+        "1" => (18, "1"),
+        "2" => (19, "2"),
+        "3" => (20, "3"),
+        "4" => (21, "4"),
+        "6" => (22, "6"),
+        "5" => (23, "5"),
+        "9" => (25, "9"),
+        "7" => (26, "7"),
+        "8" => (28, "8"),
+        "0" => (29, "0"),
+        "o" => (31, "O"),
+        "u" => (32, "U"),
+        "i" => (34, "I"),
+        "p" => (35, "P"),
+        "l" => (37, "L"),
+        "j" => (38, "J"),
+        "k" => (40, "K"),
+        "n" => (45, "N"),
+        "m" => (46, "M"),
+        "space" | " " => (49, "Space"),
+        "f1" => (122, "F1"),
+        "f2" => (120, "F2"),
+        "f3" => (99, "F3"),
+        "f4" => (118, "F4"),
+        "f5" => (96, "F5"),
+        "f6" => (97, "F6"),
+        "f7" => (98, "F7"),
+        "f8" => (100, "F8"),
+        "f9" => (101, "F9"),
+        "f10" => (109, "F10"),
+        "f11" => (103, "F11"),
+        "f12" => (111, "F12"),
+        _ => return None,
+    };
+    let is_fn_key = key_label.starts_with('F') && key_label.len() >= 2;
+    if !cmd && !ctrl && !alt && !is_fn_key {
+        return None;
+    }
+    let mut carbon_modifiers = 0_u32;
+    let mut label = String::new();
+    if ctrl {
+        carbon_modifiers |= CARBON_CONTROL_KEY;
+        label.push('⌃');
+    }
+    if alt {
+        carbon_modifiers |= CARBON_OPTION_KEY;
+        label.push('⌥');
+    }
+    if shift {
+        carbon_modifiers |= CARBON_SHIFT_KEY;
+        label.push('⇧');
+    }
+    if cmd {
+        carbon_modifiers |= CARBON_CMD_KEY;
+        label.push('⌘');
+    }
+    label.push_str(key_label);
+    Some(ShortcutConfig {
+        key_code,
+        carbon_modifiers,
+        label,
+    })
 }
 
 /// Inspects the accessibility element at screen coordinates `(x, y)` in global points.
@@ -183,7 +519,12 @@ pub fn ax_element_at(x: f64, y: f64) -> Option<(String, Option<String>)> {
     let status =
         unsafe { AXUIElementCopyElementAtPosition(root.0, x as f32, y as f32, &mut element) };
     if status != 0 || element.is_null() {
-        return hit_window.and_then(|(_, title, app)| title.or(app).map(|l| (l, None)));
+        return hit_window.and_then(|(_, title, app)| {
+            title
+                .or(app)
+                .filter(|l| !l.eq_ignore_ascii_case("scrawl"))
+                .map(|l| (l, None))
+        });
     }
     let mut current = CfObject(element);
     let _ = unsafe { AXUIElementSetMessagingTimeout(current.0, 0.08) };
@@ -230,7 +571,7 @@ pub fn ax_element_at(x: f64, y: f64) -> Option<(String, Option<String>)> {
     }
 
     if let Some((_, title, app)) = hit_window
-        && let Some(fallback) = title.or(app)
+        && let Some(fallback) = title.or(app).filter(|l| !l.eq_ignore_ascii_case("scrawl"))
     {
         return Some((fallback, role));
     }
@@ -241,8 +582,17 @@ pub fn ax_element_at(x: f64, y: f64) -> Option<(String, Option<String>)> {
 
 fn topmost_normal_window_at(x: f64, y: f64) -> Option<(i32, Option<String>, Option<String>)> {
     let content = SCShareableContent::get().ok()?;
+    let our_pid = std::process::id() as i32;
     for win in content.windows() {
         if !win.is_on_screen() || win.window_layer() != 0 {
+            continue;
+        }
+        let Some(owner) = win.owning_application() else {
+            continue;
+        };
+        let pid = owner.process_id();
+        // Skip Scrawl's own windows so pointing/drawing over the desktop hits the underlying app.
+        if pid == our_pid {
             continue;
         }
         let frame = win.frame();
@@ -254,8 +604,6 @@ fn topmost_normal_window_at(x: f64, y: f64) -> Option<(i32, Option<String>, Opti
             && y >= frame.origin.y
             && y <= frame.origin.y + frame.size.height
         {
-            let owner = win.owning_application()?;
-            let pid = owner.process_id();
             let title = win
                 .title()
                 .map(|t| clean_label(&t))
@@ -677,8 +1025,8 @@ fn capture_sck_frame(
 /// Shared state collected by the global input monitor during an active capture session.
 pub struct SharedCaptureTelemetry {
     pub active: AtomicBool,
-    pub draw_mode: AtomicBool,
     pub shift_held: AtomicBool,
+    pub shortcut: Mutex<ShortcutConfig>,
     pub started_at: Mutex<Instant>,
     pub target_frame: Mutex<TargetFrame>,
     pub pointer_screen: Mutex<[f32; 2]>,
@@ -696,8 +1044,8 @@ impl SharedCaptureTelemetry {
     pub fn new(ui_sender: flume::Sender<LiveOverlayEvent>) -> Arc<Self> {
         Arc::new(Self {
             active: AtomicBool::new(false),
-            draw_mode: AtomicBool::new(false),
             shift_held: AtomicBool::new(false),
+            shortcut: Mutex::new(ShortcutConfig::load()),
             started_at: Mutex::new(Instant::now()),
             target_frame: Mutex::new(TargetFrame {
                 x: 0.0,
@@ -751,7 +1099,6 @@ impl SharedCaptureTelemetry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
-        self.draw_mode.store(false, Ordering::Release);
         self.shift_held.store(false, Ordering::Release);
         self.active.store(true, Ordering::Release);
     }
@@ -848,7 +1195,6 @@ impl SharedCaptureTelemetry {
 
     pub fn finish_session(&self) -> (Vec<InteractionEvent>, Vec<Stroke>) {
         self.active.store(false, Ordering::Release);
-        self.draw_mode.store(false, Ordering::Release);
         *self
             .drag_start
             .lock()
@@ -895,11 +1241,7 @@ pub fn start_global_input_tap(telemetry: Arc<SharedCaptureTelemetry>) {
                 | (1_u64 << EVENT_LEFT_MOUSE_UP)
                 | (1_u64 << EVENT_RIGHT_MOUSE_DOWN)
                 | (1_u64 << EVENT_RIGHT_MOUSE_UP)
-                | (1_u64 << EVENT_MOUSE_MOVED)
-                | (1_u64 << EVENT_LEFT_MOUSE_DRAGGED)
-                | (1_u64 << EVENT_RIGHT_MOUSE_DRAGGED)
                 | (1_u64 << EVENT_KEY_DOWN)
-                | (1_u64 << EVENT_FLAGS_CHANGED)
                 | (1_u64 << EVENT_SCROLL_WHEEL);
 
             let user_info = Arc::into_raw(Arc::clone(&telemetry))
@@ -947,55 +1289,24 @@ unsafe extern "C" fn tap_callback(
         return event;
     }
 
+    if !telemetry.active.load(Ordering::Acquire) {
+        return event;
+    }
+
     let flags = unsafe { CGEventGetFlags(event) };
     let cmd = (flags & FLAG_COMMAND) != 0;
     let ctrl = (flags & FLAG_CONTROL) != 0;
     let alt = (flags & FLAG_ALTERNATE) != 0;
     let shift = (flags & FLAG_SHIFT) != 0;
-
-    if event_type == EVENT_KEY_DOWN {
-        let keycode = unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_KEYCODE) } as u16;
-        // Global shortcut: Ctrl + Option + Cmd + S
-        if ctrl && alt && cmd && keycode == KEY_S {
-            let _ = telemetry
-                .ui_sender
-                .try_send(LiveOverlayEvent::ToggleCaptureShortcut);
-            return event;
-        }
-    }
-
-    if !telemetry.active.load(Ordering::Acquire) {
-        return event;
-    }
-
-    if matches!(
-        event_type,
-        EVENT_MOUSE_MOVED | EVENT_LEFT_MOUSE_DRAGGED | EVENT_RIGHT_MOUSE_DRAGGED
-    ) && (!shift || telemetry.draw_mode.load(Ordering::Acquire))
-    {
-        return event;
-    }
+    let pure_shift = shift && !cmd && !ctrl && !alt;
 
     let t_ms = telemetry.elapsed_ms();
     let loc = unsafe { CGEventGetLocation(event) };
     let (nx, ny, fw, fh) = telemetry.normalize_point(loc.x, loc.y);
 
     match event_type {
-        EVENT_FLAGS_CHANGED => {
-            let was_shift = telemetry.shift_held.swap(shift, Ordering::AcqRel);
-            if was_shift != shift {
-                let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::ShiftHeld);
-            }
-            if !shift {
-                telemetry.finish_active_laser(Some((loc.x, loc.y)));
-            }
-        }
-        EVENT_MOUSE_MOVED | EVENT_LEFT_MOUSE_DRAGGED | EVENT_RIGHT_MOUSE_DRAGGED => {
-            telemetry.shift_held.store(true, Ordering::Release);
-            telemetry.record_laser_point(loc.x, loc.y);
-        }
         EVENT_LEFT_MOUSE_DOWN | EVENT_RIGHT_MOUSE_DOWN => {
-            if telemetry.draw_mode.load(Ordering::Acquire) {
+            if pure_shift {
                 return event;
             }
             let label_and_role = ax_element_at(loc.x, loc.y);
@@ -1006,7 +1317,7 @@ unsafe extern "C" fn tap_callback(
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((t_ms, nx, ny, label));
         }
         EVENT_LEFT_MOUSE_UP | EVENT_RIGHT_MOUSE_UP => {
-            if telemetry.draw_mode.load(Ordering::Acquire) {
+            if pure_shift {
                 return event;
             }
             let start = telemetry
@@ -1020,15 +1331,9 @@ unsafe extern "C" fn tap_callback(
                 let (label, role) = ax_element_at(loc.x, loc.y)
                     .map(|(l, r)| (Some(l), r))
                     .unwrap_or((start_label, None));
-                if let Some(ref l) = label {
-                    let _ = telemetry
-                        .ui_sender
-                        .try_send(LiveOverlayEvent::ActionCaption(format!("Clicked “{l}”")));
-                } else {
-                    let _ = telemetry
-                        .ui_sender
-                        .try_send(LiveOverlayEvent::RequestSnapshot);
-                }
+                let _ = telemetry
+                    .ui_sender
+                    .try_send(LiveOverlayEvent::RequestSnapshot);
                 telemetry
                     .events
                     .lock()
@@ -1087,21 +1392,8 @@ unsafe extern "C" fn tap_callback(
         EVENT_KEY_DOWN => {
             let keycode =
                 unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_KEYCODE) } as u16;
-            if keycode == KEY_ESCAPE {
-                let _ = telemetry
-                    .ui_sender
-                    .try_send(LiveOverlayEvent::CancelCapture);
-            } else if cmd && keycode == KEY_Z {
+            if cmd && keycode == KEY_Z {
                 let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::UndoStroke);
-            } else if !cmd
-                && !ctrl
-                && !alt
-                && keycode == KEY_D
-                && telemetry.draw_mode.load(Ordering::Acquire)
-            {
-                let _ = telemetry
-                    .ui_sender
-                    .try_send(LiveOverlayEvent::ToggleDrawMode);
             } else if cmd || ctrl {
                 // Only log modifier-chord shortcuts, never ordinary typing or secrets.
                 if let Some(key_name) = shortcut_key_name(keycode) {
@@ -1146,38 +1438,28 @@ fn current_mouse_location() -> Option<CGPoint> {
     Some(loc)
 }
 
-/// 120Hz global HID state poller so Shift-laser (`⇧` + move), Shift-drag ink (`⇧` + drag),
-/// and shortcuts work across all apps even when Scrawl is in the background.
+/// 120Hz global HID state poller so Shift-laser (`⇧` + move) and Shift-drag ink (`⇧` + drag)
+/// work across all apps even when Scrawl is in the background.
 fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
-    let mut prev_shortcut = false;
     let mut prev_shift_laser = false;
     let mut prev_shift_ink = false;
     let mut prev_undo = false;
     loop {
         thread::sleep(Duration::from_millis(8));
-        // HID_SYSTEM_STATE = 1
-        let flags = unsafe { CGEventSourceFlagsState(1) };
-        let cmd = (flags & FLAG_COMMAND) != 0;
-        let ctrl = (flags & FLAG_CONTROL) != 0;
-        let alt = (flags & FLAG_ALTERNATE) != 0;
-        let shift = (flags & FLAG_SHIFT) != 0;
-        let key_s = unsafe { CGEventSourceKeyState(1, KEY_S) };
-        let key_z = unsafe { CGEventSourceKeyState(1, KEY_Z) };
-
-        let shortcut_now = ctrl && alt && cmd && key_s;
-        if shortcut_now && !prev_shortcut {
-            let _ = telemetry
-                .ui_sender
-                .try_send(LiveOverlayEvent::ToggleCaptureShortcut);
-        }
-        prev_shortcut = shortcut_now;
-
         if !telemetry.active.load(Ordering::Acquire) {
             prev_shift_laser = false;
             prev_shift_ink = false;
             prev_undo = false;
             continue;
         }
+
+        // HID_SYSTEM_STATE = 1
+        let flags = unsafe { CGEventSourceFlagsState(1) };
+        let cmd = (flags & FLAG_COMMAND) != 0;
+        let ctrl = (flags & FLAG_CONTROL) != 0;
+        let alt = (flags & FLAG_ALTERNATE) != 0;
+        let shift = (flags & FLAG_SHIFT) != 0;
+        let key_z = unsafe { CGEventSourceKeyState(1, KEY_Z) };
 
         let undo_now = cmd && !ctrl && !alt && !shift && key_z;
         if undo_now && !prev_undo {
@@ -1193,86 +1475,79 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = [loc.x as f32, loc.y as f32];
 
-        let drawing = telemetry.draw_mode.load(Ordering::Acquire);
         let left_down = unsafe { CGEventSourceButtonState(1, 0) };
         let pure_shift = shift && !cmd && !ctrl && !alt;
 
-        if !drawing {
-            // Hold Shift + drag = draw persistent ink in any app; Hold Shift + move = optical laser
-            let shift_ink = pure_shift && left_down;
-            let shift_laser = pure_shift && !left_down;
+        // Hold Shift + drag = draw persistent ink in any app; Hold Shift + move = optical laser
+        let shift_ink = pure_shift && left_down;
+        let shift_laser = pure_shift && !left_down;
 
-            if shift_ink {
-                if prev_shift_laser {
-                    telemetry.finish_active_laser(None);
-                }
-                telemetry.shift_held.store(false, Ordering::Release);
-                let t_ms = telemetry.elapsed_ms();
-                let (nx, ny, fw, fh) = telemetry.normalize_point(loc.x, loc.y);
-                let sx = (nx * SCALE as f32).round() as i32;
-                let sy = (ny * SCALE as f32).round() as i32;
-                let mut guard = telemetry
-                    .live_ink
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let stroke = guard.get_or_insert_with(|| Stroke {
-                    t0: t_ms,
-                    t1: t_ms,
-                    fw,
-                    fh,
-                    on: None,
-                    pin: None,
-                    laser: false,
-                    pts: Vec::new(),
-                });
-                let dt = t_ms.saturating_sub(stroke.t0) as i32;
-                let should_push = stroke.pts.chunks_exact(3).last().is_none_or(|prev| {
-                    let dx = (sx - prev[0]) as f32 / SCALE as f32 * fw as f32;
-                    let dy = (sy - prev[1]) as f32 / SCALE as f32 * fh as f32;
-                    dx.hypot(dy) >= 1.5
-                });
-                if should_push && stroke.pts.len() / 3 < 2_000 {
-                    stroke.pts.extend_from_slice(&[sx, sy, dt]);
-                    stroke.t1 = t_ms;
-                }
-            } else if prev_shift_ink {
-                if let Some(mut stroke) = telemetry
-                    .live_ink
+        if shift_ink {
+            if prev_shift_laser {
+                telemetry.finish_active_laser(None);
+            }
+            telemetry.shift_held.store(false, Ordering::Release);
+            let t_ms = telemetry.elapsed_ms();
+            let (nx, ny, fw, fh) = telemetry.normalize_point(loc.x, loc.y);
+            let sx = (nx * SCALE as f32).round() as i32;
+            let sy = (ny * SCALE as f32).round() as i32;
+            let mut guard = telemetry
+                .live_ink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stroke = guard.get_or_insert_with(|| Stroke {
+                t0: t_ms,
+                t1: t_ms,
+                fw,
+                fh,
+                on: None,
+                pin: None,
+                laser: false,
+                pts: Vec::new(),
+            });
+            let dt = t_ms.saturating_sub(stroke.t0) as i32;
+            let should_push = stroke.pts.chunks_exact(3).last().is_none_or(|prev| {
+                let dx = (sx - prev[0]) as f32 / SCALE as f32 * fw as f32;
+                let dy = (sy - prev[1]) as f32 / SCALE as f32 * fh as f32;
+                dx.hypot(dy) >= 1.5
+            });
+            if should_push && stroke.pts.len() / 3 < 2_000 {
+                stroke.pts.extend_from_slice(&[sx, sy, dt]);
+                stroke.t1 = t_ms;
+            }
+        } else if prev_shift_ink {
+            if let Some(mut stroke) = telemetry
+                .live_ink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                && stroke.pts.len() >= 3
+            {
+                stroke.on = ax_element_at(loc.x, loc.y).map(|(l, _)| l);
+                telemetry
+                    .strokes
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                    && stroke.pts.len() >= 3
-                {
-                    stroke.on = ax_element_at(loc.x, loc.y).map(|(l, _)| l);
-                    telemetry
-                        .strokes
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(stroke);
-                    let _ = telemetry
-                        .ui_sender
-                        .try_send(LiveOverlayEvent::RequestSnapshot);
-                }
-            }
-
-            if shift_laser {
-                telemetry.shift_held.store(true, Ordering::Release);
-                telemetry.record_laser_point(loc.x, loc.y);
-            } else if prev_shift_laser && !shift_ink {
-                telemetry.shift_held.store(false, Ordering::Release);
-                telemetry.finish_active_laser(Some((loc.x, loc.y)));
+                    .push(stroke);
                 let _ = telemetry
                     .ui_sender
                     .try_send(LiveOverlayEvent::RequestSnapshot);
             }
-
-            prev_shift_ink = shift_ink;
-            prev_shift_laser = shift_laser;
-        } else {
-            telemetry.shift_held.store(false, Ordering::Release);
-            prev_shift_laser = false;
-            prev_shift_ink = false;
         }
+
+        if shift_laser {
+            telemetry.shift_held.store(true, Ordering::Release);
+            telemetry.record_laser_point(loc.x, loc.y);
+        } else if prev_shift_laser && !shift_ink {
+            telemetry.shift_held.store(false, Ordering::Release);
+            telemetry.finish_active_laser(Some((loc.x, loc.y)));
+            let _ = telemetry
+                .ui_sender
+                .try_send(LiveOverlayEvent::RequestSnapshot);
+        }
+
+        prev_shift_ink = shift_ink;
+        prev_shift_laser = shift_laser;
     }
 }
 

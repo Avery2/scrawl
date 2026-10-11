@@ -1,6 +1,6 @@
 //! PNG output and deterministic, CPU-rendered review images.
 use crate::model::*;
-use crate::sketch::{FreehandOptions, freehand_outline, smooth_laser_points};
+use crate::sketch::{FreehandOptions, freehand_outline, slice_laser_window, smooth_laser_points};
 use std::path::Path;
 
 type Color = [u8; 4];
@@ -204,7 +204,7 @@ fn polygon(frame: &mut RgbaFrame, points: &[[f32; 2]], color: Color) {
         return;
     }
     let mut coverage = vec![0.0f32; right - left];
-    let mut crossings = Vec::with_capacity(points.len());
+    let mut crossings: Vec<(f32, i32)> = Vec::with_capacity(points.len());
     for y in top..bottom {
         coverage.fill(0.0);
         for sample in 0..4 {
@@ -213,20 +213,31 @@ fn polygon(frame: &mut RgbaFrame, points: &[[f32; 2]], color: Color) {
             for i in 0..points.len() {
                 let a = points[i];
                 let b = points[(i + 1) % points.len()];
-                if (a[1] <= sy && b[1] > sy) || (b[1] <= sy && a[1] > sy) {
-                    crossings.push(a[0] + (sy - a[1]) / (b[1] - a[1]) * (b[0] - a[0]));
+                if a[1] <= sy && b[1] > sy {
+                    let x = a[0] + (sy - a[1]) / (b[1] - a[1]) * (b[0] - a[0]);
+                    crossings.push((x, 1));
+                } else if b[1] <= sy && a[1] > sy {
+                    let x = a[0] + (sy - a[1]) / (b[1] - a[1]) * (b[0] - a[0]);
+                    crossings.push((x, -1));
                 }
             }
-            crossings.sort_by(f32::total_cmp);
-            for span in crossings.chunks_exact(2) {
-                let a = span[0].max(left as f32);
-                let b = span[1].min(right as f32);
-                if b <= a {
-                    continue;
+            crossings.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut winding = 0_i32;
+            let mut span_start = 0.0_f32;
+            for &(x, dir) in &crossings {
+                if winding == 0 {
+                    span_start = x;
                 }
-                for x in a.floor() as usize..(b.ceil() as usize).min(right) {
-                    coverage[x - left] +=
-                        ((x as f32 + 1.0).min(b) - (x as f32).max(a)).max(0.0) * 0.25;
+                winding += dir;
+                if winding == 0 {
+                    let a = span_start.max(left as f32);
+                    let b = x.min(right as f32);
+                    if b > a {
+                        for px in a.floor() as usize..(b.ceil() as usize).min(right) {
+                            coverage[px - left] +=
+                                ((px as f32 + 1.0).min(b) - (px as f32).max(a)).max(0.0) * 0.25;
+                        }
+                    }
                 }
             }
         }
@@ -396,18 +407,11 @@ fn draw_pin(frame: &mut RgbaFrame, point: [f32; 2], number: u32, scale: f32, alp
 }
 
 fn draw_laser(frame: &mut RgbaFrame, stroke: &Stroke, time: u64) {
-    let start = time.saturating_sub(LASER_MS);
-    let raw_points: Vec<_> = stroke
-        .timed_points()
-        .into_iter()
-        .filter(|&(_, _, t)| t >= start && t <= time)
-        .map(|(x, y, t)| {
-            (
-                [x * frame.width as f32, y * frame.height as f32],
-                1.0 - time.saturating_sub(t) as f32 / LASER_MS as f32,
-            )
-        })
-        .collect();
+    let fw = frame.width as f32;
+    let fh = frame.height as f32;
+    let raw_points = slice_laser_window(&stroke.timed_points(), time, LASER_MS, |x, y| {
+        [x * fw, y * fh]
+    });
     if raw_points.is_empty() {
         return;
     }
@@ -430,8 +434,8 @@ fn draw_laser(frame: &mut RgbaFrame, stroke: &Stroke, time: u64) {
         for pair in points.windows(2) {
             let (a, fa) = pair[0];
             let (b, fb) = pair[1];
-            let w0 = radius * (0.10 + 0.90 * fa.powf(0.75));
-            let w1 = radius * (0.10 + 0.90 * fb.powf(0.75));
+            let w0 = radius * fa.powf(0.70);
+            let w1 = radius * fb.powf(0.70);
             let seg_alpha = alpha * ((fa + fb) * 0.5).powf(power);
             line(frame, a, b, w0, w1, opacity(color, seg_alpha));
         }

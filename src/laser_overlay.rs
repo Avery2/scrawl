@@ -21,10 +21,10 @@ use objc2_foundation::{NSPoint, NSRect};
 use objc2_quartz_core::CALayer;
 
 use crate::capture::SharedCaptureTelemetry;
-use crate::sketch::smooth_laser_points;
+use crate::sketch::{slice_laser_window, smooth_ink_points, smooth_laser_points};
 
-const TAIL_DURATION_SEC: f32 = 0.40;
-const MAX_SEGMENTS: usize = 1024;
+const TAIL_DURATION_SEC: f32 = 0.42;
+const MAX_SEGMENTS: usize = 1536;
 const MAX_PINS: usize = 64;
 
 #[repr(C)]
@@ -47,8 +47,8 @@ struct LaserUniforms {
 struct PathSegment {
     a: [f32; 2],
     b: [f32; 2],
-    t0_sec: f32,
-    t1_sec: f32,
+    w0: f32,
+    w1: f32,
     kind: f32,
     width: f32,
 }
@@ -316,35 +316,30 @@ impl SharedMetalOverlay {
                 if stroke.t1 < min_laser_ms {
                     continue;
                 }
-                let raw: Vec<([f32; 2], f32)> = stroke
-                    .timed_points()
-                    .into_iter()
-                    .filter(|&(_, _, t)| t >= min_laser_ms && t <= now_ms.saturating_add(50))
-                    .map(|(nx, ny, t)| (to_screen(nx, ny), t as f32 / 1_000.0))
-                    .collect();
+                let raw = slice_laser_window(&stroke.timed_points(), now_ms, tail_ms, to_screen);
                 let smoothed = smooth_laser_points(&raw);
                 for pair in smoothed.windows(2) {
                     if segments.len() >= MAX_SEGMENTS {
                         break;
                     }
-                    let (a, t0_sec) = pair[0];
-                    let (b, t1_sec) = pair[1];
+                    let (a, w0) = pair[0];
+                    let (b, w1) = pair[1];
                     segments.push(PathSegment {
                         a,
                         b,
-                        t0_sec,
-                        t1_sec,
+                        w0,
+                        w1,
                         kind: 0.0,
                         width: 3.0,
                     });
                 }
             } else {
-                let pts: Vec<([f32; 2], f32)> = stroke
+                let pts: Vec<[f32; 2]> = stroke
                     .normalized_points()
                     .into_iter()
-                    .map(|[nx, ny]| (to_screen(nx, ny), 1.0))
+                    .map(|[nx, ny]| to_screen(nx, ny))
                     .collect();
-                let smoothed = smooth_laser_points(&pts);
+                let smoothed = smooth_ink_points(&pts);
                 for pair in smoothed.windows(2) {
                     if segments.len() >= MAX_SEGMENTS {
                         break;
@@ -352,8 +347,8 @@ impl SharedMetalOverlay {
                     segments.push(PathSegment {
                         a: pair[0].0,
                         b: pair[1].0,
-                        t0_sec: 0.0,
-                        t1_sec: 0.0,
+                        w0: pair[0].1,
+                        w1: pair[1].1,
                         kind: 1.0,
                         width: ink_width,
                     });
@@ -361,8 +356,7 @@ impl SharedMetalOverlay {
             }
         }
 
-        let shift_held = self.telemetry.shift_held.load(Ordering::Acquire)
-            && !self.telemetry.draw_mode.load(Ordering::Acquire);
+        let shift_held = self.telemetry.shift_held.load(Ordering::Acquire);
         let pointer = *self
             .telemetry
             .pointer_screen

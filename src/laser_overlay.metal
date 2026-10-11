@@ -15,13 +15,13 @@ struct LaserUniforms {
 };
 
 // Each segment connects A -> B in logical screen points.
-// kind == 0.0: time-decaying laser segment (t0_sec..t1_sec)
-// kind == 1.0: persistent ink segment
+// kind == 0.0: tapered laser segment (w0..w1 = combined arc + time weight 0..1)
+// kind == 1.0: persistent ink segment (w0..w1 = simulated pressure scale)
 struct PathSegment {
     float2 a;
     float2 b;
-    float t0_sec;
-    float t1_sec;
+    float w0;
+    float w1;
     float kind;
     float width;
 };
@@ -58,15 +58,16 @@ fragment float4 laser_fragment(
     // Pixel position in logical screen points (top-left origin).
     float2 p = (in.uv * u.resolution) / max(u.scale, 1.0);
 
-    float3 laser_red = float3(1.0, 0.14, 0.18);
-    float3 laser_hot = float3(1.0, 0.96, 0.96);
+    float3 laser_red = float3(1.0, 0.16, 0.19);
+    float3 laser_hot = float3(1.0, 0.97, 0.97);
 
-    float laser_core_energy = 0.0;
-    float laser_glow_energy = 0.0;
+    float laser_core_cov = 0.0;
+    float laser_body_cov = 0.0;
+    float laser_glow_cov = 0.0;
     float ink_halo_cov = 0.0;
     float ink_red_cov = 0.0;
 
-    uint count = min(u.segment_count, 1024u);
+    uint count = min(u.segment_count, 1536u);
     for (uint i = 0; i < count; ++i) {
         PathSegment seg = segments[i];
         float2 ab = seg.b - seg.a;
@@ -74,32 +75,29 @@ fragment float4 laser_fragment(
         float h = clamp(dot(p - seg.a, ab) / len2, 0.0, 1.0);
         float2 closest = seg.a + ab * h;
         float d = length(p - closest);
+        float w = clamp(mix(seg.w0, seg.w1, h), 0.0, 1.25);
 
         if (seg.kind < 0.5) {
-            // Time-based laser segment: each point along the segment has its own birth time.
-            // As `now_sec` advances, the tail smoothly retracts into the tip.
-            float t_pt = mix(seg.t0_sec, seg.t1_sec, h);
-            float age = max(0.0, u.now_sec - t_pt);
-            if (age >= u.tail_duration) {
+            if (w <= 0.002) {
                 continue;
             }
-            float life = smoothstep(0.0, 1.0, 1.0 - age / max(u.tail_duration, 0.01));
-            // Taper both width and intensity smoothly toward the vanishing tail.
-            float core_sigma = max(0.45, 1.25 * pow(life, 0.65));
-            float glow_sigma = max(1.8, 6.2 * (0.35 + 0.65 * life));
-
-            if (d < glow_sigma * 3.2) {
-                float core = exp(-(d * d) / (core_sigma * core_sigma)) * pow(life, 1.25);
-                float glow = exp(-(d * d) / (glow_sigma * glow_sigma)) * pow(life, 1.05);
-                laser_core_energy = max(laser_core_energy, core);
-                laser_glow_energy = max(laser_glow_energy, glow);
+            float glow_sigma = max(1.4, 6.2 * (0.28 + 0.72 * w));
+            if (d < glow_sigma * 3.0) {
+                float body_r = 2.45 * pow(w, 0.68);
+                float core_r = 0.90 * pow(w, 0.82);
+                float body = smoothstep(body_r + 0.85, max(0.0, body_r - 0.85), d) * pow(w, 0.40);
+                float core = smoothstep(core_r + 0.75, max(0.0, core_r - 0.75), d) * pow(w, 0.72);
+                float glow = exp(-(d * d) / (glow_sigma * glow_sigma)) * pow(w, 0.92);
+                laser_body_cov = max(laser_body_cov, body);
+                laser_core_cov = max(laser_core_cov, core);
+                laser_glow_cov = max(laser_glow_cov, glow);
             }
         } else {
-            // Persistent ink stroke: crisp white halo + red stroke.
-            float r = seg.width * 0.5;
+            // Persistent ink stroke: smooth variable-width pressure + crisp white halo.
+            float r = seg.width * 0.5 * max(w, 0.35);
             if (d < r + 3.5) {
-                float halo = smoothstep(r + 2.2, r + 1.0, d);
-                float fill = smoothstep(r + 0.6, r - 0.6, d);
+                float halo = smoothstep(r + 2.3, r + 0.9, d);
+                float fill = smoothstep(r + 0.75, max(0.0, r - 0.75), d);
                 ink_halo_cov = max(ink_halo_cov, halo);
                 ink_red_cov = max(ink_red_cov, fill);
             }
@@ -112,8 +110,8 @@ fragment float4 laser_fragment(
         PinMarker pin = pins[i];
         float d = length(p - pin.pos);
         if (d < pin.radius + 3.5) {
-            float halo = smoothstep(pin.radius + 2.4, pin.radius + 1.2, d);
-            float fill = smoothstep(pin.radius + 0.6, pin.radius - 0.6, d);
+            float halo = smoothstep(pin.radius + 2.4, pin.radius + 1.1, d);
+            float fill = smoothstep(pin.radius + 0.75, pin.radius - 0.75, d);
             ink_halo_cov = max(ink_halo_cov, halo);
             ink_red_cov = max(ink_red_cov, fill);
         }
@@ -122,12 +120,14 @@ fragment float4 laser_fragment(
     // Active laser diode pinpoint at the cursor tip.
     if (u.tip_active > 0.01) {
         float d_tip = length(p - u.tip_pos);
-        if (d_tip < 24.0) {
-            float pulse = 0.95 + 0.05 * sin(u.now_sec * 28.0);
-            float tip_core = exp(-(d_tip * d_tip) / (1.75 * 1.75)) * u.tip_active;
-            float tip_glow = exp(-(d_tip * d_tip) / (6.8 * 6.8 * pulse)) * u.tip_active * 1.15;
-            laser_core_energy = max(laser_core_energy, tip_core);
-            laser_glow_energy = max(laser_glow_energy, tip_glow);
+        if (d_tip < 22.0) {
+            float pulse = 0.96 + 0.04 * sin(u.now_sec * 24.0);
+            float tip_body = smoothstep(2.9, 1.2, d_tip) * u.tip_active;
+            float tip_core = smoothstep(1.5, 0.3, d_tip) * u.tip_active;
+            float tip_glow = exp(-(d_tip * d_tip) / (6.4 * 6.4 * pulse)) * u.tip_active;
+            laser_body_cov = max(laser_body_cov, tip_body);
+            laser_core_cov = max(laser_core_cov, tip_core);
+            laser_glow_cov = max(laser_glow_cov, tip_glow);
         }
     }
 
@@ -146,11 +146,10 @@ fragment float4 laser_fragment(
         out.a = a + out.a * (1.0 - a);
     }
 
-    // 2. Composite optical laser (subtle ruby glow + incandescent white-pink core)
-    float laser_alpha = clamp(laser_glow_energy * 0.58 + laser_core_energy * 0.92, 0.0, 1.0);
+    // 2. Composite optical laser (soft atmospheric bloom + anti-aliased ruby ribbon + white-hot core)
+    float laser_alpha = clamp(laser_glow_cov * 0.42 + laser_body_cov * 0.88 + laser_core_cov * 0.95, 0.0, 1.0);
     if (laser_alpha > 0.002) {
-        float3 col = mix(laser_red, laser_hot, clamp(pow(laser_core_energy, 1.35), 0.0, 1.0));
-        // Premultiplied output for CAMetalLayer with non-opaque background
+        float3 col = mix(laser_red, laser_hot, clamp(laser_core_cov * 0.92, 0.0, 1.0));
         out.rgb = col * laser_alpha + out.rgb * (1.0 - laser_alpha);
         out.a = laser_alpha + out.a * (1.0 - laser_alpha);
     }

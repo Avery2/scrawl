@@ -5,29 +5,30 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Application, Bounds, Context, Div, Entity, FocusHandle, FontWeight, Image,
-    ImageFormat, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
-    Point, Render, SharedString, Size, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowKind, WindowOptions, div, img, point, prelude::*, px, rgb, rgba, size,
+    ImageFormat, IntoElement, KeyDownEvent, MouseButton, Pixels, Point, Render, SharedString, Size,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, img, point,
+    prelude::*, px, rgb, rgba, size,
 };
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{DefinedClass, MainThreadOnly, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSStatusWindowLevel, NSWindow,
-    NSWindowButton, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSWindowButton, NSWindowCollectionBehavior,
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSString};
 use screencapturekit::prelude::*;
 use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
 
 use crate::capture::{
-    LiveOverlayEvent, ScreenCaptureSession, SharedCaptureTelemetry, ax_element_at, discover_target,
-    start_global_input_tap,
+    LiveOverlayEvent, ScreenCaptureSession, SharedCaptureTelemetry, discover_target,
+    install_global_hotkeys, set_escape_hotkey_enabled, shortcut_from_key_and_mods,
+    start_global_input_tap, update_global_shortcut,
 };
 use crate::hex::AudioRecorder;
 use crate::laser_overlay::MetalLaserOverlay;
-use crate::model::{SCALE, ScrawlBundle, Stroke, TargetInfo, format_clock};
-use crate::sketch::{bounds as points_bounds, timeline};
+use crate::model::{ScrawlBundle, TargetInfo, format_clock};
+use crate::sketch::timeline;
 
 const SIDEBAR_BG: u32 = 0x111111;
 const CANVAS_BG: u32 = 0x161616;
@@ -121,7 +122,7 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
         menu.addItem(&item);
     };
 
-    add("Record Scrawl  ⌃⌥⌘S", sel!(toggleCapture:));
+    add("Record Scrawl  ⌥S", sel!(toggleCapture:));
     add("Open Latest Bundle", sel!(openLatest:));
     add("Generate Demo Bundle", sel!(runDemo:));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -181,7 +182,7 @@ fn sync_full_size_content_view(ns_window: &NSWindow) {
     }
 }
 
-fn configure_floating_window(ns_window: &NSWindow, ignores_mouse: bool, full_screen_overlay: bool) {
+fn configure_floating_window(ns_window: &NSWindow, ignores_mouse: bool) {
     ns_window.setHidesOnDeactivate(false);
     ns_window.setIgnoresMouseEvents(ignores_mouse);
     ns_window.setLevel(NSStatusWindowLevel + 1);
@@ -189,13 +190,6 @@ fn configure_floating_window(ns_window: &NSWindow, ignores_mouse: bool, full_scr
         NSWindowCollectionBehavior::CanJoinAllSpaces
             | NSWindowCollectionBehavior::FullScreenAuxiliary,
     );
-    if full_screen_overlay {
-        ns_window
-            .setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
-        if let Some(screen) = ns_window.screen() {
-            ns_window.setFrame_display(screen.frame(), true);
-        }
-    }
     sync_full_size_content_view(ns_window);
 }
 
@@ -211,8 +205,7 @@ struct ActiveRecording {
 pub struct ScrawlCoordinator {
     telemetry: Arc<SharedCaptureTelemetry>,
     active_recording: Option<ActiveRecording>,
-    active_stroke: Option<Stroke>,
-    caption: String,
+    recording_shortcut_key: bool,
     review_bundle: Option<(PathBuf, ScrawlBundle)>,
     review_status: Option<String>,
     selected_tab: ReviewTab,
@@ -233,8 +226,7 @@ impl ScrawlCoordinator {
         Self {
             telemetry,
             active_recording: None,
-            active_stroke: None,
-            caption: String::new(),
+            recording_shortcut_key: false,
             review_bundle: initial_bundle,
             review_status: None,
             selected_tab: ReviewTab::ContactSheet,
@@ -246,10 +238,13 @@ impl ScrawlCoordinator {
         self.active_recording.is_some()
     }
 
-    pub fn is_drawing(&self) -> bool {
+    pub fn shortcut_label(&self) -> String {
         self.telemetry
-            .draw_mode
-            .load(std::sync::atomic::Ordering::Acquire)
+            .shortcut
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .label
+            .clone()
     }
 
     pub fn set_review_bundle(&mut self, bundle: (PathBuf, ScrawlBundle), status: Option<String>) {
@@ -257,24 +252,6 @@ impl ScrawlCoordinator {
         self.review_status = status;
         self.selected_tab = ReviewTab::ContactSheet;
         self.selected_keyframe = 0;
-    }
-
-    pub fn toggle_draw_mode(&mut self, cx: &mut Context<Self>) {
-        if !self.is_recording() {
-            return;
-        }
-        let next = !self.is_drawing();
-        self.telemetry.finish_active_laser(None);
-        *self
-            .telemetry
-            .live_ink
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        self.active_stroke = None;
-        self.telemetry
-            .draw_mode
-            .store(next, std::sync::atomic::Ordering::Release);
-        cx.notify();
     }
 
     pub fn undo_stroke(&mut self, cx: &mut Context<Self>) {
@@ -300,6 +277,7 @@ impl ScrawlCoordinator {
         if self.is_recording() {
             return;
         }
+        self.recording_shortcut_key = false;
         let target = discover_target(None);
         let id = crate::make_bundle_id();
         let bundle_dir = crate::handoff::default_captures_dir().join(format!("{id}.scrawl"));
@@ -307,6 +285,7 @@ impl ScrawlCoordinator {
         let video_path = bundle_dir.join("recording.mp4");
 
         self.telemetry.reset_for_session(target.frame);
+        set_escape_hotkey_enabled(true);
         let metal_overlay = MetalLaserOverlay::open(Arc::clone(&self.telemetry)).ok();
         if let Some(ref overlay) = metal_overlay {
             self.telemetry
@@ -328,8 +307,6 @@ impl ScrawlCoordinator {
             audio_recorder,
             _metal_overlay: metal_overlay,
         });
-        self.active_stroke = None;
-        self.caption.clear();
 
         let entity = cx.entity().clone();
         cx.defer(move |cx| open_capture_windows(&entity, cx));
@@ -337,6 +314,7 @@ impl ScrawlCoordinator {
     }
 
     pub fn cancel_recording(&mut self, cx: &mut Context<Self>) {
+        set_escape_hotkey_enabled(false);
         let Some(rec) = self.active_recording.take() else {
             return;
         };
@@ -346,24 +324,15 @@ impl ScrawlCoordinator {
             let _ = audio.stop();
         }
         let _ = std::fs::remove_dir_all(rec.bundle_dir);
-        self.active_stroke = None;
         cx.defer(close_capture_windows);
         cx.notify();
     }
 
     pub fn finish_recording(&mut self, cx: &mut Context<Self>) {
+        set_escape_hotkey_enabled(false);
         let Some(rec) = self.active_recording.take() else {
             return;
         };
-        if let Some(stroke) = self.active_stroke.take()
-            && stroke.pts.len() >= 3
-        {
-            self.telemetry
-                .strokes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(stroke);
-        }
         let (events, strokes) = self.telemetry.finish_session();
         let (frames, video_path, duration_ms) = rec.screen_session.stop();
         let recorded_audio = rec.audio_recorder.and_then(|r| r.stop().ok());
@@ -405,7 +374,6 @@ impl Render for HudPillWindow {
             .active_recording
             .as_ref()
             .map_or(0, |r| r.screen_session.elapsed_ms());
-        let drawing = coord.is_drawing();
         let stroke_count = coord
             .telemetry
             .strokes
@@ -414,15 +382,7 @@ impl Render for HudPillWindow {
             .iter()
             .filter(|s| !s.laser)
             .count();
-        let caption = if !coord.caption.is_empty() {
-            coord.caption.clone()
-        } else if drawing {
-            "Drawing ink · Shift-click pin · D to interact".into()
-        } else {
-            "Hold ⇧ laser · ⇧-drag or D to draw".into()
-        };
 
-        let c_draw = self.coordinator.clone();
         let c_undo = self.coordinator.clone();
         let c_cancel = self.coordinator.clone();
         let c_finish = self.coordinator.clone();
@@ -433,17 +393,20 @@ impl Render for HudPillWindow {
             .items_center()
             .justify_between()
             .px_3()
-            .rounded(px(22.0))
-            .bg(rgba(0x161616e8))
+            .rounded(px(21.0))
+            .bg(rgba(0x161616ee))
             .border_1()
             .border_color(rgb(LINE_COLOR))
             .text_color(rgb(TEXT_COLOR))
             .text_size(px(12.5))
+            .whitespace_nowrap()
             .child(
                 div()
                     .flex()
+                    .flex_shrink_0()
                     .items_center()
                     .gap_2()
+                    .whitespace_nowrap()
                     .on_mouse_down(MouseButton::Left, |_, window, _| {
                         window.start_window_move();
                     })
@@ -451,46 +414,27 @@ impl Render for HudPillWindow {
                     .child(
                         div()
                             .font_weight(FontWeight::SEMIBOLD)
+                            .whitespace_nowrap()
                             .child(format_clock(elapsed_ms)),
-                    )
-                    .child(
-                        div()
-                            .pl_2()
-                            .max_w(px(210.0))
-                            .overflow_x_hidden()
-                            .text_color(if drawing {
-                                rgb(ACCENT_COLOR)
-                            } else {
-                                rgb(MUTED_COLOR)
-                            })
-                            .child(caption),
                     ),
             )
             .child(
                 div()
                     .flex()
+                    .flex_shrink_0()
                     .items_center()
                     .gap_1p5()
+                    .whitespace_nowrap()
+                    .child(pill_chip("hud-undo", "Undo", stroke_count > 0).when(
+                        stroke_count > 0,
+                        |d| {
+                            d.on_click(move |_, _, cx| {
+                                c_undo.update(cx, |coord, cx| coord.undo_stroke(cx));
+                            })
+                        },
+                    ))
                     .child(
-                        pill_chip(
-                            "hud-draw",
-                            if drawing { "✎ Draw On" } else { "✎ Draw" },
-                            drawing,
-                        )
-                        .on_click(move |_, _, cx| {
-                            c_draw.update(cx, |coord, cx| coord.toggle_draw_mode(cx));
-                        }),
-                    )
-                    .when(stroke_count > 0, |d| {
-                        d.child(
-                            pill_chip("hud-undo", &format!("Undo ({stroke_count})"), false)
-                                .on_click(move |_, _, cx| {
-                                    c_undo.update(cx, |coord, cx| coord.undo_stroke(cx));
-                                }),
-                        )
-                    })
-                    .child(
-                        pill_chip("hud-cancel", "Cancel", false).on_click(move |_, _, cx| {
+                        pill_chip("hud-cancel", "Cancel", true).on_click(move |_, _, cx| {
                             c_cancel.update(cx, |coord, cx| coord.cancel_recording(cx));
                         }),
                     )
@@ -501,7 +445,9 @@ impl Render for HudPillWindow {
                             .px_3()
                             .rounded(px(14.0))
                             .flex()
+                            .flex_shrink_0()
                             .items_center()
+                            .whitespace_nowrap()
                             .bg(rgb(ACCENT_COLOR))
                             .text_color(rgb(TEXT_COLOR))
                             .font_weight(FontWeight::SEMIBOLD)
@@ -515,227 +461,43 @@ impl Render for HudPillWindow {
     }
 }
 
-fn pill_chip(id: &'static str, label: &str, active: bool) -> gpui::Stateful<Div> {
+fn pill_chip(id: &'static str, label: &'static str, enabled: bool) -> gpui::Stateful<Div> {
     div()
         .id(id)
         .h(px(28.0))
         .px_2p5()
         .rounded(px(14.0))
         .flex()
+        .flex_shrink_0()
         .items_center()
+        .whitespace_nowrap()
         .border_1()
-        .border_color(if active {
-            rgb(ACCENT_COLOR)
-        } else {
-            rgb(LINE_COLOR)
-        })
-        .bg(if active {
-            rgb(ACCENT_COLOR)
-        } else {
-            rgb(SURFACE_BG)
-        })
-        .text_color(if active {
-            rgb(TEXT_COLOR)
-        } else {
+        .border_color(rgb(LINE_COLOR))
+        .bg(rgb(SURFACE_BG))
+        .text_color(if enabled {
             rgb(TEXT_SOFT)
+        } else {
+            rgb(0x555555)
         })
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(SURFACE_HOVER)))
-        .child(label.trim().to_string())
-}
-
-pub struct OverlayCanvasWindow {
-    coordinator: Entity<ScrawlCoordinator>,
-    focus: FocusHandle,
-    ns_window: Option<Retained<NSWindow>>,
-}
-
-impl Render for OverlayCanvasWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let coord = self.coordinator.read(cx);
-        let drawing = coord.is_drawing();
-        if let Some(ref ns_win) = self.ns_window {
-            ns_win.setIgnoresMouseEvents(!drawing);
-            sync_full_size_content_view(ns_win);
-        }
-
-        let c_down = self.coordinator.clone();
-        let c_move = self.coordinator.clone();
-        let c_up = self.coordinator.clone();
-        let c_key = self.coordinator.clone();
-        let ns_win_down = self.ns_window.clone();
-        let ns_win_up = self.ns_window.clone();
-
-        div()
-            .id("scrawl-overlay-canvas")
-            .track_focus(&self.focus)
-            .size_full()
-            .relative()
-            .when(drawing, |d| {
-                d.border_2()
-                    .border_color(rgba(0x3b5cf666))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        move |event: &MouseDownEvent, window, cx| {
-                            let win_bounds = window.bounds();
-                            let screen_x = f64::from(
-                                f32::from(win_bounds.origin.x) + f32::from(event.position.x),
-                            );
-                            let screen_y = f64::from(
-                                f32::from(win_bounds.origin.y) + f32::from(event.position.y),
-                            );
-                            let ns_win_down = ns_win_down.clone();
-                            c_down.update(cx, |coord, cx| {
-                                let t_ms = coord.telemetry.elapsed_ms();
-                                let (nx, ny, fw, fh) =
-                                    coord.telemetry.normalize_point(screen_x, screen_y);
-                                let sx = (nx * SCALE as f32).round() as i32;
-                                let sy = (ny * SCALE as f32).round() as i32;
-                                if event.modifiers.shift {
-                                    if let Some(ref ns_win) = ns_win_down {
-                                        ns_win.setIgnoresMouseEvents(true);
-                                    }
-                                    let on = ax_element_at(screen_x, screen_y).map(|(l, _)| l);
-                                    if let Some(ref ns_win) = ns_win_down {
-                                        ns_win.setIgnoresMouseEvents(false);
-                                    }
-                                    let mut guard = coord
-                                        .telemetry
-                                        .strokes
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    let pin_num =
-                                        guard.iter().filter(|s| s.pin.is_some()).count() as u32 + 1;
-                                    guard.push(Stroke {
-                                        t0: t_ms,
-                                        t1: t_ms,
-                                        fw,
-                                        fh,
-                                        on,
-                                        pin: Some(pin_num),
-                                        laser: false,
-                                        pts: vec![sx, sy, 0],
-                                    });
-                                    coord.request_immediate_frame();
-                                } else {
-                                    let stroke = Stroke {
-                                        t0: t_ms,
-                                        t1: t_ms,
-                                        fw,
-                                        fh,
-                                        on: None,
-                                        pin: None,
-                                        laser: false,
-                                        pts: vec![sx, sy, 0],
-                                    };
-                                    *coord
-                                        .telemetry
-                                        .live_ink
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                        Some(stroke.clone());
-                                    coord.active_stroke = Some(stroke);
-                                }
-                                cx.notify();
-                            });
-                        },
-                    )
-                    .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
-                        if !event.dragging() {
-                            return;
-                        }
-                        let win_bounds = window.bounds();
-                        let screen_x =
-                            f64::from(f32::from(win_bounds.origin.x) + f32::from(event.position.x));
-                        let screen_y =
-                            f64::from(f32::from(win_bounds.origin.y) + f32::from(event.position.y));
-                        c_move.update(cx, |coord, cx| {
-                            let t_ms = coord.telemetry.elapsed_ms();
-                            let (nx, ny, _, _) =
-                                coord.telemetry.normalize_point(screen_x, screen_y);
-                            let sx = (nx * SCALE as f32).round() as i32;
-                            let sy = (ny * SCALE as f32).round() as i32;
-                            if let Some(ref mut stroke) = coord.active_stroke {
-                                let dt = t_ms.saturating_sub(stroke.t0) as i32;
-                                stroke.pts.extend_from_slice(&[sx, sy, dt]);
-                                stroke.t1 = t_ms;
-                                *coord
-                                    .telemetry
-                                    .live_ink
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    Some(stroke.clone());
-                                cx.notify();
-                            }
-                        });
-                    })
-                    .on_mouse_up(MouseButton::Left, move |_, _window, cx| {
-                        let ns_win_up = ns_win_up.clone();
-                        c_up.update(cx, |coord, cx| {
-                            *coord
-                                .telemetry
-                                .live_ink
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                            if let Some(mut stroke) = coord.active_stroke.take() {
-                                if stroke.pts.len() >= 3 {
-                                    let tf = *coord
-                                        .telemetry
-                                        .target_frame
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    let [x0, y0, x1, y1] =
-                                        points_bounds(&stroke.normalized_points());
-                                    let mid_x = tf.x + f64::from((x0 + x1) * 0.5) * tf.width;
-                                    let mid_y = tf.y + f64::from((y0 + y1) * 0.5) * tf.height;
-                                    if let Some(ref ns_win) = ns_win_up {
-                                        ns_win.setIgnoresMouseEvents(true);
-                                    }
-                                    stroke.on = ax_element_at(mid_x, mid_y).map(|(l, _)| l);
-                                    if let Some(ref ns_win) = ns_win_up {
-                                        ns_win.setIgnoresMouseEvents(!coord.is_drawing());
-                                    }
-                                    coord
-                                        .telemetry
-                                        .strokes
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .push(stroke);
-                                    coord.request_immediate_frame();
-                                }
-                                cx.notify();
-                            }
-                        });
-                    })
-            })
-            .on_key_down(move |event: &KeyDownEvent, _, cx| {
-                let key = event.keystroke.key.as_str();
-                if key.eq_ignore_ascii_case("d") && !event.keystroke.modifiers.platform {
-                    c_key.update(cx, |coord, cx| coord.toggle_draw_mode(cx));
-                } else if key == "escape" {
-                    c_key.update(cx, |coord, cx| {
-                        if coord.is_drawing() {
-                            coord.toggle_draw_mode(cx);
-                        } else {
-                            coord.cancel_recording(cx);
-                        }
-                    });
-                }
-            })
-    }
+        .when(enabled, |d| {
+            d.cursor_pointer().hover(|s| s.bg(rgb(SURFACE_HOVER)))
+        })
+        .child(label)
 }
 
 pub struct BundleReviewWindow {
     coordinator: Entity<ScrawlCoordinator>,
+    focus: FocusHandle,
     cached_sheet_path: Option<PathBuf>,
     cached_sheet_image: Option<Arc<Image>>,
     cached_frames: Vec<Option<Arc<Image>>>,
 }
 
 impl BundleReviewWindow {
-    fn new(coordinator: Entity<ScrawlCoordinator>) -> Self {
+    fn new(coordinator: Entity<ScrawlCoordinator>, focus: FocusHandle) -> Self {
         Self {
             coordinator,
+            focus,
             cached_sheet_path: None,
             cached_sheet_image: None,
             cached_frames: Vec::new(),
@@ -771,10 +533,19 @@ impl Render for BundleReviewWindow {
             }
         }
         let stage_w = (f32::from(window.bounds().size.width) - 320.0 - 44.0).max(320.0);
-        let state = self.coordinator.read(cx).review_bundle.clone();
-        let status = self.coordinator.read(cx).review_status.clone();
-        let tab = self.coordinator.read(cx).selected_tab;
-        let selected_kf = self.coordinator.read(cx).selected_keyframe;
+        let coord_read = self.coordinator.read(cx);
+        let state = coord_read.review_bundle.clone();
+        let status = coord_read.review_status.clone();
+        let tab = coord_read.selected_tab;
+        let selected_kf = coord_read.selected_keyframe;
+        let shortcut_label = coord_read.shortcut_label();
+        let recording_key = coord_read.recording_shortcut_key;
+        let record_btn_label = format!("Record  {shortcut_label}");
+        let shortcut_chip_label = if recording_key {
+            "Press shortcut…".to_string()
+        } else {
+            format!("Shortcut  {shortcut_label}")
+        };
 
         let Some((dir, bundle)) = state else {
             let c_start = self.coordinator.clone();
@@ -796,16 +567,10 @@ impl Render for BundleReviewWindow {
                 )
                 .child(
                     div()
-                        .text_size(px(13.0))
-                        .text_color(rgb(MUTED_COLOR))
-                        .child("Press ⌃⌥⌘S anywhere to record screen, voice, and marks."),
-                )
-                .child(
-                    div()
                         .flex()
                         .gap_2()
                         .child(
-                            action_button("empty-record", "Record  ⌃⌥⌘S", true).on_click(
+                            action_button("empty-record", &record_btn_label, true).on_click(
                                 move |_, _, cx| {
                                     c_start.update(cx, |coord, cx| coord.start_recording(cx));
                                 },
@@ -841,14 +606,46 @@ impl Render for BundleReviewWindow {
         let timeline = timeline(&bundle);
 
         let c_record = self.coordinator.clone();
+        let c_shortcut = self.coordinator.clone();
+        let c_keydown = self.coordinator.clone();
         let c_copy = self.coordinator.clone();
         let c_send = self.coordinator.clone();
         let c_tab_sheet = self.coordinator.clone();
         let c_tab_frames = self.coordinator.clone();
         let copy_dir = dir.clone();
         let send_dir = dir.clone();
+        let focus = self.focus.clone();
 
         div()
+            .id("scrawl-review-root")
+            .track_focus(&self.focus)
+            .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                c_keydown.update(cx, |coord, cx| {
+                    if !coord.recording_shortcut_key {
+                        return;
+                    }
+                    let key = event.keystroke.key.as_str();
+                    if key == "escape" {
+                        coord.recording_shortcut_key = false;
+                        cx.notify();
+                        return;
+                    }
+                    let mods = event.keystroke.modifiers;
+                    if let Some(cfg) = shortcut_from_key_and_mods(
+                        key,
+                        mods.platform,
+                        mods.control,
+                        mods.alt,
+                        mods.shift,
+                    ) {
+                        let new_label = cfg.label.clone();
+                        update_global_shortcut(&coord.telemetry, cfg);
+                        coord.recording_shortcut_key = false;
+                        coord.review_status = Some(format!("Shortcut set to {new_label}"));
+                        cx.notify();
+                    }
+                });
+            })
             .size_full()
             .flex()
             .flex_col()
@@ -945,11 +742,24 @@ impl Render for BundleReviewWindow {
                                         .child(msg),
                                 )
                             })
-                            .child(action_button("btn-record", "Record  ⌃⌥⌘S", false).on_click(
-                                move |_, _, cx| {
-                                    c_record.update(cx, |coord, cx| coord.start_recording(cx));
-                                },
-                            ))
+                            .child(
+                                action_button("btn-shortcut", &shortcut_chip_label, recording_key)
+                                    .on_click(move |_, window, cx| {
+                                        window.focus(&focus);
+                                        c_shortcut.update(cx, |coord, cx| {
+                                            coord.recording_shortcut_key =
+                                                !coord.recording_shortcut_key;
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                            .child(
+                                action_button("btn-record", &record_btn_label, false).on_click(
+                                    move |_, _, cx| {
+                                        c_record.update(cx, |coord, cx| coord.start_recording(cx));
+                                    },
+                                ),
+                            )
                             .child(
                                 action_button("btn-reveal", "Show in Finder", false).on_click(
                                     move |_, _, cx| {
@@ -1208,14 +1018,16 @@ fn tab_chip(id: &'static str, label: &'static str, selected: bool) -> gpui::Stat
         .child(label)
 }
 
-fn action_button(id: &'static str, label: &'static str, primary: bool) -> gpui::Stateful<Div> {
+fn action_button(id: &'static str, label: &str, primary: bool) -> gpui::Stateful<Div> {
     div()
         .id(id)
         .h(px(30.0))
         .px_3()
         .rounded(px(6.0))
         .flex()
+        .flex_shrink_0()
         .items_center()
+        .whitespace_nowrap()
         .text_size(px(12.5))
         .font_weight(FontWeight::MEDIUM)
         .border_1()
@@ -1238,7 +1050,7 @@ fn action_button(id: &'static str, label: &'static str, primary: bool) -> gpui::
                 rgb(SURFACE_HOVER)
             })
         })
-        .child(SharedString::from(label))
+        .child(SharedString::from(label.to_string()))
 }
 
 fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
@@ -1253,55 +1065,8 @@ fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
     );
     let display_id = display.as_ref().map(|d| d.id());
 
-    // 1. Full-screen transparent overlay window (ignoresMouseEvents = true initially)
-    let overlay_coord = coord_entity.clone();
-    if let Ok(_) = cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds {
-                origin: Point::default(),
-                size: display_bounds.size,
-            })),
-            display_id,
-            titlebar: None,
-            focus: false,
-            show: true,
-            kind: WindowKind::PopUp,
-            is_movable: false,
-            is_resizable: false,
-            is_minimizable: false,
-            window_background: WindowBackgroundAppearance::Transparent,
-            ..Default::default()
-        },
-        move |window, cx| {
-            let ns_window = newest_ns_window();
-            if let Some(ref w) = ns_window {
-                configure_floating_window(w, true, true);
-                let num = w.windowNumber().max(0) as u32;
-                if num > 0 {
-                    overlay_coord
-                        .read(cx)
-                        .telemetry
-                        .excluded_window_ids
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(num);
-                }
-            }
-            let focus = cx.focus_handle();
-            window.focus(&focus);
-            cx.new(|cx| {
-                cx.observe(&overlay_coord, |_, _, cx| cx.notify()).detach();
-                OverlayCanvasWindow {
-                    coordinator: overlay_coord,
-                    focus,
-                    ns_window,
-                }
-            })
-        },
-    ) {}
-
-    // 2. Compact floating HUD pill positioned cleanly below the 37pt macOS menu bar
-    let pill_size: Size<Pixels> = size(px(540.0), px(44.0));
+    // Compact, single-line floating HUD pill positioned cleanly below the 37pt macOS menu bar
+    let pill_size: Size<Pixels> = size(px(328.0), px(42.0));
     let pill_bounds = Bounds {
         origin: point(
             (display_bounds.size.width - pill_size.width) * 0.5,
@@ -1326,7 +1091,7 @@ fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
         },
         move |_, cx| {
             if let Some(ns_win) = newest_ns_window() {
-                configure_floating_window(&ns_win, false, false);
+                configure_floating_window(&ns_win, false);
                 let num = ns_win.windowNumber().max(0) as u32;
                 if num > 0 {
                     pill_coord
@@ -1350,9 +1115,7 @@ fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
 
 fn close_capture_windows(cx: &mut App) {
     for handle in cx.windows() {
-        if handle.downcast::<HudPillWindow>().is_some()
-            || handle.downcast::<OverlayCanvasWindow>().is_some()
-        {
+        if handle.downcast::<HudPillWindow>().is_some() {
             let _ = handle.update(cx, |_, window, _| window.remove_window());
         }
     }
@@ -1384,13 +1147,15 @@ fn open_review_window(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
             window_background: WindowBackgroundAppearance::Opaque,
             ..Default::default()
         },
-        move |_, cx| {
+        move |window, cx| {
             if let Some(ns_win) = newest_ns_window() {
                 sync_full_size_content_view(&ns_win);
             }
+            let focus = cx.focus_handle();
+            window.focus(&focus);
             cx.new(|cx| {
                 cx.observe(&coord_clone, |_, _, cx| cx.notify()).detach();
-                BundleReviewWindow::new(coord_clone)
+                BundleReviewWindow::new(coord_clone, focus)
             })
         },
     );
@@ -1406,6 +1171,7 @@ pub fn run_app(
     Application::new().run(move |cx: &mut App| {
         let (ui_sender, ui_receiver) = flume::unbounded();
         let telemetry = SharedCaptureTelemetry::new(ui_sender);
+        install_global_hotkeys(&telemetry);
         start_global_input_tap(Arc::clone(&telemetry));
         let menu_rx = install_status_bar();
 
@@ -1516,28 +1282,13 @@ pub fn run_app(
                                     coord.start_recording(cx);
                                 }
                             }
-                            LiveOverlayEvent::ToggleDrawMode => {
-                                coord.toggle_draw_mode(cx);
-                            }
                             LiveOverlayEvent::UndoStroke => {
                                 coord.undo_stroke(cx);
                             }
                             LiveOverlayEvent::CancelCapture => {
-                                if coord.is_drawing() {
-                                    coord.toggle_draw_mode(cx);
-                                } else {
-                                    coord.cancel_recording(cx);
-                                }
-                            }
-                            LiveOverlayEvent::ShiftHeld => {
-                                cx.notify();
+                                coord.cancel_recording(cx);
                             }
                             LiveOverlayEvent::RequestSnapshot => {
-                                coord.request_immediate_frame();
-                                cx.notify();
-                            }
-                            LiveOverlayEvent::ActionCaption(text) => {
-                                coord.caption = text;
                                 coord.request_immediate_frame();
                                 cx.notify();
                             }

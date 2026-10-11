@@ -395,38 +395,207 @@ pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> 
     out
 }
 
-/// Subdivides timed `(x, y, age_0_to_1)` laser samples with Catmull-Rom spline interpolation
-/// so fast pointer motion renders as a continuous optical curve without polygonal corners.
-pub fn smooth_laser_points(points: &[([f32; 2], f32)]) -> Vec<([f32; 2], f32)> {
-    if points.len() < 3 {
-        return points.to_vec();
+/// Extracts the active `[now_ms - tail_ms, now_ms]` window of a timed laser stroke,
+/// linearly interpolating the exact tail cutoff point at `t_cutoff` so the tail
+/// glides continuously along the path at 120Hz instead of snapping vertex-by-vertex.
+pub fn slice_laser_window(
+    timed_points: &[(f32, f32, u64)],
+    now_ms: u64,
+    tail_ms: u64,
+    to_screen: impl Fn(f32, f32) -> [f32; 2],
+) -> Vec<([f32; 2], f32)> {
+    if timed_points.is_empty() || tail_ms == 0 {
+        return Vec::new();
     }
-    let mut out = Vec::with_capacity(points.len() * 4);
-    for i in 0..points.len() - 1 {
-        let p0 = points[i.saturating_sub(1)];
-        let p1 = points[i];
-        let p2 = points[i + 1];
-        let p3 = points[(i + 2).min(points.len() - 1)];
-        let dist = distance(p1.0, p2.0);
-        let steps = (dist / 4.0).ceil().clamp(1.0, 6.0) as usize;
-        for step in 0..steps {
-            let t = step as f32 / steps as f32;
-            let t2 = t * t;
-            let t3 = t2 * t;
-            let coord = |axis: usize| {
-                0.5 * ((2.0 * p1.0[axis])
-                    + (-p0.0[axis] + p2.0[axis]) * t
-                    + (2.0 * p0.0[axis] - 5.0 * p1.0[axis] + 4.0 * p2.0[axis] - p3.0[axis]) * t2
-                    + (-p0.0[axis] + 3.0 * p1.0[axis] - 3.0 * p2.0[axis] + p3.0[axis]) * t3)
-            };
-            let age = p1.1 + (p2.1 - p1.1) * t;
-            out.push(([coord(0), coord(1)], age));
+    let cutoff = now_ms.saturating_sub(tail_ms);
+    let mut out = Vec::with_capacity(timed_points.len() + 1);
+
+    for (idx, &(nx, ny, t)) in timed_points.iter().enumerate() {
+        if t > now_ms.saturating_add(50) {
+            break;
+        }
+        if t < cutoff {
+            if let Some(&(nx1, ny1, t1)) = timed_points.get(idx + 1)
+                && t1 >= cutoff
+                && t1 > t
+            {
+                let frac = ((cutoff - t) as f32 / (t1 - t) as f32).clamp(0.0, 1.0);
+                let p0 = to_screen(nx, ny);
+                let p1 = to_screen(nx1, ny1);
+                out.push((lerp(p0, p1, frac), 0.0));
+            }
+            continue;
+        }
+        let age_ms = now_ms.saturating_sub(t);
+        let life = (1.0 - age_ms as f32 / tail_ms as f32).clamp(0.0, 1.0);
+        out.push((to_screen(nx, ny), life));
+    }
+    out
+}
+
+/// Smooths timed `(x, y, life_0_to_1)` laser samples using tldraw's two-stage pipeline:
+/// 1. Exponential `streamline` low-pass filter to remove mouse/trackpad stairstepping.
+/// 2. Midpoint Quadratic B-Spline (`quadraticCurveTo(P_i, midpoint(P_i, P_{i+1}))`) subdivision,
+///    which is variation-diminishing and $C^1$-continuous (never overshoots or kinks at corners).
+/// 3. Combined arc-length start taper (`u * (2 - u)`) × time-decay life (`smoothstep`) so fast
+///    strokes immediately taper to a fine needle tail and stationary strokes retract smoothly.
+pub fn smooth_laser_points(points: &[([f32; 2], f32)]) -> Vec<([f32; 2], f32)> {
+    if points.is_empty() {
+        return Vec::new();
+    }
+    if points.len() == 1 {
+        return vec![points[0]];
+    }
+
+    // Stage 1: tldraw streamline filter (streamline = 0.62 -> alpha = 0.47)
+    let streamline_alpha = 0.47_f32;
+    let mut filtered = Vec::with_capacity(points.len() + 1);
+    filtered.push(points[0]);
+    for &(pt, life) in &points[1..] {
+        let prev = filtered.last().unwrap().0;
+        let next_pt = lerp(prev, pt, streamline_alpha);
+        if distance(prev, next_pt) >= 0.4 {
+            filtered.push((next_pt, life));
         }
     }
     if let Some(&last) = points.last() {
-        out.push(last);
+        let prev = filtered.last().unwrap().0;
+        if distance(prev, last.0) >= 0.4 {
+            filtered.push((lerp(prev, last.0, 0.65), last.1));
+            filtered.push(last);
+        } else if let Some(slot) = filtered.last_mut() {
+            *slot = last;
+        }
     }
-    out
+
+    // Stage 2: Midpoint Quadratic B-Spline (`quadraticCurveTo(P_i, midpoint(P_i, P_{i+1}))`)
+    let mut curve = Vec::with_capacity(filtered.len() * 6);
+    if filtered.len() == 2 {
+        let (a, la) = filtered[0];
+        let (b, lb) = filtered[1];
+        let steps = (distance(a, b) / 2.5).ceil().clamp(2.0, 16.0) as usize;
+        for s in 0..=steps {
+            let t = s as f32 / steps as f32;
+            curve.push((lerp(a, b, t), la + (lb - la) * t));
+        }
+    } else {
+        let first = filtered[0];
+        let second = filtered[1];
+        let m0 = (lerp(first.0, second.0, 0.5), (first.1 + second.1) * 0.5);
+        let start_steps = (distance(first.0, m0.0) / 2.5).ceil().clamp(2.0, 8.0) as usize;
+        for s in 0..start_steps {
+            let t = s as f32 / start_steps as f32;
+            curve.push((lerp(first.0, m0.0, t), first.1 + (m0.1 - first.1) * t));
+        }
+        for i in 1..filtered.len() - 1 {
+            let prev = filtered[i - 1];
+            let ctrl = filtered[i];
+            let next = filtered[i + 1];
+            let a = (lerp(prev.0, ctrl.0, 0.5), (prev.1 + ctrl.1) * 0.5);
+            let b = if i + 1 == filtered.len() - 1 {
+                next
+            } else {
+                (lerp(ctrl.0, next.0, 0.5), (ctrl.1 + next.1) * 0.5)
+            };
+            let span_len = distance(a.0, ctrl.0) + distance(ctrl.0, b.0);
+            let steps = (span_len / 2.2).ceil().clamp(3.0, 14.0) as usize;
+            for s in 0..steps {
+                let u = s as f32 / steps as f32;
+                let inv = 1.0 - u;
+                let x = inv * inv * a.0[0] + 2.0 * inv * u * ctrl.0[0] + u * u * b.0[0];
+                let y = inv * inv * a.0[1] + 2.0 * inv * u * ctrl.0[1] + u * u * b.0[1];
+                let life = inv * inv * a.1 + 2.0 * inv * u * ctrl.1 + u * u * b.1;
+                curve.push(([x, y], life));
+            }
+        }
+        if let Some(&last) = filtered.last() {
+            curve.push(last);
+        }
+    }
+
+    // Stage 3: Combine tldraw's arc-length start taper (`u * (2 - u)`) with time decay (`life`).
+    let mut lengths = Vec::with_capacity(curve.len());
+    let mut total_len = 0.0_f32;
+    lengths.push(0.0_f32);
+    for pair in curve.windows(2) {
+        total_len += distance(pair[0].0, pair[1].0);
+        lengths.push(total_len);
+    }
+    let taper_dist = total_len.clamp(16.0, 140.0);
+    for (idx, item) in curve.iter_mut().enumerate() {
+        let s = lengths[idx];
+        let u = (s / taper_dist).clamp(0.0, 1.0);
+        let arc_taper = u * (2.0 - u);
+        let life = item.1.clamp(0.0, 1.0);
+        let time_taper = life * life * (3.0 - 2.0 * life);
+        item.1 = (arc_taper * time_taper).clamp(0.0, 1.0);
+    }
+    curve
+}
+
+/// Smooths a persistent ink stroke into `(point, pressure_scale)` samples using
+/// tldraw's streamline filter + midpoint quadratic Bezier curves + simulated velocity pressure.
+pub fn smooth_ink_points(points: &[[f32; 2]]) -> Vec<([f32; 2], f32)> {
+    if points.is_empty() {
+        return Vec::new();
+    }
+    if points.len() == 1 {
+        return vec![(points[0], 0.85)];
+    }
+    let streamline_alpha = 0.45_f32;
+    let mut filtered = Vec::with_capacity(points.len() + 1);
+    filtered.push((points[0], 0.85_f32));
+    let mut pressure = 0.85_f32;
+    for &pt in &points[1..] {
+        let prev = filtered.last().unwrap().0;
+        let next_pt = lerp(prev, pt, streamline_alpha);
+        let d = distance(prev, next_pt);
+        if d >= 0.5 {
+            let speed = (d / 14.0).clamp(0.0, 1.0);
+            let target_w = 1.08 - 0.36 * speed;
+            pressure = pressure + (target_w - pressure) * 0.32;
+            filtered.push((next_pt, pressure.clamp(0.65, 1.12)));
+        }
+    }
+    if let Some(&last) = points.last() {
+        let prev = filtered.last().unwrap().0;
+        if distance(prev, last) >= 0.5 {
+            filtered.push((last, pressure));
+        } else if let Some(slot) = filtered.last_mut() {
+            slot.0 = last;
+        }
+    }
+    if filtered.len() == 2 {
+        return filtered;
+    }
+    let mut curve = Vec::with_capacity(filtered.len() * 4);
+    curve.push(filtered[0]);
+    for i in 1..filtered.len() - 1 {
+        let prev = filtered[i - 1];
+        let ctrl = filtered[i];
+        let next = filtered[i + 1];
+        let a = (lerp(prev.0, ctrl.0, 0.5), (prev.1 + ctrl.1) * 0.5);
+        let b = if i + 1 == filtered.len() - 1 {
+            next
+        } else {
+            (lerp(ctrl.0, next.0, 0.5), (ctrl.1 + next.1) * 0.5)
+        };
+        let steps = ((distance(a.0, ctrl.0) + distance(ctrl.0, b.0)) / 3.0)
+            .ceil()
+            .clamp(2.0, 8.0) as usize;
+        for s in 0..steps {
+            let u = s as f32 / steps as f32;
+            let inv = 1.0 - u;
+            let x = inv * inv * a.0[0] + 2.0 * inv * u * ctrl.0[0] + u * u * b.0[0];
+            let y = inv * inv * a.0[1] + 2.0 * inv * u * ctrl.0[1] + u * u * b.0[1];
+            let w = inv * inv * a.1 + 2.0 * inv * u * ctrl.1 + u * u * b.1;
+            curve.push(([x, y], w));
+        }
+    }
+    if let Some(&last) = filtered.last() {
+        curve.push(last);
+    }
+    curve
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -669,8 +838,8 @@ pub fn freehand_outline(points: &[[f32; 2]], options: &FreehandOptions) -> Vec<[
                 end_radius,
             ),
         );
-        for step in 1..29 {
-            left.push(rotate(cap, end, PI * 3.0 * step as f32 / 29.0));
+        for step in 1..14 {
+            left.push(rotate(cap, end, PI * step as f32 / 14.0));
         }
     }
     let start_right = right.first().copied();
@@ -682,10 +851,36 @@ pub fn freehand_outline(points: &[[f32; 2]], options: &FreehandOptions) -> Vec<[
             left.push(rotate(p, samples[0].point, PI * step as f32 / 13.0));
         }
     }
-    if let Some(&first) = left.first() {
-        left.push(first);
+    smooth_closed_polygon(&left)
+}
+
+/// Applies tldraw's `outline()` quadratic Bezier midpoint pass (`quadraticCurveTo(P_i, midpoint(P_i, P_{i+1}))`)
+/// around a closed outline polygon so freehand strokes have zero polygonal facets.
+fn smooth_closed_polygon(poly: &[[f32; 2]]) -> Vec<[f32; 2]> {
+    if poly.len() < 4 {
+        return poly.to_vec();
     }
-    left
+    let n = poly.len();
+    let mut out = Vec::with_capacity(n * 4);
+    for i in 0..n {
+        let prev = poly[(i + n - 1) % n];
+        let ctrl = poly[i];
+        let next = poly[(i + 1) % n];
+        let a = lerp(prev, ctrl, 0.5);
+        let b = lerp(ctrl, next, 0.5);
+        for s in 0..4 {
+            let u = s as f32 / 4.0;
+            let inv = 1.0 - u;
+            out.push([
+                inv * inv * a[0] + 2.0 * inv * u * ctrl[0] + u * u * b[0],
+                inv * inv * a[1] + 2.0 * inv * u * ctrl[1] + u * u * b[1],
+            ]);
+        }
+    }
+    if let Some(&first) = out.first() {
+        out.push(first);
+    }
+    out
 }
 
 #[cfg(test)]
