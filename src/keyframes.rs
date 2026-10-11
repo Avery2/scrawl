@@ -42,6 +42,7 @@ pub fn luma_diff(a: &RgbaFrame, b: &RgbaFrame) -> f32 {
 
 struct Candidate {
     frame: usize,
+    span: (u64, u64),
     score: f32,
     reason: KeyframeReason,
     mark: Option<usize>,
@@ -68,10 +69,15 @@ fn midpoint(start: u64, end: u64) -> u64 {
     start + end.saturating_sub(start) / 2
 }
 
-/// Attach each timed word (or whole segment when word timings are absent) exactly
-/// once. Overlapping 3-second windows resolve to the nearest midpoint; speech
-/// outside every window belongs to the nearest window, so no words disappear.
-fn align_transcript(selected: &mut [(Keyframe, RgbaFrame)], transcript: &TranscriptData) {
+/// Attach each timed word (or whole segment when word timings are absent)
+/// to the keyframe whose `[action_t0 - SPEECH_WINDOW_MS, action_t1 + SPEECH_WINDOW_MS]`
+/// span covers it. Overlapping spans resolve to the nearest span midpoint; speech
+/// outside every window belongs to the nearest span so no words disappear.
+fn align_transcript(
+    selected: &mut [(Keyframe, RgbaFrame)],
+    spans: &[(u64, u64)],
+    transcript: &TranscriptData,
+) {
     if selected.is_empty() {
         return;
     }
@@ -99,15 +105,29 @@ fn align_transcript(selected: &mut [(Keyframe, RgbaFrame)], transcript: &Transcr
         let index = selected
             .iter()
             .enumerate()
-            .min_by_key(|(_, (frame, _))| {
-                let start = frame.t.saturating_sub(SPEECH_WINDOW_MS);
-                let end = frame.t.saturating_add(SPEECH_WINDOW_MS);
+            .min_by_key(|(i, (frame, _))| {
+                let (s0, s1) = spans.get(*i).copied().unwrap_or((frame.t, frame.t));
+                let anchor_start = s0.min(frame.t);
+                let anchor_end = s1.max(frame.t);
+                let start = anchor_start.saturating_sub(SPEECH_WINDOW_MS);
+                let end = anchor_end.saturating_add(SPEECH_WINDOW_MS);
                 let gap = if t1 < start {
                     start - t1
                 } else {
                     t0.saturating_sub(end)
                 };
-                (gap, center.abs_diff(frame.t))
+                let span_distance = if center < anchor_start {
+                    anchor_start - center
+                } else if center > anchor_end {
+                    center - anchor_end
+                } else {
+                    0
+                };
+                (
+                    gap,
+                    span_distance,
+                    center.abs_diff(midpoint(anchor_start, anchor_end)),
+                )
             })
             .map(|(i, _)| i)
             .unwrap();
@@ -156,6 +176,7 @@ pub fn select_keyframes(
     for (i, mark) in marks.iter().enumerate() {
         candidates.push(Candidate {
             frame: nearest_frame(&frames, mark.t1),
+            span: (mark.t0, mark.t1),
             score: 100.0,
             reason: KeyframeReason::Mark,
             mark: Some(i),
@@ -184,6 +205,7 @@ pub fn select_keyframes(
                 let delta = thumbnail_diff(&thumbnails[before], &thumbnails[after]);
                 candidates.push(Candidate {
                     frame: after,
+                    span: (*t, end),
                     score: 60.0 + 30.0 * delta,
                     reason: KeyframeReason::Click,
                     mark: None,
@@ -193,6 +215,7 @@ pub fn select_keyframes(
             }
             InteractionEvent::Point { t, x, y, .. } => candidates.push(Candidate {
                 frame: nearest_frame(&frames, *t),
+                span: (*t, *t),
                 score: 55.0,
                 reason: KeyframeReason::Laser,
                 mark: None,
@@ -214,6 +237,7 @@ pub fn select_keyframes(
             .unwrap_or_default();
         candidates.push(Candidate {
             frame: nearest_frame(&frames, stroke.t1),
+            span: (stroke.t0, stroke.t1),
             score: 55.0,
             reason: KeyframeReason::Laser,
             mark: None,
@@ -223,20 +247,28 @@ pub fn select_keyframes(
     }
     // A run of changing frames is one transition. Its last changed frame is
     // the settled view, avoiding several near-identical animation keyframes.
-    let mut transition: Option<(usize, f32)> = None;
+    let mut transition: Option<(usize, u64, f32)> = None;
     for (i, &delta) in deltas.iter().enumerate() {
         if delta > 0.08 {
-            transition = Some((i + 1, transition.map_or(delta, |(_, max)| max.max(delta))));
-        } else if let Some((frame, diff)) = transition.take() {
-            candidates.push(scene_candidate(frame, diff));
+            let start_t = transition.map_or(frames[i].t_ms, |(_, t0, _)| t0);
+            transition = Some((
+                i + 1,
+                start_t,
+                transition.map_or(delta, |(_, _, max)| max.max(delta)),
+            ));
+        } else if let Some((frame, start_t, diff)) = transition.take() {
+            candidates.push(scene_candidate(frame, (start_t, frames[frame].t_ms), diff));
         }
     }
-    if let Some((frame, diff)) = transition {
-        candidates.push(scene_candidate(frame, diff));
+    if let Some((frame, start_t, diff)) = transition {
+        candidates.push(scene_candidate(frame, (start_t, frames[frame].t_ms), diff));
     }
     if candidates.is_empty() {
+        let mid = frames.len() / 2;
+        let t = frames[mid].t_ms;
         candidates.push(Candidate {
-            frame: frames.len() / 2,
+            frame: mid,
+            span: (t, t),
             score: 0.0,
             reason: KeyframeReason::Initial,
             mark: None,
@@ -269,6 +301,7 @@ pub fn select_keyframes(
         selected.push(candidate);
     }
     selected.sort_by_key(|candidate| frames[candidate.frame].t_ms);
+    let spans: Vec<(u64, u64)> = selected.iter().map(|c| c.span).collect();
     let mut out: Vec<_> = selected
         .into_iter()
         .enumerate()
@@ -295,13 +328,14 @@ pub fn select_keyframes(
             )
         })
         .collect();
-    align_transcript(&mut out, transcript);
+    align_transcript(&mut out, &spans, transcript);
     out
 }
 
-fn scene_candidate(frame: usize, diff: f32) -> Candidate {
+fn scene_candidate(frame: usize, span: (u64, u64), diff: f32) -> Candidate {
     Candidate {
         frame,
+        span,
         score: 40.0 + 40.0 * diff,
         reason: KeyframeReason::SceneChange,
         mark: None,
@@ -489,9 +523,49 @@ mod tests {
             select_keyframes(&frames, &[], &mut [], &[], &transcript, MAX_KEYFRAMES);
         assert_eq!(static_speech.len(), 1);
         assert_eq!(static_speech[0].0.reason, KeyframeReason::Initial);
+        // Words spoken during a long mark span stay attached to that mark even when
+        // the post-mark keyframe timestamp is near the end of the stroke.
+        let mut long_marks = vec![
+            Mark {
+                t0: 500,
+                t1: 600,
+                ..mark("m1", 600)
+            },
+            Mark {
+                t0: 1800,
+                t1: 5000,
+                ..mark("m2", 5000)
+            },
+        ];
+        let span_frames = vec![frame(600, 0), frame(5000, 0)];
+        let span_transcript = TranscriptData {
+            words: [
+                (400, "First."),
+                (2000, "Started"),
+                (2600, "drawing"),
+                (4800, "this."),
+            ]
+            .into_iter()
+            .map(|(t, text)| WordTiming {
+                t0: t,
+                t1: t + 100,
+                text: text.into(),
+            })
+            .collect(),
+            ..Default::default()
+        };
+        let span_selected = select_keyframes(
+            &span_frames,
+            &[],
+            &mut long_marks,
+            &[],
+            &span_transcript,
+            MAX_KEYFRAMES,
+        );
+        assert_eq!(span_selected[0].0.said.as_deref(), Some("First."));
         assert_eq!(
-            static_speech[0].0.said.as_deref(),
-            Some("First thought. Second thought.")
+            span_selected[1].0.said.as_deref(),
+            Some("Started drawing this.")
         );
     }
 

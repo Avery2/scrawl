@@ -208,6 +208,29 @@ pub fn settled_events(events: &[InteractionEvent]) -> Vec<InteractionEvent> {
     for mut event in sorted {
         let prior = out.iter().rposition(|prev| match (prev, &event) {
             (
+                InteractionEvent::Click {
+                    t: a,
+                    x: x0,
+                    y: y0,
+                    button: b0,
+                    label: l0,
+                    ..
+                },
+                InteractionEvent::Click {
+                    t: b,
+                    x: x1,
+                    y: y1,
+                    button: b1,
+                    label: l1,
+                    ..
+                },
+            ) => {
+                b0 == b1
+                    && l0 == l1
+                    && b.saturating_sub(*a) <= 650
+                    && (x1 - x0).hypot(y1 - y0) <= 0.03
+            }
+            (
                 InteractionEvent::Scroll { t: a, label: x, .. },
                 InteractionEvent::Scroll { t: b, label: y, .. },
             ) => x == y && b.saturating_sub(*a) < 1500,
@@ -265,11 +288,10 @@ fn direction(dx: f32, dy: f32, threshold: f32) -> String {
 
 pub fn describe_event(event: &InteractionEvent) -> String {
     match event {
-        InteractionEvent::Click { x, y, label, .. } => format!(
-            "clicked “{}” ({})",
-            label.as_deref().unwrap_or("something"),
-            at([*x, *y])
-        ),
+        InteractionEvent::Click { x, y, label, .. } => match label.as_deref() {
+            Some(l) if !l.is_empty() => format!("clicked “{l}” ({})", at([*x, *y])),
+            _ => format!("clicked ({})", at([*x, *y])),
+        },
         InteractionEvent::Drag {
             x0,
             y0,
@@ -281,22 +303,21 @@ pub fn describe_event(event: &InteractionEvent) -> String {
             "dragged{} {} ({} → {})",
             label
                 .as_ref()
+                .filter(|s| !s.is_empty())
                 .map(|s| format!(" “{s}”"))
                 .unwrap_or_default(),
             direction(x1 - x0, y1 - y0, 0.04),
             at([*x0, *y0]),
             at([*x1, *y1])
         ),
-        InteractionEvent::Scroll { dx, dy, label, .. } => format!(
-            "scrolled “{}” {}",
-            label.as_deref().unwrap_or("the page"),
-            direction(*dx, *dy, 0.0)
-        ),
-        InteractionEvent::Point { x, y, label, .. } => format!(
-            "pointed at “{}” ({})",
-            label.as_deref().unwrap_or("something"),
-            at([*x, *y])
-        ),
+        InteractionEvent::Scroll { dx, dy, label, .. } => match label.as_deref() {
+            Some(l) if !l.is_empty() => format!("scrolled “{l}” {}", direction(*dx, *dy, 0.0)),
+            _ => format!("scrolled {}", direction(*dx, *dy, 0.0)),
+        },
+        InteractionEvent::Point { x, y, label, .. } => match label.as_deref() {
+            Some(l) if !l.is_empty() => format!("pointed at “{l}” ({})", at([*x, *y])),
+            _ => format!("pointed at ({})", at([*x, *y])),
+        },
         InteractionEvent::Key { shortcut, .. } => format!("pressed {shortcut}"),
         InteractionEvent::AppChange {
             app, window_title, ..
@@ -1042,6 +1063,24 @@ mod tests {
             describe_event(&events[0]),
             "pointed at “Header” (x 0.30, y 0.12)"
         );
+
+        let click = |t, x, y| InteractionEvent::Click {
+            t,
+            x,
+            y,
+            button: Some("left".into()),
+            label: None,
+            role: None,
+        };
+        let coalesced = settled_events(&[
+            click(1000, 0.42, 0.18),
+            click(1220, 0.425, 0.182),
+            click(1450, 0.421, 0.181),
+            click(2500, 0.80, 0.50),
+        ]);
+        assert_eq!(coalesced.len(), 2);
+        assert_eq!(coalesced[0].timestamp_ms(), 1450);
+        assert_eq!(describe_event(&coalesced[0]), "clicked (x 0.42, y 0.18)");
     }
 
     #[test]
