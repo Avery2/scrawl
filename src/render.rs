@@ -512,175 +512,57 @@ pub fn render_contact_sheet(
     annotated_frames: &[(Keyframe, RgbaFrame)],
 ) -> RgbaFrame {
     const CELL: f32 = 640.0;
-    const PAD: f32 = 24.0;
-    const GAP: f32 = 20.0;
+    const PAD: f32 = 16.0;
+    const GAP: f32 = 14.0;
     let frames = &annotated_frames[..annotated_frames.len().min(MAX_KEYFRAMES)];
-    let columns = if frames.len() <= 1 { 1 } else { 2 };
+    if frames.is_empty() {
+        let mut sheet = solid(640, 360, [20, 20, 20, 255]);
+        sheet.t_ms = bundle.duration_ms;
+        return sheet;
+    }
+    let columns = if frames.len() == 1 { 1 } else { 2 };
     let width = (PAD * 2.0 + CELL * columns as f32 + GAP * (columns - 1) as f32) as u32;
-    let app = bundle.target.app.as_deref().unwrap_or("Display");
-    let title = match bundle
-        .target
-        .window_title
-        .as_deref()
-        .filter(|s| !s.is_empty() && *s != app)
-    {
-        Some(window) => format!("{app} · {window}"),
-        None => app.to_owned(),
-    };
-    let title_lines = wrap_text(&title, 20.0, width as f32 - PAD * 2.0, true);
-    let summary = bundle
-        .transcript
-        .text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut summary_lines = wrap_text(&summary, 15.0, width as f32 - PAD * 2.0, false);
-    if summary_lines.len() > 4 {
-        summary_lines.truncate(4);
-        if let Some(last) = summary_lines.last_mut() {
-            while text_width(&format!("{last}…"), 15.0, false) > width as f32 - PAD * 2.0 {
-                if last.pop().is_none() {
-                    break;
-                }
-            }
-            last.push('…');
-        }
-    }
-    let header_height = 72.0
-        + title_lines.len() as f32 * 26.0
-        + summary_lines.len() as f32 * 21.0
-        + if summary_lines.is_empty() { 0.0 } else { 10.0 };
-    struct Card {
-        image: [f32; 2],
-        label: String,
-        label_width: f32,
-        event: Vec<String>,
-        said: Vec<String>,
-        height: f32,
-    }
-    let cards: Vec<_> = frames
+    let card_sizes: Vec<[f32; 2]> = frames
         .iter()
-        .map(|(key, image)| {
+        .map(|(_, image)| {
             let scale = (CELL / image.width.max(1) as f32).min(960.0 / image.height.max(1) as f32);
-            let image_size = [image.width as f32 * scale, image.height as f32 * scale];
-            let label = format!("[#{} · {}]", key.index, format_clock(key.t));
-            let label_width = text_width(&label, 16.0, true) + 10.0;
-            let event = wrap_text_indented(
-                &key.event,
-                16.0,
-                CELL - 32.0,
-                (CELL - 32.0 - label_width).max(30.0),
-                false,
-            );
-            let said = key
-                .said
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| wrap_text(&format!("“{}”", s.trim()), 15.0, CELL - 32.0, false))
-                .unwrap_or_default();
-            let height = image_size[1]
-                + 30.0
-                + event.len().max(1) as f32 * 22.0
-                + if said.is_empty() {
-                    0.0
-                } else {
-                    8.0 + said.len() as f32 * 21.0
-                };
-            Card {
-                image: image_size,
-                label,
-                label_width,
-                event,
-                said,
-                height,
-            }
+            [image.width as f32 * scale, image.height as f32 * scale]
         })
         .collect();
-    let row_heights: Vec<f32> = cards
+    let row_heights: Vec<f32> = card_sizes
         .chunks(columns)
-        .map(|row| row.iter().map(|c| c.height).fold(0.0, f32::max))
+        .map(|row| row.iter().map(|s| s[1]).fold(0.0, f32::max))
         .collect();
-    let height = (header_height
+    let height = (PAD * 2.0
         + row_heights.iter().sum::<f32>()
-        + GAP * row_heights.len().saturating_sub(1) as f32
-        + PAD)
+        + GAP * row_heights.len().saturating_sub(1) as f32)
         .ceil() as u32;
     let mut sheet = solid(width, height, [20, 20, 20, 255]);
     sheet.t_ms = bundle.duration_ms;
-    circle(&mut sheet, [PAD + 4.0, 34.0], 4.0, RED);
-    draw_text(&mut sheet, "SCRAWL", PAD + 18.0, 24.0, 16.0, WHITE, true);
-    let duration = format_clock(bundle.duration_ms);
-    let duration_width = text_width(&duration, 16.0, false);
-    draw_text(
-        &mut sheet,
-        &duration,
-        width as f32 - PAD - duration_width,
-        24.0,
-        16.0,
-        MUTED,
-        false,
-    );
-    let mut y = 58.0;
-    for text in &title_lines {
-        draw_text(&mut sheet, text, PAD, y, 20.0, TEXT, true);
-        y += 26.0;
-    }
-    if !summary_lines.is_empty() {
-        y += 10.0;
-    }
-    for text in &summary_lines {
-        draw_text(&mut sheet, text, PAD, y, 15.0, MUTED, false);
-        y += 21.0;
-    }
-    let mut row_y = header_height;
+    let mut row_y = PAD;
     for (row, row_height) in row_heights.iter().enumerate() {
         for col in 0..columns {
             let i = row * columns + col;
-            let Some(card) = cards.get(i) else {
+            let Some(&image_size) = card_sizes.get(i) else {
                 continue;
             };
             let (_, image) = &frames[i];
             let x = PAD + col as f32 * (CELL + GAP);
+            let card_x = x + (CELL - image_size[0]) * 0.5;
+            let card_y = row_y + (*row_height - image_size[1]) * 0.5;
             rounded(
                 &mut sheet,
-                [x, row_y, CELL, *row_height],
+                [card_x, card_y, image_size[0], image_size[1]],
                 10.0,
-                [42, 42, 42, 255],
-            );
-            rounded(
-                &mut sheet,
-                [x + 1.0, row_y + 1.0, CELL - 2.0, *row_height - 2.0],
-                9.0,
-                [29, 29, 29, 255],
+                [46, 46, 48, 255],
             );
             let image_rect = [
-                x + (CELL - card.image[0]) * 0.5 + 1.0,
-                row_y + 1.0,
-                (card.image[0] - 2.0).max(0.0),
-                (card.image[1] - 2.0).max(0.0),
+                card_x + 1.0,
+                card_y + 1.0,
+                (image_size[0] - 2.0).max(0.0),
+                (image_size[1] - 2.0).max(0.0),
             ];
             blit_scaled(&mut sheet, image, image_rect, 9.0);
-            let mut cy = row_y + card.image[1] + 14.0;
-            draw_text(&mut sheet, &card.label, x + 16.0, cy, 16.0, RED, true);
-            for (line_index, text) in card.event.iter().enumerate() {
-                let indent = if line_index == 0 {
-                    card.label_width
-                } else {
-                    0.0
-                };
-                draw_text(&mut sheet, text, x + 16.0 + indent, cy, 16.0, TEXT, false);
-                cy += 22.0;
-            }
-            if card.event.is_empty() {
-                cy += 22.0;
-            }
-            if !card.said.is_empty() {
-                cy += 8.0;
-            }
-            for text in &card.said {
-                draw_text(&mut sheet, text, x + 16.0, cy, 15.0, MUTED, false);
-                cy += 21.0;
-            }
         }
         row_y += row_height + GAP;
     }
@@ -1375,8 +1257,8 @@ mod tests {
                 .map(|i| (key(i), solid(320, 200, [40 + i as u8 * 10, 60, 80, 255])))
                 .collect();
             let sheet = render_contact_sheet(&bundle(), &frames);
-            assert_eq!(sheet.width, if count == 1 { 688 } else { 1348 });
-            assert!(sheet.height > if count == 1 { 500 } else { 1000 });
+            assert_eq!(sheet.width, if count == 1 { 672 } else { 1326 });
+            assert!(sheet.height >= if count == 1 { 400 } else { 800 });
             assert_eq!(
                 sheet.rgba.len(),
                 sheet.width as usize * sheet.height as usize * 4

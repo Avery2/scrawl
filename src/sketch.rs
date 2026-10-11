@@ -383,15 +383,19 @@ pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> 
             out.push_str(&format!("  Said: {said}\n"));
         }
     }
+    out.push_str(&format!(
+        "\nContact sheet: {}\n",
+        bundle_dir.join(&bundle.contact_sheet).display()
+    ));
     if let Some(ref video) = bundle.video {
         out.push_str(&format!(
-            "\nVideo: {}\nLook closer: scrawl frames '{}' --from 0:00 --to {} --fps 4\n",
+            "Video: {}\nLook closer: scrawl frames '{}' --from 0:00 --to {} --fps 4\n",
             bundle_dir.join(video).display(),
             bundle_dir.display(),
             format_clock(bundle.duration_ms)
         ));
     }
-    out.push_str(&format!("\nBundle: {}\n", bundle_dir.display()));
+    out.push_str(&format!("Bundle: {}\n", bundle_dir.display()));
     out
 }
 
