@@ -468,6 +468,10 @@ pub fn smooth_laser_points(points: &[([f32; 2], f32)]) -> Vec<([f32; 2], f32)> {
         }
     }
 
+    if filtered.len() < 2 {
+        return filtered;
+    }
+
     // Stage 2: Midpoint Quadratic B-Spline (`quadraticCurveTo(P_i, midpoint(P_i, P_{i+1}))`)
     let mut curve = Vec::with_capacity(filtered.len() * 6);
     if filtered.len() == 2 {
@@ -565,7 +569,7 @@ pub fn smooth_ink_points(points: &[[f32; 2]]) -> Vec<([f32; 2], f32)> {
             slot.0 = last;
         }
     }
-    if filtered.len() == 2 {
+    if filtered.len() <= 2 {
         return filtered;
     }
     let mut curve = Vec::with_capacity(filtered.len() * 4);
@@ -1058,6 +1062,17 @@ mod tests {
         );
         assert!(tapered[0][1].abs() < 0.1);
         assert!(tapered.contains(&[100.0, 0.0]));
+    }
+
+    #[test]
+    fn smooth_laser_and_ink_handle_stationary_duplicate_points() {
+        let stationary_laser = [([120.0, 240.0], 0.8), ([120.0, 240.0], 1.0)];
+        let smoothed_laser = smooth_laser_points(&stationary_laser);
+        assert_eq!(smoothed_laser.len(), 1);
+
+        let stationary_ink = [[120.0, 240.0], [120.0, 240.0], [120.0, 240.0]];
+        let smoothed_ink = smooth_ink_points(&stationary_ink);
+        assert_eq!(smoothed_ink.len(), 1);
     }
 
     #[test]

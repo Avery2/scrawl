@@ -161,8 +161,10 @@ extern "C" fn display_link_callback(
     context: *mut c_void,
 ) -> CVReturn {
     if !context.is_null() {
-        let overlay = unsafe { &*context.cast::<SharedMetalOverlay>() };
-        overlay.draw();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let overlay = unsafe { &*context.cast::<SharedMetalOverlay>() };
+            overlay.draw();
+        }));
     }
     0
 }

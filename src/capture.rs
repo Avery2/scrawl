@@ -1608,6 +1608,7 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
     let mut prev_shift_laser = false;
     let mut prev_shift_ink = false;
     let mut prev_undo = false;
+    let mut await_shift_release = false;
     let mut prev_mod_mask = (0_u8, false, false);
     loop {
         thread::sleep(Duration::from_millis(8));
@@ -1618,6 +1619,11 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
         let ctrl = (flags & FLAG_CONTROL) != 0;
         let alt = (flags & FLAG_ALTERNATE) != 0;
         let shift = (flags & FLAG_SHIFT) != 0;
+        if !shift {
+            await_shift_release = false;
+        } else if cmd || ctrl || alt {
+            await_shift_release = true;
+        }
         let mod_mask =
             (u8::from(cmd) << 3) | (u8::from(ctrl) << 2) | (u8::from(alt) << 1) | u8::from(shift);
 
@@ -1672,7 +1678,7 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = [loc.x as f32, loc.y as f32];
 
         let left_down = unsafe { CGEventSourceButtonState(0, 0) || CGEventSourceButtonState(1, 0) };
-        let pure_shift = shift && !cmd && !ctrl && !alt;
+        let pure_shift = shift && !cmd && !ctrl && !alt && !await_shift_release;
 
         // Hold Shift + drag = draw persistent ink in any app; Hold Shift + move = optical laser
         let shift_ink = pure_shift && left_down;
