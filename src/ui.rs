@@ -573,45 +573,38 @@ impl Render for HudPillWindow {
 
         let capsule_content = match phase {
             IslandPhase::Selecting { mode } => div()
-                .size_full()
                 .flex()
                 .items_center()
-                .justify_between()
+                .gap(px(3.0))
                 .whitespace_nowrap()
                 .child(
-                    div()
-                        .flex()
-                        .flex_shrink_0()
-                        .items_center()
-                        .gap_1p5()
-                        .whitespace_nowrap()
-                        .child(
-                            mode_chip("sel-area", "⬚ Area", mode == SelectionMode::Area).on_click(
-                                move |_, _, cx| {
-                                    c_mode_area.update(cx, |coord, cx| {
-                                        coord.set_selection_mode(SelectionMode::Area, cx);
-                                    });
-                                },
-                            ),
-                        )
-                        .child(
-                            mode_chip("sel-window", "▢ Window", mode == SelectionMode::Window)
-                                .on_click(move |_, _, cx| {
-                                    c_mode_win.update(cx, |coord, cx| {
-                                        coord.set_selection_mode(SelectionMode::Window, cx);
-                                    });
-                                }),
-                        )
-                        .child(pill_chip("sel-fullscreen", "▣ Full Screen", true).on_click(
-                            move |_, _, cx| {
-                                c_full.update(cx, |coord, cx| {
-                                    coord.start_recording_full_screen(cx);
-                                });
-                            },
-                        )),
+                    mode_chip("sel-area", "Area", mode == SelectionMode::Area).on_click(
+                        move |_, _, cx| {
+                            c_mode_area.update(cx, |coord, cx| {
+                                coord.set_selection_mode(SelectionMode::Area, cx);
+                            });
+                        },
+                    ),
                 )
                 .child(
-                    pill_chip("sel-cancel", "✕", true).on_click(move |_, _, cx| {
+                    mode_chip("sel-window", "Window", mode == SelectionMode::Window).on_click(
+                        move |_, _, cx| {
+                            c_mode_win.update(cx, |coord, cx| {
+                                coord.set_selection_mode(SelectionMode::Window, cx);
+                            });
+                        },
+                    ),
+                )
+                .child(pill_chip("sel-fullscreen", "Full Screen", true).on_click(
+                    move |_, _, cx| {
+                        c_full.update(cx, |coord, cx| {
+                            coord.start_recording_full_screen(cx);
+                        });
+                    },
+                ))
+                .child(div().w(px(1.0)).h(px(16.0)).mx_1().bg(rgba(0xffffff16)))
+                .child(
+                    icon_circle_chip("sel-cancel", "✕").on_click(move |_, _, cx| {
                         c_sel_cancel.update(cx, |coord, cx| coord.cancel_recording(cx));
                     }),
                 ),
@@ -620,10 +613,9 @@ impl Render for HudPillWindow {
                 duration_ms,
                 ..
             } => div()
-                .size_full()
                 .flex()
                 .items_center()
-                .justify_between()
+                .gap(px(4.0))
                 .whitespace_nowrap()
                 .child(
                     div()
@@ -631,13 +623,15 @@ impl Render for HudPillWindow {
                         .flex_shrink_0()
                         .items_center()
                         .gap_2()
+                        .pl_1()
+                        .pr_1p5()
                         .whitespace_nowrap()
                         .on_mouse_down(MouseButton::Left, |_, window, _| {
                             window.start_window_move();
                         })
                         .child(
                             div()
-                                .size(px(20.0))
+                                .size(px(22.0))
                                 .rounded_full()
                                 .flex()
                                 .items_center()
@@ -667,45 +661,36 @@ impl Render for HudPillWindow {
                                 )),
                         ),
                 )
+                .child(div().w(px(1.0)).h(px(16.0)).mx_0p5().bg(rgba(0xffffff16)))
                 .child(
                     div()
+                        .id("hud-inspect")
+                        .h(px(32.0))
+                        .px_3()
+                        .rounded(px(16.0))
                         .flex()
                         .flex_shrink_0()
                         .items_center()
-                        .gap_1p5()
                         .whitespace_nowrap()
-                        .child(
-                            div()
-                                .id("hud-inspect")
-                                .h(px(28.0))
-                                .px_3()
-                                .rounded(px(14.0))
-                                .flex()
-                                .flex_shrink_0()
-                                .items_center()
-                                .whitespace_nowrap()
-                                .bg(rgb(ACCENT_COLOR))
-                                .text_color(rgb(TEXT_COLOR))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(0x4b6bff)))
-                                .child("Inspect")
-                                .on_click(move |_, _, cx| {
-                                    c_inspect
-                                        .update(cx, |coord, cx| coord.inspect_completed_bundle(cx));
-                                }),
-                        )
-                        .child(
-                            pill_chip("hud-dismiss", "✕", true).on_click(move |_, _, cx| {
-                                c_dismiss.update(cx, |coord, cx| coord.dismiss_island(cx));
-                            }),
-                        ),
+                        .bg(rgb(ACCENT_COLOR))
+                        .text_color(rgb(TEXT_COLOR))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(0x4b6bff)))
+                        .child("Inspect")
+                        .on_click(move |_, _, cx| {
+                            c_inspect.update(cx, |coord, cx| coord.inspect_completed_bundle(cx));
+                        }),
+                )
+                .child(
+                    icon_circle_chip("hud-dismiss", "✕").on_click(move |_, _, cx| {
+                        c_dismiss.update(cx, |coord, cx| coord.dismiss_island(cx));
+                    }),
                 ),
             _ => div()
-                .size_full()
                 .flex()
                 .items_center()
-                .justify_between()
+                .gap(px(3.0))
                 .whitespace_nowrap()
                 .child(
                     div()
@@ -713,6 +698,8 @@ impl Render for HudPillWindow {
                         .flex_shrink_0()
                         .items_center()
                         .gap_2()
+                        .pl_2p5()
+                        .pr_2()
                         .whitespace_nowrap()
                         .on_mouse_down(MouseButton::Left, |_, window, _| {
                             window.start_window_move();
@@ -725,48 +712,43 @@ impl Render for HudPillWindow {
                                 .child(format_clock(elapsed_ms)),
                         ),
                 )
+                .child(div().w(px(1.0)).h(px(16.0)).mx_0p5().bg(rgba(0xffffff16)))
+                .child(pill_chip("hud-undo", "Undo", stroke_count > 0).when(
+                    stroke_count > 0,
+                    |d| {
+                        d.on_click(move |_, _, cx| {
+                            c_undo.update(cx, |coord, cx| coord.undo_stroke(cx));
+                        })
+                    },
+                ))
+                .child(
+                    pill_chip("hud-cancel", "Cancel", true).on_click(move |_, _, cx| {
+                        c_cancel.update(cx, |coord, cx| coord.cancel_recording(cx));
+                    }),
+                )
                 .child(
                     div()
+                        .id("hud-done")
+                        .h(px(32.0))
+                        .px_3()
+                        .rounded(px(16.0))
                         .flex()
                         .flex_shrink_0()
                         .items_center()
-                        .gap_1p5()
                         .whitespace_nowrap()
-                        .child(pill_chip("hud-undo", "Undo", stroke_count > 0).when(
-                            stroke_count > 0,
-                            |d| {
-                                d.on_click(move |_, _, cx| {
-                                    c_undo.update(cx, |coord, cx| coord.undo_stroke(cx));
-                                })
-                            },
-                        ))
-                        .child(
-                            pill_chip("hud-cancel", "Cancel", true).on_click(move |_, _, cx| {
-                                c_cancel.update(cx, |coord, cx| coord.cancel_recording(cx));
-                            }),
-                        )
-                        .child(
-                            div()
-                                .id("hud-done")
-                                .h(px(28.0))
-                                .px_3()
-                                .rounded(px(14.0))
-                                .flex()
-                                .flex_shrink_0()
-                                .items_center()
-                                .whitespace_nowrap()
-                                .bg(rgb(ACCENT_COLOR))
-                                .text_color(rgb(TEXT_COLOR))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .cursor_pointer()
-                                .child("Finish")
-                                .on_click(move |_, _, cx| {
-                                    c_finish.update(cx, |coord, cx| coord.finish_recording(cx));
-                                }),
-                        ),
+                        .bg(rgb(ACCENT_COLOR))
+                        .text_color(rgb(TEXT_COLOR))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(0x4b6bff)))
+                        .child("Finish")
+                        .on_click(move |_, _, cx| {
+                            c_finish.update(cx, |coord, cx| coord.finish_recording(cx));
+                        }),
                 ),
         };
 
+        let _ = width;
         div()
             .size_full()
             .flex()
@@ -775,20 +757,20 @@ impl Render for HudPillWindow {
             .opacity(opacity)
             .child(
                 div()
-                    .w(px(width))
-                    .h(px(42.0))
-                    .px_3()
-                    .rounded(px(21.0))
-                    .overflow_hidden()
-                    .bg(rgba(0x111113f4))
+                    .h(px(40.0))
+                    .p(px(4.0))
+                    .rounded(px(20.0))
+                    .flex()
+                    .items_center()
+                    .bg(rgba(0x131316f5))
                     .border_1()
                     .border_color(if is_completed {
-                        rgba(0x69d89f66)
+                        rgba(0x69d89f55)
                     } else {
-                        rgb(LINE_COLOR)
+                        rgba(0xffffff18)
                     })
                     .text_color(rgb(TEXT_COLOR))
-                    .text_size(px(12.5))
+                    .text_size(px(13.0))
                     .whitespace_nowrap()
                     .child(capsule_content),
             )
@@ -798,47 +780,54 @@ impl Render for HudPillWindow {
 fn pill_chip(id: &'static str, label: &'static str, enabled: bool) -> gpui::Stateful<Div> {
     div()
         .id(id)
-        .h(px(28.0))
-        .px_2p5()
-        .rounded(px(14.0))
+        .h(px(32.0))
+        .px_3()
+        .rounded(px(16.0))
         .flex()
         .flex_shrink_0()
         .items_center()
         .whitespace_nowrap()
-        .border_1()
-        .border_color(rgb(LINE_COLOR))
-        .bg(rgb(SURFACE_BG))
         .text_color(if enabled {
             rgb(TEXT_SOFT)
         } else {
-            rgb(0x555555)
+            rgb(0x525256)
         })
         .when(enabled, |d| {
-            d.cursor_pointer().hover(|s| s.bg(rgb(SURFACE_HOVER)))
+            d.cursor_pointer()
+                .hover(|s| s.bg(rgba(0xffffff12)).text_color(rgb(TEXT_COLOR)))
         })
         .child(label)
+}
+
+fn icon_circle_chip(id: &'static str, icon: &'static str) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .size(px(32.0))
+        .rounded_full()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .text_color(rgb(MUTED_COLOR))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgba(0xffffff14)).text_color(rgb(TEXT_COLOR)))
+        .child(icon)
 }
 
 fn mode_chip(id: &'static str, label: &'static str, active: bool) -> gpui::Stateful<Div> {
     div()
         .id(id)
-        .h(px(28.0))
-        .px_2p5()
-        .rounded(px(14.0))
+        .h(px(32.0))
+        .px_3()
+        .rounded(px(16.0))
         .flex()
         .flex_shrink_0()
         .items_center()
         .whitespace_nowrap()
-        .border_1()
-        .border_color(if active {
-            rgb(ACCENT_COLOR)
-        } else {
-            rgb(LINE_COLOR)
-        })
         .bg(if active {
             rgb(ACCENT_COLOR)
         } else {
-            rgb(SURFACE_BG)
+            rgba(0x00000000)
         })
         .text_color(if active {
             rgb(TEXT_COLOR)
@@ -848,14 +837,14 @@ fn mode_chip(id: &'static str, label: &'static str, active: bool) -> gpui::State
         .font_weight(if active {
             FontWeight::SEMIBOLD
         } else {
-            FontWeight::NORMAL
+            FontWeight::MEDIUM
         })
         .cursor_pointer()
         .hover(|s| {
             s.bg(if active {
                 rgb(0x4b6bff)
             } else {
-                rgb(SURFACE_HOVER)
+                rgba(0xffffff12)
             })
         })
         .child(label)
