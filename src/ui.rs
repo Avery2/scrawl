@@ -69,13 +69,13 @@ struct Spring {
 }
 
 const ISLAND_SPRING: Spring = Spring {
-    response: 0.34,
-    damping_ratio: 0.68,
+    response: 0.32,
+    damping_ratio: 0.78,
 };
 
-const ISLAND_HEIGHT_SPRING: Spring = Spring {
+const ISLAND_SCALE_SPRING: Spring = Spring {
     response: 0.28,
-    damping_ratio: 0.62,
+    damping_ratio: 0.74,
 };
 
 /// Advances a damped spring with fixed 4ms sub-steps so long frames stay stable.
@@ -345,6 +345,125 @@ fn configure_floating_window(ns_window: &NSWindow, ignores_mouse: bool, level_of
     sync_full_size_content_view(ns_window);
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CATransform3D {
+    m11: f64,
+    m12: f64,
+    m13: f64,
+    m14: f64,
+    m21: f64,
+    m22: f64,
+    m23: f64,
+    m24: f64,
+    m31: f64,
+    m32: f64,
+    m33: f64,
+    m34: f64,
+    m41: f64,
+    m42: f64,
+    m43: f64,
+    m44: f64,
+}
+
+unsafe impl objc2::Encode for CATransform3D {
+    const ENCODING: objc2::Encoding = objc2::Encoding::Struct(
+        "CATransform3D",
+        &[
+            f64::ENCODING,
+            f64::ENCODING,
+            f64::ENCODING,
+            f64::ENCODING,
+            f64::ENCODING,
+            f64::ENCODING,
+            f64::ENCODING,
+            f64::ENCODING,
+            f64::ENCODING,
+            f64::ENCODING,
+            f64::ENCODING,
+            f64::ENCODING,
+            f64::ENCODING,
+            f64::ENCODING,
+            f64::ENCODING,
+            f64::ENCODING,
+        ],
+    );
+}
+
+/// Applies a hardware-accelerated QuartzCore `CATransform3D` scale/translation and
+/// `CAFilter("gaussianBlur")` directly to the HUD pill window's backing `CALayer`,
+/// eliminating CoreText font-size hinting jitter and `overflow_hidden` text clipping.
+fn apply_pill_layer_effect(
+    ns_window: &NSWindow,
+    scale_x: f32,
+    scale_y: f32,
+    y_offset: f32,
+    blur_radius: f32,
+) {
+    use objc2::runtime::AnyClass;
+    use objc2_foundation::{NSArray, NSNumber};
+    use objc2_quartz_core::CATransaction;
+
+    let Some(cv) = ns_window.contentView() else {
+        return;
+    };
+    cv.setWantsLayer(true);
+    let Some(layer) = cv.layer() else {
+        return;
+    };
+    let bounds = cv.bounds();
+    let cx = bounds.size.width * 0.5;
+    let cy = bounds.size.height * 0.5;
+    let sx = f64::from(scale_x.clamp(0.25, 1.35));
+    let sy = f64::from(scale_y.clamp(0.25, 1.35));
+    let ty = if cv.isFlipped() {
+        f64::from(y_offset)
+    } else {
+        -f64::from(y_offset)
+    };
+    let transform = CATransform3D {
+        m11: sx,
+        m12: 0.0,
+        m13: 0.0,
+        m14: 0.0,
+        m21: 0.0,
+        m22: sy,
+        m23: 0.0,
+        m24: 0.0,
+        m31: 0.0,
+        m32: 0.0,
+        m33: 1.0,
+        m34: 0.0,
+        m41: cx * (1.0 - sx),
+        m42: cy * (1.0 - sy) + ty,
+        m43: 0.0,
+        m44: 1.0,
+    };
+
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    unsafe {
+        let _: () = msg_send![&*layer, setTransform: transform];
+        if blur_radius > 0.18
+            && let Some(ca_filter_cls) = AnyClass::get(c"CAFilter")
+        {
+            let filter_type = NSString::from_str("gaussianBlur");
+            let filter: *mut AnyObject = msg_send![ca_filter_cls, filterWithType: &*filter_type];
+            if !filter.is_null() {
+                let radius_num = NSNumber::new_f64(f64::from(blur_radius));
+                let radius_key = NSString::from_str("inputRadius");
+                let _: () = msg_send![filter, setValue: &*radius_num, forKey: &*radius_key];
+                let filter_ref = &*filter;
+                let filters = NSArray::from_slice(&[filter_ref]);
+                layer.setFilters(Some(&filters));
+            }
+        } else {
+            layer.setFilters(None);
+        }
+    }
+    CATransaction::commit();
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SelectionMode {
     Area,
@@ -379,14 +498,13 @@ pub struct ScrawlCoordinator {
     telemetry: Arc<SharedCaptureTelemetry>,
     active_recording: Option<ActiveRecording>,
     island_phase: IslandPhase,
-    island_prev_phase: IslandPhase,
     island_phase_since: Instant,
     island_dismissed_from: IslandPhase,
     island_width: f32,
     island_target_width: f32,
     island_velocity: f32,
-    island_height: f32,
-    island_height_velocity: f32,
+    island_scale: f32,
+    island_scale_velocity: f32,
     island_y: f32,
     island_y_velocity: f32,
     island_opacity: f32,
@@ -419,15 +537,14 @@ impl ScrawlCoordinator {
             telemetry,
             active_recording: None,
             island_phase: IslandPhase::Hidden,
-            island_prev_phase: IslandPhase::Hidden,
             island_phase_since: Instant::now(),
             island_dismissed_from: IslandPhase::Hidden,
-            island_width: 64.0,
-            island_target_width: 210.0,
+            island_width: 205.0,
+            island_target_width: 205.0,
             island_velocity: 0.0,
-            island_height: 22.0,
-            island_height_velocity: 0.0,
-            island_y: -14.0,
+            island_scale: 0.52,
+            island_scale_velocity: 0.0,
+            island_y: -10.0,
             island_y_velocity: 0.0,
             island_opacity: 0.0,
             selectable_windows: Vec::new(),
@@ -476,9 +593,8 @@ impl ScrawlCoordinator {
     pub fn set_selection_mode(&mut self, mode: SelectionMode, cx: &mut Context<Self>) {
         if let IslandPhase::Selecting { mode: prev_mode } = self.island_phase {
             if prev_mode != mode {
-                // Crisp tactile Dynamic Island micro-pulse when Space toggles camera/crosshair mode.
-                self.island_velocity += 210.0;
-                self.island_height_velocity += 75.0;
+                // Crisp tactile Dynamic Island scale micro-pulse when Space toggles camera/crosshair mode.
+                self.island_scale_velocity += 1.25;
             }
             self.island_phase = IslandPhase::Selecting { mode };
             self.selection_drag = None;
@@ -536,27 +652,24 @@ impl ScrawlCoordinator {
         }
     }
 
-    /// Moves the island to `phase`, restarting the content cross-fade and giving the capsule a
-    /// small inward impulse when the phase kind changes (mode toggles keep their content).
+    /// Moves the island to `phase`, triggering a GPU scale+blur morph on the `CALayer`.
     fn set_island_phase(&mut self, phase: IslandPhase) {
         let changed = std::mem::discriminant(&self.island_phase) != std::mem::discriminant(&phase);
         if changed {
-            self.island_prev_phase = self.island_phase;
             if matches!(phase, IslandPhase::Dismissing) {
                 self.island_dismissed_from = self.island_phase;
-                self.island_velocity = -420.0;
-                self.island_height_velocity = -160.0;
-                self.island_y_velocity = -90.0;
+                self.island_scale_velocity = -1.4;
+                self.island_y_velocity = -60.0;
             } else if matches!(self.island_phase, IslandPhase::Hidden) {
-                self.island_velocity = 340.0;
-                self.island_height_velocity = 160.0;
-                self.island_y_velocity = 110.0;
+                self.island_scale = 0.52;
+                self.island_scale_velocity = 1.6;
+                self.island_y = -10.0;
+                self.island_y_velocity = 70.0;
             } else {
-                // Dynamic Island squish-and-bloom impulse: pinch inward & compress vertically,
-                // then spring outward past target width/height before settling.
-                self.island_velocity = -720.0;
-                self.island_height_velocity = -240.0;
-                self.island_y_velocity = -55.0;
+                // Phase morph (Selecting -> Recording or Recording -> Completed):
+                // brief inward GPU scale dip + width spring without clipping or relayouting text.
+                self.island_scale_velocity = -2.2;
+                self.island_y_velocity = -35.0;
             }
             self.island_phase_since = Instant::now();
         }
@@ -633,12 +746,13 @@ impl ScrawlCoordinator {
             }
         }
 
-        // `island_target_width` is the measured intrinsic width of the visible content, written
-        // by `HudPillWindow::render`; dismissal contracts toward a compact seed pill while fading out.
-        let (target_w, target_h, target_y, target_opacity, fade_rate) = match self.island_phase {
+        // Keep layout width at `island_target_width` during open and dismiss so the capsule never
+        // clips its inner chips; all shrink/expand happens via the GPU CALayer scale transform.
+        let (target_w, target_scale, target_y, target_opacity, fade_rate) = match self.island_phase
+        {
             IslandPhase::Hidden => return,
-            IslandPhase::Dismissing => (56.0, 22.0, -12.0, 0.0, 14.0),
-            _ => (self.island_target_width, ISLAND_H, 0.0, 1.0, 18.0),
+            IslandPhase::Dismissing => (self.island_target_width, 0.52, -10.0, 0.0, 16.0),
+            _ => (self.island_target_width, 1.0, 0.0, 1.0, 18.0),
         };
 
         let (width, velocity) = spring_step(
@@ -648,29 +762,29 @@ impl ScrawlCoordinator {
             dt,
             ISLAND_SPRING,
         );
-        let (height, h_vel) = spring_step(
-            self.island_height,
-            self.island_height_velocity,
-            target_h,
+        let (scale, s_vel) = spring_step(
+            self.island_scale,
+            self.island_scale_velocity,
+            target_scale,
             dt,
-            ISLAND_HEIGHT_SPRING,
+            ISLAND_SCALE_SPRING,
         );
         let (y_off, y_vel) = spring_step(
             self.island_y,
             self.island_y_velocity,
             target_y,
             dt,
-            ISLAND_HEIGHT_SPRING,
+            ISLAND_SCALE_SPRING,
         );
-        self.island_width = width.clamp(44.0, PILL_WINDOW_W - 16.0);
+        self.island_width = width.clamp(120.0, PILL_WINDOW_W - 16.0);
         self.island_velocity = velocity;
-        self.island_height = height.clamp(18.0, 54.0);
-        self.island_height_velocity = h_vel;
-        self.island_y = y_off.clamp(-20.0, 16.0);
+        self.island_scale = scale.clamp(0.35, 1.18);
+        self.island_scale_velocity = s_vel;
+        self.island_y = y_off.clamp(-18.0, 14.0);
         self.island_y_velocity = y_vel;
         self.island_opacity += (target_opacity - self.island_opacity) * (fade_rate * dt).min(1.0);
 
-        if matches!(self.island_phase, IslandPhase::Dismissing) && self.island_opacity < 0.04 {
+        if matches!(self.island_phase, IslandPhase::Dismissing) && self.island_opacity < 0.03 {
             self.set_island_phase(IslandPhase::Hidden);
             self.island_opacity = 0.0;
             cx.defer(close_capture_windows);
@@ -734,12 +848,13 @@ impl ScrawlCoordinator {
             self.island_phase,
             IslandPhase::Hidden | IslandPhase::Dismissing
         ) {
-            // Bloom out of a compact Dynamic Island seed pill tucked near the top bar.
-            self.island_width = 64.0;
+            // Start at full intrinsic layout width so inner buttons are never clipped;
+            // the GPU CALayer transform handles the 0.52 -> 1.0 scale + Gaussian blur bloom.
+            self.island_width = self.island_target_width.max(195.0);
             self.island_velocity = 0.0;
-            self.island_height = 22.0;
-            self.island_height_velocity = 0.0;
-            self.island_y = -14.0;
+            self.island_scale = 0.52;
+            self.island_scale_velocity = 0.0;
+            self.island_y = -10.0;
             self.island_y_velocity = 0.0;
             self.island_opacity = 0.0;
             self.island_phase = IslandPhase::Hidden;
@@ -821,11 +936,11 @@ impl ScrawlCoordinator {
             _metal_overlay: metal_overlay,
         });
         if matches!(self.island_phase, IslandPhase::Hidden) {
-            self.island_width = 64.0;
+            self.island_width = self.island_target_width.max(240.0);
             self.island_velocity = 0.0;
-            self.island_height = 22.0;
-            self.island_height_velocity = 0.0;
-            self.island_y = -14.0;
+            self.island_scale = 0.52;
+            self.island_scale_velocity = 0.0;
+            self.island_y = -10.0;
             self.island_y_velocity = 0.0;
         }
         self.set_island_phase(IslandPhase::Recording);
@@ -902,20 +1017,20 @@ impl ScrawlCoordinator {
 
 pub struct HudPillWindow {
     coordinator: Entity<ScrawlCoordinator>,
+    ns_window: Option<Retained<NSWindow>>,
 }
 
 impl Render for HudPillWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let coord = self.coordinator.read(cx);
         let phase = coord.island_phase;
-        let prev_phase = coord.island_prev_phase;
         let content_phase = match phase {
             IslandPhase::Dismissing => coord.island_dismissed_from,
             other => other,
         };
         let phase_age = coord.island_phase_since.elapsed().as_secs_f32();
         let width = coord.island_width;
-        let height = coord.island_height;
+        let scale = coord.island_scale;
         let y_off = coord.island_y;
         let opacity = coord.island_opacity.clamp(0.0, 1.0);
         let elapsed_ms = coord
@@ -933,30 +1048,33 @@ impl Render for HudPillWindow {
 
         let clock = format_clock(elapsed_ms);
         let target_width = island_content_width(window, content_phase, &clock);
-        self.coordinator
-            .update(cx, |coord, _| coord.island_target_width = target_width);
+        let snap_initial_width =
+            phase_age < 0.025 && matches!(phase, IslandPhase::Selecting { .. }) && opacity < 0.35;
+        self.coordinator.update(cx, |coord, _| {
+            coord.island_target_width = target_width;
+            if snap_initial_width {
+                coord.island_width = target_width;
+            }
+        });
+        let render_width = if snap_initial_width {
+            target_width
+        } else {
+            width
+        };
 
-        // Dynamic Island blur + scale transition:
-        // - During 0..95ms, outgoing content scales down & blurs out into a frosted glow.
-        // - During 35..240ms, incoming content scales up from 0.74x -> 1.0x and sharpens out of the blur.
-        let t_in = ease_out_cubic(((phase_age - 0.03) / 0.21).clamp(0.0, 1.0));
-        let scale_in = if matches!(phase, IslandPhase::Dismissing) {
-            0.78 + 0.22 * opacity
-        } else {
-            0.74 + 0.26 * t_in
-        };
-        let content_alpha = if matches!(phase, IslandPhase::Dismissing) {
-            opacity
-        } else {
-            t_in
-        };
-        let blur_wave = if matches!(phase, IslandPhase::Dismissing) {
-            (1.0 - opacity).clamp(0.0, 1.0)
-        } else if phase_age < 0.24 {
-            (std::f32::consts::PI * (phase_age / 0.24).clamp(0.0, 1.0)).sin()
+        // Hardware QuartzCore Gaussian blur + GPU scale transform:
+        // - Opening / Dismissing: blur scales proportionally with `(1.0 - scale)` (`0..11px`).
+        // - Phase morph (`Selecting -> Recording -> Completed`): brief 5px Gaussian blur pulse across the first 160ms.
+        let scale_blur = ((1.0 - scale.min(1.0)) * 22.0).clamp(0.0, 11.0);
+        let morph_blur = if !matches!(phase, IslandPhase::Dismissing) && phase_age < 0.16 {
+            (std::f32::consts::PI * (phase_age / 0.16).clamp(0.0, 1.0)).sin() * 4.5
         } else {
             0.0
         };
+        let blur_radius = scale_blur.max(morph_blur);
+        if let Some(ref ns_win) = self.ns_window {
+            apply_pill_layer_effect(ns_win, scale, scale, y_off, blur_radius);
+        }
 
         let c_undo = self.coordinator.clone();
         let c_cancel = self.coordinator.clone();
@@ -967,15 +1085,15 @@ impl Render for HudPillWindow {
         let c_full = self.coordinator.clone();
         let c_sel_cancel = self.coordinator.clone();
 
-        let dynamic_gap = (CHIP_GAP * scale_in - (1.0 - scale_in) * 14.0).max(-6.0);
+        // Keep typography (`HUD_TEXT`) and spacing (`CHIP_GAP`) 100% constant so glyphs never
+        // re-hint or jump; all scaling happens in the GPU CALayer transform.
         let row = div()
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(dynamic_gap))
-            .text_size(px(HUD_TEXT * scale_in))
-            .whitespace_nowrap()
-            .opacity(content_alpha);
+            .gap(px(CHIP_GAP))
+            .text_size(px(HUD_TEXT))
+            .whitespace_nowrap();
 
         let capsule_content = match content_phase {
             IslandPhase::Selecting { mode } => row
@@ -1122,15 +1240,6 @@ impl Render for HudPillWindow {
         };
 
         let is_completed = matches!(content_phase, IslandPhase::Completed { .. });
-        let outgoing_alpha = if phase_age < 0.11
-            && !matches!(prev_phase, IslandPhase::Hidden | IslandPhase::Dismissing)
-        {
-            (1.0 - phase_age / 0.11).clamp(0.0, 1.0).powi(2)
-        } else {
-            0.0
-        };
-        let scale_out = (1.0 - 0.34 * (phase_age / 0.11).clamp(0.0, 1.0)).max(0.60);
-        let radius = (height * 0.5).max(9.0);
 
         div()
             .size_full()
@@ -1140,14 +1249,12 @@ impl Render for HudPillWindow {
             .opacity(opacity)
             .child(
                 div()
-                    .mt(px(y_off))
-                    .w(px(width))
-                    .h(px(height))
+                    .w(px(render_width))
+                    .h(px(ISLAND_H))
                     .flex_none()
                     .p(px(ISLAND_PAD))
-                    .rounded(px(radius))
+                    .rounded(px(ISLAND_RADIUS))
                     .overflow_hidden()
-                    .relative()
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1155,64 +1262,19 @@ impl Render for HudPillWindow {
                     .border_1()
                     .border_color(if is_completed {
                         rgba(0x69d89f4d)
-                    } else if blur_wave > 0.05 {
-                        with_alpha(0xffffff, 0.10 + 0.22 * blur_wave)
                     } else {
                         rgba(0xffffff1a)
                     })
-                    .shadow(vec![
-                        BoxShadow {
-                            color: gpui::hsla(0.0, 0.0, 0.0, 0.42),
-                            offset: point(px(0.0), px(6.0)),
-                            blur_radius: px(16.0 + 10.0 * blur_wave),
-                            spread_radius: px(0.0),
-                        },
-                        BoxShadow {
-                            color: if is_completed {
-                                gpui::hsla(0.41, 0.60, 0.62, 0.28 * blur_wave)
-                            } else {
-                                gpui::hsla(0.62, 0.85, 0.65, 0.26 * blur_wave)
-                            },
-                            offset: point(px(0.0), px(0.0)),
-                            blur_radius: px(22.0 * blur_wave),
-                            spread_radius: px(2.0 * blur_wave),
-                        },
-                    ])
+                    .shadow(vec![BoxShadow {
+                        color: gpui::hsla(0.0, 0.0, 0.0, 0.42),
+                        offset: point(px(0.0), px(6.0)),
+                        blur_radius: px(16.0),
+                        spread_radius: px(0.0),
+                    }])
                     .text_color(rgb(TEXT_COLOR))
                     .text_size(px(HUD_TEXT))
                     .whitespace_nowrap()
-                    .when(outgoing_alpha > 0.01, |d| {
-                        // Outgoing content compresses and dissolves into the center waist.
-                        let ghost_label = match prev_phase {
-                            IslandPhase::Selecting { .. } => "Area   Full Screen",
-                            IslandPhase::Recording => "● 0:00   Undo   Cancel   Finish",
-                            IslandPhase::Completed { .. } => "✓ Copied   Inspect",
-                            IslandPhase::Hidden | IslandPhase::Dismissing => "",
-                        };
-                        d.child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .opacity(outgoing_alpha * 0.75)
-                                .text_size(px(HUD_TEXT * scale_out))
-                                .text_color(rgb(TEXT_SOFT))
-                                .child(ghost_label),
-                        )
-                    })
-                    .child(capsule_content)
-                    .when(blur_wave > 0.02, |d| {
-                        // Frosted Dynamic Island blur-bloom veil across the pinch transition.
-                        d.child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .rounded(px(radius))
-                                .bg(with_alpha(0xffffff, 0.11 * blur_wave)),
-                        )
-                    }),
+                    .child(capsule_content),
             )
     }
 }
@@ -2426,8 +2488,10 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
             ..Default::default()
         },
         move |_, cx| {
-            if let Some(ns_win) = newest_ns_window() {
-                configure_floating_window(&ns_win, false, 2);
+            let ns_window = newest_ns_window();
+            if let Some(ref ns_win) = ns_window {
+                configure_floating_window(ns_win, false, 2);
+                apply_pill_layer_effect(ns_win, 0.52, 0.52, -10.0, 10.0);
                 let num = ns_win.windowNumber().max(0) as u32;
                 if num > 0 {
                     pill_coord
@@ -2443,6 +2507,7 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
                 cx.observe(&pill_coord, |_, _, cx| cx.notify()).detach();
                 HudPillWindow {
                     coordinator: pill_coord,
+                    ns_window,
                 }
             })
         },
