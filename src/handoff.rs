@@ -97,31 +97,87 @@ pub fn load_bundle(bundle_dir: &Path) -> Result<(PathBuf, ScrawlBundle)> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn copy_bundle_to_clipboard(bundle_dir: &Path) -> Result<()> {
+pub fn copy_string_to_clipboard(content: &str) -> Result<()> {
     use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
     use objc2_foundation::{NSArray, NSString};
 
-    let (directory, bundle) = load_bundle(bundle_dir)?;
-    let summary = crate::sketch::summary_markdown(&bundle, &directory);
-    let text = NSString::from_str(&summary);
+    let text = NSString::from_str(content);
     let pasteboard = NSPasteboard::generalPasteboard();
-    // Copy plain text only so Cmd-V pastes the transcript and local image paths
-    // consistently across terminals (Ghostty/OpenCode TUI) and GUI apps (OpenCode Desktop).
     unsafe {
         let types = NSArray::from_slice(&[NSPasteboardTypeString]);
         pasteboard.clearContents();
         pasteboard.declareTypes_owner(&types, None);
         ensure!(
             pasteboard.setString_forType(&text, NSPasteboardTypeString),
-            "Could not copy capture summary"
+            "Could not copy text to clipboard"
         );
     }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn copy_png_to_clipboard(png_bytes: &[u8]) -> Result<()> {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG};
+    use objc2_foundation::{NSArray, NSData};
+
+    let data = NSData::with_bytes(png_bytes);
+    let pasteboard = NSPasteboard::generalPasteboard();
+    unsafe {
+        let types = NSArray::from_slice(&[NSPasteboardTypePNG]);
+        pasteboard.clearContents();
+        pasteboard.declareTypes_owner(&types, None);
+        ensure!(
+            pasteboard.setData_forType(Some(&data), NSPasteboardTypePNG),
+            "Could not copy PNG image to clipboard"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn copy_bundle_to_clipboard(bundle_dir: &Path) -> Result<()> {
+    let (directory, bundle) = load_bundle(bundle_dir)?;
+    let summary = crate::sketch::summary_markdown(&bundle, &directory);
+    copy_string_to_clipboard(&summary)
+}
+
+/// Pastes both the contact-sheet image and the transcript/keyframe text into the active app
+/// as a two-step sequence (`⌘V` image, then `⌘V` text) triggered by `⌃⌥⇧V`.
+#[cfg(target_os = "macos")]
+pub fn paste_bundle_image_and_text(bundle_dir: &Path) -> Result<()> {
+    let (directory, bundle) = load_bundle(bundle_dir)?;
+    let sheet_path = directory.join(&bundle.contact_sheet);
+    let image = fs::read(&sheet_path).context("Could not read contact sheet")?;
+    let summary = crate::sketch::summary_markdown(&bundle, &directory);
+
+    crate::capture::wait_for_modifiers_released(350);
+
+    if crate::capture::is_frontmost_terminal() {
+        // In terminals (Ghostty / OpenCode TUI / Claude Code), pasting the image path first
+        // resolves and attaches `[Image 1]`, and the second paste inserts the text summary.
+        copy_string_to_clipboard(&sheet_path.display().to_string())?;
+    } else {
+        // In GUI apps (OpenCode Desktop, Slack, Linear, browsers), PNG-only attaches the image.
+        copy_png_to_clipboard(&image)?;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    crate::capture::post_synthetic_cmd_v();
+
+    std::thread::sleep(std::time::Duration::from_millis(160));
+    copy_string_to_clipboard(&summary)?;
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    crate::capture::post_synthetic_cmd_v();
     Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
 pub fn copy_bundle_to_clipboard(_bundle_dir: &Path) -> Result<()> {
     bail!("Image and text clipboard handoff requires macOS")
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn paste_bundle_image_and_text(_bundle_dir: &Path) -> Result<()> {
+    bail!("Image and text paste handoff requires macOS")
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -45,6 +45,7 @@ const FLAG_COMMAND: u64 = 1 << 20;
 
 const KEY_S: u16 = 1;
 const KEY_Z: u16 = 6;
+const KEY_V: u16 = 9;
 
 // Carbon HIToolbox global hotkey constants (requires zero TCC permissions).
 pub const CARBON_CMD_KEY: u32 = 1 << 8;
@@ -59,6 +60,7 @@ const HOTKEY_SIG: u32 = u32::from_be_bytes(*b"SCRW");
 const HOTKEY_ID_TOGGLE: u32 = 1;
 const HOTKEY_ID_ESCAPE: u32 = 2;
 const HOTKEY_ID_ALT1: u32 = 3;
+const HOTKEY_ID_PASTE_BASE: u32 = 100;
 
 #[repr(C, packed(2))]
 #[derive(Clone, Copy)]
@@ -152,6 +154,13 @@ unsafe extern "C" {
     ) -> *mut c_void;
     fn CGEventTapEnable(tap: *mut c_void, enable: bool);
     fn CGEventCreate(source: *const c_void) -> EventRef;
+    fn CGEventCreateKeyboardEvent(
+        source: *const c_void,
+        virtual_key: u16,
+        key_down: bool,
+    ) -> EventRef;
+    fn CGEventSetFlags(event: EventRef, flags: u64);
+    fn CGEventPost(tap: u32, event: EventRef);
     fn CGEventSourceFlagsState(state_id: u32) -> u64;
     fn CGEventSourceKeyState(state_id: u32, key: u16) -> bool;
     fn CGEventGetFlags(event: EventRef) -> u64;
@@ -182,6 +191,7 @@ unsafe extern "C" {
 #[derive(Clone, Debug)]
 pub enum LiveOverlayEvent {
     ToggleCaptureShortcut,
+    PasteLatestShortcut,
     UndoStroke,
     CancelCapture,
     RequestSnapshot,
@@ -269,6 +279,10 @@ pub fn layout_s_keycode() -> u16 {
 
 pub fn layout_z_keycode() -> u16 {
     key_code_for_char('z').unwrap_or(KEY_Z)
+}
+
+pub fn layout_v_keycode() -> u16 {
+    key_code_for_char('v').unwrap_or(KEY_V)
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -379,6 +393,9 @@ unsafe extern "C" fn carbon_hotkey_handler(
                 let _ = telemetry
                     .ui_sender
                     .try_send(LiveOverlayEvent::CancelCapture);
+            }
+            id if id >= HOTKEY_ID_PASTE_BASE => {
+                telemetry.emit_paste_shortcut();
             }
             _ => {
                 telemetry.emit_toggle_shortcut();
@@ -491,6 +508,46 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
                 scrawl_log(format!(
                     "RegisterEventHotKey(⌃⌥⇧S-ansi, code=1, mods={mods}) -> rc={rc} ref={r:p}"
                 ));
+            }
+            // Register ⌃⌥⇧V (and Karabiner ⌘⌥⇧V / ⌃⌥⌘V) for pasting both Image + Text of the latest capture.
+            let v_code = u32::from(layout_v_keycode());
+            let mut v_codes = vec![v_code];
+            if v_code != u32::from(KEY_V) {
+                v_codes.push(u32::from(KEY_V));
+            }
+            let mut paste_id = HOTKEY_ID_PASTE_BASE;
+            for &code in &v_codes {
+                for (mods, name) in [
+                    (
+                        CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
+                        "⌃⌥⇧V",
+                    ),
+                    (
+                        CARBON_CMD_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
+                        "⌘⌥⇧V",
+                    ),
+                    (
+                        CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_CMD_KEY,
+                        "⌃⌥⌘V",
+                    ),
+                ] {
+                    let mut r: *mut c_void = ptr::null_mut();
+                    let rc = RegisterEventHotKey(
+                        code,
+                        mods,
+                        EventHotKeyID {
+                            signature: HOTKEY_SIG,
+                            id: paste_id,
+                        },
+                        target,
+                        0,
+                        &raw mut r,
+                    );
+                    scrawl_log(format!(
+                        "RegisterEventHotKey({name}, code={code}, mods={mods}) -> rc={rc} ref={r:p}"
+                    ));
+                    paste_id += 1;
+                }
             }
         }
         Mutex::new(CarbonHotKeyState { toggle_ref: 0 })
@@ -1272,6 +1329,25 @@ impl SharedCaptureTelemetry {
         }
     }
 
+    pub fn emit_paste_shortcut(&self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let prev = self.last_shortcut_ms.load(Ordering::Acquire);
+        if now_ms.saturating_sub(prev) >= 400
+            && self
+                .last_shortcut_ms
+                .compare_exchange(prev, now_ms, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            scrawl_log("emit_paste_shortcut -> sending PasteLatestShortcut");
+            let _ = self
+                .ui_sender
+                .try_send(LiveOverlayEvent::PasteLatestShortcut);
+        }
+    }
+
     pub fn matches_shortcut(
         &self,
         keycode: u16,
@@ -1666,10 +1742,61 @@ pub fn current_mouse_screen() -> Option<[f32; 2]> {
     current_mouse_location().map(|p| [p.x as f32, p.y as f32])
 }
 
+pub fn is_frontmost_terminal() -> bool {
+    let Some((_pid, app, bundle_id)) = frontmost_app_info() else {
+        return false;
+    };
+    let a = app.to_ascii_lowercase();
+    let b = bundle_id.unwrap_or_default().to_ascii_lowercase();
+    [
+        "ghostty",
+        "iterm",
+        "terminal",
+        "kitty",
+        "wezterm",
+        "alacritty",
+        "warp",
+    ]
+    .iter()
+    .any(|needle| a.contains(needle) || b.contains(needle))
+}
+
+pub fn wait_for_modifiers_released(max_wait_ms: u64) {
+    let deadline = Instant::now() + Duration::from_millis(max_wait_ms);
+    while Instant::now() < deadline {
+        let flags = unsafe { CGEventSourceFlagsState(0) | CGEventSourceFlagsState(1) };
+        let any_mod = (flags & (FLAG_COMMAND | FLAG_CONTROL | FLAG_ALTERNATE | FLAG_SHIFT)) != 0;
+        if !any_mod {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+pub fn post_synthetic_cmd_v() {
+    let v_code = layout_v_keycode();
+    unsafe {
+        let down = CGEventCreateKeyboardEvent(ptr::null(), v_code, true);
+        if !down.is_null() {
+            CGEventSetFlags(down, FLAG_COMMAND);
+            CGEventPost(0, down);
+            CFRelease(down.cast());
+        }
+        thread::sleep(Duration::from_millis(12));
+        let up = CGEventCreateKeyboardEvent(ptr::null(), v_code, false);
+        if !up.is_null() {
+            CGEventSetFlags(up, FLAG_COMMAND);
+            CGEventPost(0, up);
+            CFRelease(up.cast());
+        }
+    }
+}
+
 /// 120Hz global HID & session state poller so shortcuts, Shift-laser (`⇧` + move), and
 /// Shift-drag ink (`⇧` + drag) work across all apps (including Karabiner virtual HID).
 fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
     let mut prev_shortcut = false;
+    let mut prev_paste = false;
     let mut prev_shift_ink = false;
     let mut prev_undo = false;
     let mut await_shift_release = false;
@@ -1693,6 +1820,7 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
 
         let s_code = layout_s_keycode();
         let z_code = layout_z_keycode();
+        let v_code = layout_v_keycode();
         let cfg_keycode = telemetry
             .shortcut
             .lock()
@@ -1702,6 +1830,11 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
             CGEventSourceKeyState(1, s_code)
                 || CGEventSourceKeyState(0, s_code)
                 || CGEventSourceKeyState(1, KEY_S)
+        };
+        let key_v = unsafe {
+            CGEventSourceKeyState(1, v_code)
+                || CGEventSourceKeyState(0, v_code)
+                || CGEventSourceKeyState(1, KEY_V)
         };
         let key_cfg = if cfg_keycode == s_code {
             key_s
@@ -1724,6 +1857,12 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
             telemetry.emit_toggle_shortcut();
         }
         prev_shortcut = shortcut_now;
+
+        let paste_now = key_v && alt && ((shift && (ctrl || cmd)) || (ctrl && cmd));
+        if paste_now && !prev_paste && !telemetry.active.load(Ordering::Acquire) {
+            telemetry.emit_paste_shortcut();
+        }
+        prev_paste = paste_now;
 
         if !telemetry.active.load(Ordering::Acquire) {
             prev_shift_ink = false;

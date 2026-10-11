@@ -132,10 +132,9 @@ fn clock_template(clock: &str) -> String {
         .collect()
 }
 
-fn completed_meta(duration_ms: u64, frame_count: usize) -> String {
+fn completed_meta(_duration_ms: u64, frame_count: usize) -> String {
     format!(
-        "· {} · {} {}",
-        format_clock(duration_ms),
+        "· {} {} · ⌃⌥⇧V",
         frame_count,
         if frame_count == 1 { "frame" } else { "frames" }
     )
@@ -2703,6 +2702,21 @@ pub fn run_app(
                                     coord.begin_target_selection(cx);
                                 }
                             }
+                            LiveOverlayEvent::PasteLatestShortcut => {
+                                if !coord.is_recording() && !coord.is_selecting() {
+                                    std::thread::spawn(|| {
+                                        if let Err(err) =
+                                            crate::handoff::paste_bundle_image_and_text(
+                                                std::path::Path::new("latest"),
+                                            )
+                                        {
+                                            scrawl_log(format!(
+                                                "paste_bundle_image_and_text error: {err}"
+                                            ));
+                                        }
+                                    });
+                                }
+                            }
                             LiveOverlayEvent::UndoStroke => {
                                 coord.undo_stroke(cx);
                             }
@@ -2954,6 +2968,6 @@ mod tests {
     #[test]
     fn clock_template_is_width_stable() {
         assert_eq!(clock_template("12:34"), "00:00");
-        assert_eq!(completed_meta(8_000, 1), "· 0:08 · 1 frame");
+        assert_eq!(completed_meta(8_000, 1), "· 1 frame · ⌃⌥⇧V");
     }
 }
