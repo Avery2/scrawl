@@ -293,11 +293,33 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
     Some(receiver)
 }
 
-fn newest_ns_window() -> Option<Retained<NSWindow>> {
+fn find_hud_pill_ns_window() -> Option<Retained<NSWindow>> {
     let mtm = MainThreadMarker::new()?;
     let app = NSApplication::sharedApplication(mtm);
-    let windows = app.windows();
-    windows.lastObject()
+    for win in app.windows() {
+        let size = win.frame().size;
+        if (size.width - f64::from(PILL_WINDOW_W)).abs() < 8.0
+            && (size.height - f64::from(PILL_WINDOW_H)).abs() < 8.0
+        {
+            return Some(win);
+        }
+    }
+    None
+}
+
+fn find_picker_ns_window() -> Option<Retained<NSWindow>> {
+    let mtm = MainThreadMarker::new()?;
+    let app = NSApplication::sharedApplication(mtm);
+    for win in app.windows() {
+        let size = win.frame().size;
+        if size.width >= 600.0
+            && (size.width - 1120.0).abs() > 8.0
+            && (size.width - f64::from(PILL_WINDOW_W)).abs() > 8.0
+        {
+            return Some(win);
+        }
+    }
+    None
 }
 
 fn sync_full_size_content_view(ns_window: &NSWindow) {
@@ -390,60 +412,121 @@ unsafe impl objc2::Encode for CATransform3D {
     );
 }
 
-/// Applies a hardware-accelerated QuartzCore `CATransform3D` scale/translation and
-/// `CAFilter("gaussianBlur")` directly to the HUD pill window's backing `CALayer`,
-/// eliminating CoreText font-size hinting jitter and `overflow_hidden` text clipping.
+/// Two-layer Dynamic Island effect on `HudPillWindow`:
+/// 1. `shell_layer` (inserted behind GPUI's `contentView.layer()`) renders the outer black pill
+///    capsule, `1px` specular border, and drop shadow with **zero blur** so the pill's border and
+///    silhouette are always 100% razor-sharp.
+/// 2. `contentView.layer()` (which renders only the inner chips/text on a transparent background)
+///    receives `CAFilter("gaussianBlur")` + `CATransform3D` scale so only the inner contents blur.
 fn apply_pill_layer_effect(
     ns_window: &NSWindow,
-    scale_x: f32,
-    scale_y: f32,
+    shell_slot: &mut Option<Retained<objc2_quartz_core::CALayer>>,
+    pill_width: f32,
+    pill_height: f32,
+    scale: f32,
     y_offset: f32,
+    opacity: f32,
+    is_completed: bool,
     blur_radius: f32,
 ) {
     use objc2::runtime::AnyClass;
-    use objc2_foundation::{NSArray, NSNumber};
-    use objc2_quartz_core::CATransaction;
+    use objc2_foundation::{NSArray, NSNumber, NSPoint, NSRect, NSSize};
+    use objc2_quartz_core::{CALayer, CATransaction};
 
     let Some(cv) = ns_window.contentView() else {
         return;
     };
     cv.setWantsLayer(true);
-    let Some(layer) = cv.layer() else {
+    let Some(content_layer) = cv.layer() else {
         return;
     };
     let bounds = cv.bounds();
     let cx = bounds.size.width * 0.5;
     let cy = bounds.size.height * 0.5;
-    let sx = f64::from(scale_x.clamp(0.25, 1.35));
-    let sy = f64::from(scale_y.clamp(0.25, 1.35));
-    let ty = if cv.isFlipped() {
+    let s = f64::from(scale.clamp(0.50, 1.15));
+    let ty_unflipped = -f64::from(y_offset);
+    let ty_cv = if cv.isFlipped() {
         f64::from(y_offset)
     } else {
         -f64::from(y_offset)
     };
+
+    if shell_slot.is_none()
+        && let Some(frame_view) = unsafe { cv.superview() }
+    {
+        frame_view.setWantsLayer(true);
+        if let Some(root_layer) = frame_view.layer() {
+            let shell = CALayer::new();
+            root_layer.insertSublayer_below(&shell, Some(&content_layer));
+            *shell_slot = Some(shell);
+        }
+    }
+
+    let w_scaled = f64::from(pill_width) * s;
+    let h_scaled = f64::from(pill_height) * s;
+    let shell_rect = NSRect::new(
+        NSPoint::new(cx - w_scaled * 0.5, cy - h_scaled * 0.5 + ty_unflipped),
+        NSSize::new(w_scaled, h_scaled),
+    );
+
+    // Content scales slightly more (`0.88 .. 1.0`) inside the crisp outer shell during morphs.
+    let content_s = (s * (1.0 - f64::from(blur_radius).min(8.0) * 0.012)).clamp(0.45, 1.15);
     let transform = CATransform3D {
-        m11: sx,
+        m11: content_s,
         m12: 0.0,
         m13: 0.0,
         m14: 0.0,
         m21: 0.0,
-        m22: sy,
+        m22: content_s,
         m23: 0.0,
         m24: 0.0,
         m31: 0.0,
         m32: 0.0,
         m33: 1.0,
         m34: 0.0,
-        m41: cx * (1.0 - sx),
-        m42: cy * (1.0 - sy) + ty,
+        m41: cx * (1.0 - content_s),
+        m42: cy * (1.0 - content_s) + ty_cv,
         m43: 0.0,
         m44: 1.0,
     };
 
     CATransaction::begin();
     CATransaction::setDisableActions(true);
+    if let Some(ref shell) = *shell_slot {
+        shell.setFrame(shell_rect);
+        shell.setCornerRadius(h_scaled * 0.5);
+        shell.setBorderWidth(1.0);
+        shell.setOpacity(opacity);
+        shell.setShadowOpacity(0.40 * opacity);
+        shell.setShadowRadius(14.0);
+        shell.setShadowOffset(NSSize::new(0.0, -5.0));
+        unsafe {
+            let bg_ns = NSColor::colorWithSRGBRed_green_blue_alpha(
+                20.0 / 255.0,
+                20.0 / 255.0,
+                22.0 / 255.0,
+                0.96,
+            );
+            let bg_cg: *const AnyObject = msg_send![&*bg_ns, CGColor];
+            let _: () = msg_send![&**shell, setBackgroundColor: bg_cg];
+
+            let border_ns = if is_completed {
+                NSColor::colorWithSRGBRed_green_blue_alpha(
+                    105.0 / 255.0,
+                    216.0 / 255.0,
+                    159.0 / 255.0,
+                    0.34,
+                )
+            } else {
+                NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.12)
+            };
+            let border_cg: *const AnyObject = msg_send![&*border_ns, CGColor];
+            let _: () = msg_send![&**shell, setBorderColor: border_cg];
+        }
+    }
+
     unsafe {
-        let _: () = msg_send![&*layer, setTransform: transform];
+        let _: () = msg_send![&*content_layer, setTransform: transform];
         if blur_radius > 0.18
             && let Some(ca_filter_cls) = AnyClass::get(c"CAFilter")
         {
@@ -455,10 +538,10 @@ fn apply_pill_layer_effect(
                 let _: () = msg_send![filter, setValue: &*radius_num, forKey: &*radius_key];
                 let filter_ref = &*filter;
                 let filters = NSArray::from_slice(&[filter_ref]);
-                layer.setFilters(Some(&filters));
+                content_layer.setFilters(Some(&filters));
             }
         } else {
-            layer.setFilters(None);
+            content_layer.setFilters(None);
         }
     }
     CATransaction::commit();
@@ -1018,10 +1101,14 @@ impl ScrawlCoordinator {
 pub struct HudPillWindow {
     coordinator: Entity<ScrawlCoordinator>,
     ns_window: Option<Retained<NSWindow>>,
+    shell_layer: Option<Retained<objc2_quartz_core::CALayer>>,
 }
 
 impl Render for HudPillWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.ns_window.is_none() {
+            self.ns_window = find_hud_pill_ns_window();
+        }
         let coord = self.coordinator.read(cx);
         let phase = coord.island_phase;
         let content_phase = match phase {
@@ -1061,19 +1148,30 @@ impl Render for HudPillWindow {
         } else {
             width
         };
+        let is_completed = matches!(content_phase, IslandPhase::Completed { .. });
 
-        // Hardware QuartzCore Gaussian blur + GPU scale transform:
-        // - Opening / Dismissing: blur scales proportionally with `(1.0 - scale)` (`0..11px`).
-        // - Phase morph (`Selecting -> Recording -> Completed`): brief 5px Gaussian blur pulse across the first 160ms.
-        let scale_blur = ((1.0 - scale.min(1.0)) * 22.0).clamp(0.0, 11.0);
+        // Blur ONLY the inner contents (`content_layer`), never `shell_layer` (the pill border):
+        // - Opening / Dismissing: content blur scales with `(1.0 - scale)` (`0..8px`).
+        // - Phase morph (`Selecting -> Recording -> Completed`): 6px content blur pulse over 160ms.
+        let scale_blur = ((1.0 - scale.min(1.0)) * 18.0).clamp(0.0, 8.5);
         let morph_blur = if !matches!(phase, IslandPhase::Dismissing) && phase_age < 0.16 {
-            (std::f32::consts::PI * (phase_age / 0.16).clamp(0.0, 1.0)).sin() * 4.5
+            (std::f32::consts::PI * (phase_age / 0.16).clamp(0.0, 1.0)).sin() * 6.0
         } else {
             0.0
         };
         let blur_radius = scale_blur.max(morph_blur);
         if let Some(ref ns_win) = self.ns_window {
-            apply_pill_layer_effect(ns_win, scale, scale, y_off, blur_radius);
+            apply_pill_layer_effect(
+                ns_win,
+                &mut self.shell_layer,
+                render_width,
+                ISLAND_H,
+                scale,
+                y_off,
+                opacity,
+                is_completed,
+                blur_radius,
+            );
         }
 
         let c_undo = self.coordinator.clone();
@@ -1239,7 +1337,7 @@ impl Render for HudPillWindow {
             IslandPhase::Hidden | IslandPhase::Dismissing => row,
         };
 
-        let is_completed = matches!(content_phase, IslandPhase::Completed { .. });
+        let has_shell = self.shell_layer.is_some();
 
         div()
             .size_full()
@@ -1258,19 +1356,15 @@ impl Render for HudPillWindow {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(rgba(0x141416f5))
-                    .border_1()
-                    .border_color(if is_completed {
-                        rgba(0x69d89f4d)
-                    } else {
-                        rgba(0xffffff1a)
+                    .when(!has_shell, |d| {
+                        d.bg(rgba(0x141416f5))
+                            .border_1()
+                            .border_color(if is_completed {
+                                rgba(0x69d89f4d)
+                            } else {
+                                rgba(0xffffff1a)
+                            })
                     })
-                    .shadow(vec![BoxShadow {
-                        color: gpui::hsla(0.0, 0.0, 0.0, 0.42),
-                        offset: point(px(0.0), px(6.0)),
-                        blur_radius: px(16.0),
-                        spread_radius: px(0.0),
-                    }])
                     .text_color(rgb(TEXT_COLOR))
                     .text_size(px(HUD_TEXT))
                     .whitespace_nowrap()
@@ -1451,7 +1545,7 @@ impl Render for TargetPickerWindow {
         let hovered = coord.hovered_window.clone();
         let anim_rect = coord.animated_window_rect;
         let pointer = coord.selection_pointer;
-        let picker_fade = ease_out_cubic(coord.island_phase_since.elapsed().as_secs_f32() / 0.12);
+        let picker_fade = ease_out_cubic(coord.island_phase_since.elapsed().as_secs_f32() / 0.15);
 
         let c_down = self.coordinator.clone();
         let c_move = self.coordinator.clone();
@@ -2412,7 +2506,7 @@ fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
             ..Default::default()
         },
         move |window, cx| {
-            if let Some(ns_win) = newest_ns_window() {
+            if let Some(ns_win) = find_picker_ns_window() {
                 ns_win.setStyleMask(
                     NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
                 );
@@ -2488,10 +2582,21 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
             ..Default::default()
         },
         move |_, cx| {
-            let ns_window = newest_ns_window();
+            let ns_window = find_hud_pill_ns_window();
+            let mut shell_layer = None;
             if let Some(ref ns_win) = ns_window {
                 configure_floating_window(ns_win, false, 2);
-                apply_pill_layer_effect(ns_win, 0.52, 0.52, -10.0, 10.0);
+                apply_pill_layer_effect(
+                    ns_win,
+                    &mut shell_layer,
+                    205.0,
+                    ISLAND_H,
+                    0.52,
+                    -10.0,
+                    0.0,
+                    false,
+                    8.5,
+                );
                 let num = ns_win.windowNumber().max(0) as u32;
                 if num > 0 {
                     pill_coord
@@ -2508,6 +2613,7 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
                 HudPillWindow {
                     coordinator: pill_coord,
                     ns_window,
+                    shell_layer,
                 }
             })
         },

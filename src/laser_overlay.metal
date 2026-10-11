@@ -127,64 +127,45 @@ fragment float4 laser_fragment(
 
     float4 out = float4(0.0);
 
-    // Smooth 340ms Dynamic Island-style blur + scale settle from picker into active recording.
-    float t_intro = clamp(u.now_sec / 0.34, 0.0, 1.0);
+    // Quick 0.15s (150ms) dim transition when entering recording.
+    float t_intro = clamp(u.now_sec / 0.15, 0.0, 1.0);
     float intro_ease = 1.0 - pow(1.0 - t_intro, 3.0);
     float intro_fade = 1.0 - intro_ease;
-    float blur_bloom = sin(t_intro * 3.14159265) * (1.0 - t_intro * 0.5);
 
     if (u.constrain_rect > 0.5) {
         bool is_window = u._pad1 > 1.5;
-        float corner_r = is_window ? 10.0 : 4.0;
-        // Elastic lock-in: starts slightly expanded (+18px) with a soft blurred edge and contracts onto the target.
-        float expand = 18.0 * pow(1.0 - t_intro, 3.0);
-        float2 box_min = u.target_rect.xy - float2(expand);
-        float2 box_max = u.target_rect.xy + u.target_rect.zw + float2(expand);
+        float corner_r = is_window ? 10.0 : 2.0;
+        float2 box_min = u.target_rect.xy;
+        float2 box_max = u.target_rect.xy + u.target_rect.zw;
         float2 box_center = (box_min + box_max) * 0.5;
         float2 half_size = max((box_max - box_min) * 0.5 - float2(corner_r), float2(0.0));
         float2 q = abs(p - box_center) - half_size;
         float sdf = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - corner_r;
 
-        // Inside the selected window, dissolve the picker's blue window highlight tint over 340ms.
         if (sdf <= 0.0 && is_window && intro_fade > 0.002) {
-            float fill_a = 0.14 * intro_fade;
             out.rgb = float3(0.23, 0.36, 0.96);
-            out.a = fill_a;
+            out.a = 0.13 * intro_fade;
         }
-        // Outside the target rect, smoothly settle from the picker dim (0.32) to recording dim (0.20)
-        // with a soft blurred edge during the transition that sharpens as it locks in.
-        float edge_softness = 1.0 + 16.0 * blur_bloom;
-        if (sdf > -edge_softness) {
-            float dim_target = mix(0.32, 0.20, intro_ease);
-            float dim_a = smoothstep(-edge_softness * 0.5, edge_softness, sdf) * dim_target;
+        if (sdf > -1.2) {
+            float dim_target = mix(0.32, 0.22, intro_ease);
+            float dim_a = smoothstep(-0.5, 1.0, sdf) * dim_target;
             if (dim_a > 0.001) {
                 out.rgb = out.rgb * (1.0 - dim_a);
                 out.a = dim_a + out.a * (1.0 - dim_a);
             }
             float3 picker_border = is_window ? float3(0.36, 0.49, 0.98) : float3(1.0, 1.0, 1.0);
-            float3 rec_border = float3(1.0, 1.0, 1.0);
-            float3 border_col = mix(picker_border, rec_border, intro_ease);
-            float border_alpha_peak = mix(is_window ? 0.95 : 0.90, 0.32, intro_ease);
-            float border_half_w = mix(is_window ? 1.4 : 1.0, 0.65, intro_ease) + 4.5 * blur_bloom;
-            float border_a = (1.0 - smoothstep(border_half_w * 0.3, border_half_w + 1.2, abs(sdf - 0.6))) * border_alpha_peak;
+            float3 border_col = mix(picker_border, float3(1.0, 1.0, 1.0), intro_ease);
+            float border_alpha_peak = mix(is_window ? 0.90 : 0.85, 0.30, intro_ease);
+            float border_a = (1.0 - smoothstep(0.3, 1.3, abs(sdf - 0.5))) * border_alpha_peak;
             if (border_a > 0.001) {
                 out.rgb = border_col * border_a + out.rgb * (1.0 - border_a);
                 out.a = border_a + out.a * (1.0 - border_a);
             }
         }
     } else if (intro_fade > 0.002) {
-        // Full-screen recording: contracting vignette ring that opens outward to the screen edges over 340ms.
-        float inset = 28.0 * intro_fade;
-        float2 screen_pts = u.resolution / max(u.scale, 1.0);
-        float2 box_center = screen_pts * 0.5;
-        float2 half_size = max(screen_pts * 0.5 - float2(inset + 12.0), float2(0.0));
-        float2 q = abs(p - box_center) - half_size;
-        float sdf = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - 12.0;
-        float vignette = smoothstep(-24.0, 8.0, sdf) * 0.28 * intro_fade;
-        float base_dim = 0.24 * intro_fade * intro_fade;
-        float total_a = clamp(base_dim + vignette, 0.0, 0.45);
+        // Full-screen recording: simple 0.15s dim fade out.
         out.rgb = float3(0.0);
-        out.a = total_a;
+        out.a = 0.32 * intro_fade;
     }
 
     // 1. Composite persistent ink (white halo + red fill)
