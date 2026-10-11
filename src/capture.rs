@@ -225,8 +225,8 @@ impl Default for ShortcutConfig {
     fn default() -> Self {
         Self {
             key_code: u32::from(KEY_S),
-            carbon_modifiers: CARBON_OPTION_KEY,
-            label: "⌥S".into(),
+            carbon_modifiers: CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
+            label: "⌃⌥⇧S".into(),
         }
     }
 }
@@ -264,11 +264,31 @@ struct CarbonHotKeyState {
 
 static CARBON_HOTKEYS: std::sync::OnceLock<Mutex<CarbonHotKeyState>> = std::sync::OnceLock::new();
 
+pub fn scrawl_log(msg: impl AsRef<str>) {
+    use std::io::Write;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let line = format!("[{ts}] {}\n", msg.as_ref());
+    eprint!("{line}");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/private/var/folders/dd/5fz89drs5p9_r0fk7rwqqnbr0000gn/T/opencode/scrawl-debug.log")
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 unsafe extern "C" fn carbon_hotkey_handler(
     _next_handler: *mut c_void,
     event: *mut c_void,
     user_data: *mut c_void,
 ) -> i32 {
+    scrawl_log(format!(
+        "carbon_hotkey_handler entered: event={event:p} user_data={user_data:p}"
+    ));
     if event.is_null() || user_data.is_null() {
         return -1;
     }
@@ -287,9 +307,14 @@ unsafe extern "C" fn carbon_hotkey_handler(
             (&raw mut hotkey_id).cast(),
         )
     };
-    if status == 0 && hotkey_id.signature == HOTKEY_SIG {
+    let sig = hotkey_id.signature;
+    let id = hotkey_id.id;
+    scrawl_log(format!(
+        "carbon_hotkey_handler GetEventParameter status={status} sig={sig:#x} id={id}"
+    ));
+    if status == 0 && sig == HOTKEY_SIG {
         let telemetry = unsafe { &*user_data.cast::<SharedCaptureTelemetry>() };
-        match hotkey_id.id {
+        match id {
             HOTKEY_ID_TOGGLE | HOTKEY_ID_ALT1 | HOTKEY_ID_ALT2 | HOTKEY_ID_ALT3 => {
                 telemetry.emit_toggle_shortcut();
             }
@@ -318,8 +343,12 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
         unsafe {
             let mut handler_ref: *mut c_void = ptr::null_mut();
             let dispatcher = GetEventDispatcherTarget();
+            let app_target = GetApplicationEventTarget();
+            scrawl_log(format!(
+                "install_global_hotkeys: dispatcher={dispatcher:p} app_target={app_target:p}"
+            ));
             if !dispatcher.is_null() {
-                InstallEventHandler(
+                let rc = InstallEventHandler(
                     dispatcher,
                     carbon_hotkey_handler,
                     1,
@@ -327,11 +356,13 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
                     user_data,
                     &raw mut handler_ref,
                 );
+                scrawl_log(format!(
+                    "InstallEventHandler(dispatcher) -> rc={rc} handler_ref={handler_ref:p}"
+                ));
             }
-            let app_target = GetApplicationEventTarget();
             if !app_target.is_null() && app_target != dispatcher {
                 let mut app_handler_ref: *mut c_void = ptr::null_mut();
-                InstallEventHandler(
+                let rc = InstallEventHandler(
                     app_target,
                     carbon_hotkey_handler,
                     1,
@@ -339,26 +370,35 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
                     user_data,
                     &raw mut app_handler_ref,
                 );
+                scrawl_log(format!(
+                    "InstallEventHandler(app_target) -> rc={rc} handler_ref={app_handler_ref:p}"
+                ));
             }
             // Also register convenient built-in chords: ⌃⌥⇧S, ⌃⌥⌘S, and ⌘⇧S
-            let target = if !dispatcher.is_null() {
-                dispatcher
-            } else {
+            let target = if !app_target.is_null() {
                 app_target
+            } else {
+                dispatcher
             };
-            for (id, mods) in [
+            for (id, mods, name) in [
                 (
                     HOTKEY_ID_ALT1,
                     CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
+                    "⌃⌥⇧S",
                 ),
                 (
                     HOTKEY_ID_ALT2,
-                    CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_CMD_KEY,
+                    CARBON_CMD_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
+                    "⌘⌥⇧S",
                 ),
-                (HOTKEY_ID_ALT3, CARBON_CMD_KEY | CARBON_SHIFT_KEY),
+                (
+                    HOTKEY_ID_ALT3,
+                    CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_CMD_KEY,
+                    "⌃⌥⌘S",
+                ),
             ] {
                 let mut r: *mut c_void = ptr::null_mut();
-                RegisterEventHotKey(
+                let rc = RegisterEventHotKey(
                     u32::from(KEY_S),
                     mods,
                     EventHotKeyID {
@@ -369,6 +409,9 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
                     0,
                     &raw mut r,
                 );
+                scrawl_log(format!(
+                    "RegisterEventHotKey({name}, mods={mods}) -> rc={rc} ref={r:p}"
+                ));
             }
         }
         Mutex::new(CarbonHotKeyState {
@@ -404,11 +447,11 @@ pub fn update_global_shortcut(telemetry: &SharedCaptureTelemetry, config: Shortc
     }
     let mut new_ref: *mut c_void = ptr::null_mut();
     let target = unsafe {
-        let d = GetEventDispatcherTarget();
-        if !d.is_null() {
-            d
+        let a = GetApplicationEventTarget();
+        if !a.is_null() {
+            a
         } else {
-            GetApplicationEventTarget()
+            GetEventDispatcherTarget()
         }
     };
     let status = unsafe {
@@ -424,6 +467,10 @@ pub fn update_global_shortcut(telemetry: &SharedCaptureTelemetry, config: Shortc
             &raw mut new_ref,
         )
     };
+    scrawl_log(format!(
+        "update_global_shortcut({}, key={}, mods={}) -> status={status} ref={new_ref:p}",
+        config.label, config.key_code, config.carbon_modifiers
+    ));
     if status == 0 && !new_ref.is_null() {
         state.toggle_ref = new_ref as usize;
     }
@@ -1143,6 +1190,7 @@ impl SharedCaptureTelemetry {
                 .compare_exchange(prev, now_ms, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
+            scrawl_log("emit_toggle_shortcut -> sending ToggleCaptureShortcut");
             let _ = self
                 .ui_sender
                 .try_send(LiveOverlayEvent::ToggleCaptureShortcut);
@@ -1171,11 +1219,9 @@ impl SharedCaptureTelemetry {
             && ctrl == want_ctrl
             && alt == want_alt
             && shift == want_shift;
-        let builtin_s = keycode == KEY_S
-            && ((alt && !cmd && !ctrl && !shift)
-                || (ctrl && alt && shift && !cmd)
-                || (ctrl && alt && cmd && !shift)
-                || (cmd && shift && !ctrl && !alt));
+        // Support ⌃⌥⇧S, ⌘⌥⇧S (when Karabiner maps physical left_control -> left_command),
+        // and ⌃⌥⌘S even when COMBINED_SESSION_STATE (0) | HID_SYSTEM_STATE (1) sets both ctrl & cmd.
+        let builtin_s = keycode == KEY_S && alt && ((shift && (ctrl || cmd)) || (ctrl && cmd));
         custom_match || builtin_s
     }
 
@@ -1362,6 +1408,7 @@ pub fn start_global_input_tap(telemetry: Arc<SharedCaptureTelemetry>) {
                 .cast::<c_void>();
             // tap = 2 (kCGAnnotatedSessionEventTap), options = 1 (kCGEventTapOptionListenOnly)
             let tap = unsafe { CGEventTapCreate(2, 0, 1, mask, tap_callback, user_info) };
+            scrawl_log(format!("CGEventTapCreate -> tap={tap:p}"));
             if tap.is_null() {
                 let _ = unsafe { Arc::from_raw(user_info.cast::<SharedCaptureTelemetry>()) };
                 return;
@@ -1566,6 +1613,7 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
     let mut prev_shift_laser = false;
     let mut prev_shift_ink = false;
     let mut prev_undo = false;
+    let mut prev_mod_mask = 0_u8;
     loop {
         thread::sleep(Duration::from_millis(8));
 
@@ -1575,6 +1623,8 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
         let ctrl = (flags & FLAG_CONTROL) != 0;
         let alt = (flags & FLAG_ALTERNATE) != 0;
         let shift = (flags & FLAG_SHIFT) != 0;
+        let mod_mask =
+            (u8::from(cmd) << 3) | (u8::from(ctrl) << 2) | (u8::from(alt) << 1) | u8::from(shift);
 
         let cfg_keycode = telemetry
             .shortcut
@@ -1589,6 +1639,12 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
                 CGEventSourceKeyState(0, cfg_keycode) || CGEventSourceKeyState(1, cfg_keycode)
             }
         };
+        if mod_mask != prev_mod_mask || key_s {
+            scrawl_log(format!(
+                "hid_poller: cmd={cmd} ctrl={ctrl} alt={alt} shift={shift} key_s={key_s} key_cfg={key_cfg}"
+            ));
+            prev_mod_mask = mod_mask;
+        }
         let shortcut_now = (key_cfg
             && telemetry.matches_shortcut(cfg_keycode, cmd, ctrl, alt, shift))
             || (key_s && telemetry.matches_shortcut(KEY_S, cmd, ctrl, alt, shift));

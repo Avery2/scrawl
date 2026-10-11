@@ -22,7 +22,7 @@ use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
 
 use crate::capture::{
     LiveOverlayEvent, ScreenCaptureSession, SharedCaptureTelemetry, discover_target,
-    install_global_hotkeys, set_escape_hotkey_enabled, shortcut_from_key_and_mods,
+    install_global_hotkeys, scrawl_log, set_escape_hotkey_enabled, shortcut_from_key_and_mods,
     start_global_input_tap, update_global_shortcut,
 };
 use crate::hex::AudioRecorder;
@@ -122,7 +122,7 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
         menu.addItem(&item);
     };
 
-    add("Record Scrawl  ⌥S", sel!(toggleCapture:));
+    add("Record Scrawl  ⌃⌥⇧S", sel!(toggleCapture:));
     add("Open Latest Bundle", sel!(openLatest:));
     add("Generate Demo Bundle", sel!(runDemo:));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -357,6 +357,7 @@ impl ScrawlCoordinator {
         if self.is_recording() {
             return;
         }
+        scrawl_log("start_recording invoked");
         self.recording_shortcut_key = false;
         let target = discover_target(None);
         let id = crate::make_bundle_id();
@@ -419,6 +420,7 @@ impl ScrawlCoordinator {
     }
 
     pub fn finish_recording(&mut self, cx: &mut Context<Self>) {
+        scrawl_log("finish_recording invoked");
         set_escape_hotkey_enabled(false);
         let Some(rec) = self.active_recording.take() else {
             return;
@@ -1393,6 +1395,7 @@ pub fn run_app(
     screenshot_out: Option<PathBuf>,
 ) {
     Application::new().run(move |cx: &mut App| {
+        scrawl_log(format!("run_app started pid={}", std::process::id()));
         let (ui_sender, ui_receiver) = flume::unbounded();
         let telemetry = SharedCaptureTelemetry::new(ui_sender);
         install_global_hotkeys(&telemetry);
