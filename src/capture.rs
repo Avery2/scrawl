@@ -382,11 +382,6 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
             };
             for (id, mods, name) in [
                 (
-                    HOTKEY_ID_ALT1,
-                    CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
-                    "⌃⌥⇧S",
-                ),
-                (
                     HOTKEY_ID_ALT2,
                     CARBON_CMD_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
                     "⌘⌥⇧S",
@@ -1613,7 +1608,7 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
     let mut prev_shift_laser = false;
     let mut prev_shift_ink = false;
     let mut prev_undo = false;
-    let mut prev_mod_mask = 0_u8;
+    let mut prev_mod_mask = (0_u8, false, false);
     loop {
         thread::sleep(Duration::from_millis(8));
 
@@ -1639,11 +1634,12 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
                 CGEventSourceKeyState(0, cfg_keycode) || CGEventSourceKeyState(1, cfg_keycode)
             }
         };
-        if mod_mask != prev_mod_mask || key_s {
+        let key_state = (mod_mask, key_s, key_cfg);
+        if key_state != prev_mod_mask {
             scrawl_log(format!(
                 "hid_poller: cmd={cmd} ctrl={ctrl} alt={alt} shift={shift} key_s={key_s} key_cfg={key_cfg}"
             ));
-            prev_mod_mask = mod_mask;
+            prev_mod_mask = key_state;
         }
         let shortcut_now = (key_cfg
             && telemetry.matches_shortcut(cfg_keycode, cmd, ctrl, alt, shift))
