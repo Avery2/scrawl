@@ -1,6 +1,6 @@
 //! PNG output and deterministic, CPU-rendered review images.
 use crate::model::*;
-use crate::sketch::{FreehandOptions, freehand_outline};
+use crate::sketch::{FreehandOptions, freehand_outline, smooth_laser_points};
 use std::path::Path;
 
 type Color = [u8; 4];
@@ -351,7 +351,9 @@ pub fn annotate_keyframe_in_place(
         .or(click)
         .filter(|p| p.iter().all(|v| v.is_finite()))
     {
-        draw_cursor(frame, [cx * w, cy * h]);
+        let show_ripple = keyframe.reason == KeyframeReason::Click
+            || (click.is_some() && keyframe.reason != KeyframeReason::Laser);
+        draw_cursor(frame, [cx * w, cy * h], show_ripple);
     }
     let label = format!("#{} · {}", keyframe.index, format_clock(keyframe.t));
     let badge_w = text_width(&label, 16.0, true) + 45.0;
@@ -395,7 +397,7 @@ fn draw_pin(frame: &mut RgbaFrame, point: [f32; 2], number: u32, scale: f32, alp
 
 fn draw_laser(frame: &mut RgbaFrame, stroke: &Stroke, time: u64) {
     let start = time.saturating_sub(LASER_MS);
-    let points: Vec<_> = stroke
+    let raw_points: Vec<_> = stroke
         .timed_points()
         .into_iter()
         .filter(|&(_, _, t)| t >= start && t <= time)
@@ -406,40 +408,57 @@ fn draw_laser(frame: &mut RgbaFrame, stroke: &Stroke, time: u64) {
             )
         })
         .collect();
-    // Multiple broad, low-opacity passes form the glow; the center stays sharp.
-    for (radius, alpha, color) in [
-        (11.0, 0.08, RED),
-        (7.0, 0.16, RED),
-        (3.2, 0.9, RED),
-        (1.1, 1.0, WHITE),
+    if raw_points.is_empty() {
+        return;
+    }
+    let points = smooth_laser_points(&raw_points);
+    // Optical laser trail: wide crimson bloom tapering to an incandescent white-pink core.
+    for (radius, alpha, power, color) in [
+        (16.0, 0.06, 1.1, [255, 18, 36, 255]),
+        (10.0, 0.14, 1.2, [255, 32, 44, 255]),
+        (5.6, 0.34, 1.3, RED),
+        (2.8, 0.92, 1.4, RED),
+        (1.15, 0.98, 1.6, [255, 245, 245, 255]),
     ] {
         if points.len() == 1 {
             circle(
                 frame,
                 points[0].0,
                 radius,
-                opacity(color, alpha * points[0].1),
+                opacity(color, alpha * points[0].1.powf(power)),
             );
         }
         for pair in points.windows(2) {
             let (a, fa) = pair[0];
             let (b, fb) = pair[1];
-            line(
-                frame,
-                a,
-                b,
-                radius * (0.2 + fa * 0.8),
-                radius * (0.2 + fb * 0.8),
-                opacity(color, alpha * (fa + fb) * 0.5),
-            );
+            let w0 = radius * (0.12 + 0.88 * fa.powf(0.75));
+            let w1 = radius * (0.12 + 0.88 * fb.powf(0.75));
+            let seg_alpha = alpha * ((fa + fb) * 0.5).powf(power);
+            line(frame, a, b, w0, w1, opacity(color, seg_alpha));
+        }
+    }
+    // Glowing laser diode head at the tip of the beam.
+    if let Some(&(tip, tip_age)) = points.last()
+        && tip_age > 0.25
+    {
+        for (r, a, col) in [
+            (20.0, 0.10 * tip_age, [255, 16, 32, 255]),
+            (13.0, 0.22 * tip_age, [255, 28, 42, 255]),
+            (8.0, 0.48 * tip_age, RED),
+            (4.8, 0.95 * tip_age, RED),
+            (2.3, tip_age, WHITE),
+        ] {
+            circle(frame, tip, r, opacity(col, a));
         }
     }
 }
 
-fn draw_cursor(frame: &mut RgbaFrame, p: [f32; 2]) {
-    circle(frame, p, 19.0, [0, 136, 255, 77]);
-    ring(frame, p, 20.0, 2.0, WHITE);
-    ring(frame, p, 23.0, 2.0, [0, 136, 255, 255]);
+fn draw_cursor(frame: &mut RgbaFrame, p: [f32; 2], show_ripple: bool) {
+    if show_ripple {
+        circle(frame, p, 19.0, [0, 136, 255, 77]);
+        ring(frame, p, 20.0, 2.0, WHITE);
+        ring(frame, p, 23.0, 2.0, [0, 136, 255, 255]);
+    }
     let arrow = [
         [0.0, 0.0],
         [0.0, 27.0],

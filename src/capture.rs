@@ -72,6 +72,7 @@ type EventTapCallback = unsafe extern "C" fn(
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
+    fn AXUIElementCreateApplication(pid: i32) -> AxUiElementRef;
     fn AXUIElementCreateSystemWide() -> AxUiElementRef;
     fn AXUIElementCopyElementAtPosition(
         application: AxUiElementRef,
@@ -157,20 +158,29 @@ pub enum LiveOverlayEvent {
 }
 
 /// Inspects the accessibility element at screen coordinates `(x, y)` in global points.
-/// Returns `(human_label, role)` if available, skipping password/secure fields.
+/// Queries the topmost normal (`window_layer == 0`) window's application directly so
+/// Scrawl's own transparent overlay window never intercepts hit-testing.
 pub fn ax_element_at(x: f64, y: f64) -> Option<(String, Option<String>)> {
-    let system = unsafe { AXUIElementCreateSystemWide() };
-    if system.is_null() {
-        return None;
+    let our_pid = std::process::id() as i32;
+    let hit_window = topmost_normal_window_at(x, y);
+    let root = if let Some((pid, _, _)) = hit_window.as_ref()
+        && *pid != our_pid
+    {
+        unsafe { AXUIElementCreateApplication(*pid) }
+    } else {
+        unsafe { AXUIElementCreateSystemWide() }
+    };
+    if root.is_null() {
+        return hit_window.and_then(|(_, title, app)| title.or(app).map(|l| (l, None)));
     }
-    let system = CfObject(system);
-    let _ = unsafe { AXUIElementSetMessagingTimeout(system.0, 0.08) };
+    let root = CfObject(root);
+    let _ = unsafe { AXUIElementSetMessagingTimeout(root.0, 0.08) };
 
     let mut element: AxUiElementRef = ptr::null();
     let status =
-        unsafe { AXUIElementCopyElementAtPosition(system.0, x as f32, y as f32, &mut element) };
+        unsafe { AXUIElementCopyElementAtPosition(root.0, x as f32, y as f32, &mut element) };
     if status != 0 || element.is_null() {
-        return None;
+        return hit_window.and_then(|(_, title, app)| title.or(app).map(|l| (l, None)));
     }
     let mut current = CfObject(element);
     let _ = unsafe { AXUIElementSetMessagingTimeout(current.0, 0.08) };
@@ -192,7 +202,7 @@ pub fn ax_element_at(x: f64, y: f64) -> Option<(String, Option<String>)> {
         for attr in [c"AXTitle", c"AXDescription", c"AXIdentifier"] {
             if let Some(val) = copy_ax_string(&current, attr) {
                 let cleaned = clean_label(&val);
-                if !cleaned.is_empty() {
+                if !cleaned.is_empty() && !cleaned.eq_ignore_ascii_case("scrawl") {
                     return Some((cleaned, role));
                 }
             }
@@ -203,7 +213,8 @@ pub fn ax_element_at(x: f64, y: f64) -> Option<(String, Option<String>)> {
             && let Some(val) = copy_ax_string(&current, c"AXValue")
         {
             let cleaned = clean_label(&val);
-            if !cleaned.is_empty() && cleaned.len() <= 48 {
+            if !cleaned.is_empty() && cleaned.len() <= 48 && !cleaned.eq_ignore_ascii_case("scrawl")
+            {
                 return Some((cleaned, role));
             }
         }
@@ -215,8 +226,42 @@ pub fn ax_element_at(x: f64, y: f64) -> Option<(String, Option<String>)> {
         current = parent;
     }
 
+    if let Some((_, title, app)) = hit_window
+        && let Some(fallback) = title.or(app)
+    {
+        return Some((fallback, role));
+    }
+
     role.clone()
         .map(|r| (r.trim_start_matches("AX").to_string(), Some(r)))
+}
+
+fn topmost_normal_window_at(x: f64, y: f64) -> Option<(i32, Option<String>, Option<String>)> {
+    let content = SCShareableContent::get().ok()?;
+    for win in content.windows() {
+        if !win.is_on_screen() || win.window_layer() != 0 {
+            continue;
+        }
+        let frame = win.frame();
+        if frame.size.width < 48.0 || frame.size.height < 48.0 {
+            continue;
+        }
+        if x >= frame.origin.x
+            && x <= frame.origin.x + frame.size.width
+            && y >= frame.origin.y
+            && y <= frame.origin.y + frame.size.height
+        {
+            let owner = win.owning_application()?;
+            let pid = owner.process_id();
+            let title = win
+                .title()
+                .map(|t| clean_label(&t))
+                .filter(|t| !t.is_empty());
+            let app = Some(clean_label(&owner.application_name())).filter(|a| !a.is_empty());
+            return Some((pid, title, app));
+        }
+    }
+    None
 }
 
 fn clean_label(input: &str) -> String {
@@ -405,12 +450,13 @@ impl ScreenCaptureSession {
         let urgent_snapshot = Arc::new(AtomicBool::new(true));
         let frames = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RETAINED_FRAMES)));
 
-        let (stream, recording_output, video_path, filter_and_config) =
+        let (stream, recording_output, video_path, mut filter_and_config) =
             setup_sck_capture(&target, video_output_path);
 
         let thread_stopping = Arc::clone(&stopping);
         let thread_urgent = Arc::clone(&urgent_snapshot);
         let thread_frames = Arc::clone(&frames);
+        let sampler_target = target;
         let sampler_thread = thread::Builder::new()
             .name("scrawl-frame-sampler".into())
             .spawn(move || {
@@ -418,7 +464,18 @@ impl ScreenCaptureSession {
                     .checked_sub(FRAME_SAMPLE_INTERVAL)
                     .unwrap_or_else(Instant::now);
                 let mut phase = 0_u32;
+                let mut refreshed_overlay_exclusion = false;
                 while !thread_stopping.load(Ordering::Acquire) {
+                    if !refreshed_overlay_exclusion
+                        && started_at.elapsed() >= Duration::from_millis(120)
+                    {
+                        refreshed_overlay_exclusion = true;
+                        if let Some((new_filter, new_cfg)) =
+                            build_sck_filter_and_config(&sampler_target)
+                        {
+                            filter_and_config = Some((new_filter, new_cfg));
+                        }
+                    }
                     let urgent = thread_urgent.swap(false, Ordering::AcqRel);
                     if urgent || last_sample.elapsed() >= FRAME_SAMPLE_INTERVAL {
                         last_sample = Instant::now();
@@ -494,23 +551,11 @@ impl ScreenCaptureSession {
     }
 }
 
-fn setup_sck_capture(
+fn build_sck_filter_and_config(
     target: &TargetInfo,
-    video_output_path: Option<PathBuf>,
-) -> (
-    Option<SCStream>,
-    Option<SCRecordingOutput>,
-    Option<PathBuf>,
-    Option<(SCContentFilter, SCStreamConfiguration)>,
-) {
-    let Ok(content) = SCShareableContent::get() else {
-        return (None, None, None, None);
-    };
+) -> Option<(SCContentFilter, SCStreamConfiguration)> {
+    let content = SCShareableContent::get().ok()?;
     let our_pid = std::process::id() as i32;
-    let our_app = content
-        .applications()
-        .into_iter()
-        .find(|app| app.process_id() == our_pid);
 
     let filter = if let Some(window_id) = target.window_id
         && let Some(window) = content
@@ -525,26 +570,27 @@ fn setup_sck_capture(
         .find(|d| d.display_id() == target.display_id)
         .or_else(|| content.displays().into_iter().next())
     {
-        if let Some(ref app) = our_app {
-            SCContentFilter::create()
-                .with_display(&display)
-                .with_excluding_applications(&[app], &[])
-                .build()
-                .ok()
-        } else {
-            SCContentFilter::create()
-                .with_display(&display)
-                .with_excluding_windows(&[])
-                .build()
-                .ok()
-        }
+        // Exclude only Scrawl's floating overlay/HUD panels (window_layer != 0)
+        // so Scrawl's normal Review window (window_layer == 0) remains visible in captures.
+        let excluded_overlays: Vec<SCWindow> = content
+            .windows()
+            .into_iter()
+            .filter(|w| {
+                w.owning_application()
+                    .as_ref()
+                    .is_some_and(|a| a.process_id() == our_pid)
+                    && w.window_layer() != 0
+            })
+            .collect();
+        let excluded_refs: Vec<&SCWindow> = excluded_overlays.iter().collect();
+        SCContentFilter::create()
+            .with_display(&display)
+            .with_excluding_windows(&excluded_refs)
+            .build()
+            .ok()
     } else {
         None
-    };
-
-    let Some(filter) = filter else {
-        return (None, None, None, None);
-    };
+    }?;
 
     let aspect = (target.frame.height / target.frame.width.max(1.0)).clamp(0.3, 2.5);
     let capture_width = 1280_u32;
@@ -554,6 +600,21 @@ fn setup_sck_capture(
         .with_width(capture_width)
         .with_height(capture_height)
         .with_shows_cursor(true);
+    Some((filter, config))
+}
+
+fn setup_sck_capture(
+    target: &TargetInfo,
+    video_output_path: Option<PathBuf>,
+) -> (
+    Option<SCStream>,
+    Option<SCRecordingOutput>,
+    Option<PathBuf>,
+    Option<(SCContentFilter, SCStreamConfiguration)>,
+) {
+    let Some((filter, config)) = build_sck_filter_and_config(target) else {
+        return (None, None, None, None);
+    };
 
     if let Some(video_path) = video_output_path {
         if let Ok(rec_cfg_builder) = SCRecordingOutputConfiguration::new()

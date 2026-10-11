@@ -15,7 +15,7 @@ use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{DefinedClass, MainThreadOnly, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSStatusWindowLevel, NSWindow,
-    NSWindowButton, NSWindowCollectionBehavior,
+    NSWindowButton, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSString};
 use screencapturekit::prelude::*;
@@ -26,8 +26,10 @@ use crate::capture::{
     start_global_input_tap,
 };
 use crate::hex::AudioRecorder;
-use crate::model::{LASER_MS, SCALE, ScrawlBundle, Stroke, TargetInfo, format_clock};
-use crate::sketch::{FreehandOptions, bounds as points_bounds, freehand_outline, timeline};
+use crate::model::{LASER_MS, SCALE, ScrawlBundle, Stroke, TargetFrame, TargetInfo, format_clock};
+use crate::sketch::{
+    FreehandOptions, bounds as points_bounds, freehand_outline, smooth_laser_points, timeline,
+};
 
 const SIDEBAR_BG: u32 = 0x111111;
 const CANVAS_BG: u32 = 0x161616;
@@ -150,14 +152,7 @@ fn newest_ns_window() -> Option<Retained<NSWindow>> {
     windows.lastObject()
 }
 
-fn configure_floating_window(ns_window: &NSWindow, ignores_mouse: bool) {
-    ns_window.setHidesOnDeactivate(false);
-    ns_window.setIgnoresMouseEvents(ignores_mouse);
-    ns_window.setLevel(NSStatusWindowLevel);
-    ns_window.setCollectionBehavior(
-        NSWindowCollectionBehavior::CanJoinAllSpaces
-            | NSWindowCollectionBehavior::FullScreenAuxiliary,
-    );
+fn sync_full_size_content_view(ns_window: &NSWindow) {
     for kind in [
         NSWindowButton::CloseButton,
         NSWindowButton::MiniaturizeButton,
@@ -167,6 +162,43 @@ fn configure_floating_window(ns_window: &NSWindow, ignores_mouse: bool) {
             button.setHidden(true);
         }
     }
+    if let Some(cv) = ns_window.contentView() {
+        let bounds = cv.bounds();
+        for sub in cv.subviews() {
+            sub.setFrame(bounds);
+        }
+        if let Some(frame_view) = unsafe { cv.superview() } {
+            for sub in frame_view.subviews() {
+                if sub
+                    .class()
+                    .name()
+                    .to_bytes()
+                    .windows(8)
+                    .any(|w| w == b"Titlebar")
+                {
+                    sub.setHidden(true);
+                }
+            }
+        }
+    }
+}
+
+fn configure_floating_window(ns_window: &NSWindow, ignores_mouse: bool, full_screen_overlay: bool) {
+    ns_window.setHidesOnDeactivate(false);
+    ns_window.setIgnoresMouseEvents(ignores_mouse);
+    ns_window.setLevel(NSStatusWindowLevel + 1);
+    ns_window.setCollectionBehavior(
+        NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::FullScreenAuxiliary,
+    );
+    if full_screen_overlay {
+        ns_window
+            .setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
+        if let Some(screen) = ns_window.screen() {
+            ns_window.setFrame_display(screen.frame(), true);
+        }
+    }
+    sync_full_size_content_view(ns_window);
 }
 
 struct ActiveRecording {
@@ -516,8 +548,14 @@ impl Render for OverlayCanvasWindow {
         let drawing = coord.is_drawing();
         if let Some(ref ns_win) = self.ns_window {
             ns_win.setIgnoresMouseEvents(!drawing);
+            sync_full_size_content_view(ns_win);
         }
         let now_ms = coord.telemetry.elapsed_ms();
+        let target_frame = *coord
+            .telemetry
+            .target_frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut strokes = coord
             .telemetry
             .strokes
@@ -554,22 +592,20 @@ impl Render for OverlayCanvasWindow {
                     .on_mouse_down(
                         MouseButton::Left,
                         move |event: &MouseDownEvent, window, cx| {
-                            let bounds = window.bounds();
-                            let fw = f32::from(bounds.size.width).max(1.0);
-                            let fh = f32::from(bounds.size.height).max(1.0);
-                            let nx = (f32::from(event.position.x) / fw).clamp(0.0, 1.0);
-                            let ny = (f32::from(event.position.y) / fh).clamp(0.0, 1.0);
-                            let sx = (nx * SCALE as f32).round() as i32;
-                            let sy = (ny * SCALE as f32).round() as i32;
+                            let win_bounds = window.bounds();
+                            let screen_x = f64::from(
+                                f32::from(win_bounds.origin.x) + f32::from(event.position.x),
+                            );
+                            let screen_y = f64::from(
+                                f32::from(win_bounds.origin.y) + f32::from(event.position.y),
+                            );
                             let ns_win_down = ns_win_down.clone();
                             c_down.update(cx, |coord, cx| {
                                 let t_ms = coord.telemetry.elapsed_ms();
-                                let screen_x = f64::from(
-                                    f32::from(bounds.origin.x) + f32::from(event.position.x),
-                                );
-                                let screen_y = f64::from(
-                                    f32::from(bounds.origin.y) + f32::from(event.position.y),
-                                );
+                                let (nx, ny, fw, fh) =
+                                    coord.telemetry.normalize_point(screen_x, screen_y);
+                                let sx = (nx * SCALE as f32).round() as i32;
+                                let sy = (ny * SCALE as f32).round() as i32;
                                 if event.modifiers.shift {
                                     if let Some(ref ns_win) = ns_win_down {
                                         ns_win.setIgnoresMouseEvents(true);
@@ -588,8 +624,8 @@ impl Render for OverlayCanvasWindow {
                                     guard.push(Stroke {
                                         t0: t_ms,
                                         t1: t_ms,
-                                        fw: fw.round() as u32,
-                                        fh: fh.round() as u32,
+                                        fw,
+                                        fh,
                                         on,
                                         pin: Some(pin_num),
                                         laser: false,
@@ -600,8 +636,8 @@ impl Render for OverlayCanvasWindow {
                                     coord.active_stroke = Some(Stroke {
                                         t0: t_ms,
                                         t1: t_ms,
-                                        fw: fw.round() as u32,
-                                        fh: fh.round() as u32,
+                                        fw,
+                                        fh,
                                         on: None,
                                         pin: None,
                                         laser: false,
@@ -616,15 +652,17 @@ impl Render for OverlayCanvasWindow {
                         if !event.dragging() {
                             return;
                         }
-                        let bounds = window.bounds();
-                        let fw = f32::from(bounds.size.width).max(1.0);
-                        let fh = f32::from(bounds.size.height).max(1.0);
-                        let nx = (f32::from(event.position.x) / fw).clamp(0.0, 1.0);
-                        let ny = (f32::from(event.position.y) / fh).clamp(0.0, 1.0);
-                        let sx = (nx * SCALE as f32).round() as i32;
-                        let sy = (ny * SCALE as f32).round() as i32;
+                        let win_bounds = window.bounds();
+                        let screen_x =
+                            f64::from(f32::from(win_bounds.origin.x) + f32::from(event.position.x));
+                        let screen_y =
+                            f64::from(f32::from(win_bounds.origin.y) + f32::from(event.position.y));
                         c_move.update(cx, |coord, cx| {
                             let t_ms = coord.telemetry.elapsed_ms();
+                            let (nx, ny, _, _) =
+                                coord.telemetry.normalize_point(screen_x, screen_y);
+                            let sx = (nx * SCALE as f32).round() as i32;
+                            let sy = (ny * SCALE as f32).round() as i32;
                             if let Some(ref mut stroke) = coord.active_stroke {
                                 let dt = t_ms.saturating_sub(stroke.t0) as i32;
                                 stroke.pts.extend_from_slice(&[sx, sy, dt]);
@@ -633,22 +671,20 @@ impl Render for OverlayCanvasWindow {
                             }
                         });
                     })
-                    .on_mouse_up(MouseButton::Left, move |_, window, cx| {
-                        let bounds = window.bounds();
+                    .on_mouse_up(MouseButton::Left, move |_, _window, cx| {
                         let ns_win_up = ns_win_up.clone();
                         c_up.update(cx, |coord, cx| {
                             if let Some(mut stroke) = coord.active_stroke.take() {
                                 if stroke.pts.len() >= 3 {
+                                    let tf = *coord
+                                        .telemetry
+                                        .target_frame
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                                     let [x0, y0, x1, y1] =
                                         points_bounds(&stroke.normalized_points());
-                                    let mid_x = f64::from(
-                                        f32::from(bounds.origin.x)
-                                            + ((x0 + x1) * 0.5) * f32::from(bounds.size.width),
-                                    );
-                                    let mid_y = f64::from(
-                                        f32::from(bounds.origin.y)
-                                            + ((y0 + y1) * 0.5) * f32::from(bounds.size.height),
-                                    );
+                                    let mid_x = tf.x + f64::from((x0 + x1) * 0.5) * tf.width;
+                                    let mid_y = tf.y + f64::from((y0 + y1) * 0.5) * tf.height;
                                     if let Some(ref ns_win) = ns_win_up {
                                         ns_win.setIgnoresMouseEvents(true);
                                     }
@@ -686,8 +722,8 @@ impl Render for OverlayCanvasWindow {
             .child(
                 canvas(
                     move |bounds, _, _| bounds,
-                    move |bounds, _, window, _| {
-                        paint_live_strokes(bounds, &strokes, now_ms, window);
+                    move |_bounds, _, window, _| {
+                        paint_live_strokes(target_frame, &strokes, now_ms, window);
                     },
                 )
                 .size_full(),
@@ -696,22 +732,26 @@ impl Render for OverlayCanvasWindow {
 }
 
 fn paint_live_strokes(
-    bounds: Bounds<Pixels>,
+    target_frame: TargetFrame,
     strokes: &[Stroke],
     now_ms: u64,
     window: &mut Window,
 ) {
-    let w = f32::from(bounds.size.width).max(1.0);
-    let h = f32::from(bounds.size.height).max(1.0);
-    let ox = f32::from(bounds.origin.x);
-    let oy = f32::from(bounds.origin.y);
-    let base_size = (w.min(h) * 0.012).max(5.0);
+    let win_bounds = window.bounds();
+    let win_ox = f32::from(win_bounds.origin.x);
+    let win_oy = f32::from(win_bounds.origin.y);
+    let tx = target_frame.x as f32;
+    let ty = target_frame.y as f32;
+    let tw = (target_frame.width as f32).max(1.0);
+    let th = (target_frame.height as f32).max(1.0);
+    let base_size = (tw.min(th) * 0.012).max(5.0);
+    let to_local =
+        |nx: f32, ny: f32| -> [f32; 2] { [(tx + nx * tw) - win_ox, (ty + ny * th) - win_oy] };
 
     for stroke in strokes {
         if let Some(pin) = stroke.pin {
             if let Some([nx, ny]) = stroke.normalized_points().first().copied() {
-                let cx = ox + nx * w;
-                let cy = oy + ny * h;
+                let [cx, cy] = to_local(nx, ny);
                 paint_circle(window, cx, cy, 13.0, rgba(0xffffffdd));
                 paint_circle(window, cx, cy, 11.0, rgba(0xff3b30ff));
                 let _ = pin;
@@ -722,57 +762,85 @@ fn paint_live_strokes(
         if stroke.laser && stroke.t1 < now_ms.saturating_sub(LASER_MS) {
             continue;
         }
-        let min_t = if stroke.laser {
-            now_ms.saturating_sub(LASER_MS)
-        } else {
-            0
-        };
-        let screen_pts: Vec<[f32; 2]> = stroke
-            .timed_points()
-            .into_iter()
-            .filter(|&(_, _, t)| t >= min_t && t <= now_ms.saturating_add(50))
-            .map(|(nx, ny, _)| [ox + nx * w, oy + ny * h])
-            .collect();
-
-        if screen_pts.len() < 2 {
-            continue;
-        }
-
-        let (base_opts, passes) = if stroke.laser {
-            (
-                FreehandOptions {
+        if stroke.laser {
+            let min_t = now_ms.saturating_sub(LASER_MS);
+            let raw_timed: Vec<([f32; 2], f32)> = stroke
+                .timed_points()
+                .into_iter()
+                .filter(|&(_, _, t)| t >= min_t && t <= now_ms.saturating_add(50))
+                .map(|(nx, ny, t)| {
+                    let age =
+                        1.0 - (now_ms.saturating_sub(t) as f32 / LASER_MS as f32).clamp(0.0, 1.0);
+                    (to_local(nx, ny), age)
+                })
+                .collect();
+            if raw_timed.is_empty() {
+                continue;
+            }
+            let smoothed = smooth_laser_points(&raw_timed);
+            let screen_pts: Vec<[f32; 2]> = smoothed.iter().map(|&(pt, _)| pt).collect();
+            if screen_pts.len() >= 2 {
+                let laser_base = FreehandOptions {
                     size: base_size,
-                    thinning: 0.5,
-                    smoothing: 0.5,
-                    streamline: 0.4,
+                    thinning: 0.45,
+                    smoothing: 0.65,
+                    streamline: 0.55,
                     simulate_pressure: false,
                     taper_start: true,
                     taper_end: false,
-                },
-                [
-                    (base_size * 0.9, rgba(0xff3b30cc)),
-                    (base_size * 0.35, rgba(0xffffffff)),
-                ],
-            )
-        } else {
-            (
-                FreehandOptions {
-                    size: base_size,
-                    thinning: 0.55,
-                    smoothing: 0.6,
-                    streamline: 0.45,
-                    simulate_pressure: true,
-                    taper_start: false,
-                    taper_end: false,
-                },
-                [
-                    (base_size + 4.0, rgba(0xffffffc0)),
-                    (base_size, rgba(0xff3b30ff)),
-                ],
-            )
+                };
+                // 4-layer GPU optical laser beam: wide crimson bloom -> mid corona -> ruby core -> white-hot filament
+                for (size, color) in [
+                    (base_size * 1.65, rgba(0xff14241a)),
+                    (base_size * 1.05, rgba(0xff243042)),
+                    (base_size * 0.58, rgba(0xff3b30dc)),
+                    (base_size * 0.22, rgba(0xfff5f5f5)),
+                ] {
+                    let outline =
+                        freehand_outline(&screen_pts, &FreehandOptions { size, ..laser_base });
+                    paint_polygon(window, &outline, color);
+                }
+            }
+            // Glowing optical diode tip at the head of the laser beam
+            if let Some(&(tip, tip_age)) = smoothed.last()
+                && tip_age > 0.15
+            {
+                let pulse = 1.0 + 0.08 * (now_ms as f32 * 0.025).sin();
+                for (r, color) in [
+                    (20.0 * pulse * tip_age, rgba(0xff102018)),
+                    (13.5 * pulse * tip_age, rgba(0xff1e2c34)),
+                    (8.5 * tip_age, rgba(0xff323878)),
+                    (5.0 * tip_age, rgba(0xff3b30f2)),
+                    (2.4 * tip_age, rgba(0xffffffff)),
+                ] {
+                    paint_circle(window, tip[0], tip[1], r, color);
+                }
+            }
+            continue;
+        }
+
+        let screen_pts: Vec<[f32; 2]> = stroke
+            .normalized_points()
+            .into_iter()
+            .map(|[nx, ny]| to_local(nx, ny))
+            .collect();
+        if screen_pts.len() < 2 {
+            continue;
+        }
+        let ink_base = FreehandOptions {
+            size: base_size,
+            thinning: 0.55,
+            smoothing: 0.6,
+            streamline: 0.45,
+            simulate_pressure: true,
+            taper_start: false,
+            taper_end: false,
         };
-        for (size, color) in passes {
-            let outline = freehand_outline(&screen_pts, &FreehandOptions { size, ..base_opts });
+        for (size, color) in [
+            (base_size + 4.0, rgba(0xffffffc0)),
+            (base_size, rgba(0xff3b30ff)),
+        ] {
+            let outline = freehand_outline(&screen_pts, &FreehandOptions { size, ..ink_base });
             paint_polygon(window, &outline, color);
         }
     }
@@ -836,7 +904,15 @@ impl BundleReviewWindow {
 }
 
 impl Render for BundleReviewWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(mtm) = MainThreadMarker::new() {
+            for ns_win in NSApplication::sharedApplication(mtm).windows() {
+                if ns_win.frame().size.width >= 600.0 {
+                    sync_full_size_content_view(&ns_win);
+                }
+            }
+        }
+        let stage_w = (f32::from(window.bounds().size.width) - 320.0 - 44.0).max(320.0);
         let state = self.coordinator.read(cx).review_bundle.clone();
         let status = self.coordinator.read(cx).review_status.clone();
         let tab = self.coordinator.read(cx).selected_tab;
@@ -1011,31 +1087,34 @@ impl Render for BundleReviewWindow {
                                         .child(msg),
                                 )
                             })
-                            .child(action_button("btn-record", "New  ⌃⌥⌘S", false).on_click(
+                            .child(action_button("btn-record", "Record  ⌃⌥⌘S", false).on_click(
                                 move |_, _, cx| {
                                     c_record.update(cx, |coord, cx| coord.start_recording(cx));
                                 },
                             ))
-                            .child(action_button("btn-copy", "Copy Bundle", false).on_click(
-                                move |_, _, cx| {
-                                    let res = crate::handoff::copy_bundle_to_clipboard(&copy_dir);
-                                    c_copy.update(cx, |coord, cx| {
-                                        coord.review_status = Some(match res {
-                                            Ok(()) => "Copied to clipboard".into(),
-                                            Err(e) => format!("Copy failed: {e}"),
-                                        });
-                                        cx.notify();
-                                    });
-                                },
-                            ))
                             .child(
-                                action_button("btn-send", "Send to OpenCode", true).on_click(
+                                action_button("btn-reveal", "Show in Finder", false).on_click(
                                     move |_, _, cx| {
-                                        let res = crate::handoff::send_to_opencode(&send_dir, None);
+                                        let _ = std::process::Command::new("/usr/bin/open")
+                                            .arg(&send_dir)
+                                            .spawn();
                                         c_send.update(cx, |coord, cx| {
+                                            coord.review_status =
+                                                Some("Opened bundle folder".into());
+                                            cx.notify();
+                                        });
+                                    },
+                                ),
+                            )
+                            .child(
+                                action_button("btn-copy", "Copy to Clipboard", true).on_click(
+                                    move |_, _, cx| {
+                                        let res =
+                                            crate::handoff::copy_bundle_to_clipboard(&copy_dir);
+                                        c_copy.update(cx, |coord, cx| {
                                             coord.review_status = Some(match res {
-                                                Ok(ses) => format!("Sent to {ses}"),
-                                                Err(e) => format!("OpenCode handoff: {e}"),
+                                                Ok(()) => "Copied — press ⌘V in OpenCode".into(),
+                                                Err(e) => format!("Copy failed: {e}"),
                                             });
                                             cx.notify();
                                         });
@@ -1060,9 +1139,9 @@ impl Render for BundleReviewWindow {
                             .overflow_x_hidden()
                             .p_5()
                             .child(match tab {
-                                ReviewTab::ContactSheet => self.render_contact_sheet_stage(),
+                                ReviewTab::ContactSheet => self.render_contact_sheet_stage(stage_w),
                                 ReviewTab::Keyframes => {
-                                    self.render_keyframes_stage(&bundle, selected_kf)
+                                    self.render_keyframes_stage(&bundle, selected_kf, stage_w)
                                 }
                             }),
                     )
@@ -1146,7 +1225,7 @@ impl Render for BundleReviewWindow {
 }
 
 impl BundleReviewWindow {
-    fn render_contact_sheet_stage(&self) -> AnyElement {
+    fn render_contact_sheet_stage(&self, stage_w: f32) -> AnyElement {
         if let Some(ref image) = self.cached_sheet_image {
             div()
                 .w_full()
@@ -1155,9 +1234,7 @@ impl BundleReviewWindow {
                 .justify_center()
                 .child(
                     img(Arc::clone(image))
-                        .w(px(740.0))
-                        .max_w_full()
-                        .object_fit(gpui::ObjectFit::Contain)
+                        .w(px(stage_w))
                         .rounded(px(10.0))
                         .border_1()
                         .border_color(rgb(LINE_COLOR)),
@@ -1172,7 +1249,13 @@ impl BundleReviewWindow {
         }
     }
 
-    fn render_keyframes_stage(&self, bundle: &ScrawlBundle, selected_kf: usize) -> AnyElement {
+    fn render_keyframes_stage(
+        &self,
+        bundle: &ScrawlBundle,
+        selected_kf: usize,
+        stage_w: f32,
+    ) -> AnyElement {
+        let card_img_w = (stage_w - 26.0).max(240.0);
         let cards = bundle
             .keyframes
             .iter()
@@ -1203,7 +1286,7 @@ impl BundleReviewWindow {
                         });
                     })
                     .when_some(frame_img, |d, image| {
-                        d.child(img(image).w_full().rounded(px(6.0)))
+                        d.child(img(image).w(px(card_img_w)).rounded(px(6.0)))
                     })
                     .child(
                         div()
@@ -1334,7 +1417,7 @@ fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
         move |window, cx| {
             let ns_window = newest_ns_window();
             if let Some(ref w) = ns_window {
-                configure_floating_window(w, true);
+                configure_floating_window(w, true, true);
             }
             let focus = cx.focus_handle();
             window.focus(&focus);
@@ -1375,7 +1458,7 @@ fn open_capture_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
         },
         move |_, cx| {
             if let Some(ns_win) = newest_ns_window() {
-                configure_floating_window(&ns_win, false);
+                configure_floating_window(&ns_win, false, false);
             }
             cx.new(|cx| {
                 cx.observe(&pill_coord, |_, _, cx| cx.notify()).detach();
@@ -1425,15 +1508,7 @@ fn open_review_window(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
         },
         move |_, cx| {
             if let Some(ns_win) = newest_ns_window() {
-                for kind in [
-                    NSWindowButton::CloseButton,
-                    NSWindowButton::MiniaturizeButton,
-                    NSWindowButton::ZoomButton,
-                ] {
-                    if let Some(button) = ns_win.standardWindowButton(kind) {
-                        button.setHidden(true);
-                    }
-                }
+                sync_full_size_content_view(&ns_win);
             }
             cx.new(|cx| {
                 cx.observe(&coord_clone, |_, _, cx| cx.notify()).detach();

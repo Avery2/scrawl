@@ -383,7 +383,49 @@ pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> 
             out.push_str(&format!("  Said: {said}\n"));
         }
     }
+    if let Some(ref video) = bundle.video {
+        out.push_str(&format!(
+            "\nVideo: {}\nLook closer: scrawl frames '{}' --from 0:00 --to {} --fps 4\n",
+            bundle_dir.join(video).display(),
+            bundle_dir.display(),
+            format_clock(bundle.duration_ms)
+        ));
+    }
     out.push_str(&format!("\nBundle: {}\n", bundle_dir.display()));
+    out
+}
+
+/// Subdivides timed `(x, y, age_0_to_1)` laser samples with Catmull-Rom spline interpolation
+/// so fast pointer motion renders as a continuous optical curve without polygonal corners.
+pub fn smooth_laser_points(points: &[([f32; 2], f32)]) -> Vec<([f32; 2], f32)> {
+    if points.len() < 3 {
+        return points.to_vec();
+    }
+    let mut out = Vec::with_capacity(points.len() * 4);
+    for i in 0..points.len() - 1 {
+        let p0 = points[i.saturating_sub(1)];
+        let p1 = points[i];
+        let p2 = points[i + 1];
+        let p3 = points[(i + 2).min(points.len() - 1)];
+        let dist = distance(p1.0, p2.0);
+        let steps = (dist / 4.0).ceil().clamp(1.0, 6.0) as usize;
+        for step in 0..steps {
+            let t = step as f32 / steps as f32;
+            let t2 = t * t;
+            let t3 = t2 * t;
+            let coord = |axis: usize| {
+                0.5 * ((2.0 * p1.0[axis])
+                    + (-p0.0[axis] + p2.0[axis]) * t
+                    + (2.0 * p0.0[axis] - 5.0 * p1.0[axis] + 4.0 * p2.0[axis] - p3.0[axis]) * t2
+                    + (-p0.0[axis] + 3.0 * p1.0[axis] - 3.0 * p2.0[axis] + p3.0[axis]) * t3)
+            };
+            let age = p1.1 + (p2.1 - p1.1) * t;
+            out.push(([coord(0), coord(1)], age));
+        }
+    }
+    if let Some(&last) = points.last() {
+        out.push(last);
+    }
     out
 }
 
