@@ -681,13 +681,20 @@ impl ScrawlCoordinator {
             return;
         };
         let (events, strokes) = self.telemetry.finish_session();
-        let (frames, video_path, duration_ms) = rec.screen_session.stop();
-        let recorded_audio = rec.audio_recorder.and_then(|r| r.stop().ok());
+        let bundle_dir = rec.bundle_dir;
+        let target = rec.target;
+        let screen_session = rec.screen_session;
+        let audio_recorder = rec.audio_recorder;
+        let ((frames, video_path, duration_ms), recorded_audio) = std::thread::scope(|s| {
+            let screen_handle = s.spawn(|| screen_session.stop());
+            let audio = audio_recorder.and_then(|r| r.stop().ok());
+            (screen_handle.join().unwrap(), audio)
+        });
 
         let mut frame_count = 1;
         if let Ok((dir, bundle, _)) = crate::finalize_capture_bundle(
-            &rec.bundle_dir,
-            rec.target,
+            &bundle_dir,
+            target,
             duration_ms,
             frames,
             strokes,

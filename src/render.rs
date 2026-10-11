@@ -323,7 +323,7 @@ pub fn annotate_keyframe_in_place(
     if w == 0.0 || h == 0.0 {
         return;
     }
-    let size = (w.min(h) * 0.014).max(4.0);
+    let size = (w.min(h) * 0.009).clamp(5.5, 8.5);
     let active_mark = keyframe
         .mark_id
         .as_ref()
@@ -357,8 +357,9 @@ pub fn annotate_keyframe_in_place(
                 }
             } else if !points.is_empty() {
                 for (diameter, color) in [
-                    (size + 4.0, opacity(WHITE, 0.78 * alpha)),
+                    (size * 1.45, opacity([255, 28, 42, 255], 0.22 * alpha)),
                     (size, opacity(RED, alpha)),
+                    (size * 0.24, opacity([255, 246, 246, 255], 0.85 * alpha)),
                 ] {
                     let outline = freehand_outline(
                         &points,
@@ -1357,7 +1358,7 @@ mod tests {
             .rgba
             .chunks_exact(4)
             .enumerate()
-            .filter(|(i, p)| i / 320 > 100 && *p == RED)
+            .filter(|(i, p)| i / 320 > 100 && p[0] == 255 && p[3] == 255)
             .count();
         assert!(
             red > 80,

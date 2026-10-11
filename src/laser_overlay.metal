@@ -94,13 +94,18 @@ fragment float4 laser_fragment(
                 laser_glow_cov = max(laser_glow_cov, glow);
             }
         } else {
-            // Persistent ink stroke: smooth variable-width pressure + crisp white halo.
-            float r = seg.width * 0.5 * max(w, 0.35);
-            if (d < r + 3.5) {
-                float halo = smoothstep(r + 2.3, r + 0.9, d);
-                float fill = smoothstep(r + 0.75, max(0.0, r - 0.75), d);
-                ink_halo_cov = max(ink_halo_cov, halo);
-                ink_red_cov = max(ink_red_cov, fill);
+            // Persistent Shift-drawn stroke: full-length optical laser beam.
+            float glow_sigma = 6.2;
+            if (d < glow_sigma * 3.0) {
+                float pw = clamp(w, 0.55, 1.15);
+                float body_r = 2.55 * pw;
+                float core_r = 0.92 * pw;
+                float body = smoothstep(body_r + 0.85, max(0.0, body_r - 0.85), d);
+                float core = smoothstep(core_r + 0.75, max(0.0, core_r - 0.75), d) * 0.88;
+                float glow = exp(-(d * d) / (glow_sigma * glow_sigma)) * 0.92;
+                laser_body_cov = max(laser_body_cov, body);
+                laser_core_cov = max(laser_core_cov, core);
+                laser_glow_cov = max(laser_glow_cov, glow);
             }
         }
     }

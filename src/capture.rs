@@ -19,7 +19,7 @@ use crate::model::{
     CaptureMode, InteractionEvent, RgbaFrame, SCALE, Stroke, TargetFrame, TargetInfo,
 };
 
-const MAX_RETAINED_FRAMES: usize = 48;
+const MAX_RETAINED_FRAMES: usize = 300;
 const FRAME_SAMPLE_INTERVAL: Duration = Duration::from_millis(220);
 
 type CfTypeRef = *const c_void;
@@ -173,7 +173,6 @@ unsafe extern "C" {
     fn CGEventCreate(source: *const c_void) -> EventRef;
     fn CGEventSourceFlagsState(state_id: u32) -> u64;
     fn CGEventSourceKeyState(state_id: u32, key: u16) -> bool;
-    fn CGEventSourceButtonState(state_id: u32, button: u32) -> bool;
     fn CGEventGetFlags(event: EventRef) -> u64;
     fn CGEventGetLocation(event: EventRef) -> CGPoint;
     fn CGEventGetIntegerValueField(event: EventRef, field: u32) -> i64;
@@ -1497,42 +1496,6 @@ impl SharedCaptureTelemetry {
         }
     }
 
-    pub fn record_laser_point(&self, screen_x: f64, screen_y: f64) {
-        *self
-            .pointer_screen
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            [screen_x as f32, screen_y as f32];
-        let t_ms = self.elapsed_ms();
-        let (nx, ny, fw, fh) = self.normalize_point(screen_x, screen_y);
-        let mut guard = self
-            .active_laser
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stroke = guard.get_or_insert_with(|| Stroke {
-            t0: t_ms,
-            t1: t_ms,
-            fw,
-            fh,
-            on: None,
-            pin: None,
-            laser: true,
-            pts: Vec::new(),
-        });
-        let sx = (nx * SCALE as f32).round() as i32;
-        let sy = (ny * SCALE as f32).round() as i32;
-        let dt = t_ms.saturating_sub(stroke.t0) as i32;
-        let should_push = stroke.pts.chunks_exact(3).last().is_none_or(|prev| {
-            let dx = (sx - prev[0]) as f32 / SCALE as f32 * fw as f32;
-            let dy = (sy - prev[1]) as f32 / SCALE as f32 * fh as f32;
-            dx.hypot(dy) >= 1.2 || (dt - prev[2]) >= 16
-        });
-        if should_push && stroke.pts.len() / 3 < 1_800 {
-            stroke.pts.extend_from_slice(&[sx, sy, dt]);
-            stroke.t1 = t_ms;
-        }
-    }
-
     pub fn finish_session(&self) -> (Vec<InteractionEvent>, Vec<Stroke>) {
         self.active.store(false, Ordering::Release);
         *self
@@ -1791,7 +1754,6 @@ fn current_mouse_location() -> Option<CGPoint> {
 /// Shift-drag ink (`⇧` + drag) work across all apps (including Karabiner virtual HID).
 fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
     let mut prev_shortcut = false;
-    let mut prev_shift_laser = false;
     let mut prev_shift_ink = false;
     let mut prev_undo = false;
     let mut await_shift_release = false;
@@ -1848,7 +1810,6 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
         prev_shortcut = shortcut_now;
 
         if !telemetry.active.load(Ordering::Acquire) {
-            prev_shift_laser = false;
             prev_shift_ink = false;
             prev_undo = false;
             continue;
@@ -1873,18 +1834,11 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = [loc.x as f32, loc.y as f32];
 
-        let left_down = unsafe { CGEventSourceButtonState(0, 0) || CGEventSourceButtonState(1, 0) };
         let pure_shift = shift && !cmd && !ctrl && !alt && !await_shift_release;
 
-        // Hold Shift + drag = draw persistent ink in any app; Hold Shift + move = optical laser
-        let shift_ink = pure_shift && left_down;
-        let shift_laser = pure_shift && !left_down;
-
-        if shift_ink {
-            if prev_shift_laser {
-                telemetry.finish_active_laser(None);
-            }
-            telemetry.shift_held.store(false, Ordering::Release);
+        // Hold Shift + move cursor = draw a full persistent stroke in any app.
+        if pure_shift {
+            telemetry.shift_held.store(true, Ordering::Release);
             let t_ms = telemetry.elapsed_ms();
             let (nx, ny, fw, fh) = telemetry.normalize_point(loc.x, loc.y);
             let sx = (nx * SCALE as f32).round() as i32;
@@ -1909,43 +1863,54 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
                 let dy = (sy - prev[1]) as f32 / SCALE as f32 * fh as f32;
                 dx.hypot(dy) >= 1.5
             });
-            if should_push && stroke.pts.len() / 3 < 2_000 {
+            if should_push && stroke.pts.len() / 3 < 2_400 {
                 stroke.pts.extend_from_slice(&[sx, sy, dt]);
                 stroke.t1 = t_ms;
             }
         } else if prev_shift_ink {
+            telemetry.shift_held.store(false, Ordering::Release);
             if let Some(mut stroke) = telemetry
                 .live_ink
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()
-                && stroke.pts.len() >= 3
+                && stroke.pts.len() >= 6
             {
-                stroke.on = ax_element_at(loc.x, loc.y).map(|(l, _)| l);
-                telemetry
-                    .strokes
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(stroke);
-                let _ = telemetry
-                    .ui_sender
-                    .try_send(LiveOverlayEvent::RequestSnapshot);
+                let first = &stroke.pts[0..2];
+                let max_span_px = stroke
+                    .pts
+                    .chunks_exact(3)
+                    .map(|p| {
+                        let dx = (p[0] - first[0]) as f32 / SCALE as f32 * stroke.fw as f32;
+                        let dy = (p[1] - first[1]) as f32 / SCALE as f32 * stroke.fh as f32;
+                        dx.hypot(dy)
+                    })
+                    .fold(0.0_f32, f32::max);
+                // Ignore stationary Shift taps (e.g. typing a capital letter without moving the mouse).
+                if max_span_px >= 6.0 {
+                    let tf = *telemetry
+                        .target_frame
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let [x0, y0, x1, y1] = crate::sketch::bounds(&stroke.normalized_points());
+                    let mid_x = tf.x + f64::from((x0 + x1) * 0.5) * tf.width;
+                    let mid_y = tf.y + f64::from((y0 + y1) * 0.5) * tf.height;
+                    stroke.on = ax_element_at(mid_x, mid_y)
+                        .or_else(|| ax_element_at(loc.x, loc.y))
+                        .map(|(l, _)| l);
+                    telemetry
+                        .strokes
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(stroke);
+                    let _ = telemetry
+                        .ui_sender
+                        .try_send(LiveOverlayEvent::RequestSnapshot);
+                }
             }
         }
 
-        if shift_laser {
-            telemetry.shift_held.store(true, Ordering::Release);
-            telemetry.record_laser_point(loc.x, loc.y);
-        } else if prev_shift_laser && !shift_ink {
-            telemetry.shift_held.store(false, Ordering::Release);
-            telemetry.finish_active_laser(Some((loc.x, loc.y)));
-            let _ = telemetry
-                .ui_sender
-                .try_send(LiveOverlayEvent::RequestSnapshot);
-        }
-
-        prev_shift_ink = shift_ink;
-        prev_shift_laser = shift_laser;
+        prev_shift_ink = pure_shift;
     }
 }
 
