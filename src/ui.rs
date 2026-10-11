@@ -4,10 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Application, Bounds, Context, Div, Entity, FocusHandle, FontWeight, Image,
-    ImageFormat, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, SharedString, Size, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowKind, WindowOptions, div, img, point, prelude::*, px, rgb, rgba, size,
+    AnyElement, App, Application, Bounds, BoxShadow, Context, Div, Entity, FocusHandle, FontWeight,
+    Image, ImageFormat, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, SharedString, Size, TextRun, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, img, point,
+    prelude::*, px, relative, rgb, rgba, size,
 };
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
@@ -41,8 +42,152 @@ const TEXT_COLOR: u32 = 0xf2f2f2;
 const TEXT_SOFT: u32 = 0xd0d0d0;
 const MUTED_COLOR: u32 = 0x969696;
 const ACCENT_COLOR: u32 = 0x3b5cf6;
+const ACCENT_HOVER: u32 = 0x4b6bff;
 const INK_RED: u32 = 0xff3b30;
 const POSITIVE_COLOR: u32 = 0x69d89f;
+
+// Dynamic Island capsule geometry. GPUI boxes are border-box, so the hairline border is part of
+// the inset: R_outer (20) = R_chip (16) + border (1) + pad (3), on every side.
+const ISLAND_H: f32 = 40.0;
+const ISLAND_RADIUS: f32 = ISLAND_H / 2.0;
+const ISLAND_INSET: f32 = 4.0;
+const ISLAND_PAD: f32 = ISLAND_INSET - 1.0;
+const CHIP_H: f32 = ISLAND_H - 2.0 * ISLAND_INSET;
+const CHIP_RADIUS: f32 = CHIP_H / 2.0;
+const CHIP_PX: f32 = 12.0;
+const CHIP_GAP: f32 = 2.0;
+const DIVIDER_MX: f32 = 6.0;
+const LEAD_TRAIL: f32 = 8.0;
+const HUD_TEXT: f32 = 13.0;
+const PILL_WINDOW_W: f32 = 440.0;
+const PILL_WINDOW_H: f32 = 48.0;
+
+#[derive(Clone, Copy, Debug)]
+struct Spring {
+    response: f32,
+    damping_ratio: f32,
+}
+
+const ISLAND_SPRING: Spring = Spring {
+    response: 0.42,
+    damping_ratio: 0.78,
+};
+
+/// Advances a damped spring with fixed 4ms sub-steps so long frames stay stable.
+fn spring_step(value: f32, velocity: f32, target: f32, dt: f32, spring: Spring) -> (f32, f32) {
+    let omega = std::f32::consts::TAU / spring.response;
+    let stiffness = omega * omega;
+    let damping = 2.0 * spring.damping_ratio * omega;
+    let steps = (dt / 0.004).ceil().max(1.0) as usize;
+    let h = dt / steps as f32;
+    let (mut x, mut v) = (value, velocity);
+    for _ in 0..steps {
+        v += ((target - x) * stiffness - v * damping) * h;
+        x += v * h;
+    }
+    (x, v)
+}
+
+fn with_alpha(color: u32, alpha: f32) -> gpui::Rgba {
+    rgba((color << 8) | (alpha.clamp(0.0, 1.0) * 255.0).round() as u32)
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+fn measure_text(window: &Window, text: &str, size: f32, weight: FontWeight) -> f32 {
+    let mut font = window.text_style().font();
+    font.weight = weight;
+    let run = TextRun {
+        len: text.len(),
+        font,
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let line = window.text_system().shape_line(
+        SharedString::from(text.to_string()),
+        px(size),
+        &[run],
+        None,
+    );
+    f32::from(line.width).ceil()
+}
+
+fn chip_width(window: &Window, label: &str, weight: FontWeight) -> f32 {
+    measure_text(window, label, HUD_TEXT, weight) + 2.0 * CHIP_PX
+}
+
+fn clock_template(clock: &str) -> String {
+    clock
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '0' } else { c })
+        .collect()
+}
+
+fn completed_meta(duration_ms: u64, frame_count: usize) -> String {
+    format!(
+        "· {} · {} {}",
+        format_clock(duration_ms),
+        frame_count,
+        if frame_count == 1 { "frame" } else { "frames" }
+    )
+}
+
+/// Intrinsic outer width of the capsule for a phase, mirroring the layout in `HudPillWindow`.
+fn island_content_width(window: &Window, phase: IslandPhase, clock: &str) -> f32 {
+    let divider = 1.0 + 2.0 * DIVIDER_MX;
+    let inner = match phase {
+        IslandPhase::Selecting { .. } => {
+            chip_width(window, "Area", FontWeight::MEDIUM)
+                + chip_width(window, "Window", FontWeight::MEDIUM)
+                + chip_width(window, "Full Screen", FontWeight::MEDIUM)
+                + divider
+                + CHIP_H
+                + 4.0 * CHIP_GAP
+        }
+        IslandPhase::Recording => {
+            CHIP_H
+                + measure_text(
+                    window,
+                    &clock_template(clock),
+                    HUD_TEXT,
+                    FontWeight::SEMIBOLD,
+                )
+                + LEAD_TRAIL
+                + divider
+                + chip_width(window, "Undo", FontWeight::MEDIUM)
+                + chip_width(window, "Cancel", FontWeight::MEDIUM)
+                + chip_width(window, "Finish", FontWeight::SEMIBOLD)
+                + 4.0 * CHIP_GAP
+        }
+        IslandPhase::Completed {
+            frame_count,
+            duration_ms,
+            ..
+        } => {
+            CHIP_H
+                + 4.0
+                + measure_text(window, "Copied", HUD_TEXT, FontWeight::SEMIBOLD)
+                + 5.0
+                + measure_text(
+                    window,
+                    &completed_meta(duration_ms, frame_count),
+                    HUD_TEXT,
+                    FontWeight::NORMAL,
+                )
+                + LEAD_TRAIL
+                + divider
+                + chip_width(window, "Inspect", FontWeight::SEMIBOLD)
+                + CHIP_H
+                + 3.0 * CHIP_GAP
+        }
+        IslandPhase::Hidden | IslandPhase::Dismissing => return ISLAND_H,
+    };
+    inner + 2.0 * ISLAND_INSET
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MenuAction {
@@ -231,7 +376,10 @@ pub struct ScrawlCoordinator {
     telemetry: Arc<SharedCaptureTelemetry>,
     active_recording: Option<ActiveRecording>,
     island_phase: IslandPhase,
+    island_phase_since: Instant,
+    island_dismissed_from: IslandPhase,
     island_width: f32,
+    island_target_width: f32,
     island_velocity: f32,
     island_opacity: f32,
     selectable_windows: Vec<TargetInfo>,
@@ -259,7 +407,10 @@ impl ScrawlCoordinator {
             telemetry,
             active_recording: None,
             island_phase: IslandPhase::Hidden,
+            island_phase_since: Instant::now(),
+            island_dismissed_from: IslandPhase::Hidden,
             island_width: 220.0,
+            island_target_width: 220.0,
             island_velocity: 0.0,
             island_opacity: 0.0,
             selectable_windows: Vec::new(),
@@ -338,6 +489,21 @@ impl ScrawlCoordinator {
         }
     }
 
+    /// Moves the island to `phase`, restarting the content cross-fade and giving the capsule a
+    /// small inward impulse when the phase kind changes (mode toggles keep their content).
+    fn set_island_phase(&mut self, phase: IslandPhase) {
+        let changed = std::mem::discriminant(&self.island_phase) != std::mem::discriminant(&phase);
+        if changed {
+            if matches!(phase, IslandPhase::Dismissing) {
+                self.island_dismissed_from = self.island_phase;
+            } else if !matches!(self.island_phase, IslandPhase::Hidden) {
+                self.island_velocity -= 140.0;
+            }
+            self.island_phase_since = Instant::now();
+        }
+        self.island_phase = phase;
+    }
+
     pub fn dismiss_island(&mut self, cx: &mut Context<Self>) {
         if matches!(
             self.island_phase,
@@ -347,13 +513,13 @@ impl ScrawlCoordinator {
         }
         self.selection_drag = None;
         self.hovered_window = None;
-        self.island_phase = IslandPhase::Dismissing;
+        self.set_island_phase(IslandPhase::Dismissing);
         cx.defer(close_picker_window);
         cx.notify();
     }
 
     pub fn inspect_completed_bundle(&mut self, cx: &mut Context<Self>) {
-        self.island_phase = IslandPhase::Hidden;
+        self.set_island_phase(IslandPhase::Hidden);
         self.island_opacity = 0.0;
         let entity = cx.entity().clone();
         cx.defer(move |cx| {
@@ -368,27 +534,30 @@ impl ScrawlCoordinator {
         if let IslandPhase::Completed { finished_at, .. } = self.island_phase
             && finished_at.elapsed() >= Duration::from_millis(5_000)
         {
-            self.island_phase = IslandPhase::Dismissing;
+            self.set_island_phase(IslandPhase::Dismissing);
         }
 
-        let (target_w, target_opacity) = match self.island_phase {
+        // `island_target_width` is the measured intrinsic width of the visible content, written
+        // by `HudPillWindow::render`; dismissal contracts toward ~80% while fading out.
+        let (target_w, target_opacity, fade_rate) = match self.island_phase {
             IslandPhase::Hidden => return,
-            IslandPhase::Selecting { .. } => (376.0, 1.0),
-            IslandPhase::Recording => (328.0, 1.0),
-            IslandPhase::Completed { .. } => (356.0, 1.0),
-            IslandPhase::Dismissing => (188.0, 0.0),
+            IslandPhase::Dismissing => (self.island_target_width * 0.8, 0.0, 12.0),
+            _ => (self.island_target_width, 1.0, 16.0),
         };
 
-        // Critically-damped / slightly underdamped Dynamic Island spring
-        let stiffness = 290.0_f32;
-        let damping = 24.0_f32;
-        let accel = (target_w - self.island_width) * stiffness - self.island_velocity * damping;
-        self.island_velocity += accel * dt;
-        self.island_width = (self.island_width + self.island_velocity * dt).clamp(160.0, 416.0);
-        self.island_opacity += (target_opacity - self.island_opacity) * (14.0 * dt).min(1.0);
+        let (width, velocity) = spring_step(
+            self.island_width,
+            self.island_velocity,
+            target_w,
+            dt,
+            ISLAND_SPRING,
+        );
+        self.island_width = width.clamp(ISLAND_H, PILL_WINDOW_W - 8.0);
+        self.island_velocity = velocity;
+        self.island_opacity += (target_opacity - self.island_opacity) * (fade_rate * dt).min(1.0);
 
         if matches!(self.island_phase, IslandPhase::Dismissing) && self.island_opacity < 0.04 {
-            self.island_phase = IslandPhase::Hidden;
+            self.set_island_phase(IslandPhase::Hidden);
             self.island_opacity = 0.0;
             cx.defer(close_capture_windows);
         }
@@ -404,12 +573,19 @@ impl ScrawlCoordinator {
         self.selectable_windows = list_selectable_windows();
         self.hovered_window = self.selectable_windows.first().cloned();
         self.selection_drag = None;
-        self.island_phase = IslandPhase::Selecting {
+        if matches!(
+            self.island_phase,
+            IslandPhase::Hidden | IslandPhase::Dismissing
+        ) {
+            // Bloom out of a compact capsule; a visible island morphs from its current width.
+            self.island_width = (self.island_target_width * 0.62).max(ISLAND_H * 3.0);
+            self.island_velocity = 0.0;
+            self.island_opacity = 0.0;
+            self.island_phase = IslandPhase::Hidden;
+        }
+        self.set_island_phase(IslandPhase::Selecting {
             mode: SelectionMode::Area,
-        };
-        self.island_width = 236.0;
-        self.island_velocity = 440.0;
-        self.island_opacity = 0.40;
+        });
 
         let entity = cx.entity().clone();
         cx.defer(move |cx| {
@@ -467,9 +643,11 @@ impl ScrawlCoordinator {
             audio_recorder,
             _metal_overlay: metal_overlay,
         });
-        self.island_phase = IslandPhase::Recording;
-        self.island_velocity = -280.0;
-        self.island_opacity = 1.0;
+        if matches!(self.island_phase, IslandPhase::Hidden) {
+            self.island_width = (self.island_target_width * 0.62).max(ISLAND_H * 3.0);
+            self.island_velocity = 0.0;
+        }
+        self.set_island_phase(IslandPhase::Recording);
 
         let entity = cx.entity().clone();
         cx.defer(move |cx| {
@@ -493,10 +671,7 @@ impl ScrawlCoordinator {
             let _ = audio.stop();
         }
         let _ = std::fs::remove_dir_all(rec.bundle_dir);
-        self.island_phase = IslandPhase::Hidden;
-        self.island_opacity = 0.0;
-        cx.defer(close_capture_windows);
-        cx.notify();
+        self.dismiss_island(cx);
     }
 
     pub fn finish_recording(&mut self, cx: &mut Context<Self>) {
@@ -527,12 +702,11 @@ impl ScrawlCoordinator {
         }
         // Morph the floating HUD pill Dynamic Island-style into the "Copied" state
         // without opening the full Review window unless the user clicks "Inspect".
-        self.island_phase = IslandPhase::Completed {
+        self.set_island_phase(IslandPhase::Completed {
             finished_at: Instant::now(),
             frame_count,
             duration_ms,
-        };
-        self.island_velocity = -340.0;
+        });
         cx.notify();
     }
 }
@@ -542,9 +716,14 @@ pub struct HudPillWindow {
 }
 
 impl Render for HudPillWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let coord = self.coordinator.read(cx);
         let phase = coord.island_phase;
+        let content_phase = match phase {
+            IslandPhase::Dismissing => coord.island_dismissed_from,
+            other => other,
+        };
+        let phase_age = coord.island_phase_since.elapsed().as_secs_f32();
         let width = coord.island_width;
         let opacity = coord.island_opacity.clamp(0.0, 1.0);
         let elapsed_ms = coord
@@ -560,7 +739,18 @@ impl Render for HudPillWindow {
             .filter(|s| !s.laser)
             .count();
 
-        let is_completed = matches!(phase, IslandPhase::Completed { .. });
+        let clock = format_clock(elapsed_ms);
+        let target_width = island_content_width(window, content_phase, &clock);
+        self.coordinator
+            .update(cx, |coord, _| coord.island_target_width = target_width);
+
+        // New content fades in once the capsule has started morphing toward its width.
+        let content_alpha = if matches!(phase, IslandPhase::Dismissing) {
+            1.0
+        } else {
+            ease_out_cubic((phase_age - 0.04) / 0.2)
+        };
+
         let c_undo = self.coordinator.clone();
         let c_cancel = self.coordinator.clone();
         let c_finish = self.coordinator.clone();
@@ -571,12 +761,16 @@ impl Render for HudPillWindow {
         let c_full = self.coordinator.clone();
         let c_sel_cancel = self.coordinator.clone();
 
-        let capsule_content = match phase {
-            IslandPhase::Selecting { mode } => div()
-                .flex()
-                .items_center()
-                .gap(px(3.0))
-                .whitespace_nowrap()
+        let row = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(CHIP_GAP))
+            .whitespace_nowrap()
+            .opacity(content_alpha);
+
+        let capsule_content = match content_phase {
+            IslandPhase::Selecting { mode } => row
                 .child(
                     mode_chip("sel-area", "Area", mode == SelectionMode::Area).on_click(
                         move |_, _, cx| {
@@ -602,7 +796,7 @@ impl Render for HudPillWindow {
                         });
                     },
                 ))
-                .child(div().w(px(1.0)).h(px(16.0)).mx_1().bg(rgba(0xffffff16)))
+                .child(island_divider())
                 .child(
                     icon_circle_chip("sel-cancel", "✕").on_click(move |_, _, cx| {
                         c_sel_cancel.update(cx, |coord, cx| coord.cancel_recording(cx));
@@ -612,107 +806,100 @@ impl Render for HudPillWindow {
                 frame_count,
                 duration_ms,
                 ..
-            } => div()
-                .flex()
-                .items_center()
-                .gap(px(4.0))
-                .whitespace_nowrap()
+            } => row
                 .child(
-                    div()
-                        .flex()
-                        .flex_shrink_0()
-                        .items_center()
-                        .gap_2()
-                        .pl_1()
-                        .pr_1p5()
-                        .whitespace_nowrap()
-                        .on_mouse_down(MouseButton::Left, |_, window, _| {
-                            window.start_window_move();
-                        })
+                    island_lead()
                         .child(
                             div()
-                                .size(px(22.0))
-                                .rounded_full()
+                                .size(px(CHIP_H))
+                                .flex_none()
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .bg(rgba(0x34c7592e))
-                                .text_color(rgb(POSITIVE_COLOR))
-                                .text_size(px(12.0))
-                                .font_weight(FontWeight::BOLD)
-                                .child("✓"),
+                                .child(
+                                    div()
+                                        .size(px(24.0))
+                                        .rounded_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .bg(rgba(0x34c7592e))
+                                        .text_color(rgb(POSITIVE_COLOR))
+                                        .text_size(px(12.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .child("✓"),
+                                ),
                         )
                         .child(
                             div()
+                                .ml(px(4.0))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(TEXT_COLOR))
-                                .whitespace_nowrap()
                                 .child("Copied"),
                         )
                         .child(
                             div()
+                                .ml(px(5.0))
                                 .text_color(rgb(MUTED_COLOR))
-                                .whitespace_nowrap()
-                                .child(format!(
-                                    "· {} · {} {}",
-                                    format_clock(duration_ms),
-                                    frame_count,
-                                    if frame_count == 1 { "frame" } else { "frames" }
-                                )),
+                                .child(completed_meta(duration_ms, frame_count)),
                         ),
                 )
-                .child(div().w(px(1.0)).h(px(16.0)).mx_0p5().bg(rgba(0xffffff16)))
+                .child(island_divider())
                 .child(
-                    div()
-                        .id("hud-inspect")
-                        .h(px(32.0))
-                        .px_3()
-                        .rounded(px(16.0))
-                        .flex()
-                        .flex_shrink_0()
-                        .items_center()
-                        .whitespace_nowrap()
-                        .bg(rgb(ACCENT_COLOR))
-                        .text_color(rgb(TEXT_COLOR))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(0x4b6bff)))
-                        .child("Inspect")
-                        .on_click(move |_, _, cx| {
-                            c_inspect.update(cx, |coord, cx| coord.inspect_completed_bundle(cx));
-                        }),
+                    primary_chip("hud-inspect", "Inspect").on_click(move |_, _, cx| {
+                        c_inspect.update(cx, |coord, cx| coord.inspect_completed_bundle(cx));
+                    }),
                 )
                 .child(
                     icon_circle_chip("hud-dismiss", "✕").on_click(move |_, _, cx| {
                         c_dismiss.update(cx, |coord, cx| coord.dismiss_island(cx));
                     }),
                 ),
-            _ => div()
-                .flex()
-                .items_center()
-                .gap(px(3.0))
-                .whitespace_nowrap()
-                .child(
-                    div()
-                        .flex()
-                        .flex_shrink_0()
-                        .items_center()
-                        .gap_2()
-                        .pl_2p5()
-                        .pr_2()
-                        .whitespace_nowrap()
-                        .on_mouse_down(MouseButton::Left, |_, window, _| {
-                            window.start_window_move();
-                        })
-                        .child(div().size(px(8.0)).rounded_full().bg(rgb(INK_RED)))
+            IslandPhase::Recording => {
+                // A soft ripple leaves the dot every 1.6s while the dot itself breathes.
+                let cycle = 1.6;
+                let ripple = (phase_age / cycle).fract();
+                let breath = 0.5 + 0.5 * (std::f32::consts::TAU * phase_age / cycle).cos();
+                let halo = 8.0 + 12.0 * ease_out_cubic(ripple);
+                let clock_w = measure_text(
+                    window,
+                    &clock_template(&clock),
+                    HUD_TEXT,
+                    FontWeight::SEMIBOLD,
+                );
+                row.child(
+                    island_lead()
                         .child(
                             div()
+                                .size(px(CHIP_H))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .size(px(halo))
+                                        .rounded_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .bg(with_alpha(INK_RED, 0.34 * (1.0 - ripple).powi(2)))
+                                        .child(
+                                            div()
+                                                .size(px(8.0))
+                                                .rounded_full()
+                                                .bg(with_alpha(INK_RED, 0.72 + 0.28 * breath)),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w(px(clock_w))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .whitespace_nowrap()
-                                .child(format_clock(elapsed_ms)),
+                                .child(clock),
                         ),
                 )
-                .child(div().w(px(1.0)).h(px(16.0)).mx_0p5().bg(rgba(0xffffff16)))
+                .child(island_divider())
                 .child(pill_chip("hud-undo", "Undo", stroke_count > 0).when(
                     stroke_count > 0,
                     |d| {
@@ -727,28 +914,15 @@ impl Render for HudPillWindow {
                     }),
                 )
                 .child(
-                    div()
-                        .id("hud-done")
-                        .h(px(32.0))
-                        .px_3()
-                        .rounded(px(16.0))
-                        .flex()
-                        .flex_shrink_0()
-                        .items_center()
-                        .whitespace_nowrap()
-                        .bg(rgb(ACCENT_COLOR))
-                        .text_color(rgb(TEXT_COLOR))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(0x4b6bff)))
-                        .child("Finish")
-                        .on_click(move |_, _, cx| {
-                            c_finish.update(cx, |coord, cx| coord.finish_recording(cx));
-                        }),
-                ),
+                    primary_chip("hud-done", "Finish").on_click(move |_, _, cx| {
+                        c_finish.update(cx, |coord, cx| coord.finish_recording(cx));
+                    }),
+                )
+            }
+            IslandPhase::Hidden | IslandPhase::Dismissing => row,
         };
 
-        let _ = width;
+        let is_completed = matches!(content_phase, IslandPhase::Completed { .. });
         div()
             .size_full()
             .flex()
@@ -757,75 +931,114 @@ impl Render for HudPillWindow {
             .opacity(opacity)
             .child(
                 div()
-                    .h(px(40.0))
-                    .p(px(4.0))
-                    .rounded(px(20.0))
+                    .w(px(width))
+                    .h(px(ISLAND_H))
+                    .flex_none()
+                    .p(px(ISLAND_PAD))
+                    .rounded(px(ISLAND_RADIUS))
+                    .overflow_hidden()
                     .flex()
                     .items_center()
-                    .bg(rgba(0x131316f5))
+                    .justify_center()
+                    .bg(rgba(0x141416f5))
                     .border_1()
                     .border_color(if is_completed {
-                        rgba(0x69d89f55)
+                        rgba(0x69d89f4d)
                     } else {
-                        rgba(0xffffff18)
+                        rgba(0xffffff1a)
                     })
                     .text_color(rgb(TEXT_COLOR))
-                    .text_size(px(13.0))
+                    .text_size(px(HUD_TEXT))
                     .whitespace_nowrap()
                     .child(capsule_content),
             )
     }
 }
 
-fn pill_chip(id: &'static str, label: &'static str, enabled: bool) -> gpui::Stateful<Div> {
+/// Leading status cluster: a 32px slot concentric with the capsule's left cap, then text.
+/// Also acts as the drag handle for the floating island.
+fn island_lead() -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .pr(px(LEAD_TRAIL))
+        .whitespace_nowrap()
+        .on_mouse_down(MouseButton::Left, |_, window, _| {
+            window.start_window_move();
+        })
+}
+
+fn island_divider() -> Div {
+    div()
+        .w(px(1.0))
+        .h(px(16.0))
+        .mx(px(DIVIDER_MX))
+        .flex_none()
+        .bg(rgba(0xffffff1a))
+}
+
+fn hud_chip(id: &'static str) -> gpui::Stateful<Div> {
     div()
         .id(id)
-        .h(px(32.0))
-        .px_3()
-        .rounded(px(16.0))
+        .h(px(CHIP_H))
+        .px(px(CHIP_PX))
+        .rounded(px(CHIP_RADIUS))
         .flex()
-        .flex_shrink_0()
+        .flex_none()
         .items_center()
+        .justify_center()
         .whitespace_nowrap()
+}
+
+fn pill_chip(id: &'static str, label: &'static str, enabled: bool) -> gpui::Stateful<Div> {
+    hud_chip(id)
+        .font_weight(FontWeight::MEDIUM)
         .text_color(if enabled {
             rgb(TEXT_SOFT)
         } else {
-            rgb(0x525256)
+            rgb(0x56565a)
         })
         .when(enabled, |d| {
             d.cursor_pointer()
-                .hover(|s| s.bg(rgba(0xffffff12)).text_color(rgb(TEXT_COLOR)))
+                .hover(|s| s.bg(rgba(0xffffff14)).text_color(rgb(TEXT_COLOR)))
         })
+        .child(label)
+}
+
+fn primary_chip(id: &'static str, label: &'static str) -> gpui::Stateful<Div> {
+    hud_chip(id)
+        .bg(rgb(ACCENT_COLOR))
+        .text_color(rgb(TEXT_COLOR))
+        .font_weight(FontWeight::SEMIBOLD)
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(ACCENT_HOVER)))
         .child(label)
 }
 
 fn icon_circle_chip(id: &'static str, icon: &'static str) -> gpui::Stateful<Div> {
     div()
         .id(id)
-        .size(px(32.0))
+        .size(px(CHIP_H))
         .rounded_full()
         .flex()
-        .flex_shrink_0()
+        .flex_none()
         .items_center()
         .justify_center()
+        .text_size(px(12.0))
         .text_color(rgb(MUTED_COLOR))
         .cursor_pointer()
         .hover(|s| s.bg(rgba(0xffffff14)).text_color(rgb(TEXT_COLOR)))
         .child(icon)
 }
 
+/// Area/Window mode toggle. Weight stays constant across states so toggling never shifts the
+/// measured capsule width.
 fn mode_chip(id: &'static str, label: &'static str, active: bool) -> gpui::Stateful<Div> {
-    div()
-        .id(id)
-        .h(px(32.0))
-        .px_3()
-        .rounded(px(16.0))
-        .flex()
-        .flex_shrink_0()
-        .items_center()
-        .whitespace_nowrap()
+    hud_chip(id)
+        .font_weight(FontWeight::MEDIUM)
         .bg(if active {
-            rgb(ACCENT_COLOR)
+            rgba(0xffffff26)
         } else {
             rgba(0x00000000)
         })
@@ -834,18 +1047,14 @@ fn mode_chip(id: &'static str, label: &'static str, active: bool) -> gpui::State
         } else {
             rgb(TEXT_SOFT)
         })
-        .font_weight(if active {
-            FontWeight::SEMIBOLD
-        } else {
-            FontWeight::MEDIUM
-        })
         .cursor_pointer()
         .hover(|s| {
             s.bg(if active {
-                rgb(0x4b6bff)
+                rgba(0xffffff2e)
             } else {
-                rgba(0xffffff12)
+                rgba(0xffffff14)
             })
+            .text_color(rgb(TEXT_COLOR))
         })
         .child(label)
 }
@@ -856,7 +1065,7 @@ pub struct TargetPickerWindow {
 }
 
 impl Render for TargetPickerWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let coord = self.coordinator.read(cx);
         let mode = match coord.island_phase {
             IslandPhase::Selecting { mode } => mode,
@@ -870,17 +1079,23 @@ impl Render for TargetPickerWindow {
         let c_up = self.coordinator.clone();
         let c_key = self.coordinator.clone();
 
-        let highlight_box: Option<(f32, f32, f32, f32, String)> = match mode {
+        let win_bounds = window.bounds();
+        let origin = [
+            f32::from(win_bounds.origin.x),
+            f32::from(win_bounds.origin.y),
+        ];
+        let screen = [
+            f32::from(win_bounds.size.width),
+            f32::from(win_bounds.size.height),
+        ];
+
+        // Selection rect in window-local coordinates, clipped to the screen, plus its badge.
+        let highlight: Option<([f32; 4], String)> = match mode {
             SelectionMode::Area => drag.map(|(a, b)| {
-                let x = a[0].min(b[0]);
-                let y = a[1].min(b[1]);
-                let w = (a[0] - b[0]).abs().max(2.0);
-                let h = (a[1] - b[1]).abs().max(2.0);
+                let w = (a[0] - b[0]).abs().max(1.0);
+                let h = (a[1] - b[1]).abs().max(1.0);
                 (
-                    x,
-                    y,
-                    w,
-                    h,
+                    [a[0].min(b[0]) - origin[0], a[1].min(b[1]) - origin[1], w, h],
                     format!("{} × {}", w.round() as i32, h.round() as i32),
                 )
             }),
@@ -897,154 +1112,262 @@ impl Render for TargetPickerWindow {
                     ),
                 };
                 (
-                    t.frame.x as f32,
-                    t.frame.y as f32,
-                    t.frame.width as f32,
-                    t.frame.height as f32,
+                    [
+                        t.frame.x as f32 - origin[0],
+                        t.frame.y as f32 - origin[1],
+                        t.frame.width as f32,
+                        t.frame.height as f32,
+                    ],
                     title,
                 )
             }),
-        };
+        }
+        .map(|(rect, label)| (clip_rect(rect, screen), label));
 
-        div()
+        let badge = highlight.as_ref().map(|(rect, label)| {
+            let max_text = (screen[0] - 2.0 * BADGE_MARGIN - 2.0 * BADGE_PX - 2.0).min(480.0);
+            let text_w = measure_text(window, label, BADGE_TEXT, FontWeight::MEDIUM).min(max_text);
+            let size = [text_w + 2.0 * BADGE_PX + 2.0, BADGE_H];
+            let anchor = match mode {
+                SelectionMode::Area => BadgeAnchor::BelowTrailing,
+                SelectionMode::Window => BadgeAnchor::Center,
+            };
+            (
+                place_badge(*rect, size, screen, anchor),
+                text_w,
+                label.clone(),
+            )
+        });
+
+        let dim = rgba(0x00000052);
+        let mut root = div()
             .id("scrawl-target-picker")
             .track_focus(&self.focus)
             .size_full()
             .relative()
-            .bg(rgba(0x00000038))
-            .cursor_crosshair()
-            .on_key_down(move |event: &KeyDownEvent, _, cx| {
-                let key = event.keystroke.key.as_str();
-                if key == "space" || key == " " {
-                    c_key.update(cx, |coord, cx| coord.toggle_selection_mode(cx));
-                } else if key == "escape" {
-                    c_key.update(cx, |coord, cx| coord.cancel_recording(cx));
-                } else if key == "enter" || key.eq_ignore_ascii_case("s") {
-                    c_key.update(cx, |coord, cx| coord.start_recording_full_screen(cx));
+            .when(highlight.is_none(), |d| d.bg(dim))
+            .cursor_crosshair();
+
+        if let Some(([x, y, w, h], _)) = highlight {
+            // Dim everything around the selection so the target itself stays untouched.
+            for [dx, dy, dw, dh] in [
+                [0.0, 0.0, screen[0], y],
+                [0.0, y + h, screen[0], screen[1] - y - h],
+                [0.0, y, x, h],
+                [x + w, y, screen[0] - x - w, h],
+            ] {
+                if dw > 0.0 && dh > 0.0 {
+                    root = root.child(
+                        div()
+                            .absolute()
+                            .left(px(dx))
+                            .top(px(dy))
+                            .w(px(dw))
+                            .h(px(dh))
+                            .bg(dim),
+                    );
                 }
-            })
-            .on_mouse_down(
-                MouseButton::Left,
-                move |event: &MouseDownEvent, window, cx| {
-                    let win_bounds = window.bounds();
-                    let sx = f32::from(win_bounds.origin.x) + f32::from(event.position.x);
-                    let sy = f32::from(win_bounds.origin.y) + f32::from(event.position.y);
-                    c_down.update(cx, |coord, cx| {
-                        let cur_mode = match coord.island_phase {
-                            IslandPhase::Selecting { mode } => mode,
-                            _ => return,
-                        };
-                        match cur_mode {
-                            SelectionMode::Area => {
-                                coord.selection_drag = Some(([sx, sy], [sx, sy]));
-                                cx.notify();
-                            }
-                            SelectionMode::Window => {
-                                if let Some(target) = coord.hovered_window.clone() {
-                                    coord.start_recording_with_target(target, cx);
-                                } else {
-                                    coord.start_recording_full_screen(cx);
-                                }
-                            }
-                        }
-                    });
-                },
+            }
+            let frame = div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h));
+            root = root.child(match mode {
+                // Crisp 1px white edge with a dark hairline outside, legible on any content.
+                SelectionMode::Area => {
+                    frame
+                        .border_1()
+                        .border_color(rgba(0xffffffeb))
+                        .shadow(vec![BoxShadow {
+                            color: gpui::hsla(0.0, 0.0, 0.0, 0.35),
+                            offset: point(px(0.0), px(0.0)),
+                            blur_radius: px(0.0),
+                            spread_radius: px(1.0),
+                        }])
+                }
+                SelectionMode::Window => frame
+                    .rounded(px(10.0))
+                    .bg(rgba(0x3b5cf621))
+                    .border_2()
+                    .border_color(rgba(0x5b7cfaee)),
+            });
+        }
+
+        root.when_some(badge, |d, ([bx, by], text_w, label)| {
+            d.child(
+                div()
+                    .absolute()
+                    .left(px(bx))
+                    .top(px(by))
+                    .h(px(BADGE_H))
+                    .px(px(BADGE_PX))
+                    .rounded(px(BADGE_H / 2.0))
+                    .flex()
+                    .items_center()
+                    .bg(rgba(0x1c1c1ef2))
+                    .border_1()
+                    .border_color(rgba(0xffffff21))
+                    .shadow(vec![BoxShadow {
+                        color: gpui::hsla(0.0, 0.0, 0.0, 0.3),
+                        offset: point(px(0.0), px(2.0)),
+                        blur_radius: px(8.0),
+                        spread_radius: px(0.0),
+                    }])
+                    .text_size(px(BADGE_TEXT))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(TEXT_COLOR))
+                    .child(div().w(px(text_w)).truncate().child(label)),
             )
-            .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
+        })
+        .on_key_down(move |event: &KeyDownEvent, _, cx| {
+            let key = event.keystroke.key.as_str();
+            if key == "space" || key == " " {
+                c_key.update(cx, |coord, cx| coord.toggle_selection_mode(cx));
+            } else if key == "escape" {
+                c_key.update(cx, |coord, cx| coord.cancel_recording(cx));
+            } else if key == "enter" || key.eq_ignore_ascii_case("s") {
+                c_key.update(cx, |coord, cx| coord.start_recording_full_screen(cx));
+            }
+        })
+        .on_mouse_down(
+            MouseButton::Left,
+            move |event: &MouseDownEvent, window, cx| {
                 let win_bounds = window.bounds();
                 let sx = f32::from(win_bounds.origin.x) + f32::from(event.position.x);
                 let sy = f32::from(win_bounds.origin.y) + f32::from(event.position.y);
-                c_move.update(cx, |coord, cx| {
+                c_down.update(cx, |coord, cx| {
                     let cur_mode = match coord.island_phase {
                         IslandPhase::Selecting { mode } => mode,
                         _ => return,
                     };
                     match cur_mode {
                         SelectionMode::Area => {
-                            if event.dragging()
-                                && let Some((start, _)) = coord.selection_drag
-                            {
-                                coord.selection_drag = Some((start, [sx, sy]));
-                                cx.notify();
-                            }
+                            coord.selection_drag = Some(([sx, sy], [sx, sy]));
+                            cx.notify();
                         }
                         SelectionMode::Window => {
-                            let found = coord
-                                .selectable_windows
-                                .iter()
-                                .find(|w| {
-                                    let f = w.frame;
-                                    f64::from(sx) >= f.x
-                                        && f64::from(sx) <= f.x + f.width
-                                        && f64::from(sy) >= f.y
-                                        && f64::from(sy) <= f.y + f.height
-                                })
-                                .cloned();
-                            if coord.hovered_window.as_ref().and_then(|w| w.window_id)
-                                != found.as_ref().and_then(|w| w.window_id)
-                            {
-                                coord.hovered_window = found;
-                                cx.notify();
+                            if let Some(target) = coord.hovered_window.clone() {
+                                coord.start_recording_with_target(target, cx);
+                            } else {
+                                coord.start_recording_full_screen(cx);
                             }
                         }
                     }
                 });
-            })
-            .on_mouse_up(
-                MouseButton::Left,
-                move |event: &MouseUpEvent, window, cx| {
-                    let win_bounds = window.bounds();
-                    let sx = f32::from(win_bounds.origin.x) + f32::from(event.position.x);
-                    let sy = f32::from(win_bounds.origin.y) + f32::from(event.position.y);
-                    c_up.update(cx, |coord, cx| {
-                        if let Some((start, _)) = coord.selection_drag.take() {
-                            let x = f64::from(start[0].min(sx));
-                            let y = f64::from(start[1].min(sy));
-                            let w = f64::from((start[0] - sx).abs());
-                            let h = f64::from((start[1] - sy).abs());
-                            if w >= 36.0 && h >= 36.0 {
-                                let target = region_target(x, y, w, h);
-                                coord.start_recording_with_target(target, cx);
-                            } else {
-                                cx.notify();
-                            }
+            },
+        )
+        .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
+            let win_bounds = window.bounds();
+            let sx = f32::from(win_bounds.origin.x) + f32::from(event.position.x);
+            let sy = f32::from(win_bounds.origin.y) + f32::from(event.position.y);
+            c_move.update(cx, |coord, cx| {
+                let cur_mode = match coord.island_phase {
+                    IslandPhase::Selecting { mode } => mode,
+                    _ => return,
+                };
+                match cur_mode {
+                    SelectionMode::Area => {
+                        if event.dragging()
+                            && let Some((start, _)) = coord.selection_drag
+                        {
+                            coord.selection_drag = Some((start, [sx, sy]));
+                            cx.notify();
                         }
-                    });
-                },
-            )
-            .when_some(highlight_box, |d, (x, y, w, h, badge)| {
-                d.child(
-                    div()
-                        .absolute()
-                        .left(px(x))
-                        .top(px(y))
-                        .w(px(w))
-                        .h(px(h))
-                        .rounded(px(8.0))
-                        .bg(rgba(0x3b5cf61c))
-                        .border_2()
-                        .border_color(rgb(ACCENT_COLOR))
-                        .flex()
-                        .items_end()
-                        .justify_end()
-                        .p_2()
-                        .child(
-                            div()
-                                .px_2()
-                                .py_0p5()
-                                .rounded(px(6.0))
-                                .bg(rgba(0x111113e8))
-                                .border_1()
-                                .border_color(rgb(LINE_COLOR))
-                                .text_size(px(11.5))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(TEXT_COLOR))
-                                .whitespace_nowrap()
-                                .child(badge),
-                        ),
-                )
-            })
+                    }
+                    SelectionMode::Window => {
+                        let found = coord
+                            .selectable_windows
+                            .iter()
+                            .find(|w| {
+                                let f = w.frame;
+                                f64::from(sx) >= f.x
+                                    && f64::from(sx) <= f.x + f.width
+                                    && f64::from(sy) >= f.y
+                                    && f64::from(sy) <= f.y + f.height
+                            })
+                            .cloned();
+                        if coord.hovered_window.as_ref().and_then(|w| w.window_id)
+                            != found.as_ref().and_then(|w| w.window_id)
+                        {
+                            coord.hovered_window = found;
+                            cx.notify();
+                        }
+                    }
+                }
+            });
+        })
+        .on_mouse_up(
+            MouseButton::Left,
+            move |event: &MouseUpEvent, window, cx| {
+                let win_bounds = window.bounds();
+                let sx = f32::from(win_bounds.origin.x) + f32::from(event.position.x);
+                let sy = f32::from(win_bounds.origin.y) + f32::from(event.position.y);
+                c_up.update(cx, |coord, cx| {
+                    if let Some((start, _)) = coord.selection_drag.take() {
+                        let x = f64::from(start[0].min(sx));
+                        let y = f64::from(start[1].min(sy));
+                        let w = f64::from((start[0] - sx).abs());
+                        let h = f64::from((start[1] - sy).abs());
+                        if w >= 36.0 && h >= 36.0 {
+                            let target = region_target(x, y, w, h);
+                            coord.start_recording_with_target(target, cx);
+                        } else {
+                            cx.notify();
+                        }
+                    }
+                });
+            },
+        )
     }
+}
+
+const BADGE_H: f32 = 22.0;
+const BADGE_PX: f32 = 8.0;
+const BADGE_TEXT: f32 = 12.0;
+const BADGE_GAP: f32 = 8.0;
+const BADGE_MARGIN: f32 = 8.0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BadgeAnchor {
+    /// Just outside the bottom-right corner (Area drags), flipping above or inside near edges.
+    BelowTrailing,
+    /// Centered over the target (Window hover).
+    Center,
+}
+
+fn clip_rect([x, y, w, h]: [f32; 4], [sw, sh]: [f32; 2]) -> [f32; 4] {
+    let x0 = x.clamp(0.0, sw);
+    let y0 = y.clamp(0.0, sh);
+    let x1 = (x + w).clamp(0.0, sw);
+    let y1 = (y + h).clamp(0.0, sh);
+    [x0, y0, x1 - x0, y1 - y0]
+}
+
+/// Positions a badge of `size` relative to `rect`, keeping it fully on screen.
+fn place_badge(
+    [x, y, w, h]: [f32; 4],
+    [bw, bh]: [f32; 2],
+    [sw, sh]: [f32; 2],
+    anchor: BadgeAnchor,
+) -> [f32; 2] {
+    let (bx, by) = match anchor {
+        BadgeAnchor::BelowTrailing => {
+            let below = y + h + BADGE_GAP;
+            let above = y - BADGE_GAP - bh;
+            let by = if below + bh <= sh - BADGE_MARGIN {
+                below
+            } else if above >= BADGE_MARGIN {
+                above
+            } else {
+                y + h - BADGE_GAP - bh
+            };
+            (x + w - bw, by)
+        }
+        BadgeAnchor::Center => (x + (w - bw) / 2.0, y + (h - bh) / 2.0),
+    };
+    let max_x = (sw - BADGE_MARGIN - bw).max(BADGE_MARGIN);
+    let max_y = (sh - BADGE_MARGIN - bh).max(BADGE_MARGIN);
+    [
+        bx.clamp(BADGE_MARGIN, max_x).round(),
+        by.clamp(BADGE_MARGIN, max_y).round(),
+    ]
 }
 
 pub struct BundleReviewWindow {
@@ -1102,11 +1425,10 @@ impl Render for BundleReviewWindow {
         let selected_kf = coord_read.selected_keyframe;
         let shortcut_label = coord_read.shortcut_label();
         let recording_key = coord_read.recording_shortcut_key;
-        let record_btn_label = format!("Record  {shortcut_label}");
-        let shortcut_chip_label = if recording_key {
-            "Press shortcut…".to_string()
+        let (shortcut_chip_label, shortcut_hint) = if recording_key {
+            ("Press shortcut…", None)
         } else {
-            format!("Shortcut  {shortcut_label}")
+            ("Shortcut", Some(shortcut_label.clone()))
         };
 
         let Some((dir, bundle)) = state else {
@@ -1132,11 +1454,10 @@ impl Render for BundleReviewWindow {
                         .flex()
                         .gap_2()
                         .child(
-                            action_button("empty-record", &record_btn_label, true).on_click(
-                                move |_, _, cx| {
+                            hint_button("empty-record", "Record", Some(shortcut_label), true)
+                                .on_click(move |_, _, cx| {
                                     c_start.update(cx, |coord, cx| coord.start_recording(cx));
-                                },
-                            ),
+                                }),
                         )
                         .child(
                             action_button("empty-demo", "Load Demo Bundle", false).on_click(
@@ -1161,7 +1482,9 @@ impl Render for BundleReviewWindow {
         self.ensure_images(&dir, &bundle);
 
         let target_label = match (&bundle.target.app, &bundle.target.window_title) {
-            (Some(app), Some(win)) if !win.is_empty() => format!("{app} — “{win}”"),
+            (Some(app), Some(win)) if !win.is_empty() && win != app => {
+                format!("{app} — “{win}”")
+            }
             (Some(app), _) => app.clone(),
             _ => format!("Display {}", bundle.target.display_id),
         };
@@ -1229,47 +1552,40 @@ impl Render for BundleReviewWindow {
             .bg(rgb(CANVAS_BG))
             .text_color(rgb(TEXT_COLOR))
             .child(
-                // Top Header Bar
                 div()
                     .h(px(52.0))
-                    .px_5()
+                    .px_4()
                     .flex_none()
                     .flex()
                     .items_center()
-                    .justify_between()
+                    .gap_4()
                     .bg(rgb(SIDEBAR_BG))
                     .border_b_1()
                     .border_color(rgb(LINE_COLOR))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .flex()
                             .items_center()
                             .gap_3()
                             .child(
                                 div()
-                                    .text_size(px(14.0))
+                                    .flex_none()
+                                    .text_size(px(13.0))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child("Scrawl"),
                             )
                             .child(
+                                // Segmented control: R_outer 8 = R_tab 6 + border 1 + pad 1.
                                 div()
-                                    .text_size(px(12.5))
-                                    .text_color(rgb(MUTED_COLOR))
-                                    .child(format!(
-                                        "{} · {} · {} keyframes",
-                                        target_label,
-                                        format_clock(bundle.duration_ms),
-                                        bundle.keyframes.len()
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .ml_2()
+                                    .flex_none()
+                                    .h(px(28.0))
+                                    .p(px(1.0))
                                     .flex()
                                     .items_center()
-                                    .gap_1()
-                                    .p_0p5()
-                                    .rounded(px(7.0))
+                                    .gap(px(2.0))
+                                    .rounded(px(8.0))
                                     .bg(rgb(CANVAS_BG))
                                     .border_1()
                                     .border_color(rgb(LINE_COLOR))
@@ -1303,31 +1619,53 @@ impl Render for BundleReviewWindow {
                                             },
                                         ),
                                     ),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(MUTED_COLOR))
+                                    .child(format!(
+                                        "{} · {} · {} {}",
+                                        target_label,
+                                        format_clock(bundle.duration_ms),
+                                        bundle.keyframes.len(),
+                                        if bundle.keyframes.len() == 1 {
+                                            "keyframe"
+                                        } else {
+                                            "keyframes"
+                                        }
+                                    )),
                             ),
                     )
                     .child(
                         div()
+                            .flex_none()
                             .flex()
                             .items_center()
                             .gap_2()
                             .child(
-                                action_button("btn-shortcut", &shortcut_chip_label, recording_key)
-                                    .on_click(move |_, window, cx| {
-                                        window.focus(&focus);
-                                        c_shortcut.update(cx, |coord, cx| {
-                                            coord.recording_shortcut_key =
-                                                !coord.recording_shortcut_key;
-                                            cx.notify();
-                                        });
-                                    }),
+                                hint_button(
+                                    "btn-shortcut",
+                                    shortcut_chip_label,
+                                    shortcut_hint,
+                                    recording_key,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    window.focus(&focus);
+                                    c_shortcut.update(cx, |coord, cx| {
+                                        coord.recording_shortcut_key =
+                                            !coord.recording_shortcut_key;
+                                        cx.notify();
+                                    });
+                                }),
                             )
-                            .child(
-                                action_button("btn-record", &record_btn_label, false).on_click(
-                                    move |_, _, cx| {
-                                        c_record.update(cx, |coord, cx| coord.start_recording(cx));
-                                    },
-                                ),
-                            )
+                            .child(action_button("btn-record", "Record", false).on_click(
+                                move |_, _, cx| {
+                                    c_record.update(cx, |coord, cx| coord.start_recording(cx));
+                                },
+                            ))
                             .child(
                                 action_button("btn-reveal", "Show in Finder", false).on_click(
                                     move |_, _, cx| {
@@ -1345,9 +1683,9 @@ impl Render for BundleReviewWindow {
                                 action_button(
                                     "btn-copy",
                                     if status.as_deref() == Some("Copied ✓") {
-                                        "Copied ✓"
+                                        "Copied"
                                     } else {
-                                        "Copy to Clipboard"
+                                        "Copy"
                                     },
                                     true,
                                 )
@@ -1397,17 +1735,11 @@ impl Render for BundleReviewWindow {
                             .bg(rgb(SIDEBAR_BG))
                             .border_l_1()
                             .border_color(rgb(LINE_COLOR))
-                            .p_4()
+                            .px_4()
+                            .py(px(18.0))
                             .flex()
                             .flex_col()
-                            .gap_2p5()
-                            .child(
-                                div()
-                                    .text_size(px(11.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(MUTED_COLOR))
-                                    .child("TRANSCRIPT"),
-                            )
+                            .child(sidebar_heading("Transcript"))
                             .child(
                                 div()
                                     .p_3()
@@ -1416,48 +1748,24 @@ impl Render for BundleReviewWindow {
                                     .border_1()
                                     .border_color(rgb(LINE_COLOR))
                                     .text_size(px(13.0))
-                                    .text_color(rgb(TEXT_COLOR))
-                                    .child(if bundle.transcript.text.trim().is_empty() {
-                                        "(No speech recorded)".to_string()
-                                    } else {
-                                        format!("“{}”", bundle.transcript.text.trim())
+                                    .line_height(relative(1.45))
+                                    .map(|d| {
+                                        let text = bundle.transcript.text.trim();
+                                        if text.is_empty() {
+                                            d.text_color(rgb(MUTED_COLOR)).child("No speech")
+                                        } else {
+                                            d.text_color(rgb(TEXT_COLOR)).child(format!("“{text}”"))
+                                        }
                                     }),
                             )
+                            .child(div().mt(px(20.0)).child(sidebar_heading("Timeline")))
                             .child(
-                                div()
-                                    .mt_1()
-                                    .text_size(px(11.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(MUTED_COLOR))
-                                    .child("TIMELINE"),
-                            )
-                            .children(timeline.into_iter().enumerate().map(|(i, line)| {
-                                let is_mark = line.contains('✎');
-                                div()
-                                    .id(("timeline-row", i))
-                                    .p_2p5()
-                                    .rounded(px(7.0))
-                                    .bg(rgb(SURFACE_BG))
-                                    .border_1()
-                                    .border_color(if is_mark {
-                                        rgba(0xff3b3066)
-                                    } else {
-                                        rgb(LINE_COLOR)
-                                    })
-                                    .text_size(px(12.0))
-                                    .text_color(if is_mark {
-                                        rgb(TEXT_COLOR)
-                                    } else {
-                                        rgb(TEXT_SOFT)
-                                    })
-                                    .child(line)
-                            }))
-                            .child(
-                                div()
-                                    .mt_2()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(MUTED_COLOR))
-                                    .child(format!("Bundle: {}", dir.display())),
+                                div().mx(px(-8.0)).flex().flex_col().gap(px(1.0)).children(
+                                    timeline
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(i, line)| timeline_row(i, &line)),
+                                ),
                             ),
                     ),
             )
@@ -1496,7 +1804,8 @@ impl BundleReviewWindow {
         selected_kf: usize,
         stage_w: f32,
     ) -> AnyElement {
-        let card_img_w = (stage_w - 26.0).max(240.0);
+        // Card: border 1 + pad 8 around the frame, so R_card 12 = R_frame 3 + 9.
+        let card_img_w = (stage_w - 18.0).max(240.0);
         let cards = bundle
             .keyframes
             .iter()
@@ -1507,8 +1816,8 @@ impl BundleReviewWindow {
                 let c_select = self.coordinator.clone();
                 div()
                     .id(("kf-card", idx))
-                    .p_3()
-                    .rounded(px(10.0))
+                    .p(px(8.0))
+                    .rounded(px(12.0))
                     .bg(rgb(SURFACE_BG))
                     .border_1()
                     .border_color(if is_selected {
@@ -1518,8 +1827,9 @@ impl BundleReviewWindow {
                     })
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap(px(8.0))
                     .cursor_pointer()
+                    .when(!is_selected, |d| d.hover(|s| s.border_color(rgb(0x3a3a3a))))
                     .on_click(move |_, _, cx| {
                         c_select.update(cx, |coord, cx| {
                             coord.selected_keyframe = idx;
@@ -1527,30 +1837,45 @@ impl BundleReviewWindow {
                         });
                     })
                     .when_some(frame_img, |d, image| {
-                        d.child(img(image).w(px(card_img_w)).rounded(px(6.0)))
+                        d.child(img(image).w(px(card_img_w)).rounded(px(3.0)))
                     })
                     .child(
                         div()
+                            .px(px(4.0))
+                            .pb(px(2.0))
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .gap(px(8.0))
                             .text_size(px(12.5))
                             .child(
                                 div()
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded(px(5.0))
+                                    .h(px(20.0))
+                                    .px(px(7.0))
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .rounded(px(10.0))
                                     .bg(rgb(CANVAS_BG))
                                     .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(px(11.5))
                                     .text_color(rgb(TEXT_COLOR))
                                     .child(format!("#{} · {}", kf.index, format_clock(kf.t))),
                             )
-                            .child(div().text_color(rgb(TEXT_SOFT)).child(kf.event.clone())),
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(rgb(TEXT_SOFT))
+                                    .child(kf.event.clone()),
+                            ),
                     )
                     .when_some(kf.said.clone(), |d, said| {
                         d.child(
                             div()
+                                .px(px(4.0))
+                                .pb(px(2.0))
                                 .text_size(px(12.0))
+                                .line_height(relative(1.4))
                                 .text_color(rgb(MUTED_COLOR))
                                 .child(format!("“{said}”")),
                         )
@@ -1568,38 +1893,101 @@ impl BundleReviewWindow {
     }
 }
 
+fn sidebar_heading(label: &'static str) -> Div {
+    div()
+        .mb(px(8.0))
+        .text_size(px(11.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(MUTED_COLOR))
+        .child(label)
+}
+
+/// Splits a `sketch::timeline` line ("0:03 · Clicked…", "0:04 ✎ Circle…", "0:05 “said”") into
+/// a time column and a body, flagging annotation marks.
+fn split_timeline_line(line: &str) -> (&str, &str, bool) {
+    let (time, rest) = line.split_once(' ').unwrap_or(("", line));
+    if let Some(body) = rest.strip_prefix("✎ ") {
+        (time, body, true)
+    } else {
+        (time, rest.strip_prefix("· ").unwrap_or(rest), false)
+    }
+}
+
+fn timeline_row(index: usize, line: &str) -> gpui::Stateful<Div> {
+    let (time, body, is_mark) = split_timeline_line(line);
+    div()
+        .id(("timeline-row", index))
+        .px(px(8.0))
+        .py(px(6.0))
+        .rounded(px(6.0))
+        .flex()
+        .items_start()
+        .gap(px(10.0))
+        .text_size(px(12.5))
+        .line_height(relative(1.4))
+        .hover(|s| s.bg(rgb(SURFACE_BG)))
+        .child(
+            div()
+                .w(px(32.0))
+                .flex_none()
+                .text_color(rgb(MUTED_COLOR))
+                .child(time.to_string()),
+        )
+        .when(is_mark, |d| {
+            d.child(div().flex_none().text_color(rgb(INK_RED)).child("✎"))
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_color(if is_mark {
+                    rgb(TEXT_COLOR)
+                } else {
+                    rgb(TEXT_SOFT)
+                })
+                .child(body.to_string()),
+        )
+}
+
 fn tab_chip(id: &'static str, label: &'static str, selected: bool) -> gpui::Stateful<Div> {
     div()
         .id(id)
-        .h(px(26.0))
-        .px_2p5()
-        .rounded(px(5.0))
+        .h(px(24.0))
+        .px(px(10.0))
+        .rounded(px(6.0))
         .flex()
         .items_center()
         .text_size(px(12.0))
-        .bg(if selected {
-            rgb(SURFACE_SELECTED)
-        } else {
-            rgb(CANVAS_BG)
+        .font_weight(FontWeight::MEDIUM)
+        .when(selected, |d| {
+            d.bg(rgb(SURFACE_SELECTED)).shadow(vec![BoxShadow {
+                color: gpui::hsla(0.0, 0.0, 0.0, 0.25),
+                offset: point(px(0.0), px(1.0)),
+                blur_radius: px(2.0),
+                spread_radius: px(0.0),
+            }])
         })
         .text_color(if selected {
             rgb(TEXT_COLOR)
         } else {
             rgb(MUTED_COLOR)
         })
-        .cursor_pointer()
+        .when(!selected, |d| {
+            d.cursor_pointer().hover(|s| s.text_color(rgb(TEXT_SOFT)))
+        })
         .child(label)
 }
 
-fn action_button(id: &'static str, label: &str, primary: bool) -> gpui::Stateful<Div> {
+fn button_base(id: &'static str, primary: bool) -> gpui::Stateful<Div> {
     div()
         .id(id)
-        .h(px(30.0))
-        .px_3()
-        .rounded(px(6.0))
+        .h(px(28.0))
+        .px(px(12.0))
+        .rounded(px(7.0))
         .flex()
-        .flex_shrink_0()
+        .flex_none()
         .items_center()
+        .gap(px(6.0))
         .whitespace_nowrap()
         .text_size(px(12.5))
         .font_weight(FontWeight::MEDIUM)
@@ -1616,14 +2004,39 @@ fn action_button(id: &'static str, label: &str, primary: bool) -> gpui::Stateful
         })
         .text_color(rgb(TEXT_COLOR))
         .cursor_pointer()
-        .hover(|s| {
-            s.bg(if primary {
-                rgb(0x4b6bff)
+        .hover(move |s| {
+            if primary {
+                s.bg(rgb(ACCENT_HOVER)).border_color(rgb(ACCENT_HOVER))
             } else {
-                rgb(SURFACE_HOVER)
-            })
+                s.bg(rgb(SURFACE_HOVER))
+            }
         })
+}
+
+fn action_button(id: &'static str, label: &str, primary: bool) -> gpui::Stateful<Div> {
+    button_base(id, primary).child(SharedString::from(label.to_string()))
+}
+
+/// Button with a trailing muted hint, e.g. a keyboard shortcut.
+fn hint_button(
+    id: &'static str,
+    label: &str,
+    hint: Option<String>,
+    primary: bool,
+) -> gpui::Stateful<Div> {
+    button_base(id, primary)
         .child(SharedString::from(label.to_string()))
+        .when_some(hint, |d, hint| {
+            d.child(
+                div()
+                    .text_color(if primary {
+                        rgba(0xffffffb3)
+                    } else {
+                        rgb(MUTED_COLOR)
+                    })
+                    .child(hint),
+            )
+        })
 }
 
 fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
@@ -1708,8 +2121,8 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
     );
     let display_id = display.as_ref().map(|d| d.id());
 
-    // Transparent 430×48 Dynamic Island host positioned cleanly below the 37pt macOS menu bar
-    let pill_size: Size<Pixels> = size(px(430.0), px(48.0));
+    // Transparent Dynamic Island host positioned cleanly below the 37pt macOS menu bar
+    let pill_size: Size<Pixels> = size(px(PILL_WINDOW_W), px(PILL_WINDOW_H));
     let pill_bounds = Bounds {
         origin: point(
             (display_bounds.size.width - pill_size.width) * 0.5,
@@ -2105,4 +2518,102 @@ fn capture_cg_window_rgba(window_id: u32) -> Option<crate::model::RgbaFrame> {
         height as u32,
         rgba,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn island_geometry_is_concentric() {
+        assert_eq!(ISLAND_RADIUS, CHIP_RADIUS + ISLAND_INSET);
+        assert_eq!(ISLAND_PAD + 1.0, ISLAND_INSET);
+        assert_eq!(CHIP_H + 2.0 * ISLAND_INSET, ISLAND_H);
+        assert!(ISLAND_H <= PILL_WINDOW_H);
+    }
+
+    #[test]
+    fn island_spring_settles_without_large_overshoot() {
+        let (mut x, mut v) = (200.0_f32, 0.0_f32);
+        let mut peak = x;
+        for _ in 0..90 {
+            (x, v) = spring_step(x, v, 300.0, 1.0 / 60.0, ISLAND_SPRING);
+            peak = peak.max(x);
+        }
+        assert!((x - 300.0).abs() < 0.5, "settled at {x}");
+        assert!(peak < 300.0 + 100.0 * 0.05, "overshoot peak {peak}");
+    }
+
+    #[test]
+    fn island_spring_is_stable_for_long_frames() {
+        let (x, _) = spring_step(200.0, 0.0, 300.0, 0.05, ISLAND_SPRING);
+        assert!(x > 200.0 && x < 300.0);
+    }
+
+    #[test]
+    fn area_badge_sits_below_and_flips_near_edges() {
+        let screen = [1440.0, 900.0];
+        let badge = [90.0, BADGE_H];
+        let [bx, by] = place_badge(
+            [100.0, 100.0, 300.0, 200.0],
+            badge,
+            screen,
+            BadgeAnchor::BelowTrailing,
+        );
+        assert_eq!([bx, by], [310.0, 308.0]);
+
+        let [_, by] = place_badge(
+            [100.0, 600.0, 300.0, 290.0],
+            badge,
+            screen,
+            BadgeAnchor::BelowTrailing,
+        );
+        assert_eq!(by, 600.0 - BADGE_GAP - BADGE_H);
+
+        let [bx, by] = place_badge(
+            [0.0, 0.0, 40.0, 900.0],
+            badge,
+            screen,
+            BadgeAnchor::BelowTrailing,
+        );
+        assert_eq!(bx, BADGE_MARGIN);
+        assert!(by + BADGE_H <= 900.0 - BADGE_MARGIN);
+    }
+
+    #[test]
+    fn window_badge_centers_and_clamps_on_screen() {
+        let screen = [1440.0, 900.0];
+        let [bx, by] = place_badge(
+            [200.0, 100.0, 600.0, 400.0],
+            [200.0, BADGE_H],
+            screen,
+            BadgeAnchor::Center,
+        );
+        assert_eq!([bx, by], [400.0, 289.0]);
+
+        let clipped = clip_rect([-300.0, -50.0, 400.0, 200.0], screen);
+        assert_eq!(clipped, [0.0, 0.0, 100.0, 150.0]);
+    }
+
+    #[test]
+    fn timeline_lines_split_into_time_and_body() {
+        assert_eq!(
+            split_timeline_line("0:04 ✎ Circle around button — frame #2"),
+            ("0:04", "Circle around button — frame #2", true)
+        );
+        assert_eq!(
+            split_timeline_line("0:05 · Clicked Save"),
+            ("0:05", "Clicked Save", false)
+        );
+        assert_eq!(
+            split_timeline_line("0:01 “hello”"),
+            ("0:01", "“hello”", false)
+        );
+    }
+
+    #[test]
+    fn clock_template_is_width_stable() {
+        assert_eq!(clock_template("12:34"), "00:00");
+        assert_eq!(completed_meta(8_000, 1), "· 0:08 · 1 frame");
+    }
 }
