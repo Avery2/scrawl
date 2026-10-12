@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -1002,17 +1002,74 @@ pub fn region_target(
     }
 }
 
-fn frontmost_app_info() -> Option<(i32, String, Option<String>)> {
+static LAST_EXTERNAL_APP_PID: AtomicI32 = AtomicI32::new(0);
+
+pub fn record_external_frontmost_app() {
     use objc2_app_kit::NSWorkspace;
     let workspace = NSWorkspace::sharedWorkspace();
-    let app = workspace.frontmostApplication()?;
-    let pid = app.processIdentifier();
-    if pid == std::process::id() as i32 {
-        return None;
+    if let Some(app) = workspace.frontmostApplication() {
+        let pid = app.processIdentifier();
+        if pid > 0 && pid != std::process::id() as i32 {
+            LAST_EXTERNAL_APP_PID.store(pid, Ordering::Release);
+        }
     }
-    let name = app.localizedName()?.to_string();
-    let bundle_id = app.bundleIdentifier().map(|b| b.to_string());
-    Some((pid, name, bundle_id))
+}
+
+pub fn ensure_external_app_active() {
+    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
+    let our_pid = std::process::id() as i32;
+    let workspace = NSWorkspace::sharedWorkspace();
+    let front_pid = workspace
+        .frontmostApplication()
+        .map_or(0, |a| a.processIdentifier());
+    if front_pid != 0 && front_pid != our_pid {
+        LAST_EXTERNAL_APP_PID.store(front_pid, Ordering::Release);
+        return;
+    }
+    let target_pid = LAST_EXTERNAL_APP_PID.load(Ordering::Acquire);
+    if target_pid > 0
+        && target_pid != our_pid
+        && let Some(target_app) =
+            NSRunningApplication::runningApplicationWithProcessIdentifier(target_pid)
+    {
+        #[allow(deprecated)]
+        let _ = target_app
+            .activateWithOptions(NSApplicationActivationOptions::ActivateIgnoringOtherApps);
+        let deadline = Instant::now() + Duration::from_millis(220);
+        while Instant::now() < deadline {
+            if workspace
+                .frontmostApplication()
+                .is_some_and(|a| a.processIdentifier() == target_pid)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn frontmost_app_info() -> Option<(i32, String, Option<String>)> {
+    use objc2_app_kit::{NSRunningApplication, NSWorkspace};
+    let our_pid = std::process::id() as i32;
+    let workspace = NSWorkspace::sharedWorkspace();
+    if let Some(app) = workspace.frontmostApplication() {
+        let pid = app.processIdentifier();
+        if pid != our_pid {
+            LAST_EXTERNAL_APP_PID.store(pid, Ordering::Release);
+            let name = app.localizedName()?.to_string();
+            let bundle_id = app.bundleIdentifier().map(|b| b.to_string());
+            return Some((pid, name, bundle_id));
+        }
+    }
+    let fallback_pid = LAST_EXTERNAL_APP_PID.load(Ordering::Acquire);
+    if fallback_pid > 0 && fallback_pid != our_pid {
+        let app = NSRunningApplication::runningApplicationWithProcessIdentifier(fallback_pid)?;
+        let name = app.localizedName()?.to_string();
+        let bundle_id = app.bundleIdentifier().map(|b| b.to_string());
+        return Some((fallback_pid, name, bundle_id));
+    }
+    None
 }
 
 /// Active screen + optional MP4 recorder using `ScreenCaptureKit`.

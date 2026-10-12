@@ -23,9 +23,9 @@ use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
 
 use crate::capture::{
     LiveOverlayEvent, ScreenCaptureSession, SharedCaptureTelemetry, current_mouse_screen,
-    discover_target, install_global_hotkeys, list_selectable_windows, region_target, scrawl_log,
-    selectable_window_at, set_escape_hotkey_enabled, shortcut_from_key_and_mods,
-    start_global_input_tap,
+    discover_target, install_global_hotkeys, list_selectable_windows,
+    record_external_frontmost_app, region_target, scrawl_log, selectable_window_at,
+    set_escape_hotkey_enabled, shortcut_from_key_and_mods, start_global_input_tap,
 };
 use crate::hex::AudioRecorder;
 use crate::laser_overlay::MetalLaserOverlay;
@@ -170,30 +170,18 @@ fn island_content_width(window: &Window, phase: IslandPhase, clock: &str) -> f32
             CHIP_H
                 + 6.0
                 + measure_text(window, "Processing…", HUD_TEXT, FontWeight::SEMIBOLD)
-                + LEAD_TRAIL
-                + 4.0
+                + CHIP_PX
         }
-        IslandPhase::Completed {
-            frame_count,
-            duration_ms,
-            ..
-        } => {
+        IslandPhase::Completed { .. } => {
             CHIP_H
-                + 4.0
+                + 8.0
                 + measure_text(window, "Copied", HUD_TEXT, FontWeight::SEMIBOLD)
-                + 5.0
-                + measure_text(
-                    window,
-                    &completed_meta(duration_ms, frame_count),
-                    HUD_TEXT,
-                    FontWeight::NORMAL,
-                )
                 + LEAD_TRAIL
                 + divider
                 + chip_width(window, "Paste", FontWeight::SEMIBOLD)
                 + chip_width(window, "Inspect", FontWeight::MEDIUM)
                 + CHIP_H
-                + 4.0 * CHIP_GAP
+                + 3.0 * CHIP_GAP
         }
         IslandPhase::Hidden | IslandPhase::Dismissing => return ISLAND_H,
     };
@@ -470,29 +458,37 @@ fn apply_pill_layer_effect(
         return;
     };
     cv.setWantsLayer(true);
-    let Some(content_layer) = cv.layer() else {
+    let Some(cv_layer) = cv.layer() else {
         return;
     };
+    // GPUI attaches its `CAMetalLayer` to its child `GPUIView` (`cv.subviews().firstObject()`).
+    let gpui_view = cv.subviews().firstObject();
+    let content_layer = gpui_view
+        .as_ref()
+        .and_then(|v| {
+            v.setWantsLayer(true);
+            v.layer()
+        })
+        .unwrap_or_else(|| cv_layer.clone());
+
     let bounds = cv.bounds();
     let cx = bounds.size.width * 0.5;
     let cy = bounds.size.height * 0.5;
     let s = f64::from(scale.clamp(0.50, 1.15));
     let ty_unflipped = -f64::from(y_offset);
-    let ty_cv = if cv.isFlipped() {
+    let is_flipped = gpui_view
+        .as_ref()
+        .map_or_else(|| cv.isFlipped(), |v| v.isFlipped());
+    let ty_cv = if is_flipped {
         f64::from(y_offset)
     } else {
         -f64::from(y_offset)
     };
 
-    if shell_slot.is_none()
-        && let Some(frame_view) = unsafe { cv.superview() }
-    {
-        frame_view.setWantsLayer(true);
-        if let Some(root_layer) = frame_view.layer() {
-            let shell = CALayer::new();
-            root_layer.insertSublayer_below(&shell, Some(&content_layer));
-            *shell_slot = Some(shell);
-        }
+    if shell_slot.is_none() {
+        let shell = CALayer::new();
+        cv_layer.insertSublayer_below(&shell, Some(&content_layer));
+        *shell_slot = Some(shell);
     }
 
     let w_scaled = f64::from(pill_width) * s;
@@ -502,8 +498,8 @@ fn apply_pill_layer_effect(
         NSSize::new(w_scaled, h_scaled),
     );
 
-    // Content scales slightly more (`0.88 .. 1.0`) inside the crisp outer shell during morphs.
-    let content_s = (s * (1.0 - f64::from(blur_radius).min(8.0) * 0.012)).clamp(0.45, 1.15);
+    // Content scales down into the blur (`0.84 .. 1.0`) inside the crisp outer shell during morphs.
+    let content_s = (s * (1.0 - f64::from(blur_radius).min(10.0) * 0.016)).clamp(0.45, 1.15);
     let transform = CATransform3D {
         m11: content_s,
         m12: 0.0,
@@ -1224,16 +1220,21 @@ impl Render for HudPillWindow {
         };
         let is_completed = matches!(content_phase, IslandPhase::Completed { .. });
 
-        // Blur ONLY the inner contents (`content_layer`), never `shell_layer` (the pill border):
-        // - Opening / Dismissing: content blur scales with `(1.0 - scale)` (`0..8px`).
-        // - Phase morph (`Selecting -> Recording -> Completed`): 6px content blur pulse over 160ms.
-        let scale_blur = ((1.0 - scale.min(1.0)) * 18.0).clamp(0.0, 8.5);
-        let morph_blur = if !matches!(phase, IslandPhase::Dismissing) && phase_age < 0.16 {
-            (std::f32::consts::PI * (phase_age / 0.16).clamp(0.0, 1.0)).sin() * 6.0
+        // Blur ONLY the inner contents (`gpui_view.layer()`), never `shell_layer` (the pill border):
+        // - Opening / Dismissing: content blur scales with `(1.0 - scale)` (`0..10px`).
+        // - Phase morph (`Selecting -> Recording -> Processing -> Completed`): 9px content blur pulse over 220ms.
+        let scale_blur = ((1.0 - scale.min(1.0)) * 22.0).clamp(0.0, 10.0);
+        let morph_blur = if !matches!(phase, IslandPhase::Dismissing) && phase_age < 0.22 {
+            (std::f32::consts::PI * (phase_age / 0.22).clamp(0.0, 1.0)).sin() * 9.0
         } else {
             0.0
         };
         let blur_radius = scale_blur.max(morph_blur);
+        let content_alpha = if matches!(phase, IslandPhase::Dismissing) {
+            opacity
+        } else {
+            0.28 + 0.72 * ease_out_cubic(phase_age / 0.18)
+        };
         if let Some(ref ns_win) = self.ns_window {
             apply_pill_layer_effect(
                 ns_win,
@@ -1268,7 +1269,8 @@ impl Render for HudPillWindow {
             .items_center()
             .gap(px(CHIP_GAP))
             .text_size(px(HUD_TEXT))
-            .whitespace_nowrap();
+            .whitespace_nowrap()
+            .opacity(content_alpha);
 
         let capsule_content = match content_phase {
             IslandPhase::Selecting { mode } => row
@@ -1294,46 +1296,29 @@ impl Render for HudPillWindow {
                         c_sel_cancel.update(cx, |coord, cx| coord.cancel_recording(cx));
                     }),
                 ),
-            IslandPhase::Completed {
-                frame_count,
-                duration_ms,
-                ..
-            } => row
+            IslandPhase::Completed { .. } => row
                 .child(
                     island_lead()
                         .child(
                             div()
                                 .size(px(CHIP_H))
+                                .rounded_full()
                                 .flex_none()
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .child(
-                                    div()
-                                        .size(px(24.0))
-                                        .rounded_full()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .bg(rgba(0x34c7592e))
-                                        .text_color(rgb(POSITIVE_COLOR))
-                                        .text_size(px(12.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .child("✓"),
-                                ),
+                                .bg(rgba(0x34c7592e))
+                                .text_color(rgb(POSITIVE_COLOR))
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::BOLD)
+                                .child("✓"),
                         )
                         .child(
                             div()
-                                .ml(px(4.0))
+                                .ml(px(8.0))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(TEXT_COLOR))
                                 .child("Copied"),
-                        )
-                        .child(
-                            div()
-                                .ml(px(5.0))
-                                .text_color(rgb(MUTED_COLOR))
-                                .child(completed_meta(duration_ms, frame_count)),
                         ),
                 )
                 .child(island_divider())
@@ -1458,7 +1443,12 @@ impl Render for HudPillWindow {
                         .bg(with_alpha(TEXT_COLOR, 0.20 + 0.80 * intensity))
                 });
                 row.child(
-                    island_lead()
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .pr(px(CHIP_PX))
+                        .whitespace_nowrap()
                         .child(div().size(px(CHIP_H)).flex_none().relative().children(dots))
                         .child(
                             div()
@@ -1485,7 +1475,7 @@ impl Render for HudPillWindow {
                     .w(px(render_width))
                     .h(px(ISLAND_H))
                     .flex_none()
-                    .p(px(ISLAND_PAD))
+                    .p(px(if has_shell { ISLAND_INSET } else { ISLAND_PAD }))
                     .rounded(px(ISLAND_RADIUS))
                     .overflow_hidden()
                     .flex()
@@ -2709,7 +2699,7 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
             titlebar: None,
             focus: false,
             show: true,
-            kind: WindowKind::Floating,
+            kind: WindowKind::PopUp,
             is_movable: true,
             is_resizable: false,
             is_minimizable: false,
@@ -2723,6 +2713,13 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
                 ns_win.setStyleMask(
                     NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
                 );
+                unsafe {
+                    let sel = sel!(_setPreventsActivation:);
+                    let responds: bool = msg_send![&**ns_win, respondsToSelector: sel];
+                    if responds {
+                        let _: () = msg_send![&**ns_win, _setPreventsActivation: true];
+                    }
+                }
                 configure_floating_window(ns_win, false, 2);
                 apply_pill_layer_effect(
                     ns_win,
@@ -3040,6 +3037,7 @@ pub fn run_app(
                     }
 
                     if loop_coord.read(cx).is_island_visible() {
+                        record_external_frontmost_app();
                         loop_coord.update(cx, |coord, cx| coord.step_island(dt, cx));
                     }
                 });

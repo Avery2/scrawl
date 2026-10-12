@@ -149,6 +149,8 @@ pub fn paste_bundle_at_target(bundle_dir: &Path, click_target: Option<[f32; 2]>)
     if let Some([x, y]) = click_target {
         crate::capture::post_synthetic_click(f64::from(x), f64::from(y));
         std::thread::sleep(std::time::Duration::from_millis(65));
+    } else {
+        crate::capture::ensure_external_app_active();
     }
     paste_bundle_image_and_text(bundle_dir)
 }
