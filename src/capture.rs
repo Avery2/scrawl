@@ -154,6 +154,12 @@ unsafe extern "C" {
     ) -> *mut c_void;
     fn CGEventTapEnable(tap: *mut c_void, enable: bool);
     fn CGEventCreate(source: *const c_void) -> EventRef;
+    fn CGEventCreateMouseEvent(
+        source: *const c_void,
+        mouse_type: u32,
+        mouse_cursor_position: CGPoint,
+        mouse_button: u32,
+    ) -> EventRef;
     fn CGEventCreateKeyboardEvent(
         source: *const c_void,
         virtual_key: u16,
@@ -1802,6 +1808,26 @@ pub fn post_synthetic_cmd_v() {
         let up = CGEventCreateKeyboardEvent(ptr::null(), v_code, false);
         if !up.is_null() {
             CGEventSetFlags(up, FLAG_COMMAND);
+            CGEventPost(0, up);
+            CFRelease(up.cast());
+        }
+    }
+}
+
+pub fn post_synthetic_click(screen_x: f64, screen_y: f64) {
+    let pt = CGPoint {
+        x: screen_x,
+        y: screen_y,
+    };
+    unsafe {
+        let down = CGEventCreateMouseEvent(ptr::null(), EVENT_LEFT_MOUSE_DOWN, pt, 0);
+        if !down.is_null() {
+            CGEventPost(0, down);
+            CFRelease(down.cast());
+        }
+        thread::sleep(Duration::from_millis(14));
+        let up = CGEventCreateMouseEvent(ptr::null(), EVENT_LEFT_MOUSE_UP, pt, 0);
+        if !up.is_null() {
             CGEventPost(0, up);
             CFRelease(up.cast());
         }

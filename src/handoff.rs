@@ -142,7 +142,17 @@ pub fn copy_bundle_to_clipboard(bundle_dir: &Path) -> Result<()> {
 }
 
 /// Pastes both the contact-sheet image and the transcript/keyframe text into the active app
-/// as a two-step sequence (`⌘V` image, then `⌘V` text) triggered by `⌃⌥⇧V`.
+/// as a two-step sequence (`⌘V` image, then `⌘V` text). If `click_target` is provided (from
+/// dragging the Paste chip onto a window/input), clicks at that screen coordinate first to focus it.
+#[cfg(target_os = "macos")]
+pub fn paste_bundle_at_target(bundle_dir: &Path, click_target: Option<[f32; 2]>) -> Result<()> {
+    if let Some([x, y]) = click_target {
+        crate::capture::post_synthetic_click(f64::from(x), f64::from(y));
+        std::thread::sleep(std::time::Duration::from_millis(65));
+    }
+    paste_bundle_image_and_text(bundle_dir)
+}
+
 #[cfg(target_os = "macos")]
 pub fn paste_bundle_image_and_text(bundle_dir: &Path) -> Result<()> {
     let (directory, bundle) = load_bundle(bundle_dir)?;
@@ -177,6 +187,11 @@ pub fn copy_bundle_to_clipboard(_bundle_dir: &Path) -> Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 pub fn paste_bundle_image_and_text(_bundle_dir: &Path) -> Result<()> {
+    bail!("Image and text paste handoff requires macOS")
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn paste_bundle_at_target(_bundle_dir: &Path, _click_target: Option<[f32; 2]>) -> Result<()> {
     bail!("Image and text paste handoff requires macOS")
 }
 

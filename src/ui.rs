@@ -166,6 +166,13 @@ fn island_content_width(window: &Window, phase: IslandPhase, clock: &str) -> f32
                 + chip_width(window, "Finish", FontWeight::SEMIBOLD)
                 + 4.0 * CHIP_GAP
         }
+        IslandPhase::Processing => {
+            CHIP_H
+                + 6.0
+                + measure_text(window, "Processing…", HUD_TEXT, FontWeight::SEMIBOLD)
+                + LEAD_TRAIL
+                + 4.0
+        }
         IslandPhase::Completed {
             frame_count,
             duration_ms,
@@ -183,9 +190,10 @@ fn island_content_width(window: &Window, phase: IslandPhase, clock: &str) -> f32
                 )
                 + LEAD_TRAIL
                 + divider
-                + chip_width(window, "Inspect", FontWeight::SEMIBOLD)
+                + chip_width(window, "Paste", FontWeight::SEMIBOLD)
+                + chip_width(window, "Inspect", FontWeight::MEDIUM)
                 + CHIP_H
-                + 3.0 * CHIP_GAP
+                + 4.0 * CHIP_GAP
         }
         IslandPhase::Hidden | IslandPhase::Dismissing => return ISLAND_H,
     };
@@ -585,6 +593,7 @@ pub enum IslandPhase {
         mode: SelectionMode,
     },
     Recording,
+    Processing,
     Completed {
         finished_at: Instant,
         frame_count: usize,
@@ -623,6 +632,7 @@ pub struct ScrawlCoordinator {
     hovered_window: Option<TargetInfo>,
     animated_window_rect: Option<[f32; 4]>,
     selection_drag: Option<([f32; 2], [f32; 2])>,
+    paste_drag_start: Option<[f32; 2]>,
     recording_shortcut_key: bool,
     review_bundle: Option<(PathBuf, ScrawlBundle)>,
     review_status: Option<String>,
@@ -662,6 +672,7 @@ impl ScrawlCoordinator {
             hovered_window: None,
             animated_window_rect: None,
             selection_drag: None,
+            paste_drag_start: None,
             recording_shortcut_key: false,
             review_bundle: initial_bundle,
             review_status: None,
@@ -672,6 +683,10 @@ impl ScrawlCoordinator {
 
     pub fn is_recording(&self) -> bool {
         self.active_recording.is_some()
+    }
+
+    pub fn is_processing(&self) -> bool {
+        matches!(self.island_phase, IslandPhase::Processing)
     }
 
     pub fn is_selecting(&self) -> bool {
@@ -810,10 +825,25 @@ impl ScrawlCoordinator {
         cx.notify();
     }
 
+    pub fn paste_completed_bundle(
+        &mut self,
+        click_target: Option<[f32; 2]>,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_island(cx);
+        std::thread::spawn(move || {
+            if let Err(err) =
+                crate::handoff::paste_bundle_at_target(std::path::Path::new("latest"), click_target)
+            {
+                scrawl_log(format!("paste_bundle_at_target error: {err}"));
+            }
+        });
+    }
+
     pub fn step_island(&mut self, dt_sec: f32, cx: &mut Context<Self>) {
         let dt = dt_sec.clamp(0.001, 0.05);
         if let IslandPhase::Completed { finished_at, .. } = self.island_phase
-            && finished_at.elapsed() >= Duration::from_millis(5_000)
+            && finished_at.elapsed() >= Duration::from_millis(25_000)
         {
             self.set_island_phase(IslandPhase::Dismissing);
         }
@@ -901,7 +931,7 @@ impl ScrawlCoordinator {
     }
 
     pub fn begin_target_selection(&mut self, cx: &mut Context<Self>) {
-        if self.is_recording() {
+        if self.is_recording() || self.is_processing() {
             return;
         }
         scrawl_log("begin_target_selection invoked");
@@ -991,7 +1021,7 @@ impl ScrawlCoordinator {
     }
 
     pub fn start_recording_with_target(&mut self, target: TargetInfo, cx: &mut Context<Self>) {
-        if self.is_recording() {
+        if self.is_recording() || self.is_processing() {
             return;
         }
         let started = Instant::now();
@@ -1090,36 +1120,55 @@ impl ScrawlCoordinator {
         let target = rec.target;
         let screen_session = rec.screen_session;
         let audio_recorder = rec.audio_recorder;
-        let ((frames, video_path, duration_ms), recorded_audio) = std::thread::scope(|s| {
-            let screen_handle = s.spawn(|| screen_session.stop());
-            let audio = audio_recorder.and_then(|r| r.stop().ok());
-            (screen_handle.join().unwrap(), audio)
-        });
-
-        let mut frame_count = 1;
-        if let Ok((dir, bundle, _)) = crate::finalize_capture_bundle(
-            &bundle_dir,
-            target,
-            duration_ms,
-            frames,
-            strokes,
-            events,
-            recorded_audio,
-            video_path,
-            None,
-        ) {
-            frame_count = bundle.keyframes.len();
-            let _ = crate::handoff::copy_bundle_to_clipboard(&dir);
-            self.set_review_bundle((dir, bundle), None);
-        }
-        // Morph the floating HUD pill Dynamic Island-style into the "Copied" state
-        // without opening the full Review window unless the user clicks "Inspect".
-        self.set_island_phase(IslandPhase::Completed {
-            finished_at: Instant::now(),
-            frame_count,
-            duration_ms,
-        });
+        // Drop the Metal overlay immediately on the main thread so the screen frame clears,
+        // and morph the Dynamic Island into the compact spinning "Processing…" state while
+        // media teardown, transcription, and PNG encoding run on a background worker.
+        drop(rec._metal_overlay);
+        self.set_island_phase(IslandPhase::Processing);
         cx.notify();
+
+        cx.spawn(async move |entity, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let ((frames, video_path, duration_ms), recorded_audio) =
+                        std::thread::scope(|s| {
+                            let screen_handle = s.spawn(|| screen_session.stop());
+                            let audio = audio_recorder.and_then(|r| r.stop().ok());
+                            (screen_handle.join().unwrap(), audio)
+                        });
+                    let finalized = crate::finalize_capture_bundle(
+                        &bundle_dir,
+                        target,
+                        duration_ms,
+                        frames,
+                        strokes,
+                        events,
+                        recorded_audio,
+                        video_path,
+                        None,
+                    );
+                    (finalized, duration_ms)
+                })
+                .await;
+
+            let _ = entity.update(cx, |coord, cx| {
+                let (finalized, duration_ms) = result;
+                let mut frame_count = 1;
+                if let Ok((dir, bundle, _)) = finalized {
+                    frame_count = bundle.keyframes.len();
+                    let _ = crate::handoff::copy_bundle_to_clipboard(&dir);
+                    coord.set_review_bundle((dir, bundle), None);
+                }
+                coord.set_island_phase(IslandPhase::Completed {
+                    finished_at: Instant::now(),
+                    frame_count,
+                    duration_ms,
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }
 
@@ -1202,6 +1251,9 @@ impl Render for HudPillWindow {
         let c_undo = self.coordinator.clone();
         let c_cancel = self.coordinator.clone();
         let c_finish = self.coordinator.clone();
+        let c_paste_down = self.coordinator.clone();
+        let c_paste_up = self.coordinator.clone();
+        let c_paste_out = self.coordinator.clone();
         let c_inspect = self.coordinator.clone();
         let c_dismiss = self.coordinator.clone();
         let c_mode_area = self.coordinator.clone();
@@ -1286,7 +1338,35 @@ impl Render for HudPillWindow {
                 )
                 .child(island_divider())
                 .child(
-                    primary_chip("hud-inspect", "Inspect").on_click(move |_, _, cx| {
+                    primary_chip("hud-paste", "Paste")
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            let start = current_mouse_screen();
+                            c_paste_down.update(cx, |coord, _| {
+                                coord.paste_drag_start = start;
+                            });
+                        })
+                        .on_mouse_up(MouseButton::Left, move |_, _, cx| {
+                            c_paste_up.update(cx, |coord, cx| {
+                                coord.paste_drag_start = None;
+                                coord.paste_completed_bundle(None, cx);
+                            });
+                        })
+                        .on_mouse_up_out(MouseButton::Left, move |_, _, cx| {
+                            let end = current_mouse_screen();
+                            c_paste_out.update(cx, |coord, cx| {
+                                if let (Some(start), Some(drop_pt)) =
+                                    (coord.paste_drag_start.take(), end)
+                                {
+                                    let dist = (drop_pt[0] - start[0]).hypot(drop_pt[1] - start[1]);
+                                    if dist >= 24.0 {
+                                        coord.paste_completed_bundle(Some(drop_pt), cx);
+                                    }
+                                }
+                            });
+                        }),
+                )
+                .child(
+                    pill_chip("hud-inspect", "Inspect", true).on_click(move |_, _, cx| {
                         c_inspect.update(cx, |coord, cx| coord.inspect_completed_bundle(cx));
                     }),
                 )
@@ -1357,6 +1437,36 @@ impl Render for HudPillWindow {
                     primary_chip("hud-done", "Finish").on_click(move |_, _, cx| {
                         c_finish.update(cx, |coord, cx| coord.finish_recording(cx));
                     }),
+                )
+            }
+            IslandPhase::Processing => {
+                // 120Hz 8-dot orbiting progress ring inside the leading 32px slot.
+                let dots = (0..8).map(|i| {
+                    let frac = i as f32 / 8.0;
+                    let angle = frac * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+                    let turn = (phase_age * 2.1 - frac).rem_euclid(1.0);
+                    let intensity = (1.0 - turn).powi(2);
+                    let dot_r = 1.35 + 0.65 * intensity;
+                    let cx_dot = 16.0 + 7.2 * angle.cos() - dot_r;
+                    let cy_dot = 16.0 + 7.2 * angle.sin() - dot_r;
+                    div()
+                        .absolute()
+                        .left(px(cx_dot))
+                        .top(px(cy_dot))
+                        .size(px(dot_r * 2.0))
+                        .rounded_full()
+                        .bg(with_alpha(TEXT_COLOR, 0.20 + 0.80 * intensity))
+                });
+                row.child(
+                    island_lead()
+                        .child(div().size(px(CHIP_H)).flex_none().relative().children(dots))
+                        .child(
+                            div()
+                                .ml(px(6.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(TEXT_COLOR))
+                                .child("Processing…"),
+                        ),
                 )
             }
             IslandPhase::Hidden | IslandPhase::Dismissing => row,
@@ -2610,6 +2720,9 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
             let ns_window = find_hud_pill_ns_window();
             let mut shell_layer = None;
             if let Some(ref ns_win) = ns_window {
+                ns_win.setStyleMask(
+                    NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
+                );
                 configure_floating_window(ns_win, false, 2);
                 apply_pill_layer_effect(
                     ns_win,
@@ -2894,7 +3007,7 @@ pub fn run_app(
                                     coord.finish_recording(cx);
                                 } else if coord.is_selecting() {
                                     coord.start_recording_full_screen(cx);
-                                } else {
+                                } else if !coord.is_processing() {
                                     coord.begin_target_selection(cx);
                                 }
                             }
