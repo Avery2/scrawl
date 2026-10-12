@@ -12,12 +12,12 @@ use gpui::{
 };
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
-use objc2::{DefinedClass, MainThreadOnly, msg_send, sel};
+use objc2::{AnyThread, DefinedClass, MainThreadOnly, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSColor, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSStatusWindowLevel,
-    NSWindow, NSWindowButton, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSApplication, NSColor, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
+    NSStatusWindowLevel, NSWindow, NSWindowButton, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
-use objc2_foundation::{MainThreadMarker, NSObject, NSString};
+use objc2_foundation::{MainThreadMarker, NSData, NSObject, NSSize, NSString};
 use screencapturekit::prelude::*;
 use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
 
@@ -279,7 +279,22 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
 
     let item = NSStatusBar::systemStatusBar().statusItemWithLength(-1.0);
     if let Some(button) = item.button(mtm) {
-        button.setTitle(&NSString::from_str("✎"));
+        let mb_bytes = include_bytes!("../assets/menubar-icon@2x.png");
+        let mb_data = NSData::with_bytes(mb_bytes);
+        if let Some(img) = NSImage::initWithData(NSImage::alloc(), &mb_data) {
+            img.setSize(NSSize::new(18.0, 18.0));
+            img.setTemplate(true);
+            button.setImage(Some(&img));
+        } else {
+            button.setTitle(&NSString::from_str("✎"));
+        }
+    }
+    let app_bytes = include_bytes!("../assets/app-icon.png");
+    let app_data = NSData::with_bytes(app_bytes);
+    if let Some(app_img) = NSImage::initWithData(NSImage::alloc(), &app_data) {
+        unsafe {
+            NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&app_img));
+        }
     }
     item.setMenu(Some(&menu));
 
