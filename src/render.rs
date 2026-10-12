@@ -385,37 +385,43 @@ pub fn annotate_keyframe_in_place(
             draw_click_ripple(frame, [cx * w, cy * h]);
         }
     }
-    let label = format!("#{} · {}", keyframe.index, format_clock(keyframe.t));
-    let font_size = 12.5_f32;
-    let badge_h = 24.0_f32;
+    let label = keyframe.index.to_string();
+    let font_size = 12.0_f32;
+    let badge_h = 22.0_f32;
     let badge_r = badge_h * 0.5;
-    let badge_w = text_width(&label, font_size, true) + 30.0;
-    // Place badge in top-right by default so top-left sidebar/toolbar items stay visible,
-    // flipping to top-left only if the click/focus point is in the top-right corner.
+    let text_w = text_width(&label, font_size, true);
+    let badge_w = (text_w + 13.0).max(badge_h);
     let focus_top_right = keyframe
         .cursor
         .or(click)
-        .is_some_and(|[cx, cy]| cx > 0.65 && cy < 0.22);
+        .is_some_and(|[cx, cy]| cx > 0.72 && cy < 0.25);
     let bx = if focus_top_right {
-        8.0
+        6.0
     } else {
-        (w - badge_w - 8.0).max(8.0)
+        (w - badge_w - 6.0).max(6.0)
     };
-    let by = 8.0_f32;
+    let by = 6.0_f32;
     rounded(
         frame,
         [bx, by, badge_w, badge_h],
         badge_r,
-        [255, 255, 255, 46],
+        [255, 255, 255, 42],
     );
     rounded(
         frame,
         [bx + 1.0, by + 1.0, badge_w - 2.0, badge_h - 2.0],
         badge_r - 1.0,
-        [20, 20, 22, 224],
+        [18, 18, 20, 218],
     );
-    circle(frame, [bx + 11.0, by + badge_r], 3.2, RED);
-    draw_text(frame, &label, bx + 20.0, by + 5.5, font_size, WHITE, true);
+    draw_text(
+        frame,
+        &label,
+        bx + (badge_w - text_w) * 0.5,
+        by + 5.0,
+        font_size,
+        WHITE,
+        true,
+    );
 }
 
 fn draw_pin(frame: &mut RgbaFrame, point: [f32; 2], number: u32, scale: f32, alpha: f32) {

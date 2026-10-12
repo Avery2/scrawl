@@ -1267,9 +1267,10 @@ fn build_sck_filter_and_config(
         None
     }?;
 
-    let aspect = (target.frame.height / target.frame.width.max(1.0)).clamp(0.25, 3.0);
-    let capture_width = (target.frame.width * 2.0).round().clamp(320.0, 1280.0) as u32 & !1;
-    let capture_height = ((capture_width as f64 * aspect).round() as u32).max(200) & !1;
+    let max_dim = target.frame.width.max(target.frame.height).max(1.0);
+    let scale = (1280.0 / max_dim).min(2.0);
+    let capture_width = ((target.frame.width * scale).round() as u32).max(48) & !1;
+    let capture_height = ((target.frame.height * scale).round() as u32).max(48) & !1;
 
     let mut config = SCStreamConfiguration::new()
         .with_width(capture_width)

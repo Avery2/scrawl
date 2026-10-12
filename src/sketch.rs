@@ -394,54 +394,32 @@ pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> 
     {
         target.push_str(&format!(" “{title}”"));
     }
-    let mut out = format!("[scrawl {} · {target}]\n", format_clock(bundle.duration_ms));
+    let mut out = format!(
+        "[scrawl {} · {target} · {}]\n",
+        format_clock(bundle.duration_ms),
+        bundle_dir.display()
+    );
     if let Some(note) = &bundle.note
         && !note.trim().is_empty()
     {
         out.push_str(&format!("Note: {}\n", note.trim()));
     }
-    out.push_str(&format!(
-        "Contact sheet: {}\n",
-        bundle_dir.join(&bundle.contact_sheet).display()
-    ));
     if !bundle.keyframes.is_empty() {
-        out.push_str("\nKeyframes:\n");
         for frame in &bundle.keyframes {
-            let path = bundle_dir.join(&frame.file);
+            let clock = format_clock(frame.t);
             match frame
                 .said
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                Some(said) => out.push_str(&format!(
-                    "- [#{} · {}] {} — “{said}” ({})\n",
-                    frame.index,
-                    format_clock(frame.t),
-                    frame.event,
-                    path.display()
-                )),
-                None => out.push_str(&format!(
-                    "- [#{} · {}] {} ({})\n",
-                    frame.index,
-                    format_clock(frame.t),
-                    frame.event,
-                    path.display()
-                )),
+                Some(said) => out.push_str(&format!("- #{} ({clock}) “{said}”\n", frame.index)),
+                None => out.push_str(&format!("- #{} ({clock}) {}\n", frame.index, frame.event)),
             }
         }
     } else if !bundle.transcript.text.trim().is_empty() {
-        out.push_str(&format!("\nSaid: {}\n", bundle.transcript.text.trim()));
+        out.push_str(&format!("“{}”\n", bundle.transcript.text.trim()));
     }
-    if let Some(ref video) = bundle.video {
-        out.push_str(&format!(
-            "\nVideo: {}\nLook closer: scrawl frames '{}' --from 0:00 --to {} --fps 4\n",
-            bundle_dir.join(video).display(),
-            bundle_dir.display(),
-            format_clock(bundle.duration_ms)
-        ));
-    }
-    out.push_str(&format!("Bundle: {}\n", bundle_dir.display()));
     out
 }
 
@@ -1204,12 +1182,8 @@ mod tests {
         assert!(tl.contains("— frame #1"));
 
         let summary = summary_markdown(&bundle, std::path::Path::new("/recordings/test"));
-        assert!(summary.starts_with("[scrawl 0:14 · App “Window”]"));
+        assert!(summary.starts_with("[scrawl 0:14 · App “Window” · /recordings/test]"));
         assert!(summary.contains("Note: Simplify it."));
-        assert!(summary.contains("Contact sheet: /recordings/test/contact.png"));
-        assert!(summary.contains(
-            "- [#1 · 0:05] tapped x 0.50, y 0.50 — “This row is too dense.” (/recordings/test/frames/frame-01.png)"
-        ));
-        assert!(summary.contains("Bundle: /recordings/test"));
+        assert!(summary.contains("- #1 (0:05) “This row is too dense.”"));
     }
 }
