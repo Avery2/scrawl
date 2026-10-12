@@ -368,6 +368,16 @@ fn configure_floating_window(ns_window: &NSWindow, ignores_mouse: bool, level_of
 }
 
 #[repr(C)]
+struct OpaqueCGColor {
+    _priv: [u8; 0],
+}
+
+unsafe impl objc2::RefEncode for OpaqueCGColor {
+    const ENCODING_REF: objc2::Encoding =
+        objc2::Encoding::Pointer(&objc2::Encoding::Struct("CGColor", &[]));
+}
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct CATransform3D {
     m11: f64,
@@ -507,7 +517,7 @@ fn apply_pill_layer_effect(
                 22.0 / 255.0,
                 0.96,
             );
-            let bg_cg: *const AnyObject = msg_send![&*bg_ns, CGColor];
+            let bg_cg: *const OpaqueCGColor = msg_send![&*bg_ns, CGColor];
             let _: () = msg_send![&**shell, setBackgroundColor: bg_cg];
 
             let border_ns = if is_completed {
@@ -520,7 +530,7 @@ fn apply_pill_layer_effect(
             } else {
                 NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.12)
             };
-            let border_cg: *const AnyObject = msg_send![&*border_ns, CGColor];
+            let border_cg: *const OpaqueCGColor = msg_send![&*border_ns, CGColor];
             let _: () = msg_send![&**shell, setBorderColor: border_cg];
         }
     }
@@ -3140,5 +3150,56 @@ mod tests {
     fn clock_template_is_width_stable() {
         assert_eq!(clock_template("12:34"), "00:00");
         assert_eq!(completed_meta(8_000, 1), "· 1 frame · ⌃⌥⇧V");
+    }
+
+    #[test]
+    fn ca_layer_and_filter_encodings_pass_objc2_verification() {
+        use objc2::runtime::AnyClass;
+        use objc2_foundation::{NSArray, NSNumber};
+        use objc2_quartz_core::{CALayer, CATransaction};
+
+        let shell = CALayer::new();
+        let content_layer = CALayer::new();
+        let transform = CATransform3D {
+            m11: 0.9,
+            m12: 0.0,
+            m13: 0.0,
+            m14: 0.0,
+            m21: 0.0,
+            m22: 0.9,
+            m23: 0.0,
+            m24: 0.0,
+            m31: 0.0,
+            m32: 0.0,
+            m33: 1.0,
+            m34: 0.0,
+            m41: 10.0,
+            m42: 4.0,
+            m43: 0.0,
+            m44: 1.0,
+        };
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        unsafe {
+            let bg_ns = NSColor::colorWithSRGBRed_green_blue_alpha(0.1, 0.1, 0.1, 0.95);
+            let bg_cg: *const OpaqueCGColor = msg_send![&*bg_ns, CGColor];
+            let _: () = msg_send![&*shell, setBackgroundColor: bg_cg];
+            let _: () = msg_send![&*shell, setBorderColor: bg_cg];
+            let _: () = msg_send![&*content_layer, setTransform: transform];
+            if let Some(ca_filter_cls) = AnyClass::get(c"CAFilter") {
+                let filter_type = NSString::from_str("gaussianBlur");
+                let filter: *mut AnyObject =
+                    msg_send![ca_filter_cls, filterWithType: &*filter_type];
+                assert!(!filter.is_null());
+                let radius_num = NSNumber::new_f64(6.0);
+                let radius_key = NSString::from_str("inputRadius");
+                let _: () = msg_send![filter, setValue: &*radius_num, forKey: &*radius_key];
+                let filter_ref = &*filter;
+                let filters = NSArray::from_slice(&[filter_ref]);
+                content_layer.setFilters(Some(&filters));
+            }
+            content_layer.setFilters(None);
+        }
+        CATransaction::commit();
     }
 }
