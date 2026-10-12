@@ -169,6 +169,8 @@ unsafe extern "C" {
     fn CGMainDisplayID() -> u32;
     fn CGDisplayPixelsWide(display: u32) -> usize;
     fn CGDisplayPixelsHigh(display: u32) -> usize;
+    fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRequestScreenCaptureAccess() -> bool;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -1148,7 +1150,21 @@ fn build_sck_filter_and_config(
     target: &TargetInfo,
     excluded_window_ids: &[u32],
 ) -> Option<(SCContentFilter, SCStreamConfiguration)> {
-    let content = SCShareableContent::get().ok()?;
+    let content = match SCShareableContent::get() {
+        Ok(c) => c,
+        Err(err) => {
+            scrawl_log(format!("SCShareableContent::get() failed: {err:?}"));
+            unsafe {
+                if !CGPreflightScreenCaptureAccess() {
+                    scrawl_log(
+                        "Screen capture access not granted; calling CGRequestScreenCaptureAccess()",
+                    );
+                    let _ = CGRequestScreenCaptureAccess();
+                }
+            }
+            return None;
+        }
+    };
     let our_pid = std::process::id() as i32;
 
     let filter = if let Some(window_id) = target.window_id

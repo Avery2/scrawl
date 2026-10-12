@@ -17,4 +17,4 @@ Scrawl is a macOS shortcut-triggered (`⌃⌥⇧S`) screen, voice, cursor, and f
 - **Fast builds & local workflow**:
   - Keep `Cargo.toml` and `Cargo.lock` stable and build/test with `taskpolicy -c utility cargo build -j 3 --offline` and `taskpolicy -c utility cargo test -j 3 --offline -- --test-threads=2`.
   - Keep everything local on `main` unless asked otherwise.
-  - After building changes, restart the running background app (`pkill -f "target/debug/scrawl" || true` followed by `nohup /Users/kit/code/open-source/scrawl/target/debug/scrawl app >/dev/null 2>&1 &`).
+  - **Always install and launch via `./scripts/install-app.sh` (`~/Applications/Scrawl.app`)**: Never run `target/debug/scrawl` directly as the background daemon because `hivemind clean` purges `target/` directories, which unlinks the binary on disk and causes macOS `tccd` to revoke Screen Recording and Microphone access. `./scripts/install-app.sh` copies the binary into `~/Applications/Scrawl.app`, signs it with Kit's Developer ID (`dev.kitlangton.scrawl`) so TCC permissions persist across rebuilds, and restarts the app.
