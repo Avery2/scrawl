@@ -77,8 +77,9 @@ enum Media {
       generator.requestedTimeToleranceAfter = tolerance
     } else {
       requested = (atMs ?? []).map { min(max(0, $0), max(0, durationMs - 1)) }
-      generator.requestedTimeToleranceBefore = .zero
-      generator.requestedTimeToleranceAfter = .zero
+      let tolerance = CMTime(value: 80, timescale: 1000)
+      generator.requestedTimeToleranceBefore = tolerance
+      generator.requestedTimeToleranceAfter = tolerance
     }
     guard !requested.isEmpty else { return [] }
 
@@ -88,10 +89,13 @@ enum Media {
     for await result in generator.images(for: times) {
       defer { index += 1 }
       guard let image = try? result.image else { continue }
-      let actual = (try? result.actualTime).map { Int(($0.seconds * 1000).rounded()) } ?? requested[min(index, requested.count - 1)]
+      let reqTime = result.requestedTime.seconds.isFinite
+        ? Int((result.requestedTime.seconds * 1000).rounded())
+        : requested[min(index, requested.count - 1)]
+      let actual = (try? result.actualTime).map { Int(($0.seconds * 1000).rounded()) } ?? reqTime
       let file = outDir.appending(path: String(format: "frame-%04d.rgba", index))
       try writeRGBA(image, to: file)
-      out.append(["t": requested[min(index, requested.count - 1)], "actual": actual, "width": image.width, "height": image.height, "file": file.path])
+      out.append(["t": reqTime, "actual": actual, "width": image.width, "height": image.height, "file": file.path])
     }
     return out
   }

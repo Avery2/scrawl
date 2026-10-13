@@ -166,6 +166,38 @@ pub fn make_bundle_id() -> String {
     format!("scrawl-{ms}-{pid:x}")
 }
 
+/// Matches full-resolution decoded frames back to selected keyframes by timestamp (within 250ms),
+/// so a single frame decode failure only leaves that one keyframe at candidate resolution.
+fn merge_full_keyframes(
+    selected: Vec<(model::Keyframe, RgbaFrame)>,
+    full: Vec<RgbaFrame>,
+) -> (Vec<(model::Keyframe, RgbaFrame)>, usize) {
+    let mut pool: Vec<Option<RgbaFrame>> = full.into_iter().map(Some).collect();
+    let mut matched = 0;
+    let merged = selected
+        .into_iter()
+        .map(|(key, fallback)| {
+            let best = pool
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, f)| f.as_ref().map(|frame| (idx, frame.t_ms.abs_diff(key.t))))
+                .filter(|&(_, diff)| diff <= 250)
+                .min_by_key(|&(_, diff)| diff)
+                .map(|(idx, _)| idx);
+            if let Some(idx) = best
+                && let Some(mut full_frame) = pool[idx].take()
+            {
+                full_frame.t_ms = key.t;
+                matched += 1;
+                (key, full_frame)
+            } else {
+                (key, fallback)
+            }
+        })
+        .collect();
+    (merged, matched)
+}
+
 /// What a source other than this Mac's screen adds to a bundle.
 #[derive(Default)]
 pub struct SourceExtras {
@@ -261,21 +293,15 @@ pub fn build_bundle_from_parts(
         Some(decode) if !selected.is_empty() => {
             let times: Vec<u64> = selected.iter().map(|(k, _)| k.t).collect();
             match decode(&times) {
-                Ok(full) if full.len() == selected.len() => selected
-                    .into_iter()
-                    .zip(full)
-                    .map(|((key, _), mut frame)| {
-                        frame.t_ms = key.t;
-                        (key, frame)
-                    })
-                    .collect(),
                 Ok(full) => {
-                    capture::scrawl_log(format!(
-                        "Full-quality keyframes: decoded {} of {}",
-                        full.len(),
-                        selected.len()
-                    ));
-                    selected
+                    let total = selected.len();
+                    let (merged, matched) = merge_full_keyframes(selected, full);
+                    if matched < total {
+                        capture::scrawl_log(format!(
+                            "Full-quality keyframes: decoded {matched} of {total}"
+                        ));
+                    }
+                    merged
                 }
                 Err(error) => {
                     capture::scrawl_log(format!("Full-quality keyframes failed: {error:#}"));
@@ -661,6 +687,10 @@ fn main() -> Result<()> {
             std::fs::create_dir_all(&out)?;
             let copied = out.join(video.file_name().context("Bad video name")?);
             std::fs::copy(&video, &copied)?;
+            let timeline_src = dir.join("timeline.json");
+            if timeline_src.is_file() {
+                let _ = std::fs::copy(&timeline_src, out.join("timeline.json"));
+            }
             let flags: Vec<u64> = old
                 .marks
                 .iter()
@@ -815,5 +845,37 @@ mod tests {
         assert!(empty_frames.join("scrawl.json").exists());
         assert!(empty_frames.join("contact-sheet.png").exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn full_keyframes_match_by_time_and_preserve_partial_decodes() {
+        let kf = |index: usize, t: u64| model::Keyframe {
+            index,
+            t,
+            reason: model::KeyframeReason::Click,
+            file: format!("frames/frame-{index:02}.png"),
+            event: "tap".into(),
+            said: None,
+            mark_id: None,
+            cursor: None,
+        };
+        let small = |t: u64| RgbaFrame::new(t, 32, 32, vec![10; 32 * 32 * 4]);
+        let large = |t: u64| RgbaFrame::new(t, 160, 160, vec![200; 160 * 160 * 4]);
+
+        let selected = vec![
+            (kf(1, 1_000), small(1_000)),
+            (kf(2, 2_000), small(2_000)),
+            (kf(3, 3_000), small(3_000)),
+        ];
+        // Frame at 2_000 failed to decode and frames arrived out of order (3_000 clamped to 2_999).
+        let full = vec![large(2_999), large(1_000)];
+        let (merged, matched) = merge_full_keyframes(selected, full);
+        assert_eq!(matched, 2);
+        assert_eq!(merged[0].1.width, 160);
+        assert_eq!(merged[0].1.t_ms, 1_000);
+        assert_eq!(merged[1].1.width, 32);
+        assert_eq!(merged[1].1.t_ms, 2_000);
+        assert_eq!(merged[2].1.width, 160);
+        assert_eq!(merged[2].1.t_ms, 3_000);
     }
 }

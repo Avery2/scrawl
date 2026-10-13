@@ -378,10 +378,10 @@ pub fn extract_frames_range(
         .and_then(|(_, bundle)| bundle.video)
         .map_or_else(|| directory.join("recording.mp4"), |v| directory.join(v));
     if video.is_file() && from_ms < to_ms {
+        let output_dir = directory
+            .join("zoom")
+            .join(format!("range-{from_ms}-{to_ms}"));
         if let Some(ffmpeg) = on_path("ffmpeg") {
-            let output_dir = directory
-                .join("zoom")
-                .join(format!("range-{from_ms}-{to_ms}"));
             fs::create_dir_all(&output_dir)?;
             // Only remove our generated files, so repeating at a lower FPS cannot
             // return leftover frames from a previous extraction.
@@ -426,6 +426,29 @@ pub fn extract_frames_range(
             }
             frames.sort();
             return Ok(frames);
+        }
+
+        let step_ms = (1_000 / u64::from(fps)).max(1);
+        let times: Vec<u64> = (from_ms..=to_ms).step_by(step_ms as usize).collect();
+        if !times.is_empty()
+            && let Ok(decoded) =
+                crate::helper::frames(&video, crate::helper::FrameTimes::At(&times), 0)
+            && !decoded.is_empty()
+        {
+            fs::create_dir_all(&output_dir)?;
+            for entry in fs::read_dir(&output_dir)? {
+                let entry = entry?;
+                if generated_frame(&entry.path()) {
+                    fs::remove_file(entry.path())?;
+                }
+            }
+            let mut written = Vec::with_capacity(decoded.len());
+            for (idx, frame) in decoded.iter().enumerate() {
+                let out_path = output_dir.join(format!("frame-{:03}.png", idx + 1));
+                crate::render::save_png(frame, &out_path)?;
+                written.push(out_path);
+            }
+            return Ok(written);
         }
     }
     existing_keyframes(&directory, from_ms, to_ms, fps)

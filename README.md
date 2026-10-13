@@ -69,8 +69,8 @@ phone on the right of the screen and starts recording:
 Phone bundles are ordinary bundles: `scrawl.json` adds `"source": "iphone"` and a `device` object
 (name, capture `mirror` or `tetherkit`, id, native size, screen points and scale, app and version
 for SDK recordings), and the target's `mode` is `device`. Keyframes fit a 1600 px long edge
-(736×1600 for a 1320×2868 phone); `scrawl frames` extracts native-resolution frames when you need
-every pixel.
+(736×1600 for a 1320×2868 phone); `scrawl frames` extracts native-resolution frames (via `ffmpeg`
+or `scrawl-helper frames`) when you need every pixel.
 
 ### TetherKit recordings
 
