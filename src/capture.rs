@@ -203,6 +203,8 @@ pub enum LiveOverlayEvent {
     UndoStroke,
     CancelCapture,
     RequestSnapshot,
+    /// The iPhone mirror ended on its own (unplugged, never found, or access denied).
+    PhoneEnded,
 }
 
 static LAYOUT_KEY_CODES: std::sync::OnceLock<std::collections::HashMap<char, u16>> =
@@ -1467,7 +1469,7 @@ impl SharedCaptureTelemetry {
     pub fn set_capture_mode(&self, mode: CaptureMode) {
         let code = match mode {
             CaptureMode::Display => 0,
-            CaptureMode::Region => 1,
+            CaptureMode::Region | CaptureMode::Device => 1,
             CaptureMode::Window => 2,
         };
         self.capture_mode.store(code, Ordering::Release);
@@ -1778,6 +1780,8 @@ unsafe extern "C" fn tap_callback(
                         x1: nx,
                         y1: ny,
                         label: start_label,
+                        button: None,
+                        path: Vec::new(),
                     });
             }
         }

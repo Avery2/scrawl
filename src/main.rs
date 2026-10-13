@@ -1,25 +1,29 @@
 mod capture;
 mod handoff;
+mod helper;
 mod hex;
 mod keyframes;
 mod laser_overlay;
 mod model;
+mod phone;
 mod render;
 mod sketch;
+mod transcribe;
 mod ui;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 
 use crate::capture::{ScreenCaptureSession, discover_target, write_bundle_artifacts};
 use crate::hex::{AudioRecorder, RecordedAudio};
 use crate::keyframes::select_keyframes;
 use crate::model::{
-    CaptureMode, InteractionEvent, MAX_KEYFRAMES, RgbaFrame, SCALE, ScrawlBundle, Stroke,
-    TargetFrame, TargetInfo, TranscriptData, TranscriptSegment, WordTiming, parse_clock_ms,
+    CaptureMode, DeviceInfo, InteractionEvent, MAX_KEYFRAMES, Mark, RgbaFrame, SCALE, ScrawlBundle,
+    Shape, Stroke, TargetFrame, TargetInfo, TranscriptData, TranscriptSegment, WordTiming,
+    parse_clock_ms,
 };
 use crate::render::{
     annotate_keyframe_in_place, render_contact_sheet, render_synthetic_demo_frame,
@@ -44,6 +48,9 @@ enum Command {
         /// Start a capture session immediately on launch.
         #[arg(long)]
         record: bool,
+        /// Start capturing the cabled iPhone immediately on launch.
+        #[arg(long, conflicts_with = "record")]
+        iphone: bool,
     },
     /// Generate a realistic annotated demo bundle (contact sheet + keyframes + transcript).
     Demo {
@@ -59,6 +66,9 @@ enum Command {
         /// Optional window title or app substring to target.
         #[arg(long)]
         window: Option<String>,
+        /// Capture the cabled iPhone instead of the screen (live mirror window + native video).
+        #[arg(long, conflicts_with = "window")]
+        iphone: bool,
         /// Recording duration in seconds (default: 5).
         #[arg(long, default_value_t = 5)]
         duration: u64,
@@ -68,6 +78,34 @@ enum Command {
         /// Output `.scrawl` bundle directory.
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+    /// Build a bundle from a TetherKit in-app recording (`.mp4` + timeline `.json`).
+    Import {
+        /// The recording or its timeline; defaults to the newest pair in ~/Downloads.
+        recording: Option<PathBuf>,
+        /// Timeline JSON, when it isn't beside the recording with the same name.
+        #[arg(long)]
+        timeline: Option<PathBuf>,
+        /// Optional note to attach to the bundle.
+        #[arg(long)]
+        note: Option<String>,
+        /// Output `.scrawl` bundle directory.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Copy the summary to the clipboard.
+        #[arg(long)]
+        clipboard: bool,
+    },
+    /// List cabled iPhones and iPads that can be captured.
+    Devices,
+    /// Rebuild a bundle from its own video, audio, and input log with the current transcriber
+    /// and keyframe rules.
+    Reprocess {
+        /// Path to `.scrawl` bundle directory or `latest`.
+        bundle: PathBuf,
+        /// Output `.scrawl` bundle directory (a new bundle; the original is untouched).
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Print the agent-ready summary or JSON manifest for a `.scrawl` bundle (or `latest`).
     Inspect {
@@ -88,7 +126,7 @@ enum Command {
         /// End time (`0:05` or `5.0`).
         #[arg(long)]
         to: String,
-        /// Frames per second to extract when `recording.mp4` is present.
+        /// Frames per second to extract when the bundle has a video.
         #[arg(long, default_value_t = 4)]
         fps: u32,
     },
@@ -128,6 +166,19 @@ pub fn make_bundle_id() -> String {
     format!("scrawl-{ms}-{pid:x}")
 }
 
+/// What a source other than this Mac's screen adds to a bundle.
+#[derive(Default)]
+pub struct SourceExtras {
+    pub source: Option<String>,
+    pub device: Option<DeviceInfo>,
+    /// Time-only markers (ms); each becomes a `Flag` mark with keyframe priority.
+    pub flags: Vec<u64>,
+    /// Decodes the chosen keyframes again at full quality, for sources that select on small
+    /// candidate frames (phone movies).
+    #[allow(clippy::type_complexity)]
+    pub full_frames: Option<Box<dyn Fn(&[u64]) -> Result<Vec<RgbaFrame>>>>,
+}
+
 /// Core pipeline that turns raw frames, strokes, events, and audio/transcript into a complete `.scrawl` bundle on disk.
 #[allow(clippy::too_many_arguments)]
 pub fn finalize_capture_bundle(
@@ -146,7 +197,11 @@ pub fn finalize_capture_bundle(
         let _ = std::fs::create_dir_all(bundle_dir);
         let _ = std::fs::write(&wav_path, &audio.wav_bytes);
     }
-    let transcript = hex::transcribe_with_hex(recorded_audio.as_ref());
+    let wav_path = bundle_dir.join("audio.wav");
+    let transcript = transcribe::transcribe(
+        wav_path.exists().then_some(wav_path.as_path()),
+        recorded_audio.as_ref(),
+    );
 
     build_bundle_from_parts(
         bundle_dir,
@@ -158,6 +213,7 @@ pub fn finalize_capture_bundle(
         transcript,
         video_path,
         note,
+        SourceExtras::default(),
     )
 }
 
@@ -172,8 +228,25 @@ pub fn build_bundle_from_parts(
     transcript: TranscriptData,
     video_path: Option<PathBuf>,
     note: Option<String>,
+    extras: SourceExtras,
 ) -> Result<(PathBuf, ScrawlBundle, String)> {
     let mut marks = marks_of(&strokes);
+    for (i, &t) in extras.flags.iter().enumerate() {
+        marks.push(Mark {
+            id: format!("f{}", i + 1),
+            strokes: Vec::new(),
+            t0: t,
+            t1: t,
+            box_norm: [0.0, 0.0, 1.0, 1.0],
+            shape: Shape::Flag,
+            from: None,
+            to: None,
+            pin: None,
+            on: None,
+            description: "flagged this moment".into(),
+            frame: None,
+        });
+    }
     let bench = std::env::var_os("SCRAWL_BENCH").is_some();
     let started = std::time::Instant::now();
     let selected = select_keyframes(
@@ -184,6 +257,34 @@ pub fn build_bundle_from_parts(
         &transcript,
         MAX_KEYFRAMES,
     );
+    let selected = match &extras.full_frames {
+        Some(decode) if !selected.is_empty() => {
+            let times: Vec<u64> = selected.iter().map(|(k, _)| k.t).collect();
+            match decode(&times) {
+                Ok(full) if full.len() == selected.len() => selected
+                    .into_iter()
+                    .zip(full)
+                    .map(|((key, _), mut frame)| {
+                        frame.t_ms = key.t;
+                        (key, frame)
+                    })
+                    .collect(),
+                Ok(full) => {
+                    capture::scrawl_log(format!(
+                        "Full-quality keyframes: decoded {} of {}",
+                        full.len(),
+                        selected.len()
+                    ));
+                    selected
+                }
+                Err(error) => {
+                    capture::scrawl_log(format!("Full-quality keyframes failed: {error:#}"));
+                    selected
+                }
+            }
+        }
+        _ => selected,
+    };
     let selected_at = std::time::Instant::now();
 
     let mut annotated_frames = Vec::with_capacity(selected.len());
@@ -226,6 +327,8 @@ pub fn build_bundle_from_parts(
         contact_sheet: "contact-sheet.png".into(),
         video: video_rel,
         audio: audio_rel,
+        source: extras.source,
+        device: extras.device,
     };
 
     let contact_sheet = render_contact_sheet(&bundle, &annotated_frames);
@@ -412,6 +515,7 @@ pub fn generate_demo_bundle(out: Option<PathBuf>) -> Result<(PathBuf, ScrawlBund
             WordTiming { t0: 6_300, t1: 7_200, text: "under the card".into() },
             WordTiming { t0: 7_800, t1: 9_400, text: "feels too tight.".into() },
         ],
+        estimated: false,
     };
 
     build_bundle_from_parts(
@@ -424,6 +528,7 @@ pub fn generate_demo_bundle(out: Option<PathBuf>) -> Result<(PathBuf, ScrawlBund
         transcript,
         None,
         Some("Header inset shifts on expand".into()),
+        SourceExtras::default(),
     )
 }
 
@@ -433,9 +538,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::App { record: false }) {
-        Command::App { record } => {
-            ui::run_app(None, record, None);
+    match cli.command.unwrap_or(Command::App {
+        record: false,
+        iphone: false,
+    }) {
+        Command::App { record, iphone } => {
+            ui::run_app(None, record, iphone, None);
             Ok(())
         }
         Command::Demo { out, clipboard } => {
@@ -447,7 +555,32 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Record {
+            window: _,
+            iphone: true,
+            duration,
+            note,
+            out,
+        } => {
+            let bundle_dir = out.unwrap_or_else(|| {
+                handoff::default_captures_dir().join(format!("{}.scrawl", make_bundle_id()))
+            });
+            std::fs::create_dir_all(&bundle_dir)?;
+            let session =
+                phone::PhoneSession::start(&bundle_dir.join("recording.mov"), None, None)?;
+            let started = std::time::Instant::now();
+            while !session.has_recording() && started.elapsed() < Duration::from_secs(15) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::thread::sleep(Duration::from_secs(duration.max(1)));
+            let recording = session.stop()?;
+            let (_dir, _bundle, summary) =
+                phone::finalize_live_capture(&bundle_dir, recording, Vec::new(), Vec::new(), note)?;
+            print!("{summary}");
+            Ok(())
+        }
+        Command::Record {
             window,
+            iphone: false,
             duration,
             note,
             out,
@@ -479,6 +612,103 @@ fn main() -> Result<()> {
                 note,
             )?;
             print!("{summary}");
+            Ok(())
+        }
+        Command::Import {
+            recording,
+            timeline,
+            note,
+            out,
+            clipboard,
+        } => {
+            let (movie, timeline) =
+                phone::resolve_import(recording.as_deref(), timeline.as_deref())?;
+            let bundle_dir = out.unwrap_or_else(|| {
+                handoff::default_captures_dir().join(format!("{}.scrawl", make_bundle_id()))
+            });
+            let (dir, _bundle, summary) =
+                phone::import(&movie, timeline.as_deref(), &bundle_dir, note)?;
+            if clipboard {
+                handoff::copy_bundle_to_clipboard(&dir)?;
+            }
+            print!("{summary}");
+            Ok(())
+        }
+        Command::Reprocess { bundle, out } => {
+            let (dir, old) = handoff::load_bundle(&bundle)?;
+            let video = old
+                .video
+                .as_ref()
+                .map(|v| dir.join(v))
+                .filter(|p| p.is_file())
+                .context("The bundle has no video to reprocess")?;
+            ensure!(!out.exists(), "{} already exists", out.display());
+            std::fs::create_dir_all(&out)?;
+            let copied = out.join(video.file_name().context("Bad video name")?);
+            std::fs::copy(&video, &copied)?;
+            let flags: Vec<u64> = old
+                .marks
+                .iter()
+                .filter(|m| m.shape == Shape::Flag)
+                .map(|m| m.t0)
+                .collect();
+            let summary = if let Some(device) = old.device.clone() {
+                phone::build_movie_bundle(
+                    &out,
+                    phone::MovieCapture {
+                        movie: copied,
+                        target: old.target,
+                        device,
+                        events: old.events,
+                        strokes: old.strokes,
+                        flags,
+                        note: old.note,
+                    },
+                )?
+                .2
+            } else {
+                let audio = old
+                    .audio
+                    .as_ref()
+                    .map(|a| dir.join(a))
+                    .filter(|p| p.is_file());
+                let recorded = match &audio {
+                    Some(path) => {
+                        std::fs::copy(path, out.join("audio.wav"))?;
+                        Some(hex::recorded_audio_from_wav(std::fs::read(path)?)?)
+                    }
+                    None => None,
+                };
+                let wav = out.join("audio.wav");
+                let transcript = transcribe::transcribe(
+                    recorded.as_ref().map(|_| wav.as_path()),
+                    recorded.as_ref(),
+                );
+                let frames = helper::frames(&copied, helper::FrameTimes::Every(220), 1280)?;
+                build_bundle_from_parts(
+                    &out,
+                    old.target,
+                    old.duration_ms,
+                    frames,
+                    old.strokes,
+                    old.events,
+                    transcript,
+                    Some(copied),
+                    old.note,
+                    SourceExtras::default(),
+                )?
+                .2
+            };
+            print!("{summary}");
+            Ok(())
+        }
+        Command::Devices => {
+            for device in helper::devices(Duration::from_secs(3))? {
+                println!(
+                    "{}\t{}\t{}×{}",
+                    device.name, device.id, device.width, device.height
+                );
+            }
             Ok(())
         }
         Command::Inspect { bundle, json } => {
@@ -532,7 +762,7 @@ fn main() -> Result<()> {
                     .ok()
                     .map(|(dir, loaded, _)| (dir, loaded))
             });
-            ui::run_app(initial, false, capture_screenshot);
+            ui::run_app(initial, false, false, capture_screenshot);
             Ok(())
         }
     }

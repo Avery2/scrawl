@@ -27,9 +27,11 @@ use crate::capture::{
     record_external_frontmost_app, region_target, scrawl_log, selectable_window_at,
     set_escape_hotkey_enabled, shortcut_from_key_and_mods, start_global_input_tap,
 };
+use crate::helper::PhoneDevice;
 use crate::hex::AudioRecorder;
 use crate::laser_overlay::MetalLaserOverlay;
-use crate::model::{ScrawlBundle, TargetInfo, format_clock};
+use crate::model::{CaptureMode, ScrawlBundle, TargetFrame, TargetInfo, format_clock};
+use crate::phone::PhoneSession;
 use crate::sketch::timeline;
 
 const SIDEBAR_BG: u32 = 0x111111;
@@ -156,12 +158,17 @@ fn completed_meta(_duration_ms: u64, frame_count: usize) -> String {
 }
 
 /// Intrinsic outer width of the capsule for a phase, mirroring the layout in `HudPillWindow`.
-fn island_content_width(window: &Window, phase: IslandPhase, clock: &str) -> f32 {
+fn island_content_width(window: &Window, phase: IslandPhase, clock: &str, iphone: bool) -> f32 {
     let divider = 1.0 + 2.0 * DIVIDER_MX;
     let inner = match phase {
         IslandPhase::Selecting { .. } => {
             chip_width(window, "Area", FontWeight::MEDIUM)
                 + chip_width(window, "Full Screen", FontWeight::MEDIUM)
+                + if iphone {
+                    chip_width(window, "iPhone", FontWeight::MEDIUM) + CHIP_GAP
+                } else {
+                    0.0
+                }
                 + divider
                 + CHIP_H
                 + 3.0 * CHIP_GAP
@@ -206,6 +213,7 @@ fn island_content_width(window: &Window, phase: IslandPhase, clock: &str) -> f32
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MenuAction {
     ToggleCapture,
+    RecordIphone,
     OpenLatest,
     RunDemo,
     Quit,
@@ -227,6 +235,11 @@ objc2::define_class!(
         #[unsafe(method(toggleCapture:))]
         fn toggle_capture(&self, _sender: &AnyObject) {
             let _ = self.ivars().sender.try_send(MenuAction::ToggleCapture);
+        }
+
+        #[unsafe(method(recordIphone:))]
+        fn record_iphone(&self, _sender: &AnyObject) {
+            let _ = self.ivars().sender.try_send(MenuAction::RecordIphone);
         }
 
         #[unsafe(method(openLatest:))]
@@ -283,6 +296,7 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
     };
 
     add("Record Scrawl  ⌃⌥⇧S", sel!(toggleCapture:));
+    add("Record iPhone", sel!(recordIphone:));
     add("Open Latest Bundle", sel!(openLatest:));
     add("Generate Demo Bundle", sel!(runDemo:));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -613,12 +627,29 @@ pub enum IslandPhase {
     Dismissing,
 }
 
+enum CaptureSource {
+    Screen {
+        session: ScreenCaptureSession,
+        audio: Option<AudioRecorder>,
+    },
+    /// The helper's mirror window records the phone's native video and the narration.
+    Phone(PhoneSession),
+}
+
 struct ActiveRecording {
     target: TargetInfo,
     bundle_dir: PathBuf,
-    screen_session: ScreenCaptureSession,
-    audio_recorder: Option<AudioRecorder>,
+    source: CaptureSource,
     _metal_overlay: Option<MetalLaserOverlay>,
+}
+
+impl ActiveRecording {
+    fn elapsed_ms(&self) -> u64 {
+        match &self.source {
+            CaptureSource::Screen { session, .. } => session.elapsed_ms(),
+            CaptureSource::Phone(session) => session.elapsed_ms(),
+        }
+    }
 }
 
 /// Shared coordinator owned by the GPUI app.
@@ -651,6 +682,8 @@ pub struct ScrawlCoordinator {
     review_status: Option<String>,
     selected_tab: ReviewTab,
     selected_keyframe: usize,
+    /// A cabled iPhone, refreshed each time the picker opens.
+    iphone: Option<PhoneDevice>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -693,7 +726,30 @@ impl ScrawlCoordinator {
             review_status: None,
             selected_tab: ReviewTab::ContactSheet,
             selected_keyframe: 0,
+            iphone: None,
         }
+    }
+
+    /// Looks for a cabled iPhone in the background; the picker shows "iPhone" when one is there.
+    fn refresh_iphone(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |entity, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async {
+                    crate::helper::devices(Duration::from_millis(2_500))
+                        .inspect_err(|error| scrawl_log(format!("iPhone discovery: {error:#}")))
+                        .ok()
+                        .and_then(|devices| devices.into_iter().next())
+                })
+                .await;
+            let _ = entity.update(cx, |coord, cx| {
+                if coord.iphone != found {
+                    coord.iphone = found;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn is_recording(&self) -> bool {
@@ -813,8 +869,12 @@ impl ScrawlCoordinator {
     }
 
     pub fn request_immediate_frame(&self) {
-        if let Some(ref rec) = self.active_recording {
-            rec.screen_session.request_immediate_frame();
+        if let Some(ActiveRecording {
+            source: CaptureSource::Screen { session, .. },
+            ..
+        }) = &self.active_recording
+        {
+            session.request_immediate_frame();
         }
     }
 
@@ -983,6 +1043,7 @@ impl ScrawlCoordinator {
         self.selection_pointer = current_mouse_screen();
         self.selection_generation += 1;
         self.windows_loading = true;
+        self.refresh_iphone(cx);
         let generation = self.selection_generation;
         cx.spawn(async move |entity, cx| {
             let windows = cx
@@ -1130,8 +1191,10 @@ impl ScrawlCoordinator {
         self.active_recording = Some(ActiveRecording {
             target,
             bundle_dir,
-            screen_session,
-            audio_recorder,
+            source: CaptureSource::Screen {
+                session: screen_session,
+                audio: audio_recorder,
+            },
             _metal_overlay: metal_overlay,
         });
         if matches!(self.island_phase, IslandPhase::Hidden) {
@@ -1154,6 +1217,96 @@ impl ScrawlCoordinator {
         start_metric("recording_start_ms", started);
     }
 
+    /// Mirrors the cabled iPhone in the helper's window and records its native video. The
+    /// window's on-screen rect is the capture target, so the laser, ink, pins and clicks over it
+    /// normalize straight into phone-screen coordinates (kept current as the window moves).
+    pub fn start_recording_iphone(&mut self, cx: &mut Context<Self>) {
+        if self.is_recording() || self.is_processing() {
+            return;
+        }
+        scrawl_log("start_recording_iphone invoked");
+        self.recording_shortcut_key = false;
+        self.selection_drag = None;
+        self.hovered_window = None;
+        self.animated_window_rect = None;
+        let bundle_dir = crate::handoff::default_captures_dir()
+            .join(format!("{}.scrawl", crate::make_bundle_id()));
+        let _ = std::fs::create_dir_all(&bundle_dir);
+        let device = self.iphone.clone();
+        let name = device
+            .as_ref()
+            .map_or("iPhone", |d| d.name.as_str())
+            .to_owned();
+        let target = crate::phone::phone_target(&name, None, 0, 0);
+        self.telemetry.set_capture_mode(CaptureMode::Device);
+        // Off screen until the mirror window reports where it is.
+        self.telemetry.reset_for_session(TargetFrame {
+            x: -100_000.0,
+            y: -100_000.0,
+            width: 1.0,
+            height: 1.0,
+            scale: 2.0,
+        });
+        set_escape_hotkey_enabled(true);
+        let session = match PhoneSession::start(
+            &bundle_dir.join("recording.mov"),
+            device.as_ref().map(|d| d.id.as_str()),
+            Some(Arc::clone(&self.telemetry)),
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                scrawl_log(format!("iPhone capture could not start: {error:#}"));
+                self.telemetry.finish_session();
+                let _ = std::fs::remove_dir_all(&bundle_dir);
+                self.dismiss_island(cx);
+                return;
+            }
+        };
+        let metal_overlay = self.picker_metal_overlay.take().or_else(|| {
+            MetalLaserOverlay::open(Arc::clone(&self.telemetry))
+                .map_err(|error| scrawl_log(format!("Metal overlay failed: {error}")))
+                .ok()
+        });
+        self.active_recording = Some(ActiveRecording {
+            target,
+            bundle_dir,
+            source: CaptureSource::Phone(session),
+            _metal_overlay: metal_overlay,
+        });
+        if matches!(self.island_phase, IslandPhase::Hidden) {
+            self.island_width = self.island_target_width.max(240.0);
+            self.island_velocity = 0.0;
+            self.island_scale = 0.92;
+            self.island_scale_velocity = 0.0;
+            self.island_y = -6.0;
+            self.island_y_velocity = 0.0;
+        }
+        self.set_island_phase(IslandPhase::Recording);
+        let entity = cx.entity().clone();
+        cx.defer(move |cx| {
+            close_review_window(cx);
+            close_picker_window(cx);
+            ensure_hud_pill_open(&entity, cx);
+        });
+        cx.notify();
+    }
+
+    /// The mirror ended without being asked: keep what was recorded, or drop an empty capture.
+    fn phone_ended(&mut self, cx: &mut Context<Self>) {
+        let recorded = match &self.active_recording {
+            Some(ActiveRecording {
+                source: CaptureSource::Phone(session),
+                ..
+            }) => session.has_recording(),
+            _ => return,
+        };
+        if recorded {
+            self.finish_recording(cx);
+        } else {
+            self.cancel_recording(cx);
+        }
+    }
+
     pub fn cancel_recording(&mut self, cx: &mut Context<Self>) {
         scrawl_log("cancel_recording invoked");
         set_escape_hotkey_enabled(false);
@@ -1162,9 +1315,14 @@ impl ScrawlCoordinator {
             return;
         };
         let _ = self.telemetry.finish_session();
-        let _ = rec.screen_session.stop();
-        if let Some(audio) = rec.audio_recorder {
-            let _ = audio.stop();
+        match rec.source {
+            CaptureSource::Screen { session, audio } => {
+                let _ = session.stop();
+                if let Some(audio) = audio {
+                    let _ = audio.stop();
+                }
+            }
+            CaptureSource::Phone(session) => session.cancel(),
         }
         let _ = std::fs::remove_dir_all(rec.bundle_dir);
         self.dismiss_island(cx);
@@ -1179,8 +1337,7 @@ impl ScrawlCoordinator {
         let (events, strokes) = self.telemetry.finish_session();
         let bundle_dir = rec.bundle_dir;
         let target = rec.target;
-        let screen_session = rec.screen_session;
-        let audio_recorder = rec.audio_recorder;
+        let source = rec.source;
         // Drop the Metal overlay immediately on the main thread so the screen frame clears,
         // and morph the Dynamic Island into the compact spinning "Processing…" state while
         // media teardown, transcription, and PNG encoding run on a background worker.
@@ -1192,6 +1349,26 @@ impl ScrawlCoordinator {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    let (screen_session, audio_recorder) = match source {
+                        CaptureSource::Screen { session, audio } => (session, audio),
+                        CaptureSource::Phone(session) => {
+                            let finalized = session.stop().and_then(|recording| {
+                                crate::phone::finalize_live_capture(
+                                    &bundle_dir,
+                                    recording,
+                                    events,
+                                    strokes,
+                                    None,
+                                )
+                            });
+                            if let Err(error) = &finalized {
+                                scrawl_log(format!("iPhone capture failed: {error:#}"));
+                            }
+                            let duration_ms =
+                                finalized.as_ref().map_or(0, |(_, b, _)| b.duration_ms);
+                            return (finalized, duration_ms);
+                        }
+                    };
                     let ((frames, video_path, duration_ms), recorded_audio) =
                         std::thread::scope(|s| {
                             let screen_handle = s.spawn(|| screen_session.stop());
@@ -1259,7 +1436,7 @@ impl Render for HudPillWindow {
         let elapsed_ms = coord
             .active_recording
             .as_ref()
-            .map_or(0, |r| r.screen_session.elapsed_ms());
+            .map_or(0, ActiveRecording::elapsed_ms);
         let stroke_count = coord
             .telemetry
             .strokes
@@ -1270,7 +1447,8 @@ impl Render for HudPillWindow {
             .count();
 
         let clock = format_clock(elapsed_ms);
-        let target_width = island_content_width(window, target_phase, &clock);
+        let has_iphone = coord.iphone.is_some();
+        let target_width = island_content_width(window, target_phase, &clock, has_iphone);
         let snap_initial_width =
             phase_age < 0.025 && matches!(phase, IslandPhase::Selecting { .. }) && opacity < 0.35;
         self.coordinator.update(cx, |coord, _| {
@@ -1337,6 +1515,7 @@ impl Render for HudPillWindow {
         let c_dismiss = self.coordinator.clone();
         let c_mode_area = self.coordinator.clone();
         let c_full = self.coordinator.clone();
+        let c_iphone = self.coordinator.clone();
         let c_sel_cancel = self.coordinator.clone();
 
         // Keep typography (`HUD_TEXT`) and spacing (`CHIP_GAP`) 100% constant so glyphs never
@@ -1368,6 +1547,13 @@ impl Render for HudPillWindow {
                         });
                     },
                 ))
+                .when(has_iphone, |row| {
+                    row.child(
+                        pill_chip("sel-iphone", "iPhone", true).on_click(move |_, _, cx| {
+                            c_iphone.update(cx, |coord, cx| coord.start_recording_iphone(cx));
+                        }),
+                    )
+                })
                 .child(island_divider())
                 .child(
                     icon_circle_chip("sel-cancel", "✕").on_click(move |_, _, cx| {
@@ -2898,9 +3084,12 @@ pub fn run_start_benchmark() {
                     let rec = coord.active_recording.take().expect("Recording did not start");
                     assert!(rec._metal_overlay.is_some(), "Metal overlay failed");
                     coord.telemetry.finish_session();
+                    let CaptureSource::Screen { session, audio } = rec.source else {
+                        unreachable!("The benchmark records the screen")
+                    };
                     let ((frames, video, duration), audio) = std::thread::scope(|scope| {
-                        let screen = scope.spawn(|| rec.screen_session.stop());
-                        let audio = rec.audio_recorder.expect("Microphone failed to start").stop().expect("Microphone failed to stop");
+                        let screen = scope.spawn(|| session.stop());
+                        let audio = audio.expect("Microphone failed to start").stop().expect("Microphone failed to stop");
                         (screen.join().unwrap(), audio)
                     });
                     if !quick_stop {
@@ -2926,6 +3115,7 @@ pub fn run_start_benchmark() {
 pub fn run_app(
     initial_bundle: Option<(PathBuf, ScrawlBundle)>,
     start_recording_immediately: bool,
+    start_iphone_immediately: bool,
     screenshot_out: Option<PathBuf>,
 ) {
     Application::new().run(move |cx: &mut App| {
@@ -2945,6 +3135,9 @@ pub fn run_app(
         if start_recording_immediately {
             let coord_clone = coordinator.clone();
             coord_clone.update(cx, |coord, cx| coord.start_recording(cx));
+        }
+        if start_iphone_immediately {
+            coordinator.update(cx, |coord, cx| coord.start_recording_iphone(cx));
         }
 
         if let Some(out_path) = screenshot_out {
@@ -3004,6 +3197,15 @@ pub fn run_app(
                                             coord.start_recording_full_screen(cx);
                                         } else {
                                             coord.begin_target_selection(cx);
+                                        }
+                                    });
+                                }
+                                MenuAction::RecordIphone => {
+                                    loop_coord.update(cx, |coord, cx| {
+                                        if coord.is_recording() {
+                                            coord.finish_recording(cx);
+                                        } else {
+                                            coord.start_recording_iphone(cx);
                                         }
                                     });
                                 }
@@ -3074,6 +3276,7 @@ pub fn run_app(
                                 coord.request_immediate_frame();
                                 cx.notify();
                             }
+                            LiveOverlayEvent::PhoneEnded => coord.phone_ended(cx),
                         });
                     }
 

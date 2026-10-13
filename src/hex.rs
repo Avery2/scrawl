@@ -195,6 +195,26 @@ where
     )?)
 }
 
+/// Reads a 16 kHz mono WAV (as written by `scrawl-helper audio`) back into a recording.
+pub fn recorded_audio_from_wav(wav_bytes: Vec<u8>) -> Result<RecordedAudio> {
+    let reader = hound::WavReader::new(Cursor::new(&wav_bytes))?;
+    let spec = reader.spec();
+    ensure!(
+        spec.sample_rate == SAMPLE_RATE && spec.channels == 1 && spec.bits_per_sample == 16,
+        "Expected 16 kHz mono 16-bit audio"
+    );
+    let samples: Vec<f32> = reader
+        .into_samples::<i16>()
+        .map(|s| s.map(|v| f32::from(v) / 32_768.0))
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(RecordedAudio {
+        sample_count: samples.len(),
+        duration_ms: samples.len() as u64 * 1_000 / u64::from(SAMPLE_RATE),
+        speech_islands: detect_speech_islands(&samples, SAMPLE_RATE),
+        wav_bytes,
+    })
+}
+
 /// Energy-based speech estimates, quantized to 50 ms. These are not ASR timestamps.
 pub fn detect_speech_islands(samples_16k: &[f32], sample_rate: u32) -> Vec<(u64, u64)> {
     if sample_rate == 0 {
@@ -463,7 +483,8 @@ fn transcript_response(
                 .join(" ")
         };
     }
-    if segments.is_empty() && words.is_empty() {
+    let estimated = segments.is_empty() && words.is_empty();
+    if estimated {
         let duration = response
             .get("durationMs")
             .and_then(|v| v.as_u64())
@@ -485,6 +506,7 @@ fn transcript_response(
         text,
         segments,
         words,
+        estimated,
     })
 }
 

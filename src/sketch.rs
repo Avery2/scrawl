@@ -206,6 +206,7 @@ pub fn describe_mark(mark: &Mark) -> String {
         Shape::Pin => format!("pin {} at {}", mark.pin.unwrap_or(1), at([x0, y0])),
         Shape::Tap => format!("tapped {}{many}", at([(x0 + x1) / 2.0, (y0 + y1) / 2.0])),
         Shape::Mark => format!("marked region {region}{many}"),
+        Shape::Flag => "flagged this moment".into(),
     };
     if let Some(on) = &mark.on {
         text.push_str(&format!(" over “{on}”"));
@@ -301,19 +302,38 @@ fn direction(dx: f32, dy: f32, threshold: f32) -> String {
 
 pub fn describe_event(event: &InteractionEvent) -> String {
     match event {
-        InteractionEvent::Click { x, y, label, .. } => match label.as_deref() {
-            Some(l) if !l.is_empty() => format!("clicked “{l}” ({})", at([*x, *y])),
-            _ => format!("clicked ({})", at([*x, *y])),
-        },
+        InteractionEvent::Click {
+            x,
+            y,
+            label,
+            button,
+            ..
+        } => {
+            let verb = if button.as_deref() == Some("touch") {
+                "tapped"
+            } else {
+                "clicked"
+            };
+            match label.as_deref() {
+                Some(l) if !l.is_empty() => format!("{verb} “{l}” ({})", at([*x, *y])),
+                _ => format!("{verb} ({})", at([*x, *y])),
+            }
+        }
         InteractionEvent::Drag {
             x0,
             y0,
             x1,
             y1,
             label,
+            button,
             ..
         } => format!(
-            "dragged{} {} ({} → {})",
+            "{}{} {} ({} → {})",
+            if button.as_deref() == Some("touch") {
+                "swiped"
+            } else {
+                "dragged"
+            },
             label
                 .as_ref()
                 .filter(|s| !s.is_empty())
@@ -332,6 +352,7 @@ pub fn describe_event(event: &InteractionEvent) -> String {
             _ => format!("pointed at ({})", at([*x, *y])),
         },
         InteractionEvent::Key { shortcut, .. } => format!("pressed {shortcut}"),
+        InteractionEvent::AppEvent { label, .. } => format!("app: {label}"),
         InteractionEvent::AppChange {
             app, window_title, ..
         } => format!(
@@ -394,6 +415,15 @@ pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> 
     {
         target.push_str(&format!(" “{title}”"));
     }
+    if let Some(device) = &bundle.device {
+        target = device.name.clone();
+        if let Some(app) = &device.app {
+            target.push_str(&format!(" · {app}"));
+            if let Some(version) = device.app_version.as_deref().filter(|v| !v.is_empty()) {
+                target.push_str(&format!(" ({version})"));
+            }
+        }
+    }
     let mut out = format!(
         "[scrawl {} · {target} · {}]\n",
         format_clock(bundle.duration_ms),
@@ -404,18 +434,48 @@ pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> 
     {
         out.push_str(&format!("Note: {}\n", note.trim()));
     }
+    let app_events: Vec<(u64, &str)> = bundle
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            InteractionEvent::AppEvent { t, label } => Some((*t, label.as_str())),
+            _ => None,
+        })
+        .collect();
     if !bundle.keyframes.is_empty() {
-        for frame in &bundle.keyframes {
+        for (i, frame) in bundle.keyframes.iter().enumerate() {
             let clock = format_clock(frame.t);
+            let flag = frame
+                .mark_id
+                .as_ref()
+                .and_then(|id| bundle.marks.iter().find(|m| &m.id == id))
+                .is_some_and(|m| m.shape == Shape::Flag);
+            let flag = if flag { " ⚑" } else { "" };
             match frame
                 .said
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                Some(said) => out.push_str(&format!("- #{} ({clock}) “{said}”\n", frame.index)),
-                None => out.push_str(&format!("- #{} ({clock}) {}\n", frame.index, frame.event)),
+                Some(said) => {
+                    out.push_str(&format!("- #{} ({clock}){flag} “{said}”\n", frame.index))
+                }
+                None => out.push_str(&format!(
+                    "- #{} ({clock}){flag} {}\n",
+                    frame.index, frame.event
+                )),
             }
+            // App events nest under the keyframe on screen when they happened.
+            let next = bundle.keyframes.get(i + 1).map_or(u64::MAX, |k| k.t);
+            for (t, label) in &app_events {
+                if (*t < next || i + 1 == bundle.keyframes.len()) && (*t >= frame.t || i == 0) {
+                    out.push_str(&format!("  · {} app: {label}\n", format_clock(*t)));
+                }
+            }
+        }
+    } else if !app_events.is_empty() {
+        for (t, label) in &app_events {
+            out.push_str(&format!("· {} app: {label}\n", format_clock(*t)));
         }
     } else if !bundle.transcript.text.trim().is_empty() {
         out.push_str(&format!("“{}”\n", bundle.transcript.text.trim()));
@@ -1175,6 +1235,8 @@ mod tests {
             contact_sheet: "contact.png".into(),
             video: None,
             audio: None,
+            source: None,
+            device: None,
         };
         let tl = timeline(&bundle).join("\n");
         assert!(tl.find("0:03 “").unwrap() < tl.find("0:04 · pressed").unwrap());
@@ -1185,5 +1247,71 @@ mod tests {
         assert!(summary.starts_with("[scrawl 0:14 · App “Window” · /recordings/test]"));
         assert!(summary.contains("Note: Simplify it."));
         assert!(summary.contains("- #1 (0:05) “This row is too dense.”"));
+
+        // A phone bundle: device header, a flagged keyframe, and app events under the keyframe
+        // that was on screen when they happened.
+        let mut phone = bundle;
+        phone.note = None;
+        phone.device = Some(DeviceInfo {
+            name: "iPhone".into(),
+            capture: "tetherkit".into(),
+            app: Some("dev.example.App".into()),
+            app_version: Some("42".into()),
+            ..Default::default()
+        });
+        phone.source = Some("iphone".into());
+        phone.marks.push(Mark {
+            id: "f1".into(),
+            strokes: Vec::new(),
+            t0: 9000,
+            t1: 9000,
+            box_norm: [0.0, 0.0, 1.0, 1.0],
+            shape: Shape::Flag,
+            from: None,
+            to: None,
+            pin: None,
+            on: None,
+            description: "flagged this moment".into(),
+            frame: None,
+        });
+        phone.keyframes.push(Keyframe {
+            index: 2,
+            t: 9000,
+            reason: KeyframeReason::Mark,
+            file: "frames/frame-02.png".into(),
+            event: "flagged this moment".into(),
+            said: None,
+            mark_id: Some("f1".into()),
+            cursor: None,
+        });
+        phone.events = vec![
+            InteractionEvent::AppEvent {
+                t: 1000,
+                label: "launched".into(),
+            },
+            InteractionEvent::AppEvent {
+                t: 6000,
+                label: "rest started".into(),
+            },
+            InteractionEvent::AppEvent {
+                t: 9500,
+                label: "Done tapped".into(),
+            },
+        ];
+        let summary = summary_markdown(&phone, std::path::Path::new("/recordings/phone"));
+        assert_eq!(
+            summary,
+            "[scrawl 0:14 · iPhone · dev.example.App (42) · /recordings/phone]\n\
+             - #1 (0:05) “This row is too dense.”\n\
+             \x20 · 0:01 app: launched\n\
+             \x20 · 0:06 app: rest started\n\
+             - #2 (0:09) ⚑ flagged this moment\n\
+             \x20 · 0:09 app: Done tapped\n"
+        );
+        assert!(
+            timeline(&phone)
+                .iter()
+                .any(|l| l == "0:06 · app: rest started")
+        );
     }
 }

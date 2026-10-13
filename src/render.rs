@@ -323,18 +323,22 @@ pub fn annotate_keyframe_in_place(
     if w == 0.0 || h == 0.0 {
         return;
     }
-    let size = (w.min(h) * 0.0065).clamp(4.2, 6.0);
+    // Sizes are tuned for ~1280×800 screen frames; phone frames are taller and denser.
+    let k = (w.min(h) / 800.0).max(w.max(h) / 1280.0).clamp(1.0, 2.0);
+    let size = (w.min(h) * 0.0065).clamp(4.2, 6.0) * k;
+    // Flags carry no ink, so a flagged keyframe still shows the strokes of its moment.
     let active_mark = keyframe
         .mark_id
         .as_ref()
-        .and_then(|id| marks.iter().find(|m| &m.id == id));
+        .and_then(|id| marks.iter().find(|m| &m.id == id))
+        .filter(|m| !m.strokes.is_empty());
     for (index, stroke) in strokes.iter().enumerate() {
         if stroke.laser {
             continue;
         }
         let belongs = active_mark.is_some_and(|m| m.strokes.contains(&index));
         let active = belongs
-            || (keyframe.mark_id.is_none()
+            || (active_mark.is_none()
                 && stroke.t0 <= keyframe.t
                 && keyframe.t.saturating_sub(stroke.t1) <= MARK_GAP_MS);
         if !active {
@@ -348,7 +352,13 @@ pub fn annotate_keyframe_in_place(
             .collect();
         if let Some(number) = stroke.pin {
             if let Some(&point) = points.first() {
-                draw_pin(frame, point, number, (w / 1280.0).clamp(0.75, 2.5), 1.0);
+                draw_pin(
+                    frame,
+                    point,
+                    number,
+                    (w.max(h) / 1280.0).clamp(0.75, 2.5),
+                    1.0,
+                );
             }
         } else if !points.is_empty() {
             let outline = freehand_outline(
@@ -363,6 +373,31 @@ pub fn annotate_keyframe_in_place(
     }
     for stroke in strokes.iter().filter(|s| s.laser) {
         draw_laser(frame, stroke, keyframe.t);
+    }
+    // Phone swipes that ended just before this moment (or produced it) leave a trail.
+    for event in events {
+        if let InteractionEvent::Drag {
+            t,
+            t1,
+            x0,
+            y0,
+            x1,
+            y1,
+            path,
+            button,
+            ..
+        } = event
+            && button.as_deref() == Some("touch")
+            && *t <= keyframe.t
+            && keyframe.t.saturating_sub(*t1) <= 900
+        {
+            let points: Vec<[f32; 2]> = if path.len() >= 2 {
+                path.iter().map(|[x, y]| [x * w, y * h]).collect()
+            } else {
+                vec![[x0 * w, y0 * h], [x1 * w, y1 * h]]
+            };
+            draw_touch_trail(frame, &points, k);
+        }
     }
     let click = events
         .iter()
@@ -382,25 +417,26 @@ pub fn annotate_keyframe_in_place(
         let show_ripple = keyframe.reason == KeyframeReason::Click
             || (click.is_some() && keyframe.reason != KeyframeReason::Laser);
         if show_ripple {
-            draw_click_ripple(frame, [cx * w, cy * h]);
+            draw_click_ripple(frame, [cx * w, cy * h], k);
         }
     }
     let label = keyframe.index.to_string();
-    let font_size = 12.0_f32;
-    let badge_h = 22.0_f32;
+    let font_size = 12.0_f32 * k;
+    let badge_h = 22.0_f32 * k;
     let badge_r = badge_h * 0.5;
     let text_w = text_width(&label, font_size, true);
-    let badge_w = (text_w + 13.0).max(badge_h);
+    let badge_w = (text_w + 13.0 * k).max(badge_h);
     let focus_top_right = keyframe
         .cursor
         .or(click)
         .is_some_and(|[cx, cy]| cx > 0.72 && cy < 0.25);
+    let margin = 6.0 * k;
     let bx = if focus_top_right {
-        6.0
+        margin
     } else {
-        (w - badge_w - 6.0).max(6.0)
+        (w - badge_w - margin).max(margin)
     };
-    let by = 6.0_f32;
+    let by = margin;
     rounded(
         frame,
         [bx, by, badge_w, badge_h],
@@ -417,7 +453,7 @@ pub fn annotate_keyframe_in_place(
         frame,
         &label,
         bx + (badge_w - text_w) * 0.5,
-        by + 5.0,
+        by + 5.0 * k,
         font_size,
         WHITE,
         true,
@@ -495,10 +531,42 @@ fn draw_laser(frame: &mut RgbaFrame, stroke: &Stroke, time: u64) {
     }
 }
 
-fn draw_click_ripple(frame: &mut RgbaFrame, p: [f32; 2]) {
-    circle(frame, p, 14.0, [0, 136, 255, 68]);
-    ring(frame, p, 15.0, 1.75, WHITE);
-    ring(frame, p, 17.5, 1.75, [0, 136, 255, 235]);
+fn draw_click_ripple(frame: &mut RgbaFrame, p: [f32; 2], k: f32) {
+    circle(frame, p, 14.0 * k, [0, 136, 255, 68]);
+    ring(frame, p, 15.0 * k, 1.75 * k, WHITE);
+    ring(frame, p, 17.5 * k, 1.75 * k, [0, 136, 255, 235]);
+}
+
+/// A finger's path: a haloed blue line from a small start dot to a ring where it lifted.
+fn draw_touch_trail(frame: &mut RgbaFrame, points: &[[f32; 2]], k: f32) {
+    let (Some(&start), Some(&end)) = (points.first(), points.last()) else {
+        return;
+    };
+    for pair in points.windows(2) {
+        line(
+            frame,
+            pair[0],
+            pair[1],
+            4.5 * k,
+            4.5 * k,
+            [255, 255, 255, 150],
+        );
+    }
+    for pair in points.windows(2) {
+        line(
+            frame,
+            pair[0],
+            pair[1],
+            2.6 * k,
+            2.6 * k,
+            [0, 136, 255, 230],
+        );
+    }
+    circle(frame, start, 5.0 * k, WHITE);
+    circle(frame, start, 3.5 * k, [0, 136, 255, 255]);
+    circle(frame, end, 12.0 * k, [0, 136, 255, 60]);
+    ring(frame, end, 13.0 * k, 1.75 * k, WHITE);
+    ring(frame, end, 15.5 * k, 1.75 * k, [0, 136, 255, 235]);
 }
 
 pub fn render_contact_sheet(
@@ -514,12 +582,19 @@ pub fn render_contact_sheet(
         sheet.t_ms = bundle.duration_ms;
         return sheet;
     }
-    let columns = if frames.len() == 1 { 1 } else { 2 };
-    let width = (PAD * 2.0 + CELL * columns as f32 + GAP * (columns - 1) as f32) as u32;
+    // Phone frames are portrait: three narrower cells to a row keep the sheet compact.
+    let portrait = frames.iter().all(|(_, f)| f.height > f.width);
+    let cell = if portrait { 440.0 } else { CELL };
+    let columns = match frames.len() {
+        1 => 1,
+        n if portrait => n.min(3),
+        _ => 2,
+    };
+    let width = (PAD * 2.0 + cell * columns as f32 + GAP * (columns - 1) as f32) as u32;
     let card_sizes: Vec<[f32; 2]> = frames
         .iter()
         .map(|(_, image)| {
-            let scale = (CELL / image.width.max(1) as f32).min(960.0 / image.height.max(1) as f32);
+            let scale = (cell / image.width.max(1) as f32).min(960.0 / image.height.max(1) as f32);
             [image.width as f32 * scale, image.height as f32 * scale]
         })
         .collect();
@@ -541,8 +616,8 @@ pub fn render_contact_sheet(
                 continue;
             };
             let (_, image) = &frames[i];
-            let x = PAD + col as f32 * (CELL + GAP);
-            let card_x = x + (CELL - image_size[0]) * 0.5;
+            let x = PAD + col as f32 * (cell + GAP);
+            let card_x = x + (cell - image_size[0]) * 0.5;
             let card_y = row_y + (*row_height - image_size[1]) * 0.5;
             rounded(
                 &mut sheet,
@@ -1157,6 +1232,8 @@ mod tests {
             contact_sheet: "contact-sheet.png".into(),
             video: None,
             audio: None,
+            source: None,
+            device: None,
         }
     }
 
@@ -1195,6 +1272,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn swipes_leave_a_trail_on_phone_keyframes() {
+        let base = solid(400, 860, [240, 240, 240, 255]);
+        let swipe = InteractionEvent::Drag {
+            t: 3000,
+            t1: 3400,
+            x0: 0.5,
+            y0: 0.8,
+            x1: 0.5,
+            y1: 0.3,
+            label: None,
+            button: Some("touch".into()),
+            path: vec![[0.5, 0.8], [0.52, 0.55], [0.5, 0.3]],
+        };
+        let blue = |frame: &RgbaFrame| {
+            frame
+                .rgba
+                .chunks_exact(4)
+                .filter(|p| p[2] > 200 && p[0] < 120)
+                .count()
+        };
+        let after = render_annotated_keyframe(&base, &key(1), &[], &[], &[swipe.clone()]);
+        assert!(blue(&after) > 500, "trail missing");
+        let mut later = key(1);
+        later.t = 6000;
+        let stale = render_annotated_keyframe(&base, &later, &[], &[], &[swipe]);
+        assert_eq!(blue(&stale), 0, "an old swipe should not be drawn");
     }
 
     #[test]

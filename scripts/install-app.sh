@@ -14,7 +14,8 @@ taskpolicy -c utility cargo build -j 3
 mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}" "${HOME}/bin"
 
 cp -f "${REPO_DIR}/target/debug/scrawl" "${MACOS_DIR}/scrawl"
-chmod +x "${MACOS_DIR}/scrawl"
+cp -f "${REPO_DIR}/target/debug/scrawl-helper" "${MACOS_DIR}/scrawl-helper"
+chmod +x "${MACOS_DIR}/scrawl" "${MACOS_DIR}/scrawl-helper"
 
 if [[ -f "${REPO_DIR}/assets/Scrawl.icns" ]]; then
   cp -f "${REPO_DIR}/assets/Scrawl.icns" "${RESOURCES_DIR}/Scrawl.icns"
@@ -53,15 +54,21 @@ cat > "${CONTENTS_DIR}/Info.plist" <<'PLIST'
   <string>Scrawl captures your screen to build annotated agent bundles.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Scrawl records your voice to align transcripts with keyframes.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Scrawl mirrors and records a cabled iPhone's screen.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>Scrawl transcribes your narration on this Mac.</string>
 </dict>
 </plist>
 PLIST
 
 if security find-identity -v -p codesigning 2>/dev/null | grep -q "${SIGN_ID}"; then
-  codesign --force --deep --sign "${SIGN_ID}" --identifier "dev.kitlangton.scrawl" "${APP_DIR}"
+  IDENTITY="${SIGN_ID}"
 else
-  codesign --force --deep --sign - --identifier "dev.kitlangton.scrawl" "${APP_DIR}"
+  IDENTITY="-"
 fi
+codesign --force --sign "${IDENTITY}" --identifier "dev.kitlangton.scrawl.helper" "${MACOS_DIR}/scrawl-helper"
+codesign --force --sign "${IDENTITY}" --identifier "dev.kitlangton.scrawl" "${APP_DIR}"
 
 ln -sf "${MACOS_DIR}/scrawl" "${HOME}/bin/scrawl"
 

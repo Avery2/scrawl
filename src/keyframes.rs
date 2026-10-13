@@ -5,7 +5,6 @@ const THUMB_WIDTH: usize = 64;
 const THUMB_HEIGHT: usize = 36;
 const THUMB_PIXELS: usize = THUMB_WIDTH * THUMB_HEIGHT;
 const FRAME_GAP_MS: u64 = 750;
-const SPEECH_WINDOW_MS: u64 = 1500;
 
 /// Sample the centers of a fixed grid; cost is independent of capture resolution.
 fn luma_thumbnail(frame: &RgbaFrame) -> [f32; THUMB_PIXELS] {
@@ -98,17 +97,46 @@ fn nearest_frame(frames: &[&RgbaFrame], t: u64) -> usize {
     }
 }
 
-fn midpoint(start: u64, end: u64) -> u64 {
-    start + end.saturating_sub(start) / 2
+/// Speech that starts a new thought: after clause punctuation, a pause, or a recognizer segment.
+const CLAUSE_GAP_MS: u64 = 1_500;
+/// A spoken cue only cuts a keyframe if its image differs from every keyframe already chosen.
+const CUE_NOVELTY: f32 = 0.03;
+
+/// Words that point at the screen. The strong ones are deliberate cues ("now", "look");
+/// the rest are just as often filler ("I see why", "here and there", "that's weird"), so they
+/// rank with ordinary scene changes and only break ties when they coincide with one.
+fn spoken_cue(word: &str) -> Option<(&'static str, f32, bool)> {
+    let word = word
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    [
+        ("now", 58.0, true),
+        ("here", 56.0, true),
+        ("look", 58.0, true),
+        ("watch", 58.0, true),
+        ("see", 44.0, false),
+        ("there", 44.0, false),
+        ("this", 44.0, false),
+        ("these", 44.0, false),
+        ("that", 42.0, false),
+        ("those", 42.0, false),
+    ]
+    .into_iter()
+    .find(|(cue, _, _)| *cue == word)
 }
 
-/// Attach each timed word (or whole segment when word timings are absent)
-/// to the keyframe whose `[action_t0 - SPEECH_WINDOW_MS, action_t1 + SPEECH_WINDOW_MS]`
-/// span covers it. Overlapping spans resolve to the nearest span midpoint; speech
-/// outside every window belongs to the nearest span so no words disappear.
+fn ends_clause(text: &str) -> bool {
+    text.trim_end_matches(['"', '\'', '”', '’', ')', ']'])
+        .ends_with(['.', '!', '?', ';', ':', ','])
+}
+
+/// Each keyframe's text runs from the start of the clause in progress at its anchor (when its
+/// action began, or the cue word) until the next keyframe's start, so the transcript is
+/// partitioned in order with nothing repeated or dropped. Speech before the first keyframe
+/// belongs to it.
 fn align_transcript(
     selected: &mut [(Keyframe, RgbaFrame)],
-    spans: &[(u64, u64)],
+    anchors: &[u64],
     transcript: &TranscriptData,
 ) {
     if selected.is_empty() {
@@ -127,43 +155,48 @@ fn align_transcript(
             .map(|w| (w.t0, w.t1, w.text.as_str()))
             .collect()
     };
+    units.retain(|unit| !unit.2.trim().is_empty());
     units.sort_by_key(|unit| unit.0);
-    let mut text = vec![String::new(); selected.len()];
-    for (t0, t1, unit) in units {
-        let unit = unit.trim();
-        if unit.is_empty() {
-            continue;
+
+    let mut clauses: Vec<(u64, u64)> = Vec::new();
+    let mut previous: Option<(u64, &str)> = None;
+    for &(t0, t1, text) in &units {
+        let segment_start = transcript.segments.iter().any(|s| s.t0.abs_diff(t0) <= 20);
+        let new_clause = previous.is_none_or(|(end, prev)| {
+            ends_clause(prev) || t0.saturating_sub(end) >= CLAUSE_GAP_MS || segment_start
+        });
+        match clauses.last_mut() {
+            Some(clause) if !new_clause => clause.1 = clause.1.max(t1),
+            _ => clauses.push((t0, t1)),
         }
-        let center = midpoint(t0, t1);
-        let index = selected
+        previous = Some((t1, text));
+    }
+    let clause_start = |anchor: u64| {
+        clauses
             .iter()
-            .enumerate()
-            .min_by_key(|(i, (frame, _))| {
-                let (s0, s1) = spans.get(*i).copied().unwrap_or((frame.t, frame.t));
-                let anchor_start = s0.min(frame.t);
-                let anchor_end = s1.max(frame.t);
-                let start = anchor_start.saturating_sub(SPEECH_WINDOW_MS);
-                let end = anchor_end.saturating_add(SPEECH_WINDOW_MS);
-                let gap = if t1 < start {
-                    start - t1
-                } else {
-                    t0.saturating_sub(end)
-                };
-                let span_distance = if center < anchor_start {
-                    anchor_start - center
-                } else if center > anchor_end {
-                    center - anchor_end
-                } else {
-                    0
-                };
-                (
-                    gap,
-                    span_distance,
-                    center.abs_diff(midpoint(anchor_start, anchor_end)),
-                )
-            })
-            .map(|(i, _)| i)
-            .unwrap();
+            .find(|(t0, t1)| *t0 <= anchor && anchor <= *t1)
+            .map_or(anchor, |clause| clause.0)
+    };
+    let mut starts: Vec<u64> = Vec::with_capacity(selected.len());
+    for (i, (frame, _)) in selected.iter().enumerate() {
+        let anchor = anchors.get(i).copied().unwrap_or(frame.t);
+        let mut start = clause_start(anchor);
+        if let Some(&prev) = starts.last()
+            && start <= prev
+        {
+            // Two keyframes in one clause: the later one takes the words from its own moment.
+            start = anchor.max(prev + 1);
+        }
+        starts.push(start);
+    }
+
+    let mut text = vec![String::new(); selected.len()];
+    for (t0, _, unit) in units {
+        let unit = unit.trim();
+        let index = starts
+            .iter()
+            .rposition(|&start| start <= t0.saturating_add(50))
+            .unwrap_or(0);
         // ASR words normally include their punctuation; separate punctuation tokens
         // and contractions should still produce natural text.
         let attached = unit.starts_with([',', '.', '!', '?', ';', ':', '’', '\'', ')', ']', '”']);
@@ -280,6 +313,7 @@ pub fn select_keyframes(
     }
     // A run of changing frames is one transition. Its last changed frame is
     // the settled view, avoiding several near-identical animation keyframes.
+    let mut transitions: Vec<(usize, (u64, u64), f32)> = Vec::new();
     let mut transition: Option<(usize, u64, f32)> = None;
     for (i, &delta) in deltas.iter().enumerate() {
         if delta > 0.08 {
@@ -290,11 +324,52 @@ pub fn select_keyframes(
                 transition.map_or(delta, |(_, _, max)| max.max(delta)),
             ));
         } else if let Some((frame, start_t, diff)) = transition.take() {
-            candidates.push(scene_candidate(frame, (start_t, frames[frame].t_ms), diff));
+            transitions.push((frame, (start_t, frames[frame].t_ms), diff));
         }
     }
     if let Some((frame, start_t, diff)) = transition {
-        candidates.push(scene_candidate(frame, (start_t, frames[frame].t_ms), diff));
+        transitions.push((frame, (start_t, frames[frame].t_ms), diff));
+    }
+    for &(frame, span, diff) in &transitions {
+        candidates.push(scene_candidate(frame, span, diff));
+    }
+    // A pointing word is a deliberate cue ("if I say now, find the right image"). It looks for
+    // a transition that starts around the word; otherwise it takes what was on screen as it
+    // was said. Speech alone never cuts a keyframe over an unchanged screen: cues must show
+    // something new (checked during selection), and pauses never cut at all.
+    if !transcript.estimated {
+        for word in &transcript.words {
+            let Some((cue, score, strong)) = spoken_cue(&word.text) else {
+                continue;
+            };
+            let snapped = transitions
+                .iter()
+                .filter(|(_, (start, _), _)| {
+                    start.saturating_add(300) >= word.t0 && *start <= word.t0 + 1_200
+                })
+                .min_by_key(|(_, (start, _), _)| start.abs_diff(word.t0));
+            let (frame, score, event) = match snapped {
+                Some(&(frame, _, diff)) => (
+                    frame,
+                    score.max(40.0 + 40.0 * diff) + if strong { 6.0 } else { 1.0 },
+                    format!("said “{cue}” as the screen changed"),
+                ),
+                None => (
+                    nearest_frame(&frames, word.t0 + 150),
+                    score,
+                    format!("said “{cue}”"),
+                ),
+            };
+            candidates.push(Candidate {
+                frame,
+                span: (word.t0, word.t0),
+                score,
+                reason: KeyframeReason::Speech,
+                mark: None,
+                event,
+                cursor: None,
+            });
+        }
     }
     if candidates.is_empty() {
         let mid = frames.len() / 2;
@@ -331,10 +406,21 @@ pub fn select_keyframes(
         {
             continue;
         }
+        if candidate.reason == KeyframeReason::Speech
+            && selected.iter().any(|other| {
+                scene_transition_diff(&thumbnails[other.frame], &thumbnails[candidate.frame])
+                    < CUE_NOVELTY
+            })
+        {
+            continue;
+        }
         selected.push(candidate);
     }
     selected.sort_by_key(|candidate| frames[candidate.frame].t_ms);
-    let spans: Vec<(u64, u64)> = selected.iter().map(|c| c.span).collect();
+    let anchors: Vec<u64> = selected
+        .iter()
+        .map(|c| c.span.0.min(frames[c.frame].t_ms))
+        .collect();
     let mut out: Vec<_> = selected
         .into_iter()
         .enumerate()
@@ -361,7 +447,7 @@ pub fn select_keyframes(
             )
         })
         .collect();
-    align_transcript(&mut out, &spans, transcript);
+    align_transcript(&mut out, &anchors, transcript);
     out
 }
 
@@ -600,6 +686,148 @@ mod tests {
             span_selected[1].0.said.as_deref(),
             Some("Started drawing this.")
         );
+    }
+
+    fn words(list: &[(u64, &str)]) -> Vec<WordTiming> {
+        list.iter()
+            .map(|&(t, text)| WordTiming {
+                t0: t,
+                t1: t + 200,
+                text: text.into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn spoken_cues_never_duplicate_an_unchanged_screen() {
+        let frames: Vec<_> = (0..=20).map(|i| frame(i * 250, 90)).collect();
+        let transcript = TranscriptData {
+            words: words(&[
+                (500, "Look"),
+                (700, "at"),
+                (900, "this."),
+                (3000, "Now"),
+                (3200, "it's"),
+                (3400, "stuck."),
+            ]),
+            ..Default::default()
+        };
+        let selected = select_keyframes(&frames, &[], &mut [], &[], &transcript, MAX_KEYFRAMES);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].0.reason, KeyframeReason::Speech);
+        assert_eq!(
+            selected[0].0.said.as_deref(),
+            Some("Look at this. Now it's stuck.")
+        );
+    }
+
+    #[test]
+    fn a_spoken_cue_finds_the_change_it_points_at() {
+        // The screen changes 0.6 s after "now"; the cue picks the settled view, and its clause
+        // starts that keyframe's text.
+        let mut frames: Vec<_> = (0..=24).map(|i| frame(i * 250, 40)).collect();
+        for f in frames.iter_mut().filter(|f| f.t_ms >= 3_250) {
+            *f = frame(f.t_ms, 220);
+        }
+        let transcript = TranscriptData {
+            words: words(&[
+                (200, "Here's"),
+                (400, "the"),
+                (600, "list."),
+                (2_400, "Watch"),
+                (2_600, "it"),
+                (2_800, "now."),
+            ]),
+            ..Default::default()
+        };
+        let selected = select_keyframes(
+            &frames,
+            &[],
+            &mut [],
+            &[click(500)],
+            &transcript,
+            MAX_KEYFRAMES,
+        );
+        assert_eq!(
+            selected.len(),
+            2,
+            "{:?}",
+            selected.iter().map(|k| &k.0).collect::<Vec<_>>()
+        );
+        assert_eq!(selected[1].0.t, 3_250);
+        assert_eq!(selected[1].0.reason, KeyframeReason::Speech);
+        assert_eq!(selected[0].0.said.as_deref(), Some("Here's the list."));
+        assert_eq!(selected[1].0.said.as_deref(), Some("Watch it now."));
+    }
+
+    #[test]
+    fn estimated_word_times_do_not_cut_keyframes() {
+        let mut frames: Vec<_> = (0..=8).map(|i| frame(i * 250, 40)).collect();
+        frames.push(frame(2_500, 220));
+        let transcript = TranscriptData {
+            words: words(&[(1_000, "now")]),
+            estimated: true,
+            ..Default::default()
+        };
+        let selected = select_keyframes(&frames, &[], &mut [], &[], &transcript, MAX_KEYFRAMES);
+        assert!(
+            selected
+                .iter()
+                .all(|k| k.0.reason != KeyframeReason::Speech)
+        );
+    }
+
+    #[test]
+    fn an_action_mid_sentence_takes_the_sentence_from_its_start() {
+        let frames: Vec<_> = (0..=24).map(|i| frame(i * 250, 128)).collect();
+        let transcript = TranscriptData {
+            words: words(&[
+                (100, "First"),
+                (300, "the"),
+                (500, "header."),
+                (2_000, "When"),
+                (2_200, "I"),
+                (2_400, "tap"),
+                (2_600, "it,"),
+                (2_800, "nothing."),
+            ]),
+            ..Default::default()
+        };
+        let selected = select_keyframes(
+            &frames,
+            &[],
+            &mut [],
+            &[click(400), click(2_450)],
+            &transcript,
+            MAX_KEYFRAMES,
+        );
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].0.said.as_deref(), Some("First the header."));
+        assert_eq!(
+            selected[1].0.said.as_deref(),
+            Some("When I tap it, nothing.")
+        );
+    }
+
+    #[test]
+    fn flags_are_priority_keyframes() {
+        let frames: Vec<_> = (0..=8).map(|i| frame(i * 250, 128)).collect();
+        let mut marks = vec![Mark {
+            strokes: Vec::new(),
+            t0: 1_500,
+            shape: Shape::Flag,
+            ..mark("f1", 1_500)
+        }];
+        let selected = select_keyframes(
+            &frames,
+            &[],
+            &mut marks,
+            &[click(1_600)],
+            &TranscriptData::default(),
+            1,
+        );
+        assert_eq!(selected[0].0.mark_id.as_deref(), Some("f1"));
+        assert_eq!(selected[0].0.t, 1_500);
     }
 
     #[test]

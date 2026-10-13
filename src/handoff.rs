@@ -373,7 +373,10 @@ pub fn extract_frames_range(
     ensure!(from_ms <= to_ms, "Frame range ends before it starts");
     ensure!(fps > 0 && fps <= 240, "FPS must be between 1 and 240");
     let directory = resolve_bundle_dir(bundle_dir)?;
-    let video = directory.join("recording.mp4");
+    let video = load_bundle(&directory)
+        .ok()
+        .and_then(|(_, bundle)| bundle.video)
+        .map_or_else(|| directory.join("recording.mp4"), |v| directory.join(v));
     if video.is_file() && from_ms < to_ms {
         if let Some(ffmpeg) = on_path("ffmpeg") {
             let output_dir = directory

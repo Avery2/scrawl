@@ -62,6 +62,36 @@ pub struct ScrawlBundle {
     pub video: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<String>,
+    /// Where the pictures came from when it isn't this Mac's screen (`"iphone"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<DeviceInfo>,
+}
+
+/// The phone behind an `"iphone"` bundle.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceInfo {
+    pub name: String,
+    /// `"mirror"` for a cabled capture through Scrawl, `"tetherkit"` for an in-app SDK recording.
+    pub capture: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    /// Native video size in pixels.
+    pub width: u32,
+    pub height: u32,
+    /// Screen size in points and its scale, when the recording says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen: Option<[f64; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -86,6 +116,8 @@ pub enum CaptureMode {
     Display,
     Window,
     Region,
+    /// A phone's own screen; normalized coordinates are phone-screen coordinates.
+    Device,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -108,6 +140,10 @@ pub struct TranscriptData {
     pub segments: Vec<TranscriptSegment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub words: Vec<WordTiming>,
+    /// Word times were spread over detected speech rather than measured by the recognizer,
+    /// so they can't place a spoken cue precisely.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub estimated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +180,12 @@ pub struct Stroke {
 }
 
 impl Stroke {
+    /// Moves the stroke `ms` earlier (clamped at zero), keeping its point timing.
+    pub fn rebase(&mut self, ms: u64) {
+        self.t0 = self.t0.saturating_sub(ms);
+        self.t1 = self.t1.saturating_sub(ms);
+    }
+
     /// Returns normalized `(x, y)` points in `0.0..=1.0`.
     pub fn normalized_points(&self) -> Vec<[f32; 2]> {
         self.pts
@@ -177,6 +219,8 @@ pub enum Shape {
     Tap,
     Pin,
     Mark,
+    /// A time-only "look here" marker (M in the mirror, or a TetherKit marker).
+    Flag,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -225,6 +269,12 @@ pub enum InteractionEvent {
         y1: f32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+        /// `"touch"` for a finger on a phone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        button: Option<String>,
+        /// Intermediate positions, for drawing the trail.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        path: Vec<[f32; 2]>,
     },
     Scroll {
         t: u64,
@@ -252,9 +302,30 @@ pub enum InteractionEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         window_title: Option<String>,
     },
+    /// Something the recorded app reported about itself (TetherKit `events[]`).
+    AppEvent {
+        t: u64,
+        label: String,
+    },
 }
 
 impl InteractionEvent {
+    /// Moves the event `ms` earlier (clamped at zero), re-basing it onto a clock that started later.
+    pub fn rebase(&mut self, ms: u64) {
+        match self {
+            Self::Drag { t, t1, .. } => {
+                *t = t.saturating_sub(ms);
+                *t1 = t1.saturating_sub(ms);
+            }
+            Self::Click { t, .. }
+            | Self::Scroll { t, .. }
+            | Self::Point { t, .. }
+            | Self::Key { t, .. }
+            | Self::AppChange { t, .. }
+            | Self::AppEvent { t, .. } => *t = t.saturating_sub(ms),
+        }
+    }
+
     pub fn timestamp_ms(&self) -> u64 {
         match self {
             Self::Click { t, .. }
@@ -262,7 +333,8 @@ impl InteractionEvent {
             | Self::Scroll { t, .. }
             | Self::Point { t, .. }
             | Self::Key { t, .. }
-            | Self::AppChange { t, .. } => *t,
+            | Self::AppChange { t, .. }
+            | Self::AppEvent { t, .. } => *t,
         }
     }
 }
