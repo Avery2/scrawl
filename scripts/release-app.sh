@@ -121,3 +121,18 @@ if security find-generic-password -s 'https://sparkle-project.org' -a ed25519 -w
 fi
 
 echo "Prepared ${DIST_DIR}/${DMG_NAME} and ${DIST_DIR}/${ZIP_NAME}"
+
+if [[ -d "${REPO_DIR}/site/public" ]]; then
+  mkdir -p "${REPO_DIR}/site/public/releases"
+  cp -f "${DIST_DIR}/${DMG_NAME}" "${REPO_DIR}/site/public/releases/${DMG_NAME}"
+  cp -f "${DIST_DIR}/${LATEST_DMG}" "${REPO_DIR}/site/public/releases/${LATEST_DMG}"
+  cp -f "${DIST_DIR}/${ZIP_NAME}" "${REPO_DIR}/site/public/releases/${ZIP_NAME}"
+  cp -f "${DIST_DIR}/${ZIP_NAME}" "${REPO_DIR}/site/public/releases/Scrawl-latest-arm64.zip"
+  if [[ -f "${UPDATES_DIR}/appcast.xml" ]]; then
+    cp -f "${UPDATES_DIR}/appcast.xml" "${REPO_DIR}/site/public/appcast.xml"
+  fi
+fi
+
+if [[ "${MODE}" == "publish" ]]; then
+  (cd "${REPO_DIR}/site" && bun run build && bunx wrangler@latest deploy)
+fi

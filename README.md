@@ -2,12 +2,12 @@
 
 Show an agent a problem instead of describing it.
 
-Press a shortcut (`⌃⌥⌘S`), then talk, click around, and draw on the screen. Scrawl records the screen, your voice, and your marks, then packs them into a compact bundle: a contact sheet of annotated keyframes (`contact-sheet.png`), individual full-resolution keyframes (`frames/frame-XX.png`), a time-aligned transcript and interaction timeline (`summary.md`), and a structured manifest (`scrawl.json`).
+Press a shortcut (`⌃⌥⇧S`), then talk, click around, and draw on the screen. Scrawl records the screen, your voice, and your marks, then packs them into a compact bundle: a contact sheet of annotated keyframes (`contact-sheet.png`), individual full-resolution keyframes (`frames/frame-XX.png`), a time-aligned transcript and interaction timeline (`summary.md`), and a structured manifest (`scrawl.json`).
 
 ## Usage
 
 ```sh
-# Launch the GPUI menu-bar and review app (global shortcut: ⌃⌥⌘S)
+# Launch the GPUI menu-bar and review app (global shortcut: ⌃⌥⇧S)
 cargo run -- app
 
 # Generate a realistic multi-frame demo bundle and print its agent summary
@@ -41,13 +41,12 @@ cargo run -- reprocess latest --out /tmp/again.scrawl
 
 ## Capture Controls
 
-- `⌃⌥⌘S`: Start or finish a capture session from any app
-- **Normal pointer**: Clicks and scrolls pass straight through to the app underneath and are logged with the target element's Accessibility label
-- **Hold `⇧` (Shift)**: Point with a fading 1-second red laser trail without intercepting clicks
-- **Press `D`**: Toggle drawing mode on the overlay canvas (`perfect-freehand` ink with white halo, classifying circles, underlines, lines, and arrows)
-- **`⇧`-click (in draw mode)**: Drop a numbered pin (`1`, `2`, …) on the control underneath
-- **`⌘Z`**: Undo the last stroke or pin
-- **`Esc`**: Exit drawing mode, or cancel the active capture
+- `⌃⌥⇧S`: Start or finish a capture session from any app
+- `⌃⌥⇧V`: Paste both `contact-sheet.png` and `summary.md` into the active app or terminal
+- **Normal pointer**: Clicks and scrolls pass straight through to the app underneath
+- **Hold `⇧` (Shift) + move**: Draw a persistent red marker stroke (`#ff3b30`) on screen that fades out after release
+- **`⌘Z`**: Undo the last stroke
+- **`Esc`**: Cancel the active selection or capture
 
 ## iPhone
 

@@ -1,4 +1,6 @@
 /target
+/dist
+/site/public/releases
 /.DS_Store
 /artifacts
 /*.scrawl
