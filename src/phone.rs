@@ -488,12 +488,8 @@ pub fn finalize_live_capture(
     mut strokes: Vec<Stroke>,
     note: Option<String>,
 ) -> Result<(PathBuf, ScrawlBundle, String)> {
-    for event in &mut events {
-        event.rebase(recording.offset_ms);
-    }
-    for stroke in &mut strokes {
-        stroke.rebase(recording.offset_ms);
-    }
+    events.retain_mut(|event| event.rebase(recording.offset_ms));
+    strokes.retain_mut(|stroke| stroke.rebase(recording.offset_ms));
     let device = &recording.device;
     let target = phone_target(&device.name, None, device.width, device.height);
     let info = DeviceInfo {

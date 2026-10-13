@@ -1364,7 +1364,7 @@ pub struct SharedCaptureTelemetry {
     pub ui_sender: flume::Sender<LiveOverlayEvent>,
     tap_port: AtomicU64,
     last_shortcut_ms: AtomicU64,
-    drag_start: Mutex<Option<(u64, f32, f32, Option<String>)>>,
+    drag_start: Mutex<Option<(u64, f32, f32, Option<String>, TargetFrame)>>,
 }
 
 impl SharedCaptureTelemetry {
@@ -1551,7 +1551,10 @@ impl SharedCaptureTelemetry {
             .target_frame
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        screen_x >= frame.x
+        frame.width >= 16.0
+            && frame.height >= 16.0
+            && frame.x > -10_000.0
+            && screen_x >= frame.x
             && screen_x <= frame.x + frame.width
             && screen_y >= frame.y
             && screen_y <= frame.y + frame.height
@@ -1680,6 +1683,13 @@ pub fn start_global_input_tap(telemetry: Arc<SharedCaptureTelemetry>) {
         });
 }
 
+fn same_target_frame(a: TargetFrame, b: TargetFrame) -> bool {
+    (a.x - b.x).abs() <= 0.5
+        && (a.y - b.y).abs() <= 0.5
+        && (a.width - b.width).abs() <= 0.5
+        && (a.height - b.height).abs() <= 0.5
+}
+
 unsafe extern "C" fn tap_callback(
     _proxy: *mut c_void,
     event_type: u32,
@@ -1727,16 +1737,21 @@ unsafe extern "C" fn tap_callback(
             if pure_shift || !telemetry.contains_screen_point(loc.x, loc.y) {
                 return event;
             }
+            let start_frame = *telemetry
+                .target_frame
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *telemetry
                 .drag_start
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((t_ms, nx, ny, None));
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((t_ms, nx, ny, None, start_frame));
         }
         EVENT_LEFT_MOUSE_UP | EVENT_RIGHT_MOUSE_UP => {
             if pure_shift {
                 return event;
             }
-            let Some((t0, x0, y0, start_label)) = telemetry
+            let Some((t0, x0, y0, start_label, start_frame)) = telemetry
                 .drag_start
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1744,6 +1759,13 @@ unsafe extern "C" fn tap_callback(
             else {
                 return event;
             };
+            let end_frame = *telemetry
+                .target_frame
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !same_target_frame(start_frame, end_frame) {
+                return event;
+            }
             let dist_px = ((nx - x0) * fw as f32).hypot((ny - y0) * fh as f32);
             if dist_px < 12.0 {
                 let _ = telemetry
@@ -2026,10 +2048,11 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = [loc.x as f32, loc.y as f32];
 
+        let inside_target = telemetry.contains_screen_point(loc.x, loc.y);
         let pure_shift = shift && !cmd && !ctrl && !alt && !await_shift_release;
 
-        // Hold Shift + move cursor = draw a full persistent stroke in any app.
-        if pure_shift {
+        // Hold Shift + move cursor inside the capture target = draw a persistent stroke.
+        if pure_shift && inside_target {
             telemetry.shift_held.store(true, Ordering::Release);
             let t_ms = telemetry.elapsed_ms();
             let (nx, ny, fw, fh) = telemetry.normalize_point(loc.x, loc.y);
@@ -2059,7 +2082,7 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
                 stroke.pts.extend_from_slice(&[sx, sy, dt]);
                 stroke.t1 = t_ms;
             }
-        } else if prev_shift_ink {
+        } else if !pure_shift && prev_shift_ink {
             telemetry.shift_held.store(false, Ordering::Release);
             if let Some(stroke) = telemetry
                 .live_ink
