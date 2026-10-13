@@ -34,17 +34,16 @@ fn thumbnail_diff(a: &[f32; THUMB_PIXELS], b: &[f32; THUMB_PIXELS]) -> f32 {
     (a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f32>() / THUMB_PIXELS as f32).clamp(0.0, 1.0)
 }
 
-/// Combines global luma diff with localized `8×6`-block diff (using the 2nd-highest block
-/// so a single moving cursor block never false-triggers, while sidebar hover states,
-/// dropdowns, and tooltips across ≥2 blocks register as visual transitions).
+/// Combines global luma diff with localized `8×6`-block diff (using the 4th-highest block
+/// so a moving cursor straddling up to a 2×2 block corner in a small region capture never
+/// false-triggers, while real UI transitions across ≥4 blocks register cleanly).
 fn scene_transition_diff(a: &[f32; THUMB_PIXELS], b: &[f32; THUMB_PIXELS]) -> f32 {
     let global = thumbnail_diff(a, b);
     const COLS: usize = 8;
     const ROWS: usize = 6;
     const BW: usize = THUMB_WIDTH / COLS;
     const BH: usize = THUMB_HEIGHT / ROWS;
-    let mut best1 = 0.0_f32;
-    let mut best2 = 0.0_f32;
+    let mut top = [0.0_f32; 4];
     for by in 0..ROWS {
         for bx in 0..COLS {
             let mut sum = 0.0_f32;
@@ -56,15 +55,13 @@ fn scene_transition_diff(a: &[f32; THUMB_PIXELS], b: &[f32; THUMB_PIXELS]) -> f3
                 }
             }
             let block_diff = sum / (BW * BH) as f32;
-            if block_diff > best1 {
-                best2 = best1;
-                best1 = block_diff;
-            } else if block_diff > best2 {
-                best2 = block_diff;
+            if block_diff > top[3] {
+                top[3] = block_diff;
+                top.sort_by(|x, y| y.total_cmp(x));
             }
         }
     }
-    global.max((best2 * 1.4).clamp(0.0, 1.0))
+    global.max((top[3] * 1.4).clamp(0.0, 1.0))
 }
 
 #[cfg(test)]
@@ -427,12 +424,13 @@ pub fn select_keyframes(
         {
             continue;
         }
-        if candidate.reason == KeyframeReason::Speech
-            && selected.iter().any(|other| {
-                scene_transition_diff(&thumbnails[other.frame], &thumbnails[candidate.frame])
-                    < CUE_NOVELTY
-            })
-        {
+        if matches!(
+            candidate.reason,
+            KeyframeReason::Speech | KeyframeReason::SceneChange
+        ) && selected.iter().any(|other| {
+            scene_transition_diff(&thumbnails[other.frame], &thumbnails[candidate.frame])
+                < CUE_NOVELTY
+        }) {
             continue;
         }
         selected.push(candidate);
