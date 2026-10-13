@@ -118,6 +118,9 @@ impl MetalLaserOverlay {
         );
         unsafe { window.setReleasedWhenClosed(false) };
         window.setFrame_display(frame, true);
+        // Present Frame 0 synchronously so the cutout and border are already on screen
+        // before TargetPickerWindow closes (zero 1-frame blink).
+        shared.draw();
         window.orderFrontRegardless();
 
         let display_link = CVDisplayLink::from_active_cg_displays()
