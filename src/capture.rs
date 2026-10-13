@@ -306,8 +306,8 @@ impl Default for ShortcutConfig {
     fn default() -> Self {
         Self {
             key_code: u32::from(layout_s_keycode()),
-            carbon_modifiers: CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
-            label: "⌃⌥⇧S".into(),
+            carbon_modifiers: CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
+            label: "⌥⇧S".into(),
         }
     }
 }
@@ -325,7 +325,9 @@ impl ShortcutConfig {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        if cfg.label.ends_with('S') && cfg.key_code == u32::from(KEY_S) {
+        if cfg.label == "⌃⌥⇧S" {
+            cfg = Self::default();
+        } else if cfg.label.ends_with('S') && cfg.key_code == u32::from(KEY_S) {
             cfg.key_code = u32::from(layout_s_keycode());
         }
         cfg
@@ -474,6 +476,11 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
             }
             for &code in &codes {
                 for (mods, name) in [
+                    (CARBON_OPTION_KEY | CARBON_SHIFT_KEY, "⌥⇧S"),
+                    (
+                        CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
+                        "⌃⌥⇧S",
+                    ),
                     (
                         CARBON_CMD_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
                         "⌘⌥⇧S",
@@ -501,25 +508,7 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
                     next_alt_id += 1;
                 }
             }
-            if s_code != u32::from(KEY_S) {
-                let mut r: *mut c_void = ptr::null_mut();
-                let mods = CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY;
-                let rc = RegisterEventHotKey(
-                    u32::from(KEY_S),
-                    mods,
-                    EventHotKeyID {
-                        signature: HOTKEY_SIG,
-                        id: next_alt_id,
-                    },
-                    target,
-                    0,
-                    &raw mut r,
-                );
-                scrawl_log(format!(
-                    "RegisterEventHotKey(⌃⌥⇧S-ansi, code=1, mods={mods}) -> rc={rc} ref={r:p}"
-                ));
-            }
-            // Register ⌃⌥⇧V (and Karabiner ⌘⌥⇧V / ⌃⌥⌘V) for pasting both Image + Text of the latest capture.
+            // Register ⌥⇧V (plus ⌃⌥⇧V, ⌘⌥⇧V, ⌃⌥⌘V) for pasting both Image + Text of the latest capture.
             let v_code = u32::from(layout_v_keycode());
             let mut v_codes = vec![v_code];
             if v_code != u32::from(KEY_V) {
@@ -528,6 +517,7 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
             let mut paste_id = HOTKEY_ID_PASTE_BASE;
             for &code in &v_codes {
                 for (mods, name) in [
+                    (CARBON_OPTION_KEY | CARBON_SHIFT_KEY, "⌥⇧V"),
                     (
                         CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
                         "⌃⌥⇧V",
@@ -1458,11 +1448,10 @@ impl SharedCaptureTelemetry {
             && ctrl == want_ctrl
             && alt == want_alt
             && shift == want_shift;
-        // Support ⌃⌥⇧S, ⌘⌥⇧S (when Karabiner maps physical left_control -> left_command),
-        // and ⌃⌥⌘S on both the active layout's 's' key (41 on Dvorak) and ANSI 's' (1).
+        // Support ⌥⇧S, ⌃⌥⇧S, ⌘⌥⇧S, and ⌃⌥⌘S on both the active layout's 's' key and ANSI 's'.
         let s_code = layout_s_keycode();
         let is_s_key = keycode == s_code || keycode == KEY_S;
-        let builtin_s = is_s_key && alt && ((shift && (ctrl || cmd)) || (ctrl && cmd));
+        let builtin_s = is_s_key && alt && (shift || (ctrl && cmd));
         custom_match || builtin_s
     }
 
@@ -2017,7 +2006,7 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
         }
         prev_shortcut = shortcut_now;
 
-        let paste_now = key_v && alt && ((shift && (ctrl || cmd)) || (ctrl && cmd));
+        let paste_now = key_v && alt && (shift || (ctrl && cmd));
         if paste_now && !prev_paste && !telemetry.active.load(Ordering::Acquire) {
             telemetry.emit_paste_shortcut();
         }

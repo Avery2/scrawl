@@ -2,12 +2,12 @@
 
 Show an agent a problem instead of describing it.
 
-Press a shortcut (`⌃⌥⇧S`), then talk, click around, and draw on the screen. Scrawl records the screen, your voice, and your marks, then packs them into a compact bundle: a contact sheet of annotated keyframes (`contact-sheet.png`), individual full-resolution keyframes (`frames/frame-XX.png`), a time-aligned transcript and interaction timeline (`summary.md`), and a structured manifest (`scrawl.json`).
+Press a shortcut (`⌥⇧S`), then talk, click around, and draw on the screen. Scrawl records the screen, your voice, and your marks, then packs them into a compact bundle: a contact sheet of annotated keyframes (`contact-sheet.png`), individual full-resolution keyframes (`frames/frame-XX.png`), a time-aligned transcript and interaction timeline (`summary.md`), and a structured manifest (`scrawl.json`).
 
 ## Usage
 
 ```sh
-# Launch the GPUI menu-bar and review app (global shortcut: ⌃⌥⇧S)
+# Launch the GPUI menu-bar and review app (global shortcut: ⌥⇧S)
 cargo run -- app
 
 # Generate a realistic multi-frame demo bundle and print its agent summary
@@ -41,8 +41,8 @@ cargo run -- reprocess latest --out /tmp/again.scrawl
 
 ## Capture Controls
 
-- `⌃⌥⇧S`: Start or finish a capture session from any app
-- `⌃⌥⇧V`: Paste both `contact-sheet.png` and `summary.md` into the active app or terminal
+- `⌥⇧S`: Start or finish a capture session from any app (`⌃⌥⇧S` also works)
+- `⌥⇧V`: Paste both `contact-sheet.png` and `summary.md` into the active app or terminal (`⌃⌥⇧V` also works)
 - **Normal pointer**: Clicks and scrolls pass straight through to the app underneath
 - **Hold `⇧` (Shift) + move**: Draw a persistent red marker stroke (`#ff3b30`) on screen that fades out after release
 - **`⌘Z`**: Undo the last stroke

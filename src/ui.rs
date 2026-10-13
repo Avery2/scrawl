@@ -26,6 +26,7 @@ use crate::capture::{
     discover_target, install_global_hotkeys, list_selectable_windows,
     record_external_frontmost_app, region_target, scrawl_log, selectable_window_at,
     set_escape_hotkey_enabled, shortcut_from_key_and_mods, start_global_input_tap,
+    update_global_shortcut,
 };
 use crate::helper::PhoneDevice;
 use crate::hex::AudioRecorder;
@@ -151,7 +152,7 @@ fn clock_template(clock: &str) -> String {
 
 fn completed_meta(_duration_ms: u64, frame_count: usize) -> String {
     format!(
-        "· {} {} · ⌃⌥⇧V",
+        "· {} {} · ⌥⇧V",
         frame_count,
         if frame_count == 1 { "frame" } else { "frames" }
     )
@@ -306,7 +307,7 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
         menu.addItem(&item);
     };
 
-    add("Record Scrawl  ⌃⌥⇧S", sel!(toggleCapture:));
+    add("Record Scrawl  ⌥⇧S", sel!(toggleCapture:));
     add("Record iPhone", sel!(recordIphone:));
     add("Open Latest Bundle", sel!(openLatest:));
     add("Generate Demo Bundle", sel!(runDemo:));
@@ -2435,6 +2436,7 @@ impl Render for BundleReviewWindow {
         let tab = coord_read.selected_tab;
         let selected_kf = coord_read.selected_keyframe;
         let shortcut_label = coord_read.shortcut_label();
+        let recording_shortcut = coord_read.recording_shortcut_key;
 
         let Some((dir, bundle)) = state else {
             let c_start = self.coordinator.clone();
@@ -2496,6 +2498,7 @@ impl Render for BundleReviewWindow {
         let timeline = timeline(&bundle);
 
         let c_keydown = self.coordinator.clone();
+        let c_shortcut = self.coordinator.clone();
         let c_copy = self.coordinator.clone();
         let c_send = self.coordinator.clone();
         let c_tab_sheet = self.coordinator.clone();
@@ -2509,11 +2512,26 @@ impl Render for BundleReviewWindow {
             .on_key_down(move |event: &KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
                 let mods = event.keystroke.modifiers;
-                if key == "escape" || (mods.platform && key.eq_ignore_ascii_case("w")) {
-                    window.remove_window();
-                    return;
-                }
-                c_keydown.update(cx, |coord, _cx| {
+                let handled = c_keydown.update(cx, |coord, cx| {
+                    if coord.recording_shortcut_key {
+                        if key == "escape" {
+                            coord.recording_shortcut_key = false;
+                            cx.notify();
+                            return true;
+                        }
+                        if let Some(cfg) = shortcut_from_key_and_mods(
+                            key,
+                            mods.platform,
+                            mods.control,
+                            mods.alt,
+                            mods.shift,
+                        ) {
+                            update_global_shortcut(&coord.telemetry, cfg);
+                            coord.recording_shortcut_key = false;
+                            cx.notify();
+                            return true;
+                        }
+                    }
                     if let Some(cfg) = shortcut_from_key_and_mods(
                         key,
                         mods.platform,
@@ -2528,8 +2546,14 @@ impl Render for BundleReviewWindow {
                         mods.shift,
                     ) {
                         coord.telemetry.emit_toggle_shortcut();
+                        return true;
                     }
+                    false
                 });
+                if !handled && (key == "escape" || (mods.platform && key.eq_ignore_ascii_case("w")))
+                {
+                    window.remove_window();
+                }
             })
             .size_full()
             .flex()
@@ -2628,6 +2652,25 @@ impl Render for BundleReviewWindow {
                             .flex()
                             .items_center()
                             .gap_2()
+                            .child(
+                                hint_button(
+                                    "btn-shortcut",
+                                    if recording_shortcut {
+                                        "Press shortcut…"
+                                    } else {
+                                        "Shortcut"
+                                    },
+                                    (!recording_shortcut).then_some(shortcut_label),
+                                    false,
+                                )
+                                .on_click(move |_, _, cx| {
+                                    c_shortcut.update(cx, |coord, cx| {
+                                        coord.recording_shortcut_key =
+                                            !coord.recording_shortcut_key;
+                                        cx.notify();
+                                    });
+                                }),
+                            )
                             .child(
                                 action_button("btn-reveal", "Show in Finder", false).on_click(
                                     move |_, _, cx| {
@@ -3713,7 +3756,7 @@ mod tests {
     #[test]
     fn clock_template_is_width_stable() {
         assert_eq!(clock_template("12:34"), "00:00");
-        assert_eq!(completed_meta(8_000, 1), "· 1 frame · ⌃⌥⇧V");
+        assert_eq!(completed_meta(8_000, 1), "· 1 frame · ⌥⇧V");
     }
 
     #[test]
