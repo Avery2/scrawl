@@ -221,6 +221,7 @@ enum MenuAction {
     RecordIphone,
     OpenLatest,
     RunDemo,
+    CheckForUpdates,
     Quit,
 }
 
@@ -255,6 +256,11 @@ objc2::define_class!(
         #[unsafe(method(runDemo:))]
         fn run_demo(&self, _sender: &AnyObject) {
             let _ = self.ivars().sender.try_send(MenuAction::RunDemo);
+        }
+
+        #[unsafe(method(checkForUpdates:))]
+        fn check_for_updates(&self, _sender: &AnyObject) {
+            let _ = self.ivars().sender.try_send(MenuAction::CheckForUpdates);
         }
 
         #[unsafe(method(quitApp:))]
@@ -305,6 +311,7 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
     add("Open Latest Bundle", sel!(openLatest:));
     add("Generate Demo Bundle", sel!(runDemo:));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add("Check for Updates…", sel!(checkForUpdates:));
     add("Quit Scrawl", sel!(quitApp:));
 
     let item = NSStatusBar::systemStatusBar().statusItemWithLength(-1.0);
@@ -3298,6 +3305,7 @@ pub fn run_app(
         let telemetry = SharedCaptureTelemetry::new(ui_sender);
         install_global_hotkeys(&telemetry);
         start_global_input_tap(Arc::clone(&telemetry));
+        crate::sparkle::start();
         let menu_rx = install_status_bar();
 
         let has_initial = initial_bundle.is_some();
@@ -3406,6 +3414,9 @@ pub fn run_app(
                                         });
                                         open_review_window(&loop_coord, cx);
                                     }
+                                }
+                                MenuAction::CheckForUpdates => {
+                                    crate::sparkle::check_for_updates();
                                 }
                                 MenuAction::Quit => {
                                     should_quit = true;

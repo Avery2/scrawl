@@ -8,6 +8,7 @@ mod model;
 mod phone;
 mod render;
 mod sketch;
+mod sparkle;
 mod transcribe;
 mod ui;
 

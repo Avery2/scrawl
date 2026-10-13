@@ -6,12 +6,16 @@ APP_DIR="${HOME}/Applications/Scrawl.app"
 CONTENTS_DIR="${APP_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
 RESOURCES_DIR="${CONTENTS_DIR}/Resources"
+FRAMEWORKS_DIR="${CONTENTS_DIR}/Frameworks"
 SIGN_ID="Developer ID Application: Christopher Langton (QC99C9JE59)"
+SPARKLE_PUBLIC_KEY="mIek27lttJe8cIBqVZFhh6reRKjpTx1h9ZY9OKWPtuM="
 
 cd "${REPO_DIR}"
+chmod +x "${REPO_DIR}/scripts/setup-sparkle.sh" "${REPO_DIR}/scripts/release-app.sh" 2>/dev/null || true
+SPARKLE_DIR="$("${REPO_DIR}/scripts/setup-sparkle.sh" 2>/dev/null || true)"
 taskpolicy -c utility cargo build -j 3
 
-mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}" "${HOME}/bin"
+mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}" "${FRAMEWORKS_DIR}" "${HOME}/bin"
 
 rm -f "${MACOS_DIR}/scrawl" "${MACOS_DIR}/scrawl-helper"
 cp -f "${REPO_DIR}/target/debug/scrawl" "${MACOS_DIR}/scrawl"
@@ -22,7 +26,12 @@ if [[ -f "${REPO_DIR}/assets/Scrawl.icns" ]]; then
   cp -f "${REPO_DIR}/assets/Scrawl.icns" "${RESOURCES_DIR}/Scrawl.icns"
 fi
 
-cat > "${CONTENTS_DIR}/Info.plist" <<'PLIST'
+if [[ -n "${SPARKLE_DIR}" && -d "${SPARKLE_DIR}/Sparkle.framework" ]]; then
+  rm -rf "${FRAMEWORKS_DIR}/Sparkle.framework"
+  /usr/bin/ditto "${SPARKLE_DIR}/Sparkle.framework" "${FRAMEWORKS_DIR}/Sparkle.framework"
+fi
+
+cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -59,6 +68,18 @@ cat > "${CONTENTS_DIR}/Info.plist" <<'PLIST'
   <string>Scrawl mirrors and records a cabled iPhone's screen.</string>
   <key>NSSpeechRecognitionUsageDescription</key>
   <string>Scrawl transcribes your narration on this Mac.</string>
+  <key>SUEnableAutomaticChecks</key>
+  <true/>
+  <key>SUAutomaticallyUpdate</key>
+  <false/>
+  <key>SUAllowsAutomaticUpdates</key>
+  <false/>
+  <key>SUFeedURL</key>
+  <string>https://scrawl.kitlangton.dev/appcast.xml</string>
+  <key>SUPublicEDKey</key>
+  <string>${SPARKLE_PUBLIC_KEY}</string>
+  <key>SUVerifyUpdateBeforeExtraction</key>
+  <true/>
 </dict>
 </plist>
 PLIST
@@ -67,6 +88,14 @@ if security find-identity -v -p codesigning 2>/dev/null | grep -q "${SIGN_ID}"; 
   IDENTITY="${SIGN_ID}"
 else
   IDENTITY="-"
+fi
+if [[ -d "${FRAMEWORKS_DIR}/Sparkle.framework/Versions/B" ]]; then
+  SPARKLE_VER="${FRAMEWORKS_DIR}/Sparkle.framework/Versions/B"
+  codesign --force --sign "${IDENTITY}" "${SPARKLE_VER}/XPCServices/Installer.xpc"
+  codesign --force --sign "${IDENTITY}" --preserve-metadata=entitlements "${SPARKLE_VER}/XPCServices/Downloader.xpc"
+  codesign --force --sign "${IDENTITY}" "${SPARKLE_VER}/Autoupdate"
+  codesign --force --sign "${IDENTITY}" "${SPARKLE_VER}/Updater.app"
+  codesign --force --sign "${IDENTITY}" "${FRAMEWORKS_DIR}/Sparkle.framework"
 fi
 codesign --force --sign "${IDENTITY}" --identifier "dev.kitlangton.scrawl.helper" "${MACOS_DIR}/scrawl-helper"
 codesign --force --sign "${IDENTITY}" --identifier "dev.kitlangton.scrawl" "${APP_DIR}"
