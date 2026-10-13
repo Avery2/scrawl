@@ -18,7 +18,8 @@ pub fn path() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("SCRAWL_HELPER") {
         return Ok(PathBuf::from(path));
     }
-    let exe = std::env::current_exe().context("Could not locate scrawl")?;
+    let raw_exe = std::env::current_exe().context("Could not locate scrawl")?;
+    let exe = std::fs::canonicalize(&raw_exe).unwrap_or(raw_exe);
     // Beside the app binary, or one level up from `target/*/deps` for tests.
     exe.ancestors()
         .skip(1)
