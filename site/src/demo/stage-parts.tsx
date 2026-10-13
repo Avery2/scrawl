@@ -1,7 +1,6 @@
 import {
   AGENT,
   AREA,
-  CLAUSE_2,
   clock,
   easeInOut,
   easeOut,
@@ -18,7 +17,6 @@ import {
   STAGE,
   strokeAt,
   T,
-  WORDS,
   type Cursor as CursorState,
   MAC_WINDOW,
 } from "./script"
@@ -321,11 +319,12 @@ export function Keys({ t, mode }: { t: number; mode: Mode }) {
 
 // The spoken words follow the pen: each clause's pill sits beside the mark it describes.
 export function Caption({ t, script }: { t: number; script: Script }) {
-  const first = WORDS[0][1]
+  const { words: all, clause2 } = script.narration
+  const first = all[0][1]
   if (t < first - 300 || t > T.finish + 400) return null
-  const swap = WORDS[CLAUSE_2][1] - 20
+  const swap = all[clause2][1] - 20
   const second = t >= swap
-  const words = second ? WORDS.slice(CLAUSE_2) : WORDS.slice(0, CLAUSE_2)
+  const words = second ? all.slice(clause2) : all.slice(0, clause2)
   const opacity = Math.min(
     progress(t, first - 300, first),
     1 - progress(t, T.finish, T.finish + 400),

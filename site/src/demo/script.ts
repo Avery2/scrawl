@@ -11,9 +11,6 @@ export const PHONE: Rect = { x: 265, y: 76, w: 258, h: 556 }
 export const AGENT: Rect = { x: 760, y: 48, w: 422, h: 640 }
 export const AREA: Rect = { x: 40, y: 66, w: 708, h: 564 }
 
-// Kit's narration (public/narration.mp3) begins at SPEECH_START; word times are measured offsets.
-export const SPEECH_START = 5800
-
 export const T = {
   keys: 2400,
   keysUp: 3300,
@@ -23,63 +20,124 @@ export const T = {
   phoneClick: 4300,
   phoneRecord: 5150,
   record: 5300,
-  circle: [5950, 7500] as const,
-  pin1: 7800,
-  arrow: [9150, 9850] as const,
-  head: [9950, 10300] as const,
-  pin2: 10900,
-  finish: 13700,
-  copied: 14400,
-  promptClick: 14800,
-  paste: 15000,
-  submit: 15500,
-  read: 16100,
-  edit: 16600,
-  diff: 16800,
-  fix: [18100, 19100] as const,
-  done: 19500,
-  end: 21100,
+  circle: [7300, 8800] as const,
+  pin1: 9300,
+  arrow: [10900, 11600] as const,
+  head: [11700, 12050] as const,
+  pin2: 12700,
+  finish: 15600,
+  copied: 16300,
+  promptClick: 16700,
+  paste: 16900,
+  submit: 17400,
+  read: 18000,
+  edit: 18500,
+  diff: 18700,
+  fix: [20000, 21000] as const,
+  done: 21400,
+  end: 23000,
 }
 
 export const BEATS = [
   { label: "Broken", t: 0 },
   { label: "Capture", t: 2200 },
   { label: "Annotate", t: 5300 },
-  { label: "Handoff", t: 13500 },
-  { label: "Fix", t: 16400 },
+  { label: "Handoff", t: 15400 },
+  { label: "Fix", t: 18300 },
 ] as const
 
-const SPOKEN: [string, number, number][] = [
-  ["Look", 160, 240],
-  ["at", 280, 320],
-  ["this", 400, 560],
-  ["header", 720, 880],
-  ["badge—it's", 960, 1840],
-  ["colliding", 1960, 2320],
-  ["with", 2360, 2400],
-  ["the", 2480, 2560],
-  ["title,", 2640, 3240],
-  ["and", 3280, 3520],
-  ["this", 3640, 3760],
-  ["button", 3920, 4080],
-  ["row", 4160, 4240],
-  ["is", 4320, 4400],
-  ["shifted", 4480, 4800],
-  ["down", 4960, 5120],
-  ["14", 5240, 5600],
-  ["pixels.", 5680, 6613],
-  ["Line", 6667, 6720],
-  ["them", 6800, 6880],
-  ["up.", 6960, 7360],
+// Word onsets in ms from the start of each narration file (measured from the ElevenLabs alignment).
+const MAC_WORDS: [string, number][] = [
+  ["Look", 1200],
+  ["at", 1360],
+  ["this", 1560],
+  ["header", 1840],
+  ["badge…", 2080],
+  ["it's", 3120],
+  ["colliding", 3360],
+  ["with", 3880],
+  ["the", 4000],
+  ["title,", 4160],
+  ["and", 5120],
+  ["this", 5320],
+  ["button", 5600],
+  ["row", 5840],
+  ["is", 6080],
+  ["shifted", 6240],
+  ["down", 6640],
+  ["14", 7040],
+  ["pixels.", 7920],
+  ["Line", 8880],
+  ["them", 9120],
+  ["up.", 9360],
 ]
 
-// [word, start, end] on the demo clock.
-export const WORDS: [string, number, number][] = SPOKEN.map(([w, a, b]) => [w, SPEECH_START + a, SPEECH_START + b])
-// The second clause ("and this button row…") starts at this word index.
-export const CLAUSE_2 = 9
-export const SPEECH_END = WORDS[WORDS.length - 1][2]
-// The recording opens with a short breath; audio playback starts just before "Look".
-export const AUDIO_START = SPEECH_START + 155
+const IPHONE_WORDS: [string, number][] = [
+  ["On", 1124],
+  ["the", 1324],
+  ["phone", 1524],
+  ["it's", 1804],
+  ["even", 2004],
+  ["worse…", 2324],
+  ["this", 3324],
+  ["live", 3524],
+  ["pill", 3844],
+  ["is", 4124],
+  ["right", 4324],
+  ["on", 4564],
+  ["top", 4764],
+  ["of", 4924],
+  ["the", 5044],
+  ["header,", 5284],
+  ["and", 5994],
+  ["the", 6084],
+  ["checkout", 6364],
+  ["bar", 6644],
+  ["is", 6804],
+  ["cut", 7044],
+  ["off", 7204],
+  ["at", 7324],
+  ["the", 7444],
+  ["bottom.", 7724],
+  ["Please", 8564],
+  ["fix", 8884],
+  ["it.", 9204],
+]
+
+export type Narration = {
+  src: string
+  // [word, start, end] on the demo clock.
+  words: [string, number, number][]
+  // Index of the word that opens the second clause.
+  clause2: number
+  // Demo-clock time when the file ends.
+  end: number
+  // Seconds into the file to hold silent: the gaps where the voice model's direction tags sit.
+  mute: [number, number][]
+}
+
+// Both recordings start with a sigh at the moment recording begins.
+const narration = (src: string, spoken: [string, number][], speechEnd: number, duration: number, mute: [number, number][]): Narration => {
+  const words = spoken.map(([w, at], i): [string, number, number] => {
+    const next = spoken[i + 1]?.[1] ?? speechEnd
+    return [w, T.record + at, T.record + Math.min(next - 40, at + 520)]
+  })
+  return { src, words, clause2: spoken.findIndex(([w]) => w === "and"), end: T.record + duration, mute }
+}
+
+// The mute windows stop short of the next word's onset (measured RMS rises ~60 ms before it).
+export const NARRATION: Record<Mode, Narration> = {
+  mac: narration("/narration.mp3", MAC_WORDS, 9900, 9840, [
+    [0.7, 1.05],
+    [4.8, 5.03],
+  ]),
+  iphone: narration("/narration-iphone.mp3", IPHONE_WORDS, 9750, 9680, [
+    [0.82, 1.04],
+    [5.7, 5.86],
+  ]),
+}
+
+export const WORDS = NARRATION.mac.words
 
 export const clamp = (v: number, lo = 0, hi = 1) => Math.min(hi, Math.max(lo, v))
 export const lerp = (a: number, b: number, p: number) => a + (b - a) * p
@@ -152,6 +210,7 @@ export type Script = {
   path: Waypoint[]
   frames: { n: number; t: number; strokes: string[]; pins: number[] }[]
   drag?: { from: Point; to: Point }
+  narration: Narration
 }
 
 const circlePoints = (cx: number, cy: number, rx: number, ry: number): Point[] => {
@@ -278,6 +337,7 @@ export function buildScript(mode: Mode, a: Anchors): Script {
     clicks,
     path,
     drag,
+    narration: NARRATION[mode],
     frames: [
       { n: 1, t: T.pin1 - T.record, strokes: ["circle"], pins: [1] },
       { n: 2, t: T.pin2 - T.record, strokes: ["shaft", "head"], pins: [2] },
@@ -326,12 +386,20 @@ export function cursorAt(script: Script, t: number): Cursor {
   return { at: path[path.length - 1].at, drawing: false, pressed, shift }
 }
 
+// Splits a narration into its two keyframe clauses.
+export const clauses = (mode: Mode) => {
+  const { words, clause2 } = NARRATION[mode]
+  const text = (ws: typeof words) => ws.map(([w]) => w).join(" ")
+  return [text(words.slice(0, clause2)), text(words.slice(clause2))]
+}
+
 export const summaryText = (mode: Mode, short = false) => {
   const dir = short ? "~/…/captures" : "~/Library/Application Support/scrawl/captures"
   const target = mode === "mac" ? "Pulse “Deploy Activity”" : "iPhone · dev.pulse.app (212)"
+  const [first, second] = clauses(mode)
   return [
     `[scrawl ${clock(T.finish - T.record)} · ${target} · ${dir}/scrawl-1791924018273-3a1f.scrawl]`,
-    `- #1 (${clock(T.pin1 - T.record)}) “Look at this header badge—it's colliding with the title,”`,
-    `- #2 (${clock(T.pin2 - T.record)}) “and this button row is shifted down 14 pixels. Line them up.”`,
+    `- #1 (${clock(T.pin1 - T.record)}) “${first}”`,
+    `- #2 (${clock(T.pin2 - T.record)}) “${second}”`,
   ]
 }

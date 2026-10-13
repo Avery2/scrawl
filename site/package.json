@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "knobs": "file:/Users/kit/code/open-source/knobs",
     "perfect-freehand": "^1.2.3",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",

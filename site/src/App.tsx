@@ -3,6 +3,7 @@ import { BundleExplorer } from "./Bundle"
 import { BrushFallback } from "./brush-paths"
 import { Copy } from "./Copy"
 import { Demo } from "./demo/Demo"
+import { IPhoneSection } from "./IPhone"
 
 const Brush3D = lazy(() => import("./Brush3D").then((m) => ({ default: m.Brush3D })))
 
@@ -50,6 +51,7 @@ export function App() {
           Scrawl
         </a>
         <nav>
+          <a href="#iphone">iPhone</a>
           <a href="#bundle">Bundle</a>
           <a href="#install">Install</a>
           <a href={REPO}>GitHub</a>
@@ -76,6 +78,8 @@ export function App() {
         <section className="demo-section">
           <Demo />
         </section>
+
+        <IPhoneSection />
 
         <section id="bundle" className="bundle-section">
           <h2>

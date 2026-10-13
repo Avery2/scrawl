@@ -2,7 +2,8 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { MacWindow, PhoneMirror } from "./apps"
 import { INK_SHADOW, InkPath, inkPath } from "./ink"
 import { measureAnchors, sameAnchors } from "./measure"
-import { AGENT, type Anchors, AUDIO_START, BEATS, buildScript, cursorAt, type Mode, SPEECH_END, SPEECH_START, STAGE, T } from "./script"
+import { AGENT, type Anchors, BEATS, buildScript, cursorAt, type Mode, NARRATION, STAGE, T } from "./script"
+import * as sfx from "./sfx"
 import { Caption, Cursor, fixAmount, Island, Ink, Keys, MenuBar, phoneLive, Ripples, Selection, terminalActive } from "./stage-parts"
 import { Terminal } from "./terminal"
 
@@ -44,12 +45,13 @@ function usePlayback(duration: number, clock: React.RefObject<() => number | nul
   return { t, playing, setPlaying, seek, play }
 }
 
-// Plays Kit's narration inside the speech window. While it plays it drives the demo clock, so
-// dropped frames can't pull the words, ink, and voice apart.
-function useNarration(t: number, playing: boolean, sound: boolean, clock: React.RefObject<() => number | null>) {
+// Plays Kit's narration from the moment recording starts. While it plays it drives the demo clock,
+// so dropped frames can't pull the words, ink, and voice apart.
+function useNarration(t: number, playing: boolean, sound: boolean, mode: Mode, clock: React.RefObject<() => number | null>) {
   const audioRef = useRef<HTMLAudioElement>(null)
   const wanted = useRef(false)
   const live = useRef(false)
+  const end = NARRATION[mode].end
 
   useEffect(() => {
     const a = audioRef.current
@@ -57,11 +59,11 @@ function useNarration(t: number, playing: boolean, sound: boolean, clock: React.
     const on = () => (live.current = true)
     const off = () => (live.current = false)
     for (const e of ["playing", "seeked"]) a.addEventListener(e, on)
-    for (const e of ["pause", "waiting", "seeking", "ended"]) a.addEventListener(e, off)
-    clock.current = () => (live.current && wanted.current && !a.paused ? SPEECH_START + a.currentTime * 1000 : null)
+    for (const e of ["pause", "waiting", "seeking", "ended", "emptied"]) a.addEventListener(e, off)
+    clock.current = () => (live.current && wanted.current && !a.paused ? T.record + a.currentTime * 1000 : null)
     return () => {
       for (const e of ["playing", "seeked"]) a.removeEventListener(e, on)
-      for (const e of ["pause", "waiting", "seeking", "ended"]) a.removeEventListener(e, off)
+      for (const e of ["pause", "waiting", "seeking", "ended", "emptied"]) a.removeEventListener(e, off)
       clock.current = () => null
     }
   }, [clock])
@@ -69,25 +71,28 @@ function useNarration(t: number, playing: boolean, sound: boolean, clock: React.
   useEffect(() => {
     const a = audioRef.current
     if (!a) return
-    wanted.current = playing && sound && t >= AUDIO_START && t < SPEECH_END
+    wanted.current = playing && sound && t >= T.record && t < end - 20
     if (!wanted.current) {
       if (!a.paused) a.pause()
       return
     }
-    const want = (t - SPEECH_START) / 1000
+    const want = (t - T.record) / 1000
     if (a.paused) {
       a.currentTime = want
       a.play().catch(() => {})
     } else if (Math.abs(a.currentTime - want) > 0.2) {
       a.currentTime = want
     }
-  }, [t, playing, sound])
+    sfx.gateNarration(a, mode)
+  }, [t, playing, sound, mode, end])
 
   // Safari only lets audio start later if it was started once inside a user gesture.
   const unlock = useCallback(() => {
+    sfx.unlock()
     const a = audioRef.current
     if (!a || a.dataset.unlocked) return
     a.dataset.unlocked = "1"
+    sfx.routeNarration(a)
     a.muted = true
     a.play()
       .then(() => {
@@ -126,13 +131,21 @@ export function Demo() {
   const [drawMode, setDrawMode] = useState(false)
   const [started, setStarted] = useState(false)
   const [sound, setSound] = useState(true)
-  const { audioRef, unlock } = useNarration(t, playing, sound, clock)
+  const { audioRef, unlock } = useNarration(t, playing, sound, mode, clock)
+
+  useEffect(() => sfx.setEnabled(sound), [sound])
 
   const start = (withSound = sound) => {
     unlock()
     setStarted(true)
     setSound(withSound)
     play()
+  }
+
+  // A click on the page's own controls.
+  const click = (s: sfx.Sound = "tick") => {
+    sfx.unlock()
+    sfx.play(s, 0.8)
   }
 
   useLayoutEffect(() => {
@@ -177,6 +190,7 @@ export function Demo() {
 
   const switchMode = (next: Mode) => {
     if (next === mode) return
+    click("toggle")
     setAnchors(null)
     setUser([])
     seek(0)
@@ -185,6 +199,7 @@ export function Demo() {
   }
 
   const replay = () => {
+    click("pulse")
     setUser([])
     seek(0)
     start()
@@ -195,13 +210,25 @@ export function Demo() {
     return [(e.clientX - r.left) / scale, (e.clientY - r.top) / scale, e.pointerType === "pen" ? e.pressure : 0.5]
   }
 
+  const pen = useRef<{ x: number; y: number; at: number; speed: number } | null>(null)
+
   const onPointerDown = (e: React.PointerEvent) => {
     if (!(e.shiftKey || drawMode || e.pointerType === "pen")) return
     e.preventDefault()
     ;(e.target as Element).setPointerCapture?.(e.pointerId)
+    sfx.unlock()
+    pen.current = { x: e.clientX, y: e.clientY, at: e.timeStamp, speed: 0 }
     setUser((s) => [...s, { points: [toStage(e)], done: false }])
   }
   const onPointerMove = (e: React.PointerEvent) => {
+    const p = pen.current
+    if (p) {
+      const dt = Math.max(1, e.timeStamp - p.at)
+      const v = Math.hypot(e.clientX - p.x, e.clientY - p.y) / scale / dt
+      p.speed += (v - p.speed) * 0.35
+      pen.current = { x: e.clientX, y: e.clientY, at: e.timeStamp, speed: p.speed }
+      sfx.scribble("user", "marker", p.speed / 0.9)
+    }
     setUser((s) => {
       const last = s[s.length - 1]
       if (!last || last.done) return s
@@ -209,6 +236,8 @@ export function Demo() {
     })
   }
   const onPointerUp = () => {
+    if (pen.current) sfx.scribbleStop("user")
+    pen.current = null
     setUser((s) => {
       const last = s[s.length - 1]
       if (!last || last.done) return s
@@ -226,6 +255,7 @@ export function Demo() {
       seek(t - BEATS[i].t > 700 ? BEATS[i].t : BEATS[Math.max(0, i - 1)].t)
     } else if (e.key === " ") {
       e.preventDefault()
+      click("press")
       if (playing) setPlaying(false)
       else start()
     } else if (e.key === "z" && (e.metaKey || e.ctrlKey)) {
@@ -238,11 +268,33 @@ export function Demo() {
   const live = mode === "iphone" ? phoneLive(t) : 0
   const refs = { badge: badgeRef, actions: actionsRef, title: titleRef }
   const drawing = shiftDown || drawMode
+  const cues = useMemo(() => sfx.demoCues(mode), [mode])
+  const last = useRef<{ t: number; at: [number, number] | null; speed: number }>({ t: 0, at: null, speed: 0 })
+
+  // Scripted cues fire as the clock crosses them; seeks and scrubs (large or backward jumps) stay quiet.
+  useEffect(() => {
+    const prev = last.current
+    const at = cursor?.at ?? null
+    const dt = t - prev.t
+    const stepping = playing && sound && dt > 0 && dt < 250
+    if (stepping) for (const c of cues) if (c.t > prev.t && c.t <= t) sfx.play(c.sound, c.volume)
+    const texture: sfx.Texture | null = !stepping || !cursor ? null : cursor.drawing ? "marker" : mode === "mac" && t > T.dragStart && t < T.dragEnd ? "glass" : null
+    const v = texture && at && prev.at ? Math.hypot(at[0] - prev.at[0], at[1] - prev.at[1]) / dt : 0
+    const speed = texture ? prev.speed + (v - prev.speed) * 0.4 : 0
+    if (texture) sfx.scribble("demo", texture, speed / (texture === "marker" ? 0.45 : 1.4))
+    else sfx.scribbleStop("demo")
+    last.current = { t, at, speed }
+  }, [t, playing, sound])
+
+  const ended = started && !playing && t >= T.end
+  const other: Mode = mode === "mac" ? "iphone" : "mac"
+
   const overTerminal =
     !!cursor && cursor.at[0] > AGENT.x && cursor.at[0] < AGENT.x + AGENT.w && cursor.at[1] > AGENT.y + 28 && cursor.at[1] < AGENT.y + AGENT.h
 
   return (
     <div className="demo">
+      <ModeSwitch mode={mode} onMode={switchMode} />
       <div
         ref={wrapRef}
         className={`stage-wrap${drawing ? " drawing" : ""}`}
@@ -284,27 +336,50 @@ export function Demo() {
             Play with sound
           </button>
         )}
-        <audio ref={audioRef} src="/narration.mp3" preload="auto" />
+        {ended && (
+          <div className="stage-end" onPointerDown={(e) => e.stopPropagation()}>
+            <button className="stage-btn" onClick={replay}>
+              <ReplayIcon />
+              Replay
+            </button>
+            <button className="stage-btn primary" onClick={() => switchMode(other)}>
+              {other === "iphone" ? <PhoneIcon /> : <MacIcon />}
+              {other === "iphone" ? "Watch iPhone Mirror" : "Watch Mac Window"}
+              <span aria-hidden>→</span>
+            </button>
+          </div>
+        )}
+        <audio ref={audioRef} src={NARRATION[mode].src} preload="auto" />
       </div>
       <Controls
         t={t}
         playing={playing}
-        mode={mode}
         drawMode={drawMode}
         sound={sound}
-        onToggle={() => (playing ? setPlaying(false) : start())}
+        onToggle={() => {
+          click("press")
+          if (playing) setPlaying(false)
+          else start()
+        }}
         onSound={() => {
           unlock()
+          if (!sound) {
+            sfx.setEnabled(true)
+            sfx.play("toggle", 0.8)
+          }
           setSound((v) => !v)
         }}
         onReplay={replay}
         onSeek={seek}
         onBeat={(bt) => {
+          click("tick")
           seek(bt)
           start()
         }}
-        onMode={switchMode}
-        onDraw={() => setDrawMode((d) => !d)}
+        onDraw={() => {
+          click("toggle")
+          setDrawMode((d) => !d)
+        }}
         onPause={() => setPlaying(false)}
       />
     </div>
@@ -314,7 +389,6 @@ export function Demo() {
 function Controls(props: {
   t: number
   playing: boolean
-  mode: Mode
   drawMode: boolean
   sound: boolean
   onToggle: () => void
@@ -322,11 +396,10 @@ function Controls(props: {
   onReplay: () => void
   onSeek: (t: number) => void
   onBeat: (t: number) => void
-  onMode: (m: Mode) => void
   onDraw: () => void
   onPause: () => void
 }) {
-  const { t, playing, mode, drawMode, sound } = props
+  const { t, playing, drawMode, sound } = props
   const trackRef = useRef<HTMLDivElement>(null)
   const scrubbing = useRef(false)
 
@@ -353,10 +426,7 @@ function Controls(props: {
           )}
         </button>
         <button className="icon-btn" onClick={props.onReplay} aria-label="Replay">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
-            <path d="M3 8a5 5 0 105-5H5.5" />
-            <path d="M7 1L5 3l2 2" />
-          </svg>
+          <ReplayIcon />
         </button>
         <button className={`sound-btn${sound ? " on" : ""}`} onClick={props.onSound} aria-pressed={sound}>
           <svg viewBox="0 0 16 16" aria-hidden>
@@ -406,18 +476,47 @@ function Controls(props: {
         </div>
       </div>
       <div className="controls-right">
-        <div className="toggle" role="tablist">
-          <button className={mode === "mac" ? "on" : ""} onClick={() => props.onMode("mac")}>
-            Mac
-          </button>
-          <button className={mode === "iphone" ? "on" : ""} onClick={() => props.onMode("iphone")}>
-            iPhone
-          </button>
-        </div>
         <button className={`draw-btn${drawMode ? " on" : ""}`} onClick={props.onDraw} title="Draw (or hold ⇧ and drag)">
           <kbd>⇧</kbd> Draw
         </button>
       </div>
+    </div>
+  )
+}
+
+const ReplayIcon = () => (
+  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" aria-hidden>
+    <path d="M3 8a5 5 0 105-5H5.5" />
+    <path d="M7 1L5 3l2 2" />
+  </svg>
+)
+
+const MacIcon = () => (
+  <svg viewBox="0 0 18 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" aria-hidden>
+    <rect x="1.5" y="1.5" width="15" height="10" rx="2" />
+    <path d="M6.5 14.5h5M9 11.5v3" strokeLinecap="round" />
+  </svg>
+)
+
+const PhoneIcon = () => (
+  <svg viewBox="0 0 12 18" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden>
+    <rect x="1.5" y="1" width="9" height="16" rx="2.4" />
+    <path d="M4.6 3.2h2.8" strokeLinecap="round" strokeWidth="1.6" />
+  </svg>
+)
+
+function ModeSwitch({ mode, onMode }: { mode: Mode; onMode: (m: Mode) => void }) {
+  return (
+    <div className="mode-switch" role="tablist" aria-label="Capture source">
+      <span className={`mode-thumb ${mode}`} aria-hidden />
+      <button role="tab" aria-selected={mode === "mac"} className={mode === "mac" ? "on" : ""} onClick={() => onMode("mac")}>
+        <MacIcon />
+        Mac Window
+      </button>
+      <button role="tab" aria-selected={mode === "iphone"} className={mode === "iphone" ? "on" : ""} onClick={() => onMode("iphone")}>
+        <PhoneIcon />
+        iPhone Mirror
+      </button>
     </div>
   )
 }

@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, type CSSProperties } from "react"
+import { choice, defineControls, knob, toggle } from "knobs"
+import { useEffect, useRef, useState, useSyncExternalStore, type CSSProperties } from "react"
 import * as THREE from "three"
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js"
 import { toCreasedNormals } from "three/examples/jsm/utils/BufferGeometryUtils.js"
@@ -42,6 +43,56 @@ const TRAIL_WIDTH = 0.1
 const DROPS = 12
 // The middle of the bristle tip, in icon pixels, where the paint trail leaves the brush.
 const TIP: [number, number] = [336, 771]
+const DEG = Math.PI / 180
+
+// Hover the brush for the ⚙ knobs chip, or press 1–5 for a finish. Dev only: the production
+// build of knobs is always disabled and returns these locked defaults.
+export const brushControls = defineControls(
+  "brush",
+  {
+    handle: choice("brushed", ["brushed", "chrome", "titanium", "anodized", "ribbed"], { label: "Finish", group: "Handle" }),
+    handleRough: knob(0.24, { min: 0.04, max: 0.75, step: 0.01, label: "Handle roughness", group: "Handle" }),
+    grain: knob(0.55, { min: 0, max: 1, step: 0.01, label: "Metal grain", group: "Handle" }),
+    chamfer: knob(0.45, { min: 0, max: 1, step: 0.01, label: "Edge chamfer", group: "Handle" }),
+    dryLift: knob(0.42, { min: 0.15, max: 0.85, step: 0.01, label: "Dry bristle lift", group: "Bristles" }),
+    strands: knob(42, { min: 12, max: 90, step: 1, label: "Bristle strands", group: "Bristles" }),
+    groove: knob(0.65, { min: 0, max: 1, step: 0.01, label: "Bristle groove", group: "Bristles" }),
+    bristleRough: knob(0.72, { min: 0.2, max: 0.95, step: 0.02, label: "Bristle roughness", group: "Bristles" }),
+    dip: knob(0.38, { min: 0.15, max: 0.75, step: 0.01, label: "Paint dip", group: "Bristles" }),
+    scale: knob(1, { min: 0.7, max: 1.4, step: 0.02, label: "Brush scale", group: "Pose" }),
+    autoFlick: toggle(true, { label: "Auto flick", group: "Pose" }),
+    twirl: knob(0, { min: -180, max: 180, step: 1, unit: "deg", label: "Twirl angle", group: "Pose" }),
+    tilt: knob(0, { min: -35, max: 35, step: 1, unit: "deg", label: "Tilt angle", group: "Pose" }),
+  },
+  {
+    enabled: true,
+    // The default preset is the brushed handle, so 1–5 over the brush steps through all five finishes.
+    presets: {
+      chrome: { handle: "chrome", handleRough: 0.05, grain: 0, chamfer: 0.3 },
+      titanium: { handle: "titanium", handleRough: 0.42, grain: 0.55, chamfer: 0.3 },
+      spaceBlack: { handle: "anodized", handleRough: 0.32, grain: 0.3, chamfer: 0.85 },
+      ribbed: { handle: "ribbed", handleRough: 0.22, grain: 0.75, chamfer: 0.5 },
+    },
+  },
+)
+
+type BrushValues = ReturnType<typeof brushControls.get>
+type HandleFinish = BrushValues["handle"]
+
+// Base metal color and clearcoat for each finish; the shader adds its grain, ribs, and chamfers.
+const FINISHES: Record<HandleFinish, { index: number; color: number; clearcoat: number; clearcoatRoughness: number }> = {
+  brushed: { index: 0, color: 0xe4e7ee, clearcoat: 0.25, clearcoatRoughness: 0.2 },
+  chrome: { index: 1, color: 0xf4f6fa, clearcoat: 1, clearcoatRoughness: 0.03 },
+  titanium: { index: 2, color: 0xc4c0b8, clearcoat: 0.08, clearcoatRoughness: 0.4 },
+  anodized: { index: 3, color: 0x252830, clearcoat: 0.35, clearcoatRoughness: 0.18 },
+  ribbed: { index: 4, color: 0xd8dbe2, clearcoat: 0.4, clearcoatRoughness: 0.12 },
+}
+
+// Dry bristle colors at the default lift; the lift knob scales them together.
+const DRY_LIFT = 0.42
+const DRY_BASE = new THREE.Color(0x565d6e)
+const DRY_RIDGE = new THREE.Color(0x7c8599)
+const DRY_SEAM = new THREE.Color(0x16181f)
 
 const shape = (outline: Outline, radius: number) => new THREE.Shape(fillet(outline, radius).map(([x, y]) => new THREE.Vector2(x, y)))
 
@@ -89,8 +140,19 @@ function buildBrush() {
     g.scale(scale, scale, scale)
   }
   const brushTip = new THREE.Vector3(...toLocal(TIP), 0).sub(center).multiplyScalar(scale)
-  return { handle, bristles, base: (base - center.dot(AXIS)) * scale, tip: (tip - center.dot(AXIS)) * scale, brushTip }
+  // The ferrule ends at the handle's shoulders, where the outline steps in to the shaft.
+  const shoulder = (alongAxis(HANDLE[3]) + alongAxis(HANDLE[6])) / 2
+  return {
+    handle,
+    bristles,
+    base: (base - center.dot(AXIS)) * scale,
+    tip: (tip - center.dot(AXIS)) * scale,
+    ferrule: (shoulder - center.dot(AXIS)) * scale,
+    brushTip,
+  }
 }
+
+const alongAxis = (p: readonly [number, number]) => new THREE.Vector3(...toLocal(p), 0).dot(AXIS)
 
 const depths = (g: THREE.BufferGeometry) => Float32Array.from(g.getAttribute("position").array.filter((_, i) => i % 3 === 2))
 
@@ -129,11 +191,52 @@ function roundEdges(
   }
 }
 
-// Charcoal bristles near the ferrule, dipped in rich red paint toward the tip, with fine grooves.
+const NOISE_GLSL = `
+float hash3(vec3 p) {
+  p = fract(p * 0.1031);
+  p += dot(p, p.zyx + 31.32);
+  return fract((p.x + p.y) * p.z);
+}
+float vnoise(vec3 x) {
+  vec3 i = floor(x);
+  vec3 f = fract(x);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(
+    mix(mix(hash3(i), hash3(i + vec3(1, 0, 0)), f.x), mix(hash3(i + vec3(0, 1, 0)), hash3(i + vec3(1, 1, 0)), f.x), f.y),
+    mix(mix(hash3(i + vec3(0, 0, 1)), hash3(i + vec3(1, 0, 1)), f.x), mix(hash3(i + vec3(0, 1, 1)), hash3(i + vec3(1, 1, 1)), f.x), f.y),
+    f.z);
+}`
+
+const VERTEX_VARYINGS = [
+  "#include <common>\nuniform vec3 uAxis;\nuniform vec3 uPerp;\nvarying vec3 vObj;\nvarying vec3 vAxisView;\nvarying vec3 vPerpView;\nvarying float vCap;",
+  "#include <begin_vertex>\nvObj = position;\nvAxisView = normalize(normalMatrix * uAxis);\nvPerpView = normalize(normalMatrix * uPerp);\nvCap = abs(normal.z);",
+] as const
+
+function withVaryings(vertexShader: string) {
+  return vertexShader.replace("#include <common>", VERTEX_VARYINGS[0]).replace("#include <begin_vertex>", VERTEX_VARYINGS[1])
+}
+
+// Silver-badger bristles near the ferrule, dipped in rich paint toward the tip. Bundles of hair
+// with fine strands inside them, a grazing rim light so the dry band holds against a dark page,
+// and paint that climbs each strand to a slightly different height.
 // Matte satin throughout: the environment is bound explicitly because three ignores a material's
 // envMapIntensity when it falls back to scene.environment, and that full-strength studio reflection
 // is what washed the bristles out into white plastic.
 function bristleMaterial(base: number, tip: number, envMap: THREE.Texture) {
+  const uniforms = {
+    uAxis: { value: AXIS },
+    uPerp: { value: PERP },
+    uBase: { value: base },
+    uTip: { value: tip },
+    uDryBase: { value: DRY_BASE.clone() },
+    uDryRidge: { value: DRY_RIDGE.clone() },
+    uDrySeam: { value: DRY_SEAM.clone() },
+    uDryRough: { value: 0.86 },
+    uDensity: { value: 42 },
+    uGroove: { value: 0.65 },
+    uDip: { value: 0.38 },
+    uRim: { value: DRY_LIFT },
+  }
   const material = new THREE.MeshPhysicalMaterial({
     color: PAINT,
     roughness: 0.72,
@@ -145,22 +248,8 @@ function bristleMaterial(base: number, tip: number, envMap: THREE.Texture) {
     envMapIntensity: 0.06,
   })
   material.onBeforeCompile = (shader) => {
-    Object.assign(shader.uniforms, {
-      uAxis: { value: AXIS },
-      uPerp: { value: PERP },
-      uBase: { value: base },
-      uTip: { value: tip },
-      uDry: { value: new THREE.Color(0x202228) },
-    })
-    shader.vertexShader = shader.vertexShader
-      .replace(
-        "#include <common>",
-        "#include <common>\nuniform vec3 uPerp;\nvarying vec3 vObj;\nvarying vec3 vPerpView;\nvarying float vCap;",
-      )
-      .replace(
-        "#include <begin_vertex>",
-        "#include <begin_vertex>\nvObj = position;\nvPerpView = normalize(normalMatrix * uPerp);\nvCap = abs(normal.z);",
-      )
+    Object.assign(shader.uniforms, uniforms)
+    shader.vertexShader = withVaryings(shader.vertexShader)
     shader.fragmentShader = shader.fragmentShader
       .replace(
         "#include <common>",
@@ -169,46 +258,180 @@ uniform vec3 uAxis;
 uniform vec3 uPerp;
 uniform float uBase;
 uniform float uTip;
-uniform vec3 uDry;
+uniform vec3 uDryBase;
+uniform vec3 uDryRidge;
+uniform vec3 uDrySeam;
+uniform float uDryRough;
+uniform float uDensity;
+uniform float uGroove;
+uniform float uDip;
+uniform float uRim;
 varying vec3 vObj;
+varying vec3 vAxisView;
 varying vec3 vPerpView;
 varying float vCap;
+float across() { return dot(vObj, uPerp); }
+// Fine hair strands inside each bundle.
+float strandPhase() { return across() * uDensity * 2.4; }
 float wetness() {
-  float w = dot(vObj, uPerp);
+  float w = across();
   float u = (dot(vObj, uAxis) - uBase) / (uTip - uBase);
   u += 0.035 * sin(w * 9.0 + 0.6) + 0.02 * sin(w * 23.0);
-  return smoothstep(0.26, 0.5, u);
+  // Each strand's tip carries paint a little higher or lower than its neighbours.
+  float strand = floor(strandPhase() / 6.2831853);
+  u += (fract(sin(strand * 91.7 + 3.1) * 43758.5453) - 0.5) * 0.08;
+  float edge = 1.0 - uDip;
+  return smoothstep(edge - 0.07, edge + 0.07, u);
 }
-// Position across one fiber, -1..1, with slightly uneven fiber widths.
+// Position across one bundle, -1..1, with slightly uneven bundle widths.
 float fiber() {
-  float x = dot(vObj, uPerp) * 7.0;
+  float x = across() * uDensity * 0.18;
   return fract(x + 0.12 * sin(x * 2.1)) * 2.0 - 1.0;
 }
-// The dark seam between neighbouring fibers, antialiased to about a pixel.
+// The dark seam between neighbouring bundles, antialiased to about a pixel.
 float seam(float f) {
-  float w = fwidth(dot(vObj, uPerp)) * 9.0;
-  return smoothstep(0.86 - w, 0.86 + w, abs(f));
+  float w = fwidth(across() * uDensity * 0.18) * 2.0;
+  return smoothstep(0.84 - w, 0.84 + w, abs(f));
+}
+// Fine strands fade out before they would alias.
+float strandDetail() {
+  return 1.0 - smoothstep(0.25, 0.6, fwidth(strandPhase()) / 6.2831853);
 }`,
       )
       .replace(
         "#include <color_fragment>",
         `#include <color_fragment>
+float wet = wetness();
 float fib = fiber();
-diffuseColor.rgb = mix(uDry * (0.7 + 1.0 * (1.0 - fib * fib)), diffuseColor.rgb, wetness());
-diffuseColor.rgb *= 1.0 - 0.5 * vCap * seam(fib);`,
+float bundleSeam = seam(fib) * vCap;
+float ph = strandPhase();
+float hair = (0.5 + 0.5 * sin(ph + 1.7 * sin(ph * 0.155))) * strandDetail();
+float ridge = 1.0 - fib * fib;
+vec3 dry = mix(uDryBase, uDryRidge, clamp(ridge * 0.55 + hair * 0.45, 0.0, 1.0));
+dry *= 1.0 - 0.35 * uGroove * (1.0 - hair) * strandDetail();
+dry = mix(dry, uDrySeam, bundleSeam * uGroove);
+vec3 paint = diffuseColor.rgb * (1.0 - 0.5 * bundleSeam * uGroove) * (1.0 - 0.12 * uGroove * (1.0 - hair));
+diffuseColor.rgb = mix(dry, paint, wet);`,
       )
       .replace(
         "#include <roughnessmap_fragment>",
-        "#include <roughnessmap_fragment>\nroughnessFactor = mix(0.88, roughnessFactor, wetness());",
+        "#include <roughnessmap_fragment>\nroughnessFactor = mix(uDryRough, roughnessFactor, wet);",
       )
       .replace(
         "#include <normal_fragment_maps>",
         `#include <normal_fragment_maps>
-normal = normalize(normal + vPerpView * fiber() * 0.45 * vCap);`,
+normal = normalize(normal + vPerpView * (fib * 0.45 + cos(ph) * 0.18 * strandDetail()) * vCap * uGroove);
+// A grazing rim light picks the dry bristles out of the dark page.
+float rimLight = pow(1.0 - abs(dot(normal, normalize(vViewPosition))), 2.2);
+totalEmissiveRadiance += vec3(0.42, 0.47, 0.58) * rimLight * (0.25 + 0.9 * uRim) * (1.0 - 0.75 * wet) * (0.75 + 0.25 * hair);`,
       )
-      .replace("material.clearcoat = clearcoat;", "material.clearcoat = clearcoat * wetness();")
+      .replace("material.clearcoat = clearcoat;", "material.clearcoat = clearcoat * wet;")
   }
-  return material
+  return { material, uniforms }
+}
+
+// Metal for the handle and ferrule, with five procedural finishes chosen by uPreset.
+function handleMaterial(ferrule: number) {
+  const uniforms = {
+    uAxis: { value: AXIS },
+    uPerp: { value: PERP },
+    uFerrule: { value: ferrule },
+    uPreset: { value: 0 },
+    uGrain: { value: 0.55 },
+    uBevel: { value: 0.45 },
+  }
+  const material = new THREE.MeshPhysicalMaterial({
+    color: FINISHES.brushed.color,
+    metalness: 1,
+    roughness: 0.24,
+    clearcoat: FINISHES.brushed.clearcoat,
+    clearcoatRoughness: FINISHES.brushed.clearcoatRoughness,
+    // ExtrudeGeometry's cap UVs are the outline's x and y, so 45° runs the grain along the handle.
+    anisotropyRotation: Math.PI / 4,
+  })
+  material.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, uniforms)
+    shader.vertexShader = withVaryings(shader.vertexShader)
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        "#include <common>",
+        `#include <common>
+uniform vec3 uAxis;
+uniform vec3 uPerp;
+uniform float uFerrule;
+uniform float uPreset;
+uniform float uGrain;
+uniform float uBevel;
+varying vec3 vObj;
+varying vec3 vAxisView;
+varying vec3 vPerpView;
+varying float vCap;
+${NOISE_GLSL}`,
+      )
+      .replace(
+        "#include <color_fragment>",
+        `#include <color_fragment>
+int preset = int(uPreset + 0.5);
+float hu = dot(vObj, uAxis);
+float hw = dot(vObj, uPerp);
+float slope = 1.0 - vCap;
+// The machined chamfer: the outer part of the rounded edge, not the flat face or the side wall.
+float chamfer = smoothstep(0.08, 0.32, slope) * (1.0 - smoothstep(0.82, 0.98, slope));
+float collar = 1.0 - smoothstep(uFerrule - 0.006, uFerrule + 0.006, hu);
+float hRough = 0.0;
+vec3 hBump = vec3(0.0);
+if (preset == 0 || preset == 3) {
+  // Brushed grain: long streaks along the handle, fine ones fading before they alias.
+  float fineFreq = 520.0;
+  float fade = 1.0 - smoothstep(0.35, 1.0, fwidth(hw) * fineFreq);
+  float fine = mix(0.5, vnoise(vec3(hw * fineFreq, hu * 5.0, 1.3)), fade);
+  float coarse = vnoise(vec3(hw * 140.0, hu * 1.5, 7.1));
+  float g = (fine * 0.6 + coarse * 0.4 - 0.5) * uGrain * (preset == 3 ? 0.5 : 1.0);
+  diffuseColor.rgb *= 1.0 + g * 0.45;
+  hRough += g * 0.22;
+  hBump += vPerpView * g * 0.35;
+} else if (preset == 1) {
+  float g = (vnoise(vObj * 60.0) - 0.5) * uGrain;
+  diffuseColor.rgb *= 1.0 + g * 0.1;
+  hRough += g * 0.05;
+} else if (preset == 2) {
+  // Bead-blasted: isotropic micro-grain.
+  float fade = 1.0 - smoothstep(0.35, 1.0, fwidth(hw) * 360.0);
+  float n1 = mix(0.5, vnoise(vObj * 360.0), fade);
+  float n2 = mix(0.5, vnoise(vObj * 360.0 + 17.0), fade);
+  float n3 = vnoise(vObj * 80.0 + 5.0);
+  float g = (n1 * 0.65 + n3 * 0.35 - 0.5) * uGrain;
+  diffuseColor.rgb *= 1.0 + g * 0.3;
+  hRough += g * 0.3;
+  hBump += (vPerpView * (n1 - 0.5) + vAxisView * (n2 - 0.5)) * 0.22 * uGrain;
+} else {
+  // CNC ribs along the shaft, with a polished collar on the ferrule.
+  float shaft = 1.0 - collar;
+  float phase = hu * 9.0 * 6.2831853;
+  float aa = 1.0 - smoothstep(0.25, 0.6, fwidth(hu * 9.0));
+  float rib = smoothstep(-0.35, 0.55, sin(phase));
+  diffuseColor.rgb *= 1.0 - 0.5 * (1.0 - rib) * shaft * uGrain * aa;
+  hBump += vAxisView * cos(phase) * 0.6 * shaft * uGrain * aa;
+  hRough += mix(0.0, -0.18, collar) + (1.0 - rib) * 0.15 * shaft * uGrain;
+  float line = 1.0 - smoothstep(0.0, 0.012, abs(hu - uFerrule));
+  diffuseColor.rgb *= 1.0 - 0.7 * line;
+}
+// Anodizing is cut through to bright aluminium on the chamfers; other finishes just catch a rim.
+vec3 silver = vec3(0.86, 0.88, 0.92);
+float cut = chamfer * uBevel * (preset == 3 ? 1.0 : 0.55);
+diffuseColor.rgb = mix(diffuseColor.rgb, silver, cut);
+hRough -= cut * 0.25;`,
+      )
+      .replace(
+        "#include <roughnessmap_fragment>",
+        "#include <roughnessmap_fragment>\nroughnessFactor = clamp(roughnessFactor + hRough, 0.02, 1.0);",
+      )
+      .replace(
+        "#include <normal_fragment_maps>",
+        "#include <normal_fragment_maps>\nnormal = normalize(normal + hBump);",
+      )
+  }
+  return { material, uniforms }
 }
 
 // A tapering ribbon of paint left behind the bristle tip, facing the camera.
@@ -355,7 +578,11 @@ const glowStyle: CSSProperties = {
   pointerEvents: "none",
 }
 
+const useBrushControls = () => useSyncExternalStore(brushControls.subscribe, brushControls.get, brushControls.getServerSnapshot)
+
 export function Brush3D() {
+  const values = useBrushControls()
+  const applyRef = useRef<(values: BrushValues) => void>(null)
   const hostRef = useRef<HTMLDivElement>(null)
   const flatRef = useRef<HTMLDivElement>(null)
   const liveRef = useRef<HTMLDivElement>(null)
@@ -402,15 +629,9 @@ export function Brush3D() {
     const fill = new THREE.AmbientLight(0xffffff, 0.9)
     scene.add(key, rim, fill)
 
-    const { handle, bristles, base, tip, brushTip } = buildBrush()
-    const metal = new THREE.MeshPhysicalMaterial({
-      color: 0xe4e7ee,
-      metalness: 1,
-      roughness: 0.14,
-      clearcoat: 0.8,
-      clearcoatRoughness: 0.08,
-    })
-    const paint = bristleMaterial(base, tip, envMap)
+    const { handle, bristles, base, tip, ferrule, brushTip } = buildBrush()
+    const { material: metal, uniforms: metalUniforms } = handleMaterial(ferrule)
+    const { material: paint, uniforms: paintUniforms } = bristleMaterial(base, tip, envMap)
 
     // root (idle drift, hop) → pivot (swish about the wrist) → spin (twirl about the handle)
     const root = new THREE.Group()
@@ -488,13 +709,43 @@ export function Brush3D() {
     }
     resize()
     const ro = new ResizeObserver(resize)
+    let pixelScale = 1
+
+    applyRef.current = (v) => {
+      const finish = FINISHES[v.handle]
+      metal.color.setHex(finish.color)
+      metal.roughness = v.handleRough
+      metal.clearcoat = finish.clearcoat
+      metal.clearcoatRoughness = finish.clearcoatRoughness
+      metal.anisotropy = v.handle === "brushed" ? 0.6 * v.grain : 0
+      metalUniforms.uPreset.value = finish.index
+      metalUniforms.uGrain.value = v.grain
+      metalUniforms.uBevel.value = v.chamfer
+      const lift = v.dryLift / DRY_LIFT
+      paintUniforms.uDryBase.value.copy(DRY_BASE).multiplyScalar(lift)
+      paintUniforms.uDryRidge.value.copy(DRY_RIDGE).multiplyScalar(lift)
+      paintUniforms.uRim.value = v.dryLift
+      paintUniforms.uDensity.value = v.strands
+      paintUniforms.uGroove.value = v.groove
+      paintUniforms.uDryRough.value = Math.min(0.95, v.bristleRough + 0.14)
+      paintUniforms.uDip.value = v.dip
+      paint.roughness = v.bristleRough
+      // The host is scaled with CSS; render at the matching resolution so it stays crisp.
+      if (v.scale !== pixelScale) {
+        pixelScale = v.scale
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 3) * pixelScale)
+        resize()
+      }
+    }
+    applyRef.current(brushControls.get())
     ro.observe(host)
 
     const frame = (now: number) => {
       const dt = Math.min(0.05, (now - last) / 1000)
       last = now
 
-      if (!reduce && !drag.active && now >= nextFlick) {
+      const pose = brushControls.get()
+      if (!reduce && pose.autoFlick && !drag.active && now >= nextFlick) {
         flick(now)
         nextFlick = now + FLICK_EVERY
       }
@@ -533,13 +784,13 @@ export function Brush3D() {
       }
 
       const s = now / 1000
-      const idle = reduce ? 0 : 1
+      const idle = reduce || !pose.autoFlick ? 0 : 1
       root.position.y = settle * idle * Math.sin(s * 1.25) * 0.06 + hop
       root.rotation.x = settle * (-0.2 + idle * Math.sin(s * 0.7) * 0.08)
-      root.rotation.y = settle * (0.24 + idle * Math.sin(s * 0.55 + 1) * 0.12)
+      root.rotation.y = settle * (0.24 + idle * Math.sin(s * 0.55 + 1) * 0.12) + pose.tilt * DEG
       root.rotation.z = settle * idle * Math.sin(s * 0.9) * 0.03
       pivot.rotation.z = swing
-      spin.quaternion.setFromAxisAngle(AXIS, roll)
+      spin.quaternion.setFromAxisAngle(AXIS, roll + pose.twirl * DEG)
       scene.updateMatrixWorld()
 
       tipNow.copy(brushTip).applyMatrix4(spin.matrixWorld)
@@ -630,6 +881,7 @@ export function Brush3D() {
     canvas.addEventListener("pointercancel", onUp)
 
     return () => {
+      applyRef.current = null
       cancelAnimationFrame(raf)
       clearTimeout(revealTimer)
       visible = false
@@ -653,10 +905,29 @@ export function Brush3D() {
     }
   }, [])
 
+  useEffect(() => applyRef.current?.(values), [values])
+
+  useEffect(() => {
+    const host = hostRef.current
+    if (!host || !brushControls.enabled) return
+    const detach = brushControls.attach(host)
+    let detachSwitcher: (() => void) | undefined
+    let disposed = false
+    if (import.meta.env.DEV)
+      void import("knobs/panel").then(({ attachVariantSwitcher }) => {
+        if (!disposed) detachSwitcher = attachVariantSwitcher(host, brushControls)
+      })
+    return () => {
+      disposed = true
+      detach()
+      detachSwitcher?.()
+    }
+  }, [failed])
+
   if (failed) return <BrushFallback />
 
   return (
-    <div ref={hostRef} style={hostStyle} role="img" aria-label="Scrawl">
+    <div ref={hostRef} style={values.scale === 1 ? hostStyle : { ...hostStyle, transform: `scale(${values.scale})` }} role="img" aria-label="Scrawl">
       <div ref={flatRef} style={flatStyle}>
         <BrushIcon />
       </div>
