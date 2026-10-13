@@ -2,15 +2,35 @@ import { useEffect, useRef, useState, type CSSProperties } from "react"
 import * as THREE from "three"
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js"
 import { toCreasedNormals } from "three/examples/jsm/utils/BufferGeometryUtils.js"
-import { BRISTLES, HANDLE, type Outline } from "./brush-paths"
+import {
+  BRISTLE_SLAB,
+  BRISTLES,
+  BRUSH,
+  BRUSH_BOX,
+  BrushFallback,
+  BrushIcon,
+  fillet,
+  HANDLE,
+  HANDLE_SLAB,
+  TAPER,
+  toLocal,
+  VIEW,
+  type Outline,
+} from "./brush-paths"
+
+export { BrushFallback }
 
 const TAU = Math.PI * 2
 const AXIS = new THREE.Vector3(1, 1, 0).normalize()
 const PERP = new THREE.Vector3(-1, 1, 0).normalize()
 const PAINT = 0xff3b30
-const WIDTH = 184
-const HEIGHT = 132
 const FLICK_EVERY = 5000
+// After the first frame, hold the flat icon for a beat, then blur-crossfade it into the live brush.
+const REVEAL_DELAY = 180
+const REVEAL_MS = 650
+const REVEAL_EASE = "cubic-bezier(0.22, 1, 0.36, 1)"
+const SETTLE_K = 38
+const SETTLE_C = 2 * Math.sqrt(SETTLE_K) * 0.5
 const ROLL_K = 46
 const ROLL_C = 2 * Math.sqrt(ROLL_K) * 0.58
 const SWING_K = 70
@@ -23,46 +43,12 @@ const DROPS = 12
 // The middle of the bristle tip, in icon pixels, where the paint trail leaves the brush.
 const TIP: [number, number] = [336, 771]
 
-const toLocal = ([x, y]: readonly [number, number]) => new THREE.Vector2(x - 512, 512 - y)
-
-// Fillet every corner with a true circular arc so bevels and normals stay crease-free. Straight runs
-// stay single segments: ExtrudeGeometry reuses the outline's triangulation for the inset caps, and
-// collinear points there become slivers that fold out through the bevel. (A quadratic fillet is also
-// much tighter than its nominal radius at the apex, which folds the inset bevel the same way.)
-function rounded(outline: Outline, radius: number) {
-  const pts = outline.map(toLocal)
-  const n = pts.length
-  const corners = pts.map((p, i) => {
-    const da = pts[(i + n - 1) % n].clone().sub(p)
-    const db = pts[(i + 1) % n].clone().sub(p)
-    const la = da.length()
-    const lb = db.length()
-    da.divideScalar(la)
-    db.divideScalar(lb)
-    const half = Math.acos(THREE.MathUtils.clamp(da.dot(db), -1, 1)) / 2
-    const d = Math.min(radius / Math.tan(half), la * 0.45, lb * 0.45)
-    const r = d * Math.tan(half)
-    const center = p.clone().addScaledVector(da.clone().add(db).normalize(), r / Math.sin(half))
-    const a = p.clone().addScaledVector(da, d)
-    const b = p.clone().addScaledVector(db, d)
-    return { a, b, center, r, sweep: Math.PI - 2 * half, turn: Math.sign(da.cross(db)) }
-  })
-  const out: THREE.Vector2[] = []
-  corners.forEach((c) => {
-    const start = Math.atan2(c.a.y - c.center.y, c.a.x - c.center.x)
-    const arc = Math.max(2, Math.ceil(c.sweep / (Math.PI / 24)))
-    for (let s = 0; s <= arc; s++) {
-      const angle = start - c.turn * c.sweep * (s / arc)
-      out.push(new THREE.Vector2(c.center.x + Math.cos(angle) * c.r, c.center.y + Math.sin(angle) * c.r))
-    }
-  })
-  return new THREE.Shape(out)
-}
+const shape = (outline: Outline, radius: number) => new THREE.Shape(fillet(outline, radius).map(([x, y]) => new THREE.Vector2(x, y)))
 
 function slab(outline: Outline, radius: number, depth: number, bevel: number) {
   // A negative offset keeps the side walls on the outline and rounds the caps inward.
   const inset = bevel * 0.8
-  const geometry = new THREE.ExtrudeGeometry(rounded(outline, radius), {
+  const geometry = new THREE.ExtrudeGeometry(shape(outline, radius), {
     depth,
     steps: 1,
     curveSegments: 1,
@@ -76,61 +62,34 @@ function slab(outline: Outline, radius: number, depth: number, bevel: number) {
   return geometry
 }
 
-const HANDLE_SLAB = { radius: 20, depth: 34, bevel: 15 }
-const BRISTLE_SLAB = { radius: 16, depth: 30, bevel: 14 }
-
 function buildBrush() {
   const handle = slab(HANDLE, HANDLE_SLAB.radius, HANDLE_SLAB.depth, HANDLE_SLAB.bevel)
   const bristles = slab(BRISTLES, BRISTLE_SLAB.radius, BRISTLE_SLAB.depth, BRISTLE_SLAB.bevel)
-
-  const [uMin, uMax] = [span(handle, AXIS), span(bristles, AXIS)].reduce((a, b) => [Math.min(a[0], b[0]), Math.max(a[1], b[1])])
-  const [wMin, wMax] = span(handle, PERP)
-  const scale = 2.15 / ((uMax - uMin) / 2)
+  const { scale, tip, base } = BRUSH
   const handleZ = depths(handle)
   const bristleZ = depths(bristles)
 
-  // The bristles thin toward the tip like a real flat brush.
-  const taper = 0.4
-  const [tip, base] = span(bristles, AXIS)
-  const [bwMin, bwMax] = span(bristles, PERP)
   const pos = bristles.getAttribute("position")
   const v = new THREE.Vector3()
   for (let i = 0; i < pos.count; i++) {
     v.fromBufferAttribute(pos, i)
-    pos.setZ(i, v.z * (1 - (taper * (base - v.dot(AXIS))) / (base - tip)))
+    pos.setZ(i, v.z * (1 - (TAPER * (base - v.dot(AXIS))) / (base - tip)))
   }
-  const slope = ((BRISTLE_SLAB.depth / 2 + BRISTLE_SLAB.bevel) * taper) / (base - tip)
+  const slope = ((BRISTLE_SLAB.depth / 2 + BRISTLE_SLAB.bevel) * TAPER) / (base - tip)
 
   // Normals are welded by position hash, so build them at icon scale where vertices are well apart.
   toCreasedNormals(handle, Math.PI / 3)
   toCreasedNormals(bristles, Math.PI / 3)
-  roundEdges(handle, handleZ, HANDLE_SLAB, 0, (wMin + wMax) / 2, 0.5 * scale)
-  roundEdges(bristles, bristleZ, BRISTLE_SLAB, slope, (bwMin + bwMax) / 2, 0.35 * scale)
+  roundEdges(handle, handleZ, HANDLE_SLAB, 0, BRUSH.handleMid, 0.5 * scale)
+  roundEdges(bristles, bristleZ, BRISTLE_SLAB, slope, BRUSH.bristleMid, 0.35 * scale)
 
-  // Center on the handle's centerline so a roll about AXIS twirls the brush in place.
-  const center = AXIS.clone()
-    .multiplyScalar((uMin + uMax) / 2)
-    .addScaledVector(PERP, (wMin + wMax) / 2)
+  const center = new THREE.Vector3(...BRUSH.center, 0)
   for (const g of [handle, bristles]) {
     g.translate(-center.x, -center.y, 0)
     g.scale(scale, scale, scale)
   }
-  const l = toLocal(TIP)
-  const brushTip = new THREE.Vector3(l.x, l.y, 0).sub(center).multiplyScalar(scale)
+  const brushTip = new THREE.Vector3(...toLocal(TIP), 0).sub(center).multiplyScalar(scale)
   return { handle, bristles, base: (base - center.dot(AXIS)) * scale, tip: (tip - center.dot(AXIS)) * scale, brushTip }
-}
-
-function span(g: THREE.BufferGeometry, along: THREE.Vector3) {
-  const pos = g.getAttribute("position")
-  const v = new THREE.Vector3()
-  let min = Infinity
-  let max = -Infinity
-  for (let i = 0; i < pos.count; i++) {
-    const u = v.fromBufferAttribute(pos, i).dot(along)
-    min = Math.min(min, u)
-    max = Math.max(max, u)
-  }
-  return [min, max]
 }
 
 const depths = (g: THREE.BufferGeometry) => Float32Array.from(g.getAttribute("position").array.filter((_, i) => i % 3 === 2))
@@ -170,15 +129,20 @@ function roundEdges(
   }
 }
 
-// Charcoal bristles near the ferrule, dipped in wet red paint toward the tip, with fine grooves.
-function bristleMaterial(base: number, tip: number) {
+// Charcoal bristles near the ferrule, dipped in rich red paint toward the tip, with fine grooves.
+// Matte satin throughout: the environment is bound explicitly because three ignores a material's
+// envMapIntensity when it falls back to scene.environment, and that full-strength studio reflection
+// is what washed the bristles out into white plastic.
+function bristleMaterial(base: number, tip: number, envMap: THREE.Texture) {
   const material = new THREE.MeshPhysicalMaterial({
     color: PAINT,
-    roughness: 0.3,
+    roughness: 0.72,
     metalness: 0,
-    clearcoat: 0.6,
-    clearcoatRoughness: 0.06,
-    envMapIntensity: 0.4,
+    specularIntensity: 0.35,
+    clearcoat: 0.03,
+    clearcoatRoughness: 0.6,
+    envMap,
+    envMapIntensity: 0.06,
   })
   material.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, {
@@ -186,7 +150,7 @@ function bristleMaterial(base: number, tip: number) {
       uPerp: { value: PERP },
       uBase: { value: base },
       uTip: { value: tip },
-      uDry: { value: new THREE.Color(0x2c2f36) },
+      uDry: { value: new THREE.Color(0x202228) },
     })
     shader.vertexShader = shader.vertexShader
       .replace(
@@ -214,26 +178,33 @@ float wetness() {
   float u = (dot(vObj, uAxis) - uBase) / (uTip - uBase);
   u += 0.035 * sin(w * 9.0 + 0.6) + 0.02 * sin(w * 23.0);
   return smoothstep(0.26, 0.5, u);
+}
+// Position across one fiber, -1..1, with slightly uneven fiber widths.
+float fiber() {
+  float x = dot(vObj, uPerp) * 7.0;
+  return fract(x + 0.12 * sin(x * 2.1)) * 2.0 - 1.0;
+}
+// The dark seam between neighbouring fibers, antialiased to about a pixel.
+float seam(float f) {
+  float w = fwidth(dot(vObj, uPerp)) * 9.0;
+  return smoothstep(0.86 - w, 0.86 + w, abs(f));
 }`,
       )
       .replace(
         "#include <color_fragment>",
-        "#include <color_fragment>\ndiffuseColor.rgb = mix(uDry, diffuseColor.rgb, wetness());",
+        `#include <color_fragment>
+float fib = fiber();
+diffuseColor.rgb = mix(uDry * (0.7 + 1.0 * (1.0 - fib * fib)), diffuseColor.rgb, wetness());
+diffuseColor.rgb *= 1.0 - 0.5 * vCap * seam(fib);`,
       )
       .replace(
         "#include <roughnessmap_fragment>",
-        "#include <roughnessmap_fragment>\nroughnessFactor = mix(0.5, roughnessFactor, wetness());",
-      )
-      .replace(
-        "#include <metalnessmap_fragment>",
-        "#include <metalnessmap_fragment>\nmetalnessFactor = mix(0.55, metalnessFactor, wetness());",
+        "#include <roughnessmap_fragment>\nroughnessFactor = mix(0.88, roughnessFactor, wetness());",
       )
       .replace(
         "#include <normal_fragment_maps>",
         `#include <normal_fragment_maps>
-float groove = dot(vObj, uPerp) * 34.0;
-float g = sin(groove) * 0.7 + sin(groove * 2.3 + 1.7) * 0.3;
-normal = normalize(normal + vPerpView * g * 0.32 * vCap * (1.0 - 0.7 * wetness()));`,
+normal = normalize(normal + vPerpView * fiber() * 0.45 * vCap);`,
       )
       .replace("material.clearcoat = clearcoat;", "material.clearcoat = clearcoat * wetness();")
   }
@@ -346,14 +317,29 @@ function droplets() {
 }
 
 const hostStyle: CSSProperties = {
-  position: "relative",
-  width: WIDTH,
-  height: HEIGHT,
-  margin: "-26px 0 -18px",
+  ...BRUSH_BOX,
   cursor: "grab",
   touchAction: "none",
   userSelect: "none",
   WebkitUserSelect: "none",
+}
+
+const fade = ["opacity", "filter", "transform"].map((p) => `${p} ${REVEAL_MS}ms ${REVEAL_EASE}`).join(", ")
+
+const flatStyle: CSSProperties = {
+  position: "absolute",
+  inset: 0,
+  pointerEvents: "none",
+  transition: fade,
+}
+
+const liveStyle: CSSProperties = {
+  position: "absolute",
+  inset: 0,
+  opacity: 0,
+  filter: "blur(10px)",
+  transform: "scale(0.96)",
+  transition: fade,
 }
 
 const glowStyle: CSSProperties = {
@@ -371,12 +357,16 @@ const glowStyle: CSSProperties = {
 
 export function Brush3D() {
   const hostRef = useRef<HTMLDivElement>(null)
+  const flatRef = useRef<HTMLDivElement>(null)
+  const liveRef = useRef<HTMLDivElement>(null)
   const glowRef = useRef<HTMLDivElement>(null)
   const [failed, setFailed] = useState(false)
 
   useEffect(() => {
     const host = hostRef.current
-    if (!host) return
+    const flat = flatRef.current
+    const live = liveRef.current
+    if (!host || !flat || !live) return
 
     let renderer: THREE.WebGLRenderer
     try {
@@ -390,16 +380,8 @@ export function Brush3D() {
     renderer.toneMappingExposure = 1.05
     renderer.setClearColor(0x000000, 0)
     const canvas = renderer.domElement
-    Object.assign(canvas.style, {
-      position: "absolute",
-      inset: "0",
-      width: "100%",
-      height: "100%",
-      opacity: "0",
-      transform: "scale(0.92)",
-      transition: "opacity 0.5s ease, transform 0.7s cubic-bezier(0.2, 0.9, 0.3, 1.2)",
-    })
-    host.appendChild(canvas)
+    Object.assign(canvas.style, { position: "absolute", inset: "0", width: "100%", height: "100%" })
+    live.appendChild(canvas)
 
     const scene = new THREE.Scene()
     const pmrem = new THREE.PMREMGenerator(renderer)
@@ -409,14 +391,16 @@ export function Brush3D() {
     scene.environment = envMap
     scene.environmentIntensity = 1.1
 
-    const camera = new THREE.PerspectiveCamera(34, WIDTH / HEIGHT, 0.1, 100)
-    camera.position.set(0, 0, 10)
+    const camera = new THREE.PerspectiveCamera(VIEW.fov, VIEW.width / VIEW.height, 0.1, 100)
+    camera.position.set(0, 0, VIEW.distance)
 
     const key = new THREE.DirectionalLight(0xffffff, 1.1)
     key.position.set(-4, 6, 6)
     const rim = new THREE.DirectionalLight(0xff8a80, 1.2)
     rim.position.set(5, -3, -4)
-    scene.add(key, rim)
+    // The metal handle reflects the room; the matte bristles take their fill from here instead.
+    const fill = new THREE.AmbientLight(0xffffff, 0.9)
+    scene.add(key, rim, fill)
 
     const { handle, bristles, base, tip, brushTip } = buildBrush()
     const metal = new THREE.MeshPhysicalMaterial({
@@ -426,7 +410,7 @@ export function Brush3D() {
       clearcoat: 0.8,
       clearcoatRoughness: 0.08,
     })
-    const paint = bristleMaterial(base, tip)
+    const paint = bristleMaterial(base, tip, envMap)
 
     // root (idle drift, hop) → pivot (swish about the wrist) → spin (twirl about the handle)
     const root = new THREE.Group()
@@ -456,7 +440,12 @@ export function Brush3D() {
     let hop = 0
     let hopVel = 0
     let release = 0
-    let nextFlick = performance.now() + 1200
+    let nextFlick = Infinity
+    // The brush starts face-on, exactly under the flat icon, and settles into its tilt as it reveals.
+    let settle = 0
+    let settleVel = 0
+    let settleTarget = 0
+    let revealTimer = 0
     let visible = true
     let raf = 0
     let last = performance.now()
@@ -476,8 +465,22 @@ export function Brush3D() {
       release = now + (windup ? 190 : 0)
     }
 
+    const reveal = () => {
+      Object.assign(flat.style, { opacity: "0", filter: "blur(10px)", transform: "scale(1.03)" })
+      Object.assign(live.style, { opacity: "1", filter: "blur(0px)", transform: "none" })
+      settleTarget = 1
+      if (reduce) settle = 1
+      else rollVel = 3.6
+      nextFlick = performance.now() + 2600
+    }
+    const revealed = (e: TransitionEvent) => {
+      if (e.target === live && e.propertyName === "filter") live.style.filter = "none"
+    }
+    live.addEventListener("transitionend", revealed)
+
     const resize = () => {
-      const { width, height } = host.getBoundingClientRect()
+      const width = host.clientWidth
+      const height = host.clientHeight
       if (!width || !height) return
       renderer.setSize(width, height, false)
       camera.aspect = width / height
@@ -511,6 +514,8 @@ export function Brush3D() {
           rollVel += (ROLL_K * (rollTarget - roll) - ROLL_C * rollVel) * h
           roll += rollVel * h
         }
+        settleVel += (SETTLE_K * (settleTarget - settle) - SETTLE_C * settleVel) * h
+        settle += settleVel * h
         swingVel += (SWING_K * (swingTarget - swing) - SWING_C * swingVel) * h
         swing += swingVel * h
         hopVel -= GRAVITY * h
@@ -529,10 +534,10 @@ export function Brush3D() {
 
       const s = now / 1000
       const idle = reduce ? 0 : 1
-      root.position.y = idle * Math.sin(s * 1.25) * 0.06 + hop
-      root.rotation.x = -0.2 + idle * Math.sin(s * 0.7) * 0.08
-      root.rotation.y = 0.24 + idle * Math.sin(s * 0.55 + 1) * 0.12
-      root.rotation.z = idle * Math.sin(s * 0.9) * 0.03
+      root.position.y = settle * idle * Math.sin(s * 1.25) * 0.06 + hop
+      root.rotation.x = settle * (-0.2 + idle * Math.sin(s * 0.7) * 0.08)
+      root.rotation.y = settle * (0.24 + idle * Math.sin(s * 0.55 + 1) * 0.12)
+      root.rotation.z = settle * idle * Math.sin(s * 0.9) * 0.03
       pivot.rotation.z = swing
       spin.quaternion.setFromAxisAngle(AXIS, roll)
       scene.updateMatrixWorld()
@@ -561,8 +566,7 @@ export function Brush3D() {
       renderer.render(scene, camera)
       if (firstFrame) {
         firstFrame = false
-        canvas.style.opacity = "1"
-        canvas.style.transform = "none"
+        revealTimer = window.setTimeout(reveal, REVEAL_DELAY)
       }
       if (visible) raf = requestAnimationFrame(frame)
     }
@@ -627,7 +631,9 @@ export function Brush3D() {
 
     return () => {
       cancelAnimationFrame(raf)
+      clearTimeout(revealTimer)
       visible = false
+      live.removeEventListener("transitionend", revealed)
       ro.disconnect()
       io.disconnect()
       canvas.removeEventListener("pointerdown", onDown)
@@ -647,16 +653,16 @@ export function Brush3D() {
     }
   }, [])
 
-  if (failed)
-    return (
-      <div style={{ ...hostStyle, display: "grid", placeItems: "center", cursor: "default" }}>
-        <img src="/app-icon.png" alt="Scrawl" width={76} height={76} />
-      </div>
-    )
+  if (failed) return <BrushFallback />
 
   return (
     <div ref={hostRef} style={hostStyle} role="img" aria-label="Scrawl">
-      <div ref={glowRef} style={glowStyle} />
+      <div ref={flatRef} style={flatStyle}>
+        <BrushIcon />
+      </div>
+      <div ref={liveRef} style={liveStyle}>
+        <div ref={glowRef} style={glowStyle} />
+      </div>
     </div>
   )
 }

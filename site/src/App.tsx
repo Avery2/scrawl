@@ -1,5 +1,6 @@
 import { lazy, Suspense } from "react"
 import { BundleExplorer } from "./Bundle"
+import { BrushFallback } from "./brush-paths"
 import { Copy } from "./Copy"
 import { Demo } from "./demo/Demo"
 
@@ -60,21 +61,7 @@ export function App() {
 
       <main>
         <section className="hero">
-          <Suspense
-            fallback={
-              <div
-                style={{
-                  width: 184,
-                  height: 132,
-                  margin: "-26px auto -18px",
-                  display: "grid",
-                  placeItems: "center",
-                }}
-              >
-                <img className="hero-icon" src="/app-icon.png" alt="Scrawl" />
-              </div>
-            }
-          >
+          <Suspense fallback={<BrushFallback />}>
             <Brush3D />
           </Suspense>
           <h1>Show an agent the problem.</h1>

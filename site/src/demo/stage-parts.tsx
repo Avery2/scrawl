@@ -1,7 +1,9 @@
 import {
   AGENT,
   AREA,
+  CLAUSE_2,
   clock,
+  easeInOut,
   easeOut,
   easeOutBack,
   type Mode,
@@ -9,10 +11,10 @@ import {
   PILL,
   pillState,
   pillWidth,
+  lerp,
   progress,
   type Rect,
   type Script,
-  SPEECH_END,
   STAGE,
   strokeAt,
   T,
@@ -20,7 +22,7 @@ import {
   type Cursor as CursorState,
   MAC_WINDOW,
 } from "./script"
-import { InkPath, inkPath, PinMark } from "./ink"
+import { INK_SHADOW, InkPath, inkPath, PinMark } from "./ink"
 import { MacWindow, PhoneMirror } from "./apps"
 
 const pressedAt = (t: number, at: number) => t >= at - 60 && t < at + 160
@@ -232,10 +234,10 @@ export function Ink({ t, script }: { t: number; script: Script }) {
   const fade = 1 - progress(t, T.finish, T.finish + 280)
   if (fade <= 0) return null
   return (
-    <svg className="ink" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`} style={{ opacity: fade }}>
+    <svg className="ink" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`} style={{ opacity: fade, ...INK_SHADOW }}>
       {script.strokes.map((s) => {
         const live = strokeAt(s, t)
-        return live ? <InkPath key={s.id} d={inkPath(live.points, live.done)} /> : null
+        return live ? <InkPath key={s.id} d={inkPath(live.points)} /> : null
       })}
       {script.pins.map((p) =>
         t >= p.t ? <PinMark key={p.n} n={p.n} at={p.at} scale={Math.max(0, easeOutBack(progress(t, p.t, p.t + 260)))} /> : null,
@@ -317,15 +319,25 @@ export function Keys({ t, mode }: { t: number; mode: Mode }) {
   return null
 }
 
-export function Caption({ t, mode }: { t: number; mode: Mode }) {
-  if (t < WORDS[0][1] - 300 || t > T.finish + 400) return null
-  const opacity = Math.min(progress(t, WORDS[0][1] - 300, WORDS[0][1]), 1 - progress(t, T.finish, T.finish + 400))
-  const spoken = WORDS.filter(([, at]) => at <= t)
-  const last = spoken.length - 1
-  const talking = t < SPEECH_END && last >= 0 && t - spoken[last][1] < 500
-  const cx = mode === "mac" ? MAC_WINDOW.x + MAC_WINDOW.w / 2 : PHONE.x + PHONE.w / 2
+// The spoken words follow the pen: each clause's pill sits beside the mark it describes.
+export function Caption({ t, script }: { t: number; script: Script }) {
+  const first = WORDS[0][1]
+  if (t < first - 300 || t > T.finish + 400) return null
+  const swap = WORDS[CLAUSE_2][1] - 20
+  const second = t >= swap
+  const words = second ? WORDS.slice(CLAUSE_2) : WORDS.slice(0, CLAUSE_2)
+  const opacity = Math.min(
+    progress(t, first - 300, first),
+    1 - progress(t, T.finish, T.finish + 400),
+    second ? 0.25 + 0.75 * progress(t, swap, swap + 140) : 1 - 0.75 * progress(t, swap - 140, swap),
+  )
+  const glide = easeInOut(progress(t, swap - 100, swap + 520))
+  const [a, b] = script.speech
+  const pos = (i: 0 | 1) => lerp(a[i], b[i], glide)
+  const now = words.findIndex(([, at, end]) => t >= at && t < end + 120)
+  const talking = now >= 0
   return (
-    <div className="caption" style={{ left: cx, top: mode === "mac" ? 642 : 646, opacity }}>
+    <div className="caption" style={{ left: pos(0), top: pos(1), opacity }}>
       <span className="wave">
         {[0, 1, 2, 3, 4].map((i) => {
           const amp = talking ? 0.35 + 0.65 * Math.abs(Math.sin(t / (90 + i * 23) + i * 1.7)) : 0.16
@@ -333,9 +345,9 @@ export function Caption({ t, mode }: { t: number; mode: Mode }) {
         })}
       </span>
       <p>
-        {WORDS.map(([w, at], i) => (
-          <span key={i} className={at > t ? "w pending" : i === last && talking ? "w now" : "w said"}>
-            {w}{" "}
+        {words.map(([w, at], i) => (
+          <span key={i} className={at > t ? "w pending" : i === now ? "w now" : "w said"}>
+            {w.replace("—", "\u2060—\u2060")}{" "}
           </span>
         ))}
       </p>
@@ -350,11 +362,11 @@ export function KeyframeScene({ mode, script, frame, scale }: { mode: Mode; scri
   return (
     <div className="sheet-scene wallpaper" style={{ width: STAGE.w, height: STAGE.h, transform: `scale(${scale}) translate(${-area.x}px, ${-area.y}px)` }}>
       {mode === "mac" ? <MacWindow fix={0} settle={0} /> : <PhoneMirror fix={0} settle={0} />}
-      <svg className="ink" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`}>
+      <svg className="ink" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`} style={INK_SHADOW}>
         {script.strokes
           .filter((st) => frame.strokes.includes(st.id))
           .map((st) => (
-            <InkPath key={st.id} d={inkPath(st.points, true, 10)} />
+            <InkPath key={st.id} d={inkPath(st.points, 10)} />
           ))}
         {script.pins
           .filter((p) => frame.pins.includes(p.n))

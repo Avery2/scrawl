@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { MacWindow, PhoneMirror } from "./apps"
-import { InkPath, inkPath } from "./ink"
+import { INK_SHADOW, InkPath, inkPath } from "./ink"
 import { measureAnchors, sameAnchors } from "./measure"
-import { AGENT, type Anchors, BEATS, buildScript, cursorAt, type Mode, STAGE, T } from "./script"
+import { AGENT, type Anchors, AUDIO_START, BEATS, buildScript, cursorAt, type Mode, SPEECH_END, SPEECH_START, STAGE, T } from "./script"
 import { Caption, Cursor, fixAmount, Island, Ink, Keys, MenuBar, phoneLive, Ripples, Selection, terminalActive } from "./stage-parts"
 import { Terminal } from "./terminal"
 
 type UserStroke = { points: [number, number, number][]; done: boolean }
 
-function usePlayback(duration: number) {
+// `clock` can report an authoritative time (the narration while it plays); otherwise frames advance t.
+function usePlayback(duration: number, clock: React.RefObject<() => number | null>) {
   const [t, setT] = useState(0)
   const [playing, setPlaying] = useState(false)
   const tRef = useRef(0)
@@ -18,7 +19,8 @@ function usePlayback(duration: number) {
     let raf = 0
     let last = performance.now()
     const tick = (now: number) => {
-      const next = Math.min(duration, tRef.current + Math.min(64, now - last))
+      const master = clock.current()
+      const next = Math.min(duration, master !== null ? Math.max(tRef.current, master) : tRef.current + Math.min(64, now - last))
       last = now
       tRef.current = next
       setT(next)
@@ -27,7 +29,7 @@ function usePlayback(duration: number) {
     }
     raf = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(raf)
-  }, [playing, duration])
+  }, [playing, duration, clock])
 
   const seek = useCallback((v: number) => {
     tRef.current = Math.max(0, Math.min(duration, v))
@@ -42,6 +44,64 @@ function usePlayback(duration: number) {
   return { t, playing, setPlaying, seek, play }
 }
 
+// Plays Kit's narration inside the speech window. While it plays it drives the demo clock, so
+// dropped frames can't pull the words, ink, and voice apart.
+function useNarration(t: number, playing: boolean, sound: boolean, clock: React.RefObject<() => number | null>) {
+  const audioRef = useRef<HTMLAudioElement>(null)
+  const wanted = useRef(false)
+  const live = useRef(false)
+
+  useEffect(() => {
+    const a = audioRef.current
+    if (!a) return
+    const on = () => (live.current = true)
+    const off = () => (live.current = false)
+    for (const e of ["playing", "seeked"]) a.addEventListener(e, on)
+    for (const e of ["pause", "waiting", "seeking", "ended"]) a.addEventListener(e, off)
+    clock.current = () => (live.current && wanted.current && !a.paused ? SPEECH_START + a.currentTime * 1000 : null)
+    return () => {
+      for (const e of ["playing", "seeked"]) a.removeEventListener(e, on)
+      for (const e of ["pause", "waiting", "seeking", "ended"]) a.removeEventListener(e, off)
+      clock.current = () => null
+    }
+  }, [clock])
+
+  useEffect(() => {
+    const a = audioRef.current
+    if (!a) return
+    wanted.current = playing && sound && t >= AUDIO_START && t < SPEECH_END
+    if (!wanted.current) {
+      if (!a.paused) a.pause()
+      return
+    }
+    const want = (t - SPEECH_START) / 1000
+    if (a.paused) {
+      a.currentTime = want
+      a.play().catch(() => {})
+    } else if (Math.abs(a.currentTime - want) > 0.2) {
+      a.currentTime = want
+    }
+  }, [t, playing, sound])
+
+  // Safari only lets audio start later if it was started once inside a user gesture.
+  const unlock = useCallback(() => {
+    const a = audioRef.current
+    if (!a || a.dataset.unlocked) return
+    a.dataset.unlocked = "1"
+    a.muted = true
+    a.play()
+      .then(() => {
+        if (!wanted.current) a.pause()
+        a.muted = false
+      })
+      .catch(() => {
+        a.muted = false
+      })
+  }, [])
+
+  return { audioRef, unlock }
+}
+
 const beatIndex = (t: number) => {
   let i = 0
   BEATS.forEach((b, j) => {
@@ -52,7 +112,8 @@ const beatIndex = (t: number) => {
 
 export function Demo() {
   const [mode, setMode] = useState<Mode>("mac")
-  const { t, playing, setPlaying, seek, play } = usePlayback(T.end)
+  const clock = useRef<() => number | null>(() => null)
+  const { t, playing, setPlaying, seek, play } = usePlayback(T.end, clock)
   const wrapRef = useRef<HTMLDivElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
   const badgeRef = useRef<HTMLSpanElement>(null)
@@ -63,7 +124,16 @@ export function Demo() {
   const [user, setUser] = useState<UserStroke[]>([])
   const [shiftDown, setShiftDown] = useState(false)
   const [drawMode, setDrawMode] = useState(false)
-  const started = useRef(false)
+  const [started, setStarted] = useState(false)
+  const [sound, setSound] = useState(true)
+  const { audioRef, unlock } = useNarration(t, playing, sound, clock)
+
+  const start = (withSound = sound) => {
+    unlock()
+    setStarted(true)
+    setSound(withSound)
+    play()
+  }
 
   useLayoutEffect(() => {
     const el = wrapRef.current
@@ -91,23 +161,6 @@ export function Demo() {
   }, [mode, broken])
 
   useEffect(() => {
-    const el = wrapRef.current
-    if (!el) return
-    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches
-    const io = new IntersectionObserver(
-      ([entry]) => {
-        if (entry.isIntersecting && !started.current) {
-          started.current = true
-          if (!reduce) play()
-        }
-      },
-      { threshold: 0.45 },
-    )
-    io.observe(el)
-    return () => io.disconnect()
-  }, [play])
-
-  useEffect(() => {
     const key = (e: KeyboardEvent) => setShiftDown(e.shiftKey)
     const blur = () => setShiftDown(false)
     window.addEventListener("keydown", key)
@@ -128,13 +181,13 @@ export function Demo() {
     setUser([])
     seek(0)
     setMode(next)
-    setPlaying(true)
+    start()
   }
 
   const replay = () => {
     setUser([])
     seek(0)
-    setPlaying(true)
+    start()
   }
 
   const toStage = (e: React.PointerEvent): [number, number, number] => {
@@ -174,7 +227,7 @@ export function Demo() {
     } else if (e.key === " ") {
       e.preventDefault()
       if (playing) setPlaying(false)
-      else play()
+      else start()
     } else if (e.key === "z" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault()
       setUser((s) => s.slice(0, -1))
@@ -212,29 +265,43 @@ export function Demo() {
           {script && <Terminal t={t} mode={mode} script={script} />}
           {script && <Selection t={t} script={script} cursor={cursor} />}
           {script && <Ink t={t} script={script} />}
-          <Caption t={t} mode={mode} />
+          {script && <Caption t={t} script={script} />}
           <Keys t={t} mode={mode} />
           <Island t={t} mode={mode} />
           {script && <Ripples t={t} script={script} />}
-          <svg className="ink" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`}>
+          <svg className="ink" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`} style={INK_SHADOW}>
             {user.map((s, i) => (
-              <InkPath key={i} d={inkPath(s.points.length > 1 ? s.points : [...s.points, s.points[0]], s.done)} />
+              <InkPath key={i} d={inkPath(s.points)} />
             ))}
           </svg>
           {cursor && <Cursor c={cursor} crosshair={mode === "mac" && t >= T.select && t < T.record} ibeam={overTerminal && t >= T.promptClick - 400} />}
         </div>
+        {!started && (
+          <button className="stage-play" onPointerDown={(e) => e.stopPropagation()} onClick={() => start(true)}>
+            <svg viewBox="0 0 16 16" aria-hidden>
+              <path d="M4.5 2.8v10.4a.6.6 0 00.9.5l8.3-5.2a.6.6 0 000-1L5.4 2.3a.6.6 0 00-.9.5z" />
+            </svg>
+            Play with sound
+          </button>
+        )}
+        <audio ref={audioRef} src="/narration.mp3" preload="auto" />
       </div>
       <Controls
         t={t}
         playing={playing}
         mode={mode}
         drawMode={drawMode}
-        onToggle={() => (playing ? setPlaying(false) : play())}
+        sound={sound}
+        onToggle={() => (playing ? setPlaying(false) : start())}
+        onSound={() => {
+          unlock()
+          setSound((v) => !v)
+        }}
         onReplay={replay}
         onSeek={seek}
         onBeat={(bt) => {
           seek(bt)
-          setPlaying(true)
+          start()
         }}
         onMode={switchMode}
         onDraw={() => setDrawMode((d) => !d)}
@@ -249,7 +316,9 @@ function Controls(props: {
   playing: boolean
   mode: Mode
   drawMode: boolean
+  sound: boolean
   onToggle: () => void
+  onSound: () => void
   onReplay: () => void
   onSeek: (t: number) => void
   onBeat: (t: number) => void
@@ -257,7 +326,7 @@ function Controls(props: {
   onDraw: () => void
   onPause: () => void
 }) {
-  const { t, playing, mode, drawMode } = props
+  const { t, playing, mode, drawMode, sound } = props
   const trackRef = useRef<HTMLDivElement>(null)
   const scrubbing = useRef(false)
 
@@ -288,6 +357,17 @@ function Controls(props: {
             <path d="M3 8a5 5 0 105-5H5.5" />
             <path d="M7 1L5 3l2 2" />
           </svg>
+        </button>
+        <button className={`sound-btn${sound ? " on" : ""}`} onClick={props.onSound} aria-pressed={sound}>
+          <svg viewBox="0 0 16 16" aria-hidden>
+            <path d="M2.5 6h2.2L8 3.2v9.6L4.7 10H2.5z" fill="currentColor" />
+            {sound ? (
+              <path d="M10.5 5.5a3.5 3.5 0 010 5M12.3 3.7a6 6 0 010 8.6" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+            ) : (
+              <path d="M10.5 6l4 4M14.5 6l-4 4" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+            )}
+          </svg>
+          {sound ? "Sound" : "Muted"}
         </button>
       </div>
       <div className="scrubber">

@@ -18,30 +18,30 @@ function outlinePath(points: number[][]) {
   return d + "Z"
 }
 
-export function inkPath(points: (Point | [number, number, number])[], done = true, size = 5) {
+// A uniform, round-capped marker line. The options never depend on whether the stroke is finished,
+// so the last frame of a stroke can't snap to a different shape.
+export function inkPath(points: (Point | [number, number, number])[], size = 4.5) {
   return outlinePath(
     getStroke(points, {
       size,
-      thinning: 0.55,
-      smoothing: 0.6,
-      streamline: 0.45,
-      simulatePressure: points[0]?.length !== 3,
-      last: done,
-      start: { taper: 6 },
-      end: { taper: done ? 10 : 0 },
+      thinning: 0.25,
+      smoothing: 0.7,
+      streamline: 0.6,
+      simulatePressure: false,
+      last: true,
+      start: { cap: true, taper: 0 },
+      end: { cap: true, taper: 0 },
     }),
   )
 }
 
 export function InkPath({ d }: { d: string }) {
   if (!d) return null
-  return (
-    <g>
-      <path d={d} fill="#fff" stroke="#fff" strokeWidth={3} strokeLinejoin="round" opacity={0.92} />
-      <path d={d} fill={INK} />
-    </g>
-  )
+  return <path d={d} fill={INK} />
 }
+
+// Strokes share one shadow at the layer level so overlapping strokes read as one shape.
+export const INK_SHADOW = { filter: "drop-shadow(0 1px 2px rgba(0, 0, 0, 0.35))" }
 
 export function PinMark({ n, at, scale = 1 }: { n: number; at: Point; scale?: number }) {
   return (

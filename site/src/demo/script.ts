@@ -11,6 +11,9 @@ export const PHONE: Rect = { x: 265, y: 76, w: 258, h: 556 }
 export const AGENT: Rect = { x: 760, y: 48, w: 422, h: 640 }
 export const AREA: Rect = { x: 40, y: 66, w: 708, h: 564 }
 
+// Kit's narration (public/narration.mp3) begins at SPEECH_START; word times are measured offsets.
+export const SPEECH_START = 5800
+
 export const T = {
   keys: 2400,
   keysUp: 3300,
@@ -20,58 +23,63 @@ export const T = {
   phoneClick: 4300,
   phoneRecord: 5150,
   record: 5300,
-  circle: [6000, 7300] as const,
-  pin1: 7600,
-  arrow: [8900, 9800] as const,
-  head1: [9850, 10050] as const,
-  head2: [10100, 10300] as const,
-  pin2: 10600,
-  finish: 12600,
-  copied: 13300,
-  promptClick: 13700,
-  paste: 13900,
-  submit: 14400,
-  read: 15000,
-  edit: 15500,
-  diff: 15700,
-  fix: [17000, 18000] as const,
-  done: 18400,
-  end: 20000,
+  circle: [5950, 7500] as const,
+  pin1: 7800,
+  arrow: [9150, 9850] as const,
+  head: [9950, 10300] as const,
+  pin2: 10900,
+  finish: 13700,
+  copied: 14400,
+  promptClick: 14800,
+  paste: 15000,
+  submit: 15500,
+  read: 16100,
+  edit: 16600,
+  diff: 16800,
+  fix: [18100, 19100] as const,
+  done: 19500,
+  end: 21100,
 }
 
 export const BEATS = [
   { label: "Broken", t: 0 },
   { label: "Capture", t: 2200 },
   { label: "Annotate", t: 5300 },
-  { label: "Handoff", t: 12400 },
-  { label: "Fix", t: 15300 },
+  { label: "Handoff", t: 13500 },
+  { label: "Fix", t: 16400 },
 ] as const
 
-export const WORDS: [string, number][] = [
-  ["Look", 5900],
-  ["at", 6100],
-  ["this", 6250],
-  ["header", 6450],
-  ["badge—", 6750],
-  ["it's", 7200],
-  ["colliding", 7400],
-  ["with", 7800],
-  ["the", 7950],
-  ["title,", 8100],
-  ["and", 8700],
-  ["this", 8850],
-  ["button", 9000],
-  ["row", 9250],
-  ["is", 9450],
-  ["shifted", 9600],
-  ["down", 9900],
-  ["14", 10150],
-  ["pixels.", 10450],
-  ["Line", 11100],
-  ["them", 11300],
-  ["up.", 11500],
+const SPOKEN: [string, number, number][] = [
+  ["Look", 160, 240],
+  ["at", 280, 320],
+  ["this", 400, 560],
+  ["header", 720, 880],
+  ["badge—it's", 960, 1840],
+  ["colliding", 1960, 2320],
+  ["with", 2360, 2400],
+  ["the", 2480, 2560],
+  ["title,", 2640, 3240],
+  ["and", 3280, 3520],
+  ["this", 3640, 3760],
+  ["button", 3920, 4080],
+  ["row", 4160, 4240],
+  ["is", 4320, 4400],
+  ["shifted", 4480, 4800],
+  ["down", 4960, 5120],
+  ["14", 5240, 5600],
+  ["pixels.", 5680, 6613],
+  ["Line", 6667, 6720],
+  ["them", 6800, 6880],
+  ["up.", 6960, 7360],
 ]
-export const SPEECH_END = 11900
+
+// [word, start, end] on the demo clock.
+export const WORDS: [string, number, number][] = SPOKEN.map(([w, a, b]) => [w, SPEECH_START + a, SPEECH_START + b])
+// The second clause ("and this button row…") starts at this word index.
+export const CLAUSE_2 = 9
+export const SPEECH_END = WORDS[WORDS.length - 1][2]
+// The recording opens with a short breath; audio playback starts just before "Look".
+export const AUDIO_START = SPEECH_START + 155
 
 export const clamp = (v: number, lo = 0, hi = 1) => Math.min(hi, Math.max(lo, v))
 export const lerp = (a: number, b: number, p: number) => a + (b - a) * p
@@ -137,6 +145,8 @@ export type Waypoint = { t: number; at: Point }
 
 export type Script = {
   strokes: Stroke[]
+  // Where the spoken caption pill's right edge sits (vertically centered) for each clause.
+  speech: [Point, Point]
   pins: Pin[]
   clicks: Click[]
   path: Waypoint[]
@@ -148,12 +158,13 @@ const circlePoints = (cx: number, cy: number, rx: number, ry: number): Point[] =
   const pts: Point[] = []
   const start = -2.5
   const sweep = Math.PI * 2 * 1.1
-  const n = 72
+  const n = 96
   for (let i = 0; i <= n; i++) {
     const k = i / n
     const a = start + sweep * k
-    const wobble = 1 + 0.035 * Math.sin(a * 3 + 0.7) + k * 0.07
-    pts.push([cx + Math.cos(a) * rx * wobble, cy + Math.sin(a) * ry * wobble - k * 5])
+    // A slow outward drift lets the overlap land beside the start instead of on top of it.
+    const grow = 1 + k * 0.06
+    pts.push([cx + Math.cos(a) * rx * grow, cy + Math.sin(a) * ry * grow - k * 4])
   }
   return pts
 }
@@ -185,20 +196,33 @@ export function buildScript(mode: Mode, a: Anchors): Script {
       : [a.actions.x + a.actions.w * 0.62, a.actions.y + a.actions.h + 6]
   const start: Point = mode === "mac" ? [tip[0] - 104, tip[1] + 52] : [tip[0] + 34, tip[1] + 92]
   const ctrl: Point = mode === "mac" ? [tip[0] - 44, tip[1] + 46] : [tip[0] + 44, tip[1] + 34]
-  const shaft = curvePoints(start, ctrl, tip)
-  const before = shaft[shaft.length - 5]
-  const angle = Math.atan2(tip[1] - before[1], tip[0] - before[0])
-  const head = (side: number): Point => [
-    tip[0] - Math.cos(angle + side * 0.5) * 15,
-    tip[1] - Math.sin(angle + side * 0.5) * 15,
-  ]
+  const shaft = curvePoints(start, ctrl, tip, 40)
+  // A quadratic's end tangent points from the control point to the tip.
+  const angle = Math.atan2(tip[1] - ctrl[1], tip[0] - ctrl[0])
+  const wing = (side: number): Point => [tip[0] - Math.cos(angle + side * 0.5) * 19, tip[1] - Math.sin(angle + side * 0.5) * 19]
+  const wing1 = wing(1)
+  const wing2 = wing(-1)
+  const head = [...line(wing1, tip, 12), ...line(tip, wing2, 12).slice(1)]
 
   const strokes: Stroke[] = [
     { id: "circle", points: circle, t0: T.circle[0], t1: T.circle[1] },
     { id: "shaft", points: shaft, t0: T.arrow[0], t1: T.arrow[1] },
-    { id: "head1", points: line(head(1), tip), t0: T.head1[0], t1: T.head1[1] },
-    { id: "head2", points: line(tip, head(-1)), t0: T.head2[0], t1: T.head2[1] },
+    { id: "head", points: head, t0: T.head[0], t1: T.head[1] },
   ]
+
+  // The pill rides to the left of each mark, so it never covers the ink or the thing being
+  // described, and its glide between clauses never crosses the circle.
+  const circleLeft = Math.min(...circle.map((p) => p[0]))
+  const speech: Script["speech"] =
+    mode === "mac"
+      ? [
+          [circleLeft - 12, badge[1]],
+          [start[0] - 20, start[1]],
+        ]
+      : [
+          [PHONE.x - 16, badge[1]],
+          [PHONE.x - 16, start[1]],
+        ]
 
   const pin1: Point = [a.badge.x + a.badge.w + 2, a.badge.y - 2]
   const pin2: Point =
@@ -236,9 +260,8 @@ export function buildScript(mode: Mode, a: Anchors): Script {
     { t: T.pin1 + 500, at: [pin1[0] + 30, pin1[1] + 40] },
     { t: T.arrow[0], at: shaft[0] },
     { t: T.arrow[1], at: tip },
-    { t: T.head1[0], at: head(1) },
-    { t: T.head1[1], at: tip },
-    { t: T.head2[1], at: head(-1) },
+    { t: T.head[0], at: wing1 },
+    { t: T.head[1], at: wing2 },
     { t: T.pin2, at: pin2 },
     { t: T.pin2 + 700, at: [pin2[0] + 40, pin2[1] + 50] },
     { t: T.finish - 120, at: finish },
@@ -250,22 +273,30 @@ export function buildScript(mode: Mode, a: Anchors): Script {
 
   return {
     strokes,
+    speech,
     pins,
     clicks,
     path,
     drag,
     frames: [
       { n: 1, t: T.pin1 - T.record, strokes: ["circle"], pins: [1] },
-      { n: 2, t: T.pin2 - T.record, strokes: ["shaft", "head1", "head2"], pins: [2] },
+      { n: 2, t: T.pin2 - T.record, strokes: ["shaft", "head"], pins: [2] },
     ],
   }
 }
 
+// The tip is interpolated between samples so the stroke grows continuously every frame.
 export function strokeAt(s: Stroke, t: number) {
   if (t <= s.t0) return null
   const p = easeInOut(progress(t, s.t0, s.t1))
-  const count = Math.max(2, Math.ceil(p * s.points.length))
-  return { points: s.points.slice(0, count), done: p >= 1 }
+  const last = s.points.length - 1
+  const at = p * last
+  const i = Math.floor(at)
+  if (i >= last) return { points: s.points, tip: s.points[last], done: true }
+  const a = s.points[i]
+  const b = s.points[i + 1]
+  const tip: Point = [lerp(a[0], b[0], at - i), lerp(a[1], b[1], at - i)]
+  return { points: [...s.points.slice(0, i + 1), tip], tip, done: false }
 }
 
 export type Cursor = { at: Point; drawing: boolean; pressed: boolean; shift: boolean }
@@ -275,8 +306,7 @@ export function cursorAt(script: Script, t: number): Cursor {
   const pressed = script.clicks.some((c) => t >= c.t - 60 && t < c.t + 140)
   const shift = !!active || script.pins.some((p) => t >= p.t - 250 && t < p.t + 250)
   if (active) {
-    const pts = strokeAt(active, t)!.points
-    return { at: pts[pts.length - 1], drawing: true, pressed: true, shift: true }
+    return { at: strokeAt(active, t)!.tip, drawing: true, pressed: true, shift: true }
   }
   const path = script.path
   if (t <= path[0].t) return { at: path[0].at, drawing: false, pressed, shift }
