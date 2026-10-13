@@ -125,9 +125,16 @@ fn spoken_cue(word: &str) -> Option<(&'static str, f32, bool)> {
     .find(|(cue, _, _)| *cue == word)
 }
 
-fn ends_clause(text: &str) -> bool {
-    text.trim_end_matches(['"', '\'', '”', '’', ')', ']'])
-        .ends_with(['.', '!', '?', ';', ':', ','])
+fn ends_clause(text: &str, clause_words: usize) -> bool {
+    let trimmed = text.trim_end_matches(['"', '\'', '”', '’', ')', ']']);
+    trimmed.ends_with(['.', '!', '?', ';', ':']) || (clause_words >= 3 && trimmed.ends_with(','))
+}
+
+fn word_count(text: &str) -> usize {
+    text.split_whitespace()
+        .filter(|w| w.chars().any(char::is_alphanumeric))
+        .count()
+        .max(1)
 }
 
 /// Each keyframe's text runs from the start of the clause in progress at its anchor (when its
@@ -160,14 +167,23 @@ fn align_transcript(
 
     let mut clauses: Vec<(u64, u64)> = Vec::new();
     let mut previous: Option<(u64, &str)> = None;
+    let mut clause_words = 0_usize;
     for &(t0, t1, text) in &units {
         let segment_start = transcript.segments.iter().any(|s| s.t0.abs_diff(t0) <= 20);
         let new_clause = previous.is_none_or(|(end, prev)| {
-            ends_clause(prev) || t0.saturating_sub(end) >= CLAUSE_GAP_MS || segment_start
+            ends_clause(prev, clause_words)
+                || t0.saturating_sub(end) >= CLAUSE_GAP_MS
+                || segment_start
         });
         match clauses.last_mut() {
-            Some(clause) if !new_clause => clause.1 = clause.1.max(t1),
-            _ => clauses.push((t0, t1)),
+            Some(clause) if !new_clause => {
+                clause.1 = clause.1.max(t1);
+                clause_words += word_count(text);
+            }
+            _ => {
+                clauses.push((t0, t1));
+                clause_words = word_count(text);
+            }
         }
         previous = Some((t1, text));
     }
@@ -385,9 +401,14 @@ pub fn select_keyframes(
         });
     }
     candidates.sort_by(|a, b| {
+        let a_unsnapped_speech =
+            a.reason == KeyframeReason::Speech && !a.event.ends_with("as the screen changed");
+        let b_unsnapped_speech =
+            b.reason == KeyframeReason::Speech && !b.event.ends_with("as the screen changed");
         b.mark
             .is_some()
             .cmp(&a.mark.is_some())
+            .then_with(|| a_unsnapped_speech.cmp(&b_unsnapped_speech))
             .then_with(|| b.score.total_cmp(&a.score))
             .then_with(|| frames[a.frame].t_ms.cmp(&frames[b.frame].t_ms))
     });
@@ -415,6 +436,24 @@ pub fn select_keyframes(
             continue;
         }
         selected.push(candidate);
+    }
+    // Order-independent novelty pass: if a speech cue duplicates the screen of any visual/input
+    // keyframe selected after it, drop the redundant speech cue (keeping at least one frame).
+    if selected.len() > 1 {
+        let non_speech_frames: Vec<usize> = selected
+            .iter()
+            .filter(|c| c.reason != KeyframeReason::Speech)
+            .map(|c| c.frame)
+            .collect();
+        if !non_speech_frames.is_empty() {
+            selected.retain(|c| {
+                c.reason != KeyframeReason::Speech
+                    || non_speech_frames.iter().all(|&other_frame| {
+                        scene_transition_diff(&thumbnails[other_frame], &thumbnails[c.frame])
+                            >= CUE_NOVELTY
+                    })
+            });
+        }
     }
     selected.sort_by_key(|candidate| frames[candidate.frame].t_ms);
     let anchors: Vec<u64> = selected
@@ -718,6 +757,64 @@ mod tests {
         assert_eq!(
             selected[0].0.said.as_deref(),
             Some("Look at this. Now it's stuck.")
+        );
+
+        // Even when a scene change (score < 58) settles onto a screen and a strong unsnapped
+        // cue ("Look", score 58) is spoken later over that same settled screen, cue novelty
+        // must be enforced order-independently so the settled screen is not duplicated.
+        let mut changing: Vec<_> = (0..=20).map(|i| frame(i * 250, 40)).collect();
+        for f in changing.iter_mut().filter(|f| f.t_ms >= 1_000) {
+            *f = frame(f.t_ms, 90);
+        }
+        let cue_after_change = TranscriptData {
+            words: words(&[(3_500, "Look"), (3_700, "here.")]),
+            ..Default::default()
+        };
+        let selected2 = select_keyframes(
+            &changing,
+            &[],
+            &mut [],
+            &[],
+            &cue_after_change,
+            MAX_KEYFRAMES,
+        );
+        assert_eq!(selected2.len(), 1);
+        assert_eq!(selected2[0].0.reason, KeyframeReason::SceneChange);
+    }
+
+    #[test]
+    fn short_comma_lead_in_stays_with_its_clause() {
+        let frames: Vec<_> = (0..=24).map(|i| frame(i * 250, 128)).collect();
+        let transcript = TranscriptData {
+            words: words(&[
+                (200, "The"),
+                (400, "message"),
+                (600, "was"),
+                (800, "received."),
+                (2_000, "Um,"),
+                (2_300, "Or"),
+                (2_500, "it"),
+                (2_700, "should"),
+                (2_900, "appear."),
+            ]),
+            ..Default::default()
+        };
+        let selected = select_keyframes(
+            &frames,
+            &[],
+            &mut [],
+            &[click(500), click(2_600)],
+            &transcript,
+            MAX_KEYFRAMES,
+        );
+        assert_eq!(selected.len(), 2);
+        assert_eq!(
+            selected[0].0.said.as_deref(),
+            Some("The message was received.")
+        );
+        assert_eq!(
+            selected[1].0.said.as_deref(),
+            Some("Um, Or it should appear.")
         );
     }
 

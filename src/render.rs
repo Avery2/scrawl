@@ -385,9 +385,10 @@ pub fn annotate_keyframe_in_place(
             y1,
             path,
             button,
-            ..
+            label,
         } = event
             && button.as_deref() == Some("touch")
+            && label.as_deref() != Some("long press")
             && *t <= keyframe.t
             && keyframe.t.saturating_sub(*t1) <= 900
         {
@@ -404,6 +405,19 @@ pub fn annotate_keyframe_in_place(
         .filter_map(|event| match event {
             InteractionEvent::Click { t, x, y, .. } if t.abs_diff(keyframe.t) <= 600 => {
                 Some((t.abs_diff(keyframe.t), [*x, *y]))
+            }
+            InteractionEvent::Drag {
+                t,
+                t1,
+                x0,
+                y0,
+                label,
+                ..
+            } if label.as_deref() == Some("long press")
+                && ((*t <= keyframe.t && keyframe.t.saturating_sub(*t1) <= 600)
+                    || t.abs_diff(keyframe.t) <= 600) =>
+            {
+                Some((t1.abs_diff(keyframe.t), [*x0, *y0]))
             }
             _ => None,
         })

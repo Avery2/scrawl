@@ -327,22 +327,28 @@ pub fn describe_event(event: &InteractionEvent) -> String {
             label,
             button,
             ..
-        } => format!(
-            "{}{} {} ({} → {})",
-            if button.as_deref() == Some("touch") {
-                "swiped"
+        } => {
+            if label.as_deref() == Some("long press") {
+                format!("long-pressed ({})", at([*x0, *y0]))
             } else {
-                "dragged"
-            },
-            label
-                .as_ref()
-                .filter(|s| !s.is_empty())
-                .map(|s| format!(" “{s}”"))
-                .unwrap_or_default(),
-            direction(x1 - x0, y1 - y0, 0.04),
-            at([*x0, *y0]),
-            at([*x1, *y1])
-        ),
+                format!(
+                    "{}{} {} ({} → {})",
+                    if button.as_deref() == Some("touch") {
+                        "swiped"
+                    } else {
+                        "dragged"
+                    },
+                    label
+                        .as_ref()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!(" “{s}”"))
+                        .unwrap_or_default(),
+                    direction(x1 - x0, y1 - y0, 0.04),
+                    at([*x0, *y0]),
+                    at([*x1, *y1])
+                )
+            }
+        }
         InteractionEvent::Scroll { dx, dy, label, .. } => match label.as_deref() {
             Some(l) if !l.is_empty() => format!("scrolled “{l}” {}", direction(*dx, *dy, 0.0)),
             _ => format!("scrolled {}", direction(*dx, *dy, 0.0)),
@@ -443,6 +449,12 @@ pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> 
         })
         .collect();
     if !bundle.keyframes.is_empty() {
+        let first_t = bundle.keyframes[0].t;
+        for (t, label) in &app_events {
+            if *t < first_t {
+                out.push_str(&format!("  · {} app: {label}\n", format_clock(*t)));
+            }
+        }
         for (i, frame) in bundle.keyframes.iter().enumerate() {
             let clock = format_clock(frame.t);
             let flag = frame
@@ -450,7 +462,7 @@ pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> 
                 .as_ref()
                 .and_then(|id| bundle.marks.iter().find(|m| &m.id == id))
                 .is_some_and(|m| m.shape == Shape::Flag);
-            let flag = if flag { " ⚑" } else { "" };
+            let flag_marker = if flag { " ⚑" } else { "" };
             match frame
                 .said
                 .as_deref()
@@ -458,17 +470,37 @@ pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> 
                 .filter(|s| !s.is_empty())
             {
                 Some(said) => {
-                    out.push_str(&format!("- #{} ({clock}){flag} “{said}”\n", frame.index))
+                    let action_marker = if flag {
+                        " ⚑".to_owned()
+                    } else if frame.reason == KeyframeReason::Click {
+                        let compact = frame
+                            .event
+                            .split(" (")
+                            .next()
+                            .unwrap_or(&frame.event)
+                            .trim();
+                        if compact.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{compact}]")
+                        }
+                    } else {
+                        String::new()
+                    };
+                    out.push_str(&format!(
+                        "- #{} ({clock}){action_marker} “{said}”\n",
+                        frame.index
+                    ));
                 }
                 None => out.push_str(&format!(
-                    "- #{} ({clock}){flag} {}\n",
+                    "- #{} ({clock}){flag_marker} {}\n",
                     frame.index, frame.event
                 )),
             }
             // App events nest under the keyframe on screen when they happened.
             let next = bundle.keyframes.get(i + 1).map_or(u64::MAX, |k| k.t);
             for (t, label) in &app_events {
-                if (*t < next || i + 1 == bundle.keyframes.len()) && (*t >= frame.t || i == 0) {
+                if (*t < next || i + 1 == bundle.keyframes.len()) && *t >= frame.t {
                     out.push_str(&format!("  · {} app: {label}\n", format_clock(*t)));
                 }
             }
@@ -1302,8 +1334,8 @@ mod tests {
         assert_eq!(
             summary,
             "[scrawl 0:14 · iPhone · dev.example.App (42) · /recordings/phone]\n\
-             - #1 (0:05) “This row is too dense.”\n\
              \x20 · 0:01 app: launched\n\
+             - #1 (0:05) “This row is too dense.”\n\
              \x20 · 0:06 app: rest started\n\
              - #2 (0:09) ⚑ flagged this moment\n\
              \x20 · 0:09 app: Done tapped\n"
@@ -1313,5 +1345,32 @@ mod tests {
                 .iter()
                 .any(|l| l == "0:06 · app: rest started")
         );
+
+        let long_press = InteractionEvent::Drag {
+            t: 1_000,
+            t1: 1_800,
+            x0: 0.42,
+            y0: 0.68,
+            x1: 0.42,
+            y1: 0.68,
+            label: Some("long press".into()),
+            button: Some("touch".into()),
+            path: vec![[0.42, 0.68], [0.42, 0.68]],
+        };
+        assert_eq!(describe_event(&long_press), "long-pressed (x 0.42, y 0.68)");
+
+        phone.keyframes.push(Keyframe {
+            index: 3,
+            t: 11_000,
+            reason: KeyframeReason::Click,
+            file: "frames/frame-03.png".into(),
+            event: "swiped up (x 0.50, y 0.80 → x 0.50, y 0.20)".into(),
+            said: Some("And then I scroll up.".into()),
+            mark_id: None,
+            cursor: Some([0.50, 0.20]),
+        });
+        let summary_with_action =
+            summary_markdown(&phone, std::path::Path::new("/recordings/phone"));
+        assert!(summary_with_action.contains("- #3 (0:11) [swiped up] “And then I scroll up.”"));
     }
 }
