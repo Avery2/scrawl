@@ -9,7 +9,7 @@
             <sparkle:shortVersionString>0.1.0</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://scrawl.kitlangton.dev/releases/Scrawl-0.1.0-arm64.zip" length="6312025" type="application/octet-stream" sparkle:edSignature="aHOvOLWW0PglhVKu+VsFdftfnv3xpenLUC4gwWs8grIvGfoRvNS8NnmjZt+lPsoVd976apRgSaZwxucjhYcHCQ=="/>
+            <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl-0.1.0-arm64.zip" length="6312025" type="application/octet-stream" sparkle:edSignature="aHOvOLWW0PglhVKu+VsFdftfnv3xpenLUC4gwWs8grIvGfoRvNS8NnmjZt+lPsoVd976apRgSaZwxucjhYcHCQ=="/>
         </item>
     </channel>
 </rss>

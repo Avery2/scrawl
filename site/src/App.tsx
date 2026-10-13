@@ -3,8 +3,8 @@ import { Demo } from "./demo/Demo"
 import { summaryText } from "./demo/script"
 
 const REPO = "https://github.com/kitlangton/scrawl"
-const BASE = "https://scrawl.kitlangton.dev"
-const DMG = `${BASE}/releases/Scrawl-latest-arm64.dmg`
+const BASE = "https://scrawl.kitlangton.com"
+const DMG = `/releases/Scrawl-latest-arm64.dmg`
 const ZIP = `${BASE}/releases/Scrawl-latest-arm64.zip`
 
 const INSTALL = `curl -LO ${ZIP}

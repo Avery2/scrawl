@@ -5,7 +5,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="${1:-prepare}"
 VERSION="${SCRAWL_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "${REPO_DIR}/Cargo.toml" | head -1)}"
 BUILD_NUMBER="${SCRAWL_BUILD_NUMBER:-1}"
-BASE_URL="${SCRAWL_RELEASE_BASE_URL:-https://scrawl.kitlangton.dev}"
+BASE_URL="${SCRAWL_RELEASE_BASE_URL:-https://scrawl.kitlangton.com}"
 SIGN_ID="Developer ID Application: Christopher Langton (QC99C9JE59)"
 SPARKLE_PUBLIC_KEY="mIek27lttJe8cIBqVZFhh6reRKjpTx1h9ZY9OKWPtuM="
 

@@ -6,6 +6,7 @@
     "directory": "./dist"
   },
   "routes": [
+    { "pattern": "scrawl.kitlangton.com", "custom_domain": true },
     { "pattern": "scrawl.kitlangton.dev", "custom_domain": true }
   ]
 }

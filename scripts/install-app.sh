@@ -75,7 +75,7 @@ cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
   <key>SUAllowsAutomaticUpdates</key>
   <false/>
   <key>SUFeedURL</key>
-  <string>https://scrawl.kitlangton.dev/appcast.xml</string>
+  <string>https://scrawl.kitlangton.com/appcast.xml</string>
   <key>SUPublicEDKey</key>
   <string>${SPARKLE_PUBLIC_KEY}</string>
   <key>SUVerifyUpdateBeforeExtraction</key>
