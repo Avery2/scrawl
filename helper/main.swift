@@ -1,6 +1,6 @@
 // scrawl-helper: the parts of Scrawl that need Swift-only Apple frameworks.
 //
-//   scrawl-helper devices [--timeout S]                 cabled iPhones/iPads as JSON
+//   scrawl-helper devices                               cabled iPhones/iPads (USB registry) as JSON
 //   scrawl-helper mirror --out FILE.mov [--device ID]   live mirror window + native recording (JSON lines)
 //   scrawl-helper transcribe FILE                       SpeechAnalyzer transcript with word timings
 //   scrawl-helper frames MOVIE --out-dir DIR (--every MS | --at MS,MS…) [--max-edge PX]
@@ -49,8 +49,7 @@ func runAsync(_ body: @escaping () async throws -> Void) -> Never {
 let arguments = Array(CommandLine.arguments.dropFirst())
 switch arguments.first {
 case "devices":
-  let timeout = option("--timeout", in: arguments).flatMap(Double.init) ?? 2.5
-  emit(Phone.waitForDevices(timeout: timeout).map(Phone.describe))
+  emit(Phone.cabled())
 case "mirror":
   guard let out = option("--out", in: arguments) else { fail("mirror needs --out FILE.mov") }
   Mirror.run(output: URL(filePath: out), deviceID: option("--device", in: arguments))

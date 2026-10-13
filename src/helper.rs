@@ -78,13 +78,10 @@ pub struct PhoneDevice {
     pub height: u32,
 }
 
-/// Cabled iPhones and iPads that can be mirrored.
-pub fn devices(timeout: Duration) -> Result<Vec<PhoneDevice>> {
-    let seconds = format!("{:.1}", timeout.as_secs_f64());
-    run(
-        &[os("devices"), os("--timeout"), os(&seconds)],
-        timeout + Duration::from_secs(5),
-    )
+/// Cabled iPhones and iPads, from the USB registry (no camera permission needed). `id` is the
+/// USB serial and the size is unknown until the mirror attaches.
+pub fn devices() -> Result<Vec<PhoneDevice>> {
+    run(&[os("devices")], Duration::from_secs(5))
 }
 
 #[derive(Deserialize)]

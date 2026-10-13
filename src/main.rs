@@ -703,11 +703,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Devices => {
-            for device in helper::devices(Duration::from_secs(3))? {
-                println!(
-                    "{}\t{}\t{}×{}",
-                    device.name, device.id, device.width, device.height
-                );
+            for device in helper::devices()? {
+                println!("{}\t{}", device.name, device.id);
             }
             Ok(())
         }

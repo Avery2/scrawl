@@ -1,6 +1,7 @@
 @preconcurrency import AVFoundation
 import AppKit
 import CoreMediaIO
+import IOKit
 
 /// Cabled iPhones and iPads, which macOS publishes as muxed capture devices once an app sets
 /// `kCMIOHardwarePropertyAllowScreenCaptureDevices` (the switch QuickTime flips for New Movie
@@ -23,14 +24,26 @@ enum Phone {
     discovery.devices.filter { $0.modelID == "iOS Device" }
   }
 
-  /// Spins the main run loop until a phone appears or the timeout passes.
-  static func waitForDevices(timeout: TimeInterval) -> [AVCaptureDevice] {
-    publishScreenCaptureDevices()
-    let deadline = Date().addingTimeInterval(timeout)
-    while devices.isEmpty, Date() < deadline {
-      RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+  /// Cabled iPhones and iPads from the USB registry: instant, and unlike AVFoundation it needs no
+  /// camera permission, so the picker can look every time it opens without prompting.
+  static func cabled() -> [[String: Any]] {
+    var iterator: io_iterator_t = 0
+    guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOUSBHostDevice"), &iterator) == KERN_SUCCESS else { return [] }
+    defer { IOObjectRelease(iterator) }
+    var found: [[String: Any]] = []
+    while case let service = IOIteratorNext(iterator), service != 0 {
+      defer { IOObjectRelease(service) }
+      func property(_ key: String) -> Any? {
+        IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
+      }
+      var entryName = [CChar](repeating: 0, count: 128)
+      IORegistryEntryGetName(service, &entryName)
+      let product = (property("USB Product Name") ?? property("kUSBProductString")) as? String ?? String(cString: entryName)
+      guard product.hasPrefix("iPhone") || product.hasPrefix("iPad") else { continue }
+      let serial = (property("USB Serial Number") ?? property("kUSBSerialNumberString")) as? String ?? ""
+      found.append(["id": serial, "name": product, "model": product, "width": 0, "height": 0])
     }
-    return devices
+    return found
   }
 
   static func size(of device: AVCaptureDevice) -> CMVideoDimensions {

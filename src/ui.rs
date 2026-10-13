@@ -736,7 +736,7 @@ impl ScrawlCoordinator {
             let found = cx
                 .background_executor()
                 .spawn(async {
-                    crate::helper::devices(Duration::from_millis(2_500))
+                    crate::helper::devices()
                         .inspect_err(|error| scrawl_log(format!("iPhone discovery: {error:#}")))
                         .ok()
                         .and_then(|devices| devices.into_iter().next())
@@ -1250,7 +1250,7 @@ impl ScrawlCoordinator {
         set_escape_hotkey_enabled(true);
         let session = match PhoneSession::start(
             &bundle_dir.join("recording.mov"),
-            device.as_ref().map(|d| d.id.as_str()),
+            None,
             Some(Arc::clone(&self.telemetry)),
         ) {
             Ok(session) => session,
