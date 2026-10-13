@@ -555,7 +555,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Record {
-            window: _,
+            window,
             iphone: true,
             duration,
             note,
@@ -565,13 +565,28 @@ fn main() -> Result<()> {
                 handoff::default_captures_dir().join(format!("{}.scrawl", make_bundle_id()))
             });
             std::fs::create_dir_all(&bundle_dir)?;
-            let session =
-                phone::PhoneSession::start(&bundle_dir.join("recording.mov"), None, None)?;
+            let dev_id = window.or_else(|| {
+                helper::devices()
+                    .ok()
+                    .and_then(|mut d| d.drain(..).next().map(|p| p.id))
+            });
+            let session = phone::PhoneSession::start(
+                &bundle_dir.join("recording.mov"),
+                dev_id.as_deref(),
+                None,
+            )?;
             let started = std::time::Instant::now();
-            while !session.has_recording() && started.elapsed() < Duration::from_secs(15) {
+            while !session.has_recording()
+                && !session.has_ended()
+                && started.elapsed() < Duration::from_secs(15)
+            {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            std::thread::sleep(Duration::from_secs(duration.max(1)));
+            let record_started = std::time::Instant::now();
+            let target_dur = Duration::from_secs(duration.max(1));
+            while !session.has_ended() && record_started.elapsed() < target_dur {
+                std::thread::sleep(Duration::from_millis(50));
+            }
             let recording = session.stop()?;
             let (_dir, _bundle, summary) =
                 phone::finalize_live_capture(&bundle_dir, recording, Vec::new(), Vec::new(), note)?;

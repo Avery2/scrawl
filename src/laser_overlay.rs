@@ -261,7 +261,8 @@ impl SharedMetalOverlay {
     fn draw(&self) {
         let is_active = self.telemetry.active.load(Ordering::Acquire);
         let is_selecting = self.telemetry.selecting.load(Ordering::Acquire);
-        if !is_active && !is_selecting {
+        let is_device_pending = self.telemetry.capture_mode.load(Ordering::Acquire) == 3;
+        if !is_active && !is_selecting && !is_device_pending {
             return;
         }
         let now_ms = self.telemetry.elapsed_ms();

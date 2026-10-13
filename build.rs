@@ -101,6 +101,7 @@ fn compile_helper() {
         status.success(),
         "scrawl-helper failed to compile (needs the macOS 26 SDK)"
     );
-    std::fs::copy(&built, profile_dir.join("scrawl-helper"))
-        .expect("Could not place scrawl-helper");
+    let dest = profile_dir.join("scrawl-helper");
+    let _ = std::fs::remove_file(&dest);
+    std::fs::copy(&built, dest).expect("Could not place scrawl-helper");
 }

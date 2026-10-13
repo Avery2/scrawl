@@ -766,8 +766,9 @@ impl ScrawlCoordinator {
                             mode: SelectionMode::Iphone
                         }
                     );
+                    let dev_id = coord.iphone.as_ref().map(|d| d.id.as_str());
                     if let Ok(session) = PhoneSession::start_preview(
-                        None,
+                        dev_id,
                         hidden,
                         Some(Arc::clone(&coord.telemetry)),
                     ) {
@@ -897,7 +898,8 @@ impl ScrawlCoordinator {
         if let Some(ref mut preview) = self.iphone_preview {
             preview.show_preview();
         } else {
-            match PhoneSession::start_preview(None, false, Some(Arc::clone(&self.telemetry))) {
+            let dev_id = self.iphone.as_ref().map(|d| d.id.as_str());
+            match PhoneSession::start_preview(dev_id, false, Some(Arc::clone(&self.telemetry))) {
                 Ok(session) => {
                     self.iphone_preview = Some(session);
                 }
@@ -1333,12 +1335,17 @@ impl ScrawlCoordinator {
             );
         self.telemetry.set_capture_mode(CaptureMode::Device);
         self.telemetry.reset_for_session(initial_frame);
+        // Hold interaction telemetry inactive until the helper's `recording` event arrives.
+        self.telemetry
+            .active
+            .store(false, std::sync::atomic::Ordering::Release);
         set_escape_hotkey_enabled(true);
         let session = if let Some(mut preview) = existing_preview {
             preview.begin_recording(&movie_path);
             preview
         } else {
-            match PhoneSession::start(&movie_path, None, Some(Arc::clone(&self.telemetry))) {
+            let dev_id = device.as_ref().map(|d| d.id.as_str());
+            match PhoneSession::start(&movie_path, dev_id, Some(Arc::clone(&self.telemetry))) {
                 Ok(session) => session,
                 Err(error) => {
                     scrawl_log(format!("iPhone capture could not start: {error:#}"));

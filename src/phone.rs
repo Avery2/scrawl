@@ -31,8 +31,10 @@ struct MirrorState {
     device: Option<PhoneDevice>,
     rect: Option<[f32; 4]>,
     recording_epoch_ms: Option<u64>,
+    recording_instant: Option<Instant>,
     markers_epoch_ms: Vec<u64>,
     finished: Option<(PathBuf, u64)>,
+    ended: bool,
     error: Option<String>,
 }
 
@@ -81,6 +83,9 @@ enum MirrorEvent {
         duration_ms: u64,
     },
     Cancelled,
+    Warning {
+        message: String,
+    },
     Error {
         message: String,
     },
@@ -131,11 +136,23 @@ impl PhoneSession {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .context("Could not start the iPhone mirror")?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().context("No mirror output")?;
+        if let Some(stderr) = child.stderr.take() {
+            let _ = std::thread::Builder::new()
+                .name("scrawl-phone-stderr".into())
+                .spawn(move || {
+                    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            scrawl_log(trimmed.to_owned());
+                        }
+                    }
+                });
+        }
         let state = Arc::new(Mutex::new(MirrorState::default()));
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader_state = Arc::clone(&state);
@@ -185,26 +202,39 @@ impl PhoneSession {
                         }
                         MirrorEvent::Recording { started_at } => {
                             state.recording_epoch_ms = Some(started_at);
+                            state.recording_instant = Some(Instant::now());
+                            if let Some(telemetry) = &telemetry {
+                                telemetry
+                                    .active
+                                    .store(true, std::sync::atomic::Ordering::Release);
+                            }
                         }
                         MirrorEvent::Marker { at } => state.markers_epoch_ms.push(at),
                         MirrorEvent::Finished { path, duration_ms } => {
                             state.finished = Some((path, duration_ms));
+                            state.ended = true;
                         }
-                        MirrorEvent::Cancelled => {}
+                        MirrorEvent::Cancelled => {
+                            state.ended = true;
+                        }
+                        MirrorEvent::Warning { message } => {
+                            scrawl_log(format!("iPhone mirror: {message}"));
+                        }
                         MirrorEvent::Error { message } => {
                             scrawl_log(format!("iPhone mirror: {message}"));
                             state.error = Some(message);
+                            state.ended = true;
                         }
                     }
                 }
+                reader_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .ended = true;
                 // The helper ended; if Scrawl didn't ask (phone unplugged, no phone, denied),
                 // let the app finish or cancel the capture.
                 if !reader_cancelled.load(std::sync::atomic::Ordering::Acquire)
                     && let Some(telemetry) = &telemetry
-                    && (telemetry.active.load(std::sync::atomic::Ordering::Acquire)
-                        || telemetry
-                            .selecting
-                            .load(std::sync::atomic::Ordering::Acquire))
                 {
                     let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::PhoneEnded);
                 }
@@ -225,7 +255,12 @@ impl PhoneSession {
     pub fn begin_recording(&mut self, movie: &Path) {
         self.started_at = Instant::now();
         self.session_epoch_ms = crate::now_epoch_ms();
-        self.lock().markers_epoch_ms.clear();
+        {
+            let mut state = self.lock();
+            state.recording_epoch_ms = None;
+            state.recording_instant = None;
+            state.markers_epoch_ms.clear();
+        }
         self.send(&format!("start {}", movie.display()));
     }
 
@@ -246,13 +281,21 @@ impl PhoneSession {
     }
 
     pub fn elapsed_ms(&self) -> u64 {
-        self.started_at.elapsed().as_millis() as u64
+        self.lock()
+            .recording_instant
+            .map_or(0, |t| t.elapsed().as_millis() as u64)
     }
 
     /// Whether the movie has started (or the capture already ended).
     pub fn has_recording(&self) -> bool {
         let state = self.lock();
         state.recording_epoch_ms.is_some() || state.finished.is_some()
+    }
+
+    /// Whether the helper process has finished, cancelled, or exited with an error.
+    pub fn has_ended(&self) -> bool {
+        let state = self.lock();
+        state.ended || state.finished.is_some() || state.error.is_some()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, MirrorState> {

@@ -13,6 +13,7 @@ taskpolicy -c utility cargo build -j 3
 
 mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}" "${HOME}/bin"
 
+rm -f "${MACOS_DIR}/scrawl" "${MACOS_DIR}/scrawl-helper"
 cp -f "${REPO_DIR}/target/debug/scrawl" "${MACOS_DIR}/scrawl"
 cp -f "${REPO_DIR}/target/debug/scrawl-helper" "${MACOS_DIR}/scrawl-helper"
 chmod +x "${MACOS_DIR}/scrawl" "${MACOS_DIR}/scrawl-helper"
@@ -45,7 +46,7 @@ cat > "${CONTENTS_DIR}/Info.plist" <<'PLIST'
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>LSMinimumSystemVersion</key>
-  <string>14.0</string>
+  <string>26.0</string>
   <key>LSUIElement</key>
   <true/>
   <key>NSHighResolutionCapable</key>

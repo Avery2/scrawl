@@ -25,6 +25,10 @@ enum Phone {
     discovery.devices.filter { $0.modelID == "iOS Device" }
   }
 
+  static func normalizeID(_ id: String) -> String {
+    id.replacingOccurrences(of: "-", with: "").lowercased()
+  }
+
   /// Cabled iPhones and iPads from the USB registry: instant, and unlike AVFoundation it needs no
   /// camera permission, so the picker can look every time it opens without prompting.
   static func cabled() -> [[String: Any]] {
@@ -37,11 +41,13 @@ enum Phone {
       func property(_ key: String) -> Any? {
         IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
       }
+      let vendor = (property("idVendor") ?? property("kUSBVendorID")) as? Int
+      guard vendor == 0x05ac else { continue }
       var entryName = [CChar](repeating: 0, count: 128)
       IORegistryEntryGetName(service, &entryName)
       let product = (property("USB Product Name") ?? property("kUSBProductString")) as? String ?? String(cString: entryName)
       guard product.hasPrefix("iPhone") || product.hasPrefix("iPad") else { continue }
-      let serial = (property("USB Serial Number") ?? property("kUSBSerialNumberString")) as? String ?? ""
+      let serial = normalizeID((property("USB Serial Number") ?? property("kUSBSerialNumberString")) as? String ?? "")
       found.append(["id": serial, "name": product, "model": product, "width": 0, "height": 0])
     }
     return found
@@ -66,6 +72,7 @@ enum Phone {
 ///   {"event":"marker", "at": epochMs}                    M pressed in the mirror window
 ///   {"event":"finished", path, durationMs}               movie finalized; the helper then exits
 ///   {"event":"cancelled"} / {"event":"error", message}
+///   {"event":"warning", message}                         e.g. no microphone, so no narration
 /// Commands on stdin: `show`, `hide`, `start [PATH]`, `stop`, `cancel`. End of input means stop.
 final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCaptureFileOutputRecordingDelegate {
   static func run(output: URL?, previewOnly: Bool = false, hiddenPreview: Bool = false, deviceID: String?) -> Never {
@@ -91,16 +98,14 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
   var stopping = false
   var cancelled = false
   var finished = false
+  /// The movie output was asked to start (it starts once the phone's video is flowing).
+  var movieRequested = false
 
   init(output: URL?, previewOnly: Bool, hiddenPreview: Bool, deviceID: String?) {
     self.output = output
     self.previewOnly = previewOnly
     self.hiddenPreview = hiddenPreview
     self.deviceID = deviceID
-  }
-
-  private static func normalizeID(_ id: String) -> String {
-    id.replacingOccurrences(of: "-", with: "").lowercased()
   }
 
   func applicationDidFinishLaunching(_: Notification) {
@@ -110,8 +115,14 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
     AVCaptureDevice.requestAccess(for: .video) { granted in
       DispatchQueue.main.async {
         guard granted else { return self.die("Camera access denied; allow Scrawl in System Settings › Privacy & Security › Camera") }
-        self.findPhone(deadline: Date().addingTimeInterval(12))
-        AVCaptureDevice.requestAccess(for: .audio) { _ in }
+        AVCaptureDevice.requestAccess(for: .audio) { micGranted in
+          DispatchQueue.main.async {
+            if !micGranted {
+              self.warn("Microphone access denied; recording without narration (allow Scrawl in System Settings › Privacy & Security › Microphone)")
+            }
+            self.findPhone(deadline: Date().addingTimeInterval(10))
+          }
+        }
       }
     }
   }
@@ -119,11 +130,8 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
   private func findPhone(deadline: Date) {
     Phone.publishScreenCaptureDevices()
     let phones = Phone.devices
-    let match = phones.first(where: {
-      guard let deviceID, !deviceID.isEmpty else { return true }
-      return Self.normalizeID($0.uniqueID) == Self.normalizeID(deviceID)
-    }) ?? phones.first
-    if let phone = match {
+    let wanted = deviceID.map(Phone.normalizeID).flatMap { $0.isEmpty ? nil : $0 }
+    if let phone = phones.first(where: { wanted == nil || Phone.normalizeID($0.uniqueID) == wanted }) {
       attach(phone)
     } else if Date() < deadline, !stopping {
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.findPhone(deadline: deadline) }
@@ -143,27 +151,30 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
     caseView?.statusField.isHidden = true
     fitWindow()
 
-    let mic = AVCaptureDevice.default(for: .audio).flatMap { try? AVCaptureDeviceInput(device: $0) }
-    let session = session, movieOutput = movieOutput, output = output, shouldRecord = !previewOnly
-    if shouldRecord, let output { try? FileManager.default.removeItem(at: output) }
+    var mic: AVCaptureDeviceInput?
+    if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
+      if let microphone = AVCaptureDevice.default(for: .audio) {
+        do { mic = try AVCaptureDeviceInput(device: microphone) } catch {
+          warn("Could not open the microphone (\(error.localizedDescription)); recording without narration")
+        }
+      } else {
+        warn("No microphone; recording without narration")
+      }
+    }
+    let session = session, movieOutput = movieOutput
     queue.async {
       session.beginConfiguration()
       if session.canAddInput(input) { session.addInput(input) }
       if let mic, session.canAddInput(mic) { session.addInput(mic) }
       if session.canAddOutput(movieOutput) { session.addOutput(movieOutput) }
-      // Narration comes from the Mac's microphone, not the phone's own sound.
-      for connection in movieOutput.connections where connection.inputPorts.contains(where: { $0.input === input && $0.mediaType == .audio }) {
-        connection.isEnabled = false
-      }
+      Self.disablePhoneAudio(movieOutput, phone: input)
       session.commitConfiguration()
       session.startRunning()
-      if shouldRecord, let output {
-        movieOutput.startRecording(to: output, recordingDelegate: self)
-      }
+      DispatchQueue.main.async { self.startMovieWhenReady() }
     }
     NotificationCenter.default.addObserver(forName: AVCaptureInput.Port.formatDescriptionDidChangeNotification, object: nil, queue: .main) { [weak self] note in
-      guard let self, let port = note.object as? AVCaptureInput.Port, port.input === self.phoneInput, port.mediaType == .video,
-            let format = port.formatDescription else { return }
+      guard let self, let port = note.object as? AVCaptureInput.Port, port.input === self.phoneInput,
+            let format = port.formatDescription, CMFormatDescriptionGetMediaType(format) == kCMMediaType_Video else { return }
       let size = CMVideoFormatDescriptionGetDimensions(format)
       guard size.width > 0, size.height > 0, let device = self.phoneInput?.device else { return }
       let aspect = CGFloat(size.height) / CGFloat(size.width)
@@ -176,6 +187,61 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
       guard let self, (note.object as? AVCaptureDevice) == self.phoneInput?.device else { return }
       self.stop()
     }
+  }
+
+  /// Narration comes from the Mac's microphone, not the phone's own sound. A muxed phone input
+  /// can label its ports `.audio` or `.muxed`, so audio connections are recognized by what they
+  /// carry (an audio port or audio channels) rather than by one port type.
+  static func disablePhoneAudio(_ output: AVCaptureMovieFileOutput, phone: AVCaptureDeviceInput) {
+    for connection in output.connections {
+      let ports = connection.inputPorts
+      guard ports.contains(where: { $0.input === phone }) else { continue }
+      let isVideo = ports.contains { port in
+        port.mediaType == .video || port.formatDescription.map { CMFormatDescriptionGetMediaType($0) == kCMMediaType_Video } == true
+      }
+      let isAudio = !connection.audioChannels.isEmpty || ports.contains { port in
+        port.mediaType == .audio || port.formatDescription.map { CMFormatDescriptionGetMediaType($0) == kCMMediaType_Audio } == true
+      }
+      if isAudio, !isVideo {
+        connection.isEnabled = false
+      } else if isAudio {
+        log("phone audio shares the video connection and cannot be dropped separately")
+      }
+    }
+  }
+
+  /// The phone's video size from its input ports, zero until frames have a format.
+  private func phoneVideoSize() -> CMVideoDimensions? {
+    phoneInput?.ports.lazy
+      .compactMap(\.formatDescription)
+      .filter { CMFormatDescriptionGetMediaType($0) == kCMMediaType_Video }
+      .map(CMVideoFormatDescriptionGetDimensions)
+      .first { $0.width > 0 && $0.height > 0 }
+  }
+
+  /// Starts the movie only once the session is running and the phone's video port reports real
+  /// dimensions; starting earlier can produce a movie without a usable video track.
+  private func startMovieWhenReady(deadline: Date = Date().addingTimeInterval(8)) {
+    guard !previewOnly, !stopping, !movieRequested, phoneInput != nil, let output else { return }
+    guard session.isRunning, phoneVideoSize() != nil else {
+      if Date() < deadline {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { self.startMovieWhenReady(deadline: deadline) }
+      } else {
+        die("The iPhone's video never started; unlock the phone and try again")
+      }
+      return
+    }
+    movieRequested = true
+    try? FileManager.default.removeItem(at: output)
+    let movieOutput = movieOutput
+    queue.async {
+      if !movieOutput.isRecording { movieOutput.startRecording(to: output, recordingDelegate: self) }
+    }
+  }
+
+  private func warn(_ message: String) {
+    log(message)
+    emit(["event": "warning", "message": message])
   }
 
   // MARK: Window
@@ -295,21 +361,14 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
       window?.orderFrontRegardless()
       emitRect()
     }
-    guard phoneInput != nil, let output else { return }
-    try? FileManager.default.removeItem(at: output)
-    let movieOutput = movieOutput
-    queue.async {
-      if !movieOutput.isRecording {
-        movieOutput.startRecording(to: output, recordingDelegate: self)
-      }
-    }
+    startMovieWhenReady()
   }
 
   private func stop() {
     guard !stopping else { return }
     stopping = true
     window?.orderOut(nil)
-    guard phoneInput != nil, !previewOnly else {
+    guard phoneInput != nil, !previewOnly, movieRequested else {
       finish(["event": "cancelled"])
       return
     }
@@ -357,18 +416,27 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
   }
 
   func fileOutput(_ fileOutput: AVCaptureFileOutput, didFinishRecordingTo url: URL, from _: [AVCaptureConnection], error: Error?) {
-    let seconds = fileOutput.recordedDuration.seconds
+    let seconds = fileOutput.recordedDuration.seconds.isFinite ? fileOutput.recordedDuration.seconds : 0
     DispatchQueue.main.async {
       if self.cancelled {
         try? FileManager.default.removeItem(at: url)
         return self.finish(["event": "cancelled"])
       }
-      let exists = FileManager.default.fileExists(atPath: url.path)
-      if !exists {
-        return self.die("Recording failed: \(error?.localizedDescription ?? "no file")")
+      guard Self.recordingSucceeded(error: error, stopping: self.stopping, seconds: seconds),
+            FileManager.default.fileExists(atPath: url.path)
+      else {
+        return self.die("Recording failed: \(error?.localizedDescription ?? "no movie was written")")
       }
-      self.finish(["event": "finished", "path": url.path, "durationMs": Int(((seconds.isFinite ? seconds : 0) * 1000).rounded())])
+      self.finish(["event": "finished", "path": url.path, "durationMs": Int((seconds * 1000).rounded())])
     }
+  }
+
+  /// AVFoundation reports some clean stops as errors; only trust those it marks as finished,
+  /// or a stop we asked for that left a real movie behind.
+  static func recordingSucceeded(error: Error?, stopping: Bool, seconds: Double) -> Bool {
+    guard let error else { return true }
+    if (error as NSError).userInfo[AVErrorRecordingSuccessfullyFinishedKey] as? Bool == true { return true }
+    return stopping && seconds > 0.1
   }
 }
 
@@ -443,6 +511,10 @@ final class PhoneCaseView: NSView {
     statusField.frame = NSRect(x: 16, y: bounds.midY - 10, width: max(bounds.width - 32, 0), height: 20)
     CATransaction.commit()
   }
+}
+
+func log(_ message: String) {
+  FileHandle.standardError.write(Data("scrawl-helper: \(message)\n".utf8))
 }
 
 func nowMs() -> Int {
