@@ -766,25 +766,6 @@ impl ScrawlCoordinator {
                     coord.iphone = found;
                     cx.notify();
                 }
-                if coord.iphone.is_some() && coord.is_selecting() && coord.iphone_preview.is_none()
-                {
-                    let hidden = !matches!(
-                        coord.island_phase,
-                        IslandPhase::Selecting {
-                            mode: SelectionMode::Iphone
-                        }
-                    );
-                    let dev_id = coord.iphone.as_ref().map(|d| d.id.as_str());
-                    if let Ok(session) = PhoneSession::start_preview(
-                        dev_id,
-                        hidden,
-                        Some(Arc::clone(&coord.telemetry)),
-                    ) {
-                        coord.iphone_preview = Some(session);
-                        coord.sync_picker_overlay();
-                        cx.notify();
-                    }
-                }
             });
         })
         .detach();

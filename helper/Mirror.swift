@@ -19,10 +19,10 @@ enum Phone {
     CMIOObjectSetPropertyData(CMIOObjectID(kCMIOObjectSystemObject), &address, 0, nil, UInt32(MemoryLayout<UInt32>.size), &allow)
   }
 
-  static let discovery = AVCaptureDevice.DiscoverySession(deviceTypes: [.external], mediaType: .muxed, position: .unspecified)
-
   static var devices: [AVCaptureDevice] {
-    discovery.devices.filter { $0.modelID == "iOS Device" }
+    let muxed = AVCaptureDevice.DiscoverySession(deviceTypes: [.external], mediaType: .muxed, position: .unspecified).devices
+    let filtered = muxed.filter { $0.modelID == "iOS Device" }
+    return filtered.isEmpty ? muxed : filtered
   }
 
   static func normalizeID(_ id: String) -> String {
@@ -88,12 +88,13 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
   var previewOnly: Bool
   var hiddenPreview: Bool
   let deviceID: String?
-  let session = AVCaptureSession()
-  let movieOutput = AVCaptureMovieFileOutput()
+  lazy var session = AVCaptureSession()
+  lazy var movieOutput = AVCaptureMovieFileOutput()
   let queue = DispatchQueue(label: "dev.kitlangton.scrawl.helper.session")
   var phoneInput: AVCaptureDeviceInput?
   var window: MirrorPanel?
   var caseView: PhoneCaseView?
+  var discoveryObservation: NSKeyValueObservation?
   var aspect: CGFloat = 2868.0 / 1320.0
   var stopping = false
   var cancelled = false
@@ -110,7 +111,6 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
 
   func applicationDidFinishLaunching(_: Notification) {
     readCommands()
-    Phone.publishScreenCaptureDevices()
     showWindow(title: "iPhone", orderFront: !hiddenPreview)
     AVCaptureDevice.requestAccess(for: .video) { granted in
       DispatchQueue.main.async {
@@ -120,7 +120,12 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
             if !micGranted {
               self.warn("Microphone access denied; recording without narration (allow Scrawl in System Settings › Privacy & Security › Microphone)")
             }
-            self.findPhone(deadline: Date().addingTimeInterval(10))
+            Phone.publishScreenCaptureDevices()
+            let deadline = Date().addingTimeInterval(12)
+            NotificationCenter.default.addObserver(forName: AVCaptureDevice.wasConnectedNotification, object: nil, queue: .main) { [weak self] _ in
+              self?.findPhone(deadline: deadline)
+            }
+            self.findPhone(deadline: deadline)
           }
         }
       }
@@ -128,19 +133,21 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
   }
 
   private func findPhone(deadline: Date) {
+    guard phoneInput == nil else { return }
     Phone.publishScreenCaptureDevices()
     let phones = Phone.devices
     let wanted = deviceID.map(Phone.normalizeID).flatMap { $0.isEmpty ? nil : $0 }
-    if let phone = phones.first(where: { wanted == nil || Phone.normalizeID($0.uniqueID) == wanted }) {
+    if let phone = phones.first(where: { wanted == nil || Phone.normalizeID($0.uniqueID) == wanted }) ?? phones.first {
       attach(phone)
     } else if Date() < deadline, !stopping {
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.findPhone(deadline: deadline) }
-    } else {
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { self.findPhone(deadline: deadline) }
+    } else if phoneInput == nil {
       die(stopping ? "Stopped before the iPhone appeared" : "No iPhone found; connect one with a cable and unlock it")
     }
   }
 
   private func attach(_ device: AVCaptureDevice) {
+    guard phoneInput == nil else { return }
     let input: AVCaptureDeviceInput
     do { input = try AVCaptureDeviceInput(device: device) } catch { return die("Could not open \(device.localizedName): \(error.localizedDescription)") }
     phoneInput = input
@@ -148,7 +155,8 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
     if size.width > 0, size.height > 0 { aspect = CGFloat(size.height) / CGFloat(size.width) }
     emit(["event": "device"].merging(Phone.describe(device)) { a, _ in a })
     window?.title = device.localizedName
-    caseView?.statusField.isHidden = true
+    let session = session, movieOutput = movieOutput
+    caseView?.attachSession(session)
     fitWindow()
 
     var mic: AVCaptureDeviceInput?
@@ -161,7 +169,6 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
         warn("No microphone; recording without narration")
       }
     }
-    let session = session, movieOutput = movieOutput
     queue.async {
       session.beginConfiguration()
       if session.canAddInput(input) { session.addInput(input) }
@@ -275,7 +282,7 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
     panel.delegate = self
     panel.onMarker = { emit(["event": "marker", "at": nowMs()]) }
 
-    let view = PhoneCaseView(frame: NSRect(origin: .zero, size: frame.size), session: session)
+    let view = PhoneCaseView(frame: NSRect(origin: .zero, size: frame.size))
     view.autoresizingMask = [.width, .height]
     panel.contentView = view
     view.needsLayout = true
@@ -459,11 +466,10 @@ final class PhoneCaseView: NSView {
   let bezelInset: CGFloat = 8
   let caseLayer = CALayer()
   let screenLayer = CALayer()
-  let previewLayer: AVCaptureVideoPreviewLayer
+  var previewLayer: AVCaptureVideoPreviewLayer?
   let statusField: NSTextField
 
-  init(frame: NSRect, session: AVCaptureSession) {
-    previewLayer = AVCaptureVideoPreviewLayer(session: session)
+  override init(frame: NSRect) {
     statusField = NSTextField(labelWithString: "Connecting iPhone…")
     super.init(frame: frame)
     wantsLayer = true
@@ -476,9 +482,6 @@ final class PhoneCaseView: NSView {
     screenLayer.backgroundColor = NSColor.black.cgColor
     screenLayer.cornerCurve = .continuous
     screenLayer.masksToBounds = true
-
-    previewLayer.videoGravity = .resizeAspectFill
-    screenLayer.addSublayer(previewLayer)
     caseLayer.addSublayer(screenLayer)
 
     statusField.font = NSFont.systemFont(ofSize: 13, weight: .medium)
@@ -494,6 +497,19 @@ final class PhoneCaseView: NSView {
   @available(*, unavailable)
   required init?(coder _: NSCoder) { fatalError() }
 
+  func attachSession(_ session: AVCaptureSession) {
+    statusField.isHidden = true
+    if previewLayer == nil {
+      let layer = AVCaptureVideoPreviewLayer(session: session)
+      layer.videoGravity = .resizeAspectFill
+      layer.frame = screenLayer.bounds
+      screenLayer.addSublayer(layer)
+      previewLayer = layer
+    }
+    needsLayout = true
+    layoutSubtreeIfNeeded()
+  }
+
   override func makeBackingLayer() -> CALayer {
     caseLayer
   }
@@ -507,7 +523,7 @@ final class PhoneCaseView: NSView {
     let inner = bounds.insetBy(dx: bezelInset, dy: bezelInset)
     screenLayer.frame = inner
     screenLayer.cornerRadius = max(outerRadius - bezelInset, 24)
-    previewLayer.frame = screenLayer.bounds
+    previewLayer?.frame = screenLayer.bounds
     statusField.frame = NSRect(x: 16, y: bounds.midY - 10, width: max(bounds.width - 32, 0), height: 20)
     CATransaction.commit()
   }
