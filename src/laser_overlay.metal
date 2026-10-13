@@ -147,7 +147,7 @@ fragment float4 laser_fragment(
             out.a = 0.13 * intro_fade;
         }
         if (sdf > -1.2) {
-            float dim_target = mix(0.50, 0.28, intro_ease);
+            float dim_target = mix(0.32, 0.22, intro_ease);
             float dim_a = smoothstep(-0.5, 1.0, sdf) * dim_target;
             if (dim_a > 0.001) {
                 out.rgb = out.rgb * (1.0 - dim_a);
@@ -165,7 +165,7 @@ fragment float4 laser_fragment(
     } else if (intro_fade > 0.002) {
         // Full-screen recording: simple 0.15s dim fade out.
         out.rgb = float3(0.0);
-        out.a = 0.50 * intro_fade;
+        out.a = 0.32 * intro_fade;
     }
 
     // 1. Composite persistent ink (white halo + red fill)

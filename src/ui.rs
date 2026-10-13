@@ -1750,7 +1750,7 @@ impl Render for TargetPickerWindow {
             )
         });
 
-        let dim = with_alpha(0x000000, 0.50 * picker_fade);
+        let dim = with_alpha(0x000000, 0.32 * picker_fade);
         let mut root = div()
             .id("scrawl-target-picker")
             .track_focus(&self.focus)
@@ -1784,18 +1784,8 @@ impl Render for TargetPickerWindow {
             }
             let frame = div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h));
             root = root.child(match mode {
-                // Crisp 1px white edge with a dark hairline outside, legible on any content.
-                SelectionMode::Area => {
-                    frame
-                        .border_1()
-                        .border_color(rgba(0xffffffeb))
-                        .shadow(vec![BoxShadow {
-                            color: gpui::hsla(0.0, 0.0, 0.0, 0.35),
-                            offset: point(px(0.0), px(0.0)),
-                            blur_radius: px(0.0),
-                            spread_radius: px(1.0),
-                        }])
-                }
+                // Crisp 1px white edge; no BoxShadow (GPUI BoxShadow fills the interior of transparent divs!).
+                SelectionMode::Area => frame.border_1().border_color(rgba(0xffffffeb)),
                 SelectionMode::Window => frame
                     .rounded(px(10.0))
                     .bg(rgba(0x3b5cf621))
