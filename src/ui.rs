@@ -844,6 +844,11 @@ impl ScrawlCoordinator {
         if let IslandPhase::Selecting { mode } = self.island_phase {
             if let Some(pos) = current_mouse_screen() {
                 self.selection_pointer = Some(pos);
+                if mode == SelectionMode::Area
+                    && let Some((start, _)) = self.selection_drag
+                {
+                    self.selection_drag = Some((start, pos));
+                }
                 if mode == SelectionMode::Window && !self.windows_loading {
                     self.hovered_window = selectable_window_at(
                         &self.selectable_windows,
@@ -1745,7 +1750,7 @@ impl Render for TargetPickerWindow {
             )
         });
 
-        let dim = with_alpha(0x000000, 0.32 * picker_fade);
+        let dim = with_alpha(0x000000, 0.50 * picker_fade);
         let mut root = div()
             .id("scrawl-target-picker")
             .track_focus(&self.focus)
@@ -1891,9 +1896,7 @@ impl Render for TargetPickerWindow {
                 };
                 match cur_mode {
                     SelectionMode::Area => {
-                        if event.dragging()
-                            && let Some((start, _)) = coord.selection_drag
-                        {
+                        if let Some((start, _)) = coord.selection_drag {
                             coord.selection_drag = Some((start, [sx, sy]));
                             cx.notify();
                         }

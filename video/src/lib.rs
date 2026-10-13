@@ -323,6 +323,12 @@ impl Scene for TargetScene {
                 <text x="890" y="368" font-family={FONT_MONO} font-weight="400" font-size="24" fill={TEXT_SOFT}>"fn start_recording_with_target(&mut self)"</text>
                 <text x="890" y="412" font-family={FONT_MONO} font-weight="400" font-size="24" fill={ACCENT_GREEN}>"// 4.2ms non-blocking startup"</text>
 
+                // Dim everything outside the selection cutout inside the stage (160..1760, 200..830)
+                <rect x="160" y="200" width="1600" height={(sel_y - 200.0).max(0.5)} fill="#000000" fill-opacity="0.52" />
+                <rect x="160" y={sel_y + sel_h} width="1600" height={(830.0 - (sel_y + sel_h)).max(0.5)} fill="#000000" fill-opacity="0.52" />
+                <rect x="160" y={sel_y} width={(sel_x - 160.0).max(0.5)} height={sel_h} fill="#000000" fill-opacity="0.52" />
+                <rect x={sel_x + sel_w} y={sel_y} width={(1760.0 - (sel_x + sel_w)).max(0.5)} height={sel_h} fill="#000000" fill-opacity="0.52" />
+
                 // Active Picker Highlight Box (Area -> Window)
                 <rect x={sel_x} y={sel_y} width={sel_w} height={sel_h} rx={sel_rx}
                     fill={ACCENT_BLUE} fill-opacity={sel_fill_op}
