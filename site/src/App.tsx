@@ -62,7 +62,15 @@ export function App() {
         <section className="hero">
           <Suspense
             fallback={
-              <div className="hero-brush">
+              <div
+                style={{
+                  width: 184,
+                  height: 132,
+                  margin: "-26px auto -18px",
+                  display: "grid",
+                  placeItems: "center",
+                }}
+              >
                 <img className="hero-icon" src="/app-icon.png" alt="Scrawl" />
               </div>
             }

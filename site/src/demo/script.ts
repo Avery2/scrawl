@@ -5,10 +5,11 @@ export type Rect = { x: number; y: number; w: number; h: number }
 export const STAGE = { w: 1200, h: 720 }
 export const INK = "#ff3b30"
 
-export const MAC_WINDOW: Rect = { x: 56, y: 64, w: 680, h: 540 }
-export const PHONE: Rect = { x: 267, y: 64, w: 258, h: 560 }
-export const AGENT: Rect = { x: 768, y: 64, w: 376, h: 612 }
-export const AREA: Rect = { x: 44, y: 52, w: 704, h: 564 }
+export const MENUBAR_H = 28
+export const MAC_WINDOW: Rect = { x: 52, y: 78, w: 684, h: 540 }
+export const PHONE: Rect = { x: 265, y: 76, w: 258, h: 556 }
+export const AGENT: Rect = { x: 760, y: 48, w: 422, h: 640 }
+export const AREA: Rect = { x: 40, y: 66, w: 708, h: 564 }
 
 export const T = {
   keys: 2400,
@@ -17,6 +18,7 @@ export const T = {
   dragStart: 3900,
   dragEnd: 4900,
   phoneClick: 4300,
+  phoneRecord: 5150,
   record: 5300,
   circle: [6000, 7300] as const,
   pin1: 7600,
@@ -97,27 +99,34 @@ export const pillState = (t: number): Pill => {
   return "copied"
 }
 
-// Fixed chip columns keep the island's geometry predictable for the scripted cursor.
+// Mirrors the HUD in src/ui.rs: a 40px capsule, 4px inset, 32px chips with 2px gaps. Item widths
+// are fixed (a divider is 1px plus 6px margins) so the scripted cursor can hit exact chip centers.
 export const PILL = {
   cx: STAGE.w / 2,
-  cy: 24,
-  pad: 5,
-  gap: 4,
-  cols: {
-    select: [56, 86, 64, 30],
-    recording: [66, 54, 62, 62],
-    copied: [78, 56, 66, 30],
+  top: MENUBAR_H + 10,
+  h: 40,
+  inset: 4,
+  gap: 2,
+  items: {
+    select: [56, 94, 66, 13, 32],
+    selectPhone: [56, 94, 66, 72, 13, 32],
+    recording: [70, 13, 58, 68, 68],
+    processing: [132],
+    copied: [98, 13, 62, 74, 32],
   },
 }
+export const PILL_CY = PILL.top + PILL.h / 2
 
-export const pillWidth = (cols: number[]) =>
-  cols.reduce((a, b) => a + b, 0) + PILL.gap * (cols.length - 1) + PILL.pad * 2
+export const pillWidth = (items: number[]) => items.reduce((a, b) => a + b, 0) + PILL.gap * (items.length - 1) + PILL.inset * 2
 
-const chipCenter = (cols: number[], index: number): Point => {
-  let x = PILL.cx - pillWidth(cols) / 2 + PILL.pad
-  for (let i = 0; i < index; i++) x += cols[i] + PILL.gap
-  return [x + cols[index] / 2, PILL.cy]
+const chipCenter = (items: number[], index: number): Point => {
+  let x = PILL.cx - pillWidth(items) / 2 + PILL.inset
+  for (let i = 0; i < index; i++) x += items[i] + PILL.gap
+  return [x + items[index] / 2, PILL_CY]
 }
+
+// The home-screen prompt row inside the OpenCode terminal (see Terminal in stage-parts.tsx).
+export const PROMPT_AT: Point = [AGENT.x + 150, AGENT.y + 356]
 
 export type Anchors = { badge: Rect; actions: Rect; title: Rect }
 
@@ -168,12 +177,14 @@ export function buildScript(mode: Mode, a: Anchors): Script {
   const badge = center(a.badge)
   const circle = circlePoints(badge[0] - 10, badge[1], a.badge.w / 2 + 40, a.badge.h / 2 + 15)
 
+  // On the Mac the arrow swings up from below-left into the clipped "Retry failed" button.
+  const buttons = a.actions.x + a.actions.w - 200
   const tip: Point =
     mode === "mac"
-      ? [a.actions.x - 8, a.actions.y + a.actions.h * 0.55]
+      ? [buttons - 10, a.actions.y + a.actions.h * 0.6]
       : [a.actions.x + a.actions.w * 0.62, a.actions.y + a.actions.h + 6]
-  const start: Point = mode === "mac" ? [tip[0] - 88, tip[1] - 56] : [tip[0] + 34, tip[1] + 92]
-  const ctrl: Point = mode === "mac" ? [tip[0] - 28, tip[1] - 48] : [tip[0] + 44, tip[1] + 34]
+  const start: Point = mode === "mac" ? [tip[0] - 104, tip[1] + 52] : [tip[0] + 34, tip[1] + 92]
+  const ctrl: Point = mode === "mac" ? [tip[0] - 44, tip[1] + 46] : [tip[0] + 44, tip[1] + 34]
   const shaft = curvePoints(start, ctrl, tip)
   const before = shaft[shaft.length - 5]
   const angle = Math.atan2(tip[1] - before[1], tip[0] - before[0])
@@ -197,8 +208,8 @@ export function buildScript(mode: Mode, a: Anchors): Script {
     { n: 2, t: T.pin2, at: pin2 },
   ]
 
-  const finish = chipCenter(PILL.cols.recording, 3)
-  const prompt: Point = [AGENT.x + 140, AGENT.y + AGENT.h - 30]
+  const finish = chipCenter(PILL.items.recording, 4)
+  const prompt: Point = PROMPT_AT
   const clicks: Click[] = [...pins.map((p) => ({ t: p.t, at: p.at })), { t: T.finish, at: finish }, { t: T.promptClick, at: prompt }]
 
   const path: Waypoint[] = [
@@ -212,9 +223,10 @@ export function buildScript(mode: Mode, a: Anchors): Script {
     drag = { from: [AREA.x, AREA.y], to: [AREA.x + AREA.w, AREA.y + AREA.h] }
     path.push({ t: T.dragStart, at: drag.from }, { t: T.dragEnd, at: drag.to })
   } else {
-    const phoneChip = chipCenter(PILL.cols.select, 2)
-    clicks.push({ t: T.phoneClick, at: phoneChip })
-    path.push({ t: T.phoneClick, at: phoneChip })
+    const phoneChip = chipCenter(PILL.items.select, 2)
+    const recordChip = chipCenter(PILL.items.selectPhone, 3)
+    clicks.push({ t: T.phoneClick, at: phoneChip }, { t: T.phoneRecord, at: recordChip })
+    path.push({ t: T.phoneClick, at: phoneChip }, { t: T.phoneRecord - 250, at: recordChip }, { t: T.phoneRecord, at: recordChip })
   }
 
   path.push(

@@ -15,7 +15,6 @@ import {
   SPEECH_END,
   STAGE,
   strokeAt,
-  summaryText,
   T,
   WORDS,
   type Cursor as CursorState,
@@ -26,15 +25,21 @@ import { MacWindow, PhoneMirror } from "./apps"
 
 const pressedAt = (t: number, at: number) => t >= at - 60 && t < at + 160
 
+// Ghostty becomes the key window once the cursor clicks into the OpenCode prompt.
+export const terminalActive = (t: number) => t >= T.promptClick
+
+const APPLE =
+  "M11.2 4.3c.6-.8 1-1.8.9-2.8-.9 0-2 .6-2.6 1.4-.6.7-1.1 1.7-.9 2.7 1 .1 2-.5 2.6-1.3zM12.1 5.8c-1.4-.1-2.7.8-3.3.8-.7 0-1.7-.8-2.9-.8C4.4 5.9 3 6.8 2.2 8.1c-1.6 2.7-.4 6.8 1.1 9 .8 1.1 1.7 2.3 2.8 2.3 1.1 0 1.6-.7 2.9-.7 1.4 0 1.8.7 2.9.7 1.2 0 2-1.1 2.7-2.2.9-1.3 1.2-2.5 1.2-2.6 0 0-2.4-.9-2.4-3.6 0-2.2 1.8-3.3 1.9-3.4-1-1.5-2.6-1.7-3.2-1.7z"
+
 export function MenuBar({ t }: { t: number }) {
-  const recording = t >= T.record && t < T.finish
+  const app = terminalActive(t) ? "Ghostty" : "Pulse"
   return (
     <div className="menubar">
       <div className="menubar-left">
         <svg className="apple" viewBox="0 0 17 21" aria-hidden>
-          <path d="M11.2 4.3c.6-.8 1-1.8.9-2.8-.9 0-2 .6-2.6 1.4-.6.7-1.1 1.7-.9 2.7 1 .1 2-.5 2.6-1.3zM12.1 5.8c-1.4-.1-2.7.8-3.3.8-.7 0-1.7-.8-2.9-.8C4.4 5.9 3 6.8 2.2 8.1c-1.6 2.7-.4 6.8 1.1 9 .8 1.1 1.7 2.3 2.8 2.3 1.1 0 1.6-.7 2.9-.7 1.4 0 1.8.7 2.9.7 1.2 0 2-1.1 2.7-2.2.9-1.3 1.2-2.5 1.2-2.6 0 0-2.4-.9-2.4-3.6 0-2.2 1.8-3.3 1.9-3.4-1-1.5-2.6-1.7-3.2-1.7z" />
+          <path d={APPLE} />
         </svg>
-        <b>Pulse</b>
+        <b>{app}</b>
         <span>File</span>
         <span>Edit</span>
         <span>View</span>
@@ -42,83 +47,135 @@ export function MenuBar({ t }: { t: number }) {
         <span>Help</span>
       </div>
       <div className="menubar-right">
-        <span className={`menubar-scrawl${recording ? " rec" : ""}`}>
+        <span className="menubar-extra menubar-scrawl">
           <img src="/menubar-icon@2x.png" alt="" />
         </span>
-        <svg viewBox="0 0 20 14" className="wifi" aria-hidden>
-          <path d="M10 13.2l2.3-2.6a3.4 3.4 0 00-4.6 0zM4.9 7.5l1.5 1.7a5.4 5.4 0 017.2 0l1.5-1.7a7.6 7.6 0 00-10.2 0zM1.6 4.1l1.5 1.7a10 10 0 0113.8 0l1.5-1.7a12.2 12.2 0 00-16.8 0z" />
-        </svg>
-        <span className="battery">
-          <i />
+        <span className="menubar-extra">
+          <span className="battery">
+            <i />
+          </span>
         </span>
-        <span>Tue 9:41 AM</span>
+        <span className="menubar-extra">
+          <svg viewBox="0 0 20 14" className="wifi" aria-hidden>
+            <path d="M10 13.2l2.3-2.6a3.4 3.4 0 00-4.6 0zM4.9 7.5l1.5 1.7a5.4 5.4 0 017.2 0l1.5-1.7a7.6 7.6 0 00-10.2 0zM1.6 4.1l1.5 1.7a10 10 0 0113.8 0l1.5-1.7a12.2 12.2 0 00-16.8 0z" />
+          </svg>
+        </span>
+        <span className="menubar-extra">
+          <svg viewBox="0 0 16 16" className="spot" aria-hidden>
+            <circle cx="6.6" cy="6.6" r="4.6" fill="none" stroke="currentColor" strokeWidth="1.7" />
+            <path d="M10 10l4 4" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" />
+          </svg>
+        </span>
+        <span className="menubar-extra">
+          <svg viewBox="0 0 18 16" className="cc" aria-hidden>
+            <rect x="1" y="1.5" width="16" height="5.6" rx="2.8" fill="none" stroke="currentColor" strokeWidth="1.3" />
+            <circle cx="4.4" cy="4.3" r="1.7" />
+            <rect x="1" y="8.9" width="16" height="5.6" rx="2.8" />
+            <circle cx="13.6" cy="11.7" r="1.7" fill="#2b2b33" />
+          </svg>
+        </span>
+        <span className="menubar-clock">Tue Oct 13&nbsp;&nbsp;9:41 AM</span>
       </div>
     </div>
   )
 }
 
-function Chip({ w, children, on, primary, dim, pressed }: { w: number; children: React.ReactNode; on?: boolean; primary?: boolean; dim?: boolean; pressed?: boolean }) {
+function Chip({ w, children, on, primary, dim, pressed, round }: { w: number; children: React.ReactNode; on?: boolean; primary?: boolean; dim?: boolean; pressed?: boolean; round?: boolean }) {
+  const cls = ["chip", on && "on", primary && "primary", dim && "dim", pressed && "pressed", round && "round"].filter(Boolean).join(" ")
   return (
-    <span className={`chip${on ? " on" : ""}${primary ? " primary" : ""}${dim ? " dim" : ""}${pressed ? " pressed" : ""}`} style={{ width: w }}>
+    <span className={cls} style={{ width: w }}>
       {children}
     </span>
   )
 }
 
+const Divider = () => <span className="island-divider" />
+
 export function Island({ t, mode }: { t: number; mode: Mode }) {
   const state = pillState(t)
-  const cols = state === "select" || state === "recording" || state === "copied" ? PILL.cols[state] : null
-  const notch = state === "notch"
-  const width = cols ? pillWidth(cols) : notch ? 184 : 92
   const phoneOn = mode === "iphone" && t >= T.phoneClick
+  const items = state === "notch" ? PILL.items.select : state === "select" && phoneOn ? PILL.items.selectPhone : PILL.items[state]
+  const gone = state === "notch" || t >= T.paste
+  const width = pillWidth(items)
+  const [lead, , c2, c3, c4, c5] = items
   return (
     <div
-      className={`island ${state}`}
-      style={{
-        left: PILL.cx,
-        width,
-        top: notch ? 0 : 6,
-        height: notch ? 30 : 36,
-        borderRadius: notch ? "0 0 13px 13px" : 18,
-      }}
+      className={`island ${state}${gone ? " gone" : ""}`}
+      style={{ left: PILL.cx, top: PILL.top, width, height: PILL.h }}
+      aria-hidden={gone}
     >
-      <div className="island-content" key={state}>
-        {state === "select" && cols && (
+      <div className="island-content" key={state === "select" && phoneOn ? "select-phone" : state}>
+        {state === "select" && (
           <>
-            <Chip w={cols[0]} on={!phoneOn}>
+            <Chip w={lead} on={!phoneOn}>
               Area
             </Chip>
-            <Chip w={cols[1]}>Full Screen</Chip>
-            <Chip w={cols[2]} on={phoneOn} pressed={mode === "iphone" && pressedAt(t, T.phoneClick)}>
+            <Chip w={items[1]}>Full Screen</Chip>
+            <Chip w={c2} on={phoneOn} pressed={mode === "iphone" && pressedAt(t, T.phoneClick)}>
               iPhone
             </Chip>
-            <Chip w={cols[3]}>✕</Chip>
+            {phoneOn && (
+              <Chip w={c3} primary pressed={pressedAt(t, T.phoneRecord)}>
+                Record
+              </Chip>
+            )}
+            <Divider />
+            <Chip w={phoneOn ? c5 : c4} round>
+              <svg viewBox="0 0 10 10" aria-hidden>
+                <path d="M2 2l6 6M8 2L2 8" />
+              </svg>
+            </Chip>
           </>
         )}
-        {state === "recording" && cols && (
+        {state === "recording" && (
           <>
-            <Chip w={cols[0]}>
-              <i className="rec-dot" />
-              {clock(t - T.record)}
-            </Chip>
-            <Chip w={cols[1]} dim={t < T.circle[1]}>
+            <span className="island-lead" style={{ width: lead }}>
+              <span className="rec-slot">
+                <i className="rec-halo" />
+                <i className="rec-dot" />
+              </span>
+              <b>{clock(t - T.record)}</b>
+            </span>
+            <Divider />
+            <Chip w={c2} dim={t < T.circle[1]}>
               Undo
             </Chip>
-            <Chip w={cols[2]}>Cancel</Chip>
-            <Chip w={cols[3]} primary pressed={pressedAt(t, T.finish)}>
+            <Chip w={c3}>Cancel</Chip>
+            <Chip w={c4} primary pressed={pressedAt(t, T.finish)}>
               Finish
             </Chip>
           </>
         )}
-        {state === "processing" && <span className="spinner" />}
-        {state === "copied" && cols && (
+        {state === "processing" && (
+          <span className="island-lead" style={{ width: lead }}>
+            <span className="orbit">
+              {Array.from({ length: 8 }, (_, i) => (
+                <i key={i} style={{ transform: `rotate(${i * 45}deg) translateY(-7.2px)`, animationDelay: `${(i / 8) * 0.476 - 0.476}s` }} />
+              ))}
+            </span>
+            <b>Processing…</b>
+          </span>
+        )}
+        {state === "copied" && (
           <>
-            <Chip w={cols[0]}>
-              <span className="check">✓</span> Copied
+            <span className="island-lead" style={{ width: lead }}>
+              <span className="check">
+                <svg viewBox="0 0 12 12" aria-hidden>
+                  <path d="M2.6 6.3l2.2 2.2 4.6-4.9" />
+                </svg>
+              </span>
+              <b>Copied</b>
+            </span>
+            <Divider />
+            <Chip w={c2} primary>
+              Paste
             </Chip>
-            <Chip w={cols[1]}>Paste</Chip>
-            <Chip w={cols[2]}>Inspect</Chip>
-            <Chip w={cols[3]}>✕</Chip>
+            <Chip w={c3}>Inspect</Chip>
+            <Chip w={c4} round>
+              <svg viewBox="0 0 10 10" aria-hidden>
+                <path d="M2 2l6 6M8 2L2 8" />
+              </svg>
+            </Chip>
           </>
         )}
       </div>
@@ -137,8 +194,10 @@ export function Selection({ t, script, cursor }: { t: number; script: Script; cu
   } else if (t >= T.dragEnd) {
     rect = { x: fx, y: fy, w: AREA.w, h: AREA.h }
   }
-  const recording = t >= T.record
-  const dim = recording ? 0.16 : 0.5
+  // Matches laser_overlay.metal: 0.32 picker dim easing to 0.22 while recording, 1px border 0.92 → 0.28.
+  const intro = easeOut(progress(t, T.record, T.record + 240))
+  const dim = 0.32 + (0.22 - 0.32) * intro
+  const border = 0.92 + (0.28 - 0.92) * intro
   const fade = 1 - progress(t, T.finish, T.finish + 300)
   const sizeOpacity = Math.min(progress(t, T.dragStart, T.dragStart + 120), 1 - progress(t, T.dragEnd, T.dragEnd + 220))
   return (
@@ -146,8 +205,14 @@ export function Selection({ t, script, cursor }: { t: number; script: Script; cu
       {rect ? (
         <>
           <div
-            className={`selection-rect${recording ? " rec" : ""}`}
-            style={{ left: rect.x, top: rect.y, width: rect.w, height: rect.h, boxShadow: `0 0 0 4000px rgba(0,0,0,${dim})` }}
+            className="selection-rect"
+            style={{
+              left: rect.x,
+              top: rect.y,
+              width: rect.w,
+              height: rect.h,
+              boxShadow: `0 0 0 4000px rgba(0,0,0,${dim}), inset 0 0 0 1px rgba(255,255,255,${border})`,
+            }}
           />
           {sizeOpacity > 0 && (
             <span className="selection-size" style={{ left: rect.x + rect.w, top: rect.y + rect.h, opacity: sizeOpacity }}>
@@ -191,7 +256,7 @@ export function Ripples({ t, script }: { t: number; script: Script }) {
   )
 }
 
-export function Cursor({ c, crosshair }: { c: CursorState; crosshair?: boolean }) {
+export function Cursor({ c, crosshair, ibeam }: { c: CursorState; crosshair?: boolean; ibeam?: boolean }) {
   const [x, y] = c.at
   return (
     <div className="cursor" style={{ transform: `translate(${x}px, ${y}px)` }}>
@@ -205,6 +270,11 @@ export function Cursor({ c, crosshair }: { c: CursorState; crosshair?: boolean }
           <path d="M3 23l2-7L18 3l5 5L10 21z" fill="#f2f2f2" stroke="#111" strokeWidth="1.3" strokeLinejoin="round" />
           <path d="M3 23l2-7 5 5z" fill="#ff3b30" stroke="#111" strokeWidth="1.3" strokeLinejoin="round" />
           <path d="M15.5 5.5l5 5" stroke="#111" strokeWidth="1.3" />
+        </svg>
+      ) : ibeam ? (
+        <svg width="10" height="20" viewBox="0 0 10 20" style={{ transform: "translate(-5px, -10px)" }}>
+          <path d="M1.5 1.5c2 0 3.5.6 3.5 2v13c0 1.4-1.5 2-3.5 2M8.5 1.5c-2 0-3.5.6-3.5 2v13c0 1.4 1.5 2 3.5 2M3 10h4" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" />
+          <path d="M1.5 1.5c2 0 3.5.6 3.5 2v13c0 1.4-1.5 2-3.5 2M8.5 1.5c-2 0-3.5.6-3.5 2v13c0 1.4 1.5 2 3.5 2M3 10h4" fill="none" stroke="#000" strokeWidth="1.1" strokeLinecap="round" />
         </svg>
       ) : (
         <svg width="22" height="28" viewBox="0 0 22 28" style={{ transform: `translate(-2px, -2px) scale(${c.pressed ? 0.88 : 1})`, transformOrigin: "2px 2px" }}>
@@ -221,11 +291,11 @@ const KEYS = ["⌥", "⇧", "S"]
 export function Keys({ t, mode }: { t: number; mode: Mode }) {
   const cx = mode === "mac" ? MAC_WINDOW.x + MAC_WINDOW.w / 2 : PHONE.x + PHONE.w / 2
   const shortcut = t >= T.keys - 150 && t < T.keysUp + 350
-  const paste = t >= T.paste - 250 && t < T.paste + 450
+  const paste = t >= T.paste - 400 && t < T.paste + 500
   if (shortcut) {
     const out = progress(t, T.keysUp, T.keysUp + 350)
     return (
-      <div className="keys" style={{ left: cx, top: 640, opacity: (1 - out) * Math.min(1, progress(t, T.keys - 150, T.keys)) }}>
+      <div className="keys" style={{ left: cx, top: 646, opacity: (1 - out) * Math.min(1, progress(t, T.keys - 150, T.keys)) }}>
         {KEYS.map((k, i) => (
           <kbd key={k} className={t >= T.keys + i * 150 && t < T.keysUp ? "down" : ""}>
             {k}
@@ -235,11 +305,12 @@ export function Keys({ t, mode }: { t: number; mode: Mode }) {
     )
   }
   if (paste) {
-    const out = progress(t, T.paste + 200, T.paste + 450)
+    const out = progress(t, T.paste + 250, T.paste + 500)
     return (
-      <div className="keys small" style={{ left: AGENT.x + AGENT.w / 2, top: AGENT.y + AGENT.h - 110, opacity: 1 - out }}>
-        <kbd className={t >= T.paste - 150 ? "down" : ""}>⌘</kbd>
-        <kbd className={t >= T.paste && t < T.paste + 250 ? "down" : ""}>V</kbd>
+      <div className="keys small" style={{ left: AGENT.x + AGENT.w / 2, top: AGENT.y + AGENT.h - 150, opacity: (1 - out) * Math.min(1, progress(t, T.paste - 400, T.paste - 250)) }}>
+        <kbd className={t >= T.paste - 300 && t < T.paste + 250 ? "down" : ""}>⌥</kbd>
+        <kbd className={t >= T.paste - 150 && t < T.paste + 250 ? "down" : ""}>⇧</kbd>
+        <kbd className={t >= T.paste && t < T.paste + 200 ? "down" : ""}>V</kbd>
       </div>
     )
   }
@@ -254,10 +325,10 @@ export function Caption({ t, mode }: { t: number; mode: Mode }) {
   const talking = t < SPEECH_END && last >= 0 && t - spoken[last][1] < 500
   const cx = mode === "mac" ? MAC_WINDOW.x + MAC_WINDOW.w / 2 : PHONE.x + PHONE.w / 2
   return (
-    <div className="caption" style={{ left: cx, top: mode === "mac" ? 628 : 640, opacity }}>
+    <div className="caption" style={{ left: cx, top: mode === "mac" ? 642 : 646, opacity }}>
       <span className="wave">
         {[0, 1, 2, 3, 4].map((i) => {
-          const amp = talking ? 0.35 + 0.65 * Math.abs(Math.sin(t / (90 + i * 23) + i * 1.7)) : 0.12
+          const amp = talking ? 0.35 + 0.65 * Math.abs(Math.sin(t / (90 + i * 23) + i * 1.7)) : 0.16
           return <i key={i} style={{ transform: `scaleY(${amp})` }} />
         })}
       </span>
@@ -277,10 +348,7 @@ export const captureArea = (mode: Mode): Rect => (mode === "mac" ? AREA : { x: P
 export function KeyframeScene({ mode, script, frame, scale }: { mode: Mode; script: Script; frame: Script["frames"][number]; scale: number }) {
   const area = captureArea(mode)
   return (
-    <div
-      className="sheet-scene wallpaper"
-      style={{ width: STAGE.w, height: STAGE.h, transform: `scale(${scale}) translate(${-area.x}px, ${-area.y}px)` }}
-    >
+    <div className="sheet-scene wallpaper" style={{ width: STAGE.w, height: STAGE.h, transform: `scale(${scale}) translate(${-area.x}px, ${-area.y}px)` }}>
       {mode === "mac" ? <MacWindow fix={0} settle={0} /> : <PhoneMirror fix={0} settle={0} />}
       <svg className="ink" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`}>
         {script.strokes
@@ -298,108 +366,38 @@ export function KeyframeScene({ mode, script, frame, scale }: { mode: Mode; scri
   )
 }
 
-export function ContactSheet({ mode, script, width, height }: { mode: Mode; script: Script; width: number; height?: number }) {
-  const area = captureArea(mode)
-  const gap = 3
-  const maxW = (width - gap - 6) / 2
-  const maxH = height ?? (mode === "mac" ? 150 : 176)
-  const s = Math.min(maxW / area.w, maxH / area.h)
-  const fw = area.w * s
-  const fh = area.h * s
+// Corner index badge drawn by render.rs: a 22px dark pill with a faint ring, top-right.
+export function FrameBadge({ n, k }: { n: number; k: number }) {
+  const s = Math.max(k, 0.42)
   return (
-    <div className="sheet" style={{ gridTemplateColumns: `repeat(2, ${fw}px)`, gap }}>
-      {script.frames.map((f) => (
-        <div key={f.n} className="sheet-frame" style={{ width: fw, height: fh }}>
-          <KeyframeScene mode={mode} script={script} frame={f} scale={s} />
-          <span className="sheet-badge">
-            #{f.n} · {clock(f.t)}
-          </span>
-        </div>
-      ))}
-    </div>
+    <span className="frame-badge" style={{ height: 22 * s, minWidth: 22 * s, padding: `0 ${6.5 * s}px`, fontSize: 12 * s, top: 6 * s, right: 6 * s }}>
+      {n}
+    </span>
   )
 }
 
-const DIFF: [string, string][] = [
-  ["-", `<Badge className="absolute -left-14 -top-2">`],
-  ["+", `<Badge className="ml-2.5">`],
-  ["-", `<ul className="space-y-0 py-px">`],
-  ["+", `<ul className="divide-y py-2.5">`],
-  ["-", `<div className="h-8 overflow-hidden pt-3.5">`],
-  ["+", `<div className="flex h-8 justify-end">`],
-]
-
-export function Agent({ t, mode, script }: { t: number; mode: Mode; script: Script }) {
-  const pasted = t >= T.paste && t < T.submit
-  const submitted = t >= T.submit
-  const working = submitted && t < T.done
-  const summary = summaryText(mode, true)
+// Same geometry as render_contact_sheet: 640px cells (440 for portrait), 16px padding, 14px gaps,
+// 10px card radius with a 1px #2e2e30 rim on a #141414 sheet.
+export function ContactSheet({ mode, script, width, height }: { mode: Mode; script: Script; width: number; height?: number }) {
+  const area = captureArea(mode)
+  const portrait = area.h > area.w
+  const cell = portrait ? 440 : 640
+  const fw0 = Math.min(cell, (960 * area.w) / area.h)
+  const fh0 = (fw0 * area.h) / area.w
+  const n = script.frames.length
+  const w0 = 32 + cell * n + 14 * (n - 1)
+  const h0 = 32 + fh0
+  const k = Math.min(width / w0, (height ?? Infinity) / h0)
   return (
-    <div className="agent" style={{ left: AGENT.x, top: AGENT.y, width: AGENT.w, height: AGENT.h }}>
-      <div className="agent-head">
-        <span className="agent-brand">opencode</span>
-        <span className="agent-title">{submitted ? "Fix header card alignment" : "New session"}</span>
-      </div>
-      <div className="agent-body">
-        {!submitted && <div className="agent-empty">opencode</div>}
-        {submitted && (
-          <div className="msg user enter">
-            <div className="attach">
-              <span>[Image 1]</span> contact-sheet.png
-            </div>
-            <ContactSheet mode={mode} script={script} width={AGENT.w - 46} />
-            <pre className="summary">{summary.join("\n")}</pre>
+    <div className="sheet" style={{ width: w0 * k, height: h0 * k, padding: 16 * k, gap: 14 * k, borderRadius: Math.max(2, 6 * k) }}>
+      {script.frames.map((f) => (
+        <div key={f.n} className="sheet-frame" style={{ width: cell * k, height: fh0 * k }}>
+          <div className="sheet-card" style={{ width: fw0 * k, height: fh0 * k, borderRadius: 10 * k }}>
+            <KeyframeScene mode={mode} script={script} frame={f} scale={(fw0 * k) / area.w} />
+            <FrameBadge n={f.n} k={k} />
           </div>
-        )}
-        {t >= T.read && (
-          <div className="tool enter">
-            <span className="tool-icon">✱</span> Read <b>src/HeaderCard.tsx</b>
-          </div>
-        )}
-        {t >= T.edit && (
-          <div className="tool enter">
-            <div>
-              <span className="tool-icon">←</span> Edit <b>src/HeaderCard.tsx</b>
-            </div>
-            <div className="diff">
-              {DIFF.map(([sign, code], i) =>
-                t >= T.diff + i * 190 ? (
-                  <div key={i} className={`diff-line ${sign === "+" ? "add" : "del"} enter`}>
-                    <span>{sign}</span>
-                    {code}
-                  </div>
-                ) : null,
-              )}
-            </div>
-          </div>
-        )}
-        {t >= T.done && <div className="msg assistant enter">Badge sits after the title, the button row is back on its baseline, and rows have 10px padding.</div>}
-        {working && (
-          <div className="working">
-            <i />
-            <i />
-            <i />
-          </div>
-        )}
-      </div>
-      <div className={`agent-prompt${t >= T.promptClick && t < T.submit ? " focus" : ""}`}>
-        <span className="caret-mark">›</span>
-        {pasted ? (
-          <span className="prompt-text">
-            <span className="paste-chip">[Image 1]</span> <span className="paste-chip">[Pasted ~3 lines]</span>
-            <i className="caret" />
-          </span>
-        ) : (
-          <span className="prompt-placeholder">
-            <i className="caret" />
-            Ask anything
-          </span>
-        )}
-      </div>
-      <div className="agent-foot">
-        <span className="agent-mode">Build</span>
-        <span>{working ? "esc interrupt" : "enter send"}</span>
-      </div>
+        </div>
+      ))}
     </div>
   )
 }
@@ -409,5 +407,4 @@ export function fixAmount(t: number) {
   return { fix: easeOutBack(p), settle: progress(t, T.fix[1] - 150, T.fix[1] + 1100), p }
 }
 
-export const phoneLive = (t: number) => Math.min(progress(t, T.phoneClick + 80, T.phoneClick + 380), 1 - progress(t, T.finish, T.finish + 300))
-
+export const phoneLive = (t: number) => Math.min(progress(t, T.phoneRecord, T.phoneRecord + 300), 1 - progress(t, T.finish, T.finish + 300))

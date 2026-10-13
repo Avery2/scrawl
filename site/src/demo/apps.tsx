@@ -1,4 +1,4 @@
-import type { Ref } from "react"
+import type { ReactNode, Ref } from "react"
 import { lerp, MAC_WINDOW, PHONE } from "./script"
 
 export type CardRefs = {
@@ -8,35 +8,45 @@ export type CardRefs = {
 }
 
 const ROWS = [
-  ["api-gateway", "prod", "ok", "2m"],
-  ["billing-worker", "prod", "fail", "9m"],
-  ["web-console", "staging", "ok", "14m"],
-  ["search-indexer", "prod", "ok", "31m"],
+  ["api-gateway", "a41c9e2", "prod", "ok", "2m"],
+  ["billing-worker", "7f03b1d", "prod", "fail", "9m"],
+  ["web-console", "c2e88a0", "staging", "ok", "14m"],
+  ["search-indexer", "19bd4f7", "prod", "ok", "31m"],
 ] as const
+
+export function TrafficLights({ inactive }: { inactive?: boolean }) {
+  return (
+    <span className={`lights${inactive ? " inactive" : ""}`} aria-hidden>
+      <i />
+      <i />
+      <i />
+    </span>
+  )
+}
 
 export function DeployCard({ fix, settle, refs, compact }: { fix: number; settle: number; refs?: CardRefs; compact?: boolean }) {
   const badgeX = compact ? -46 : -60
+  const f = Math.min(1, Math.max(0, fix))
   return (
-    <div className={`card${compact ? " compact" : ""}`} style={{ boxShadow: settle > 0 && settle < 1 ? `0 0 0 ${1.5}px rgba(52,199,89,${0.55 * (1 - settle)})` : undefined }}>
+    <div className={`card${compact ? " compact" : ""}`} style={{ boxShadow: settle > 0 && settle < 1 ? `0 0 0 1.5px rgba(48,209,88,${0.55 * (1 - settle)})` : undefined }}>
       <div className="card-head">
         <h3 ref={refs?.title} className="card-title">
           Deploy Activity
         </h3>
-        <span
-          ref={refs?.badge}
-          className="badge"
-          style={{ transform: `translate(${lerp(badgeX, 0, fix)}px, ${lerp(-8, 0, fix)}px)` }}
-        >
+        <span ref={refs?.badge} className="badge" style={{ transform: `translate(${lerp(badgeX, 0, fix)}px, ${lerp(-8, 0, fix)}px)` }}>
           <i />
           Live
         </span>
       </div>
       <p className="card-sub">Last 24 hours · 128 deploys</p>
       <ul className="rows">
-        {ROWS.map(([name, env, status, ago]) => (
-          <li key={name} style={{ paddingBlock: lerp(1, compact ? 8 : 9, Math.min(1, Math.max(0, fix))) }}>
-            <span className="row-name">{name}</span>
-            {!compact && <span className="row-env">{env}</span>}
+        {ROWS.map(([name, sha, env, status, ago]) => (
+          <li key={name} style={{ paddingBlock: lerp(1, compact ? 8 : 9, f) }}>
+            <span className="row-name">
+              {name}
+              {!compact && <em>{sha}</em>}
+            </span>
+            {!compact && <span className={`row-env ${env}`}>{env}</span>}
             <span className={`row-status ${status}`}>
               <i />
               {status === "ok" ? "Healthy" : "Failed"}
@@ -55,34 +65,146 @@ export function DeployCard({ fix, settle, refs, compact }: { fix: number; settle
   )
 }
 
-export function MacWindow({ fix, settle, refs }: { fix: number; settle: number; refs?: CardRefs }) {
+const icon = (d: ReactNode) => (
+  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+    {d}
+  </svg>
+)
+
+const NAV: [string, ReactNode, string?][] = [
+  ["Overview", icon(<><rect x="2.5" y="2.5" width="4.5" height="4.5" rx="1.2" /><rect x="9" y="2.5" width="4.5" height="4.5" rx="1.2" /><rect x="2.5" y="9" width="4.5" height="4.5" rx="1.2" /><rect x="9" y="9" width="4.5" height="4.5" rx="1.2" /></>)],
+  ["Deploys", icon(<><circle cx="8" cy="8" r="5.6" /><path d="M8 10.8V5.4M5.6 7.6L8 5.2l2.4 2.4" /></>)],
+  ["Services", icon(<><rect x="2.5" y="3" width="11" height="4" rx="1.2" /><rect x="2.5" y="9" width="11" height="4" rx="1.2" /><path d="M5 5h.01M5 11h.01" strokeWidth="1.8" /></>)],
+  ["Incidents", icon(<><path d="M8 2.6l5.6 9.8H2.4z" /><path d="M8 6.6v2.6M8 11h.01" /></>), "1"],
+  ["Logs", icon(<><path d="M3 4h10M3 8h10M3 12h6" /></>)],
+]
+
+const ENVS: [string, string][] = [
+  ["production", "#30d158"],
+  ["staging", "#ffd60a"],
+  ["preview", "#8e8e93"],
+]
+
+function Spark() {
+  const pts = [9, 12, 10, 14, 13, 17, 15, 19, 16, 21, 18, 22]
+  const d = pts.map((v, i) => `${i ? "L" : "M"}${(i / (pts.length - 1)) * 64},${24 - v}`).join(" ")
   return (
-    <div className="win" style={{ left: MAC_WINDOW.x, top: MAC_WINDOW.y, width: MAC_WINDOW.w, height: MAC_WINDOW.h }}>
-      <div className="win-side">
-        <div className="lights">
-          <i />
-          <i />
-          <i />
-        </div>
+    <svg className="spark" viewBox="0 0 64 24" aria-hidden>
+      <path d={`${d} L64,24 L0,24 Z`} fill="rgba(10,132,255,.18)" />
+      <path d={d} fill="none" stroke="#0a84ff" strokeWidth="1.4" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+export function MacWindow({ fix, settle, refs, inactive }: { fix: number; settle: number; refs?: CardRefs; inactive?: boolean }) {
+  return (
+    <div className={`win${inactive ? " inactive" : ""}`} style={{ left: MAC_WINDOW.x, top: MAC_WINDOW.y, width: MAC_WINDOW.w, height: MAC_WINDOW.h }}>
+      <aside className="win-side">
+        <TrafficLights inactive={inactive} />
         <nav>
-          <span>Overview</span>
-          <span className="on">Deploys</span>
-          <span>Services</span>
-          <span>Incidents</span>
-          <span>Settings</span>
+          {NAV.map(([label, glyph, count]) => (
+            <span key={label} className={label === "Deploys" ? "on" : ""}>
+              {glyph}
+              {label}
+              {count && <em>{count}</em>}
+            </span>
+          ))}
+          <b>Environments</b>
+          {ENVS.map(([label, color]) => (
+            <span key={label}>
+              <i style={{ background: color }} />
+              {label}
+            </span>
+          ))}
         </nav>
-      </div>
+        <div className="win-user">
+          <span>KL</span>
+          <div>
+            <b>Kit Langton</b>
+            <em>pulse.dev</em>
+          </div>
+        </div>
+      </aside>
       <div className="win-main">
-        <div className="win-toolbar">
-          <b>Deploys</b>
+        <header className="win-toolbar">
+          <div className="win-title">
+            <b>Deploys</b>
+            <em>main · 3 services</em>
+          </div>
           <span className="seg">
             <span className="on">24h</span>
             <span>7d</span>
             <span>30d</span>
           </span>
+          <span className="win-search">
+            {icon(<><circle cx="7" cy="7" r="4.2" /><path d="M10.2 10.2l3 3" /></>)}
+            Search
+          </span>
+        </header>
+        <div className="win-content">
+          <div className="stats">
+            <div>
+              <em>Deploys</em>
+              <b>128</b>
+              <Spark />
+            </div>
+            <div>
+              <em>Success rate</em>
+              <b>97.6%</b>
+              <small className="up">▲ 1.2%</small>
+            </div>
+            <div>
+              <em>Median duration</em>
+              <b>4m 12s</b>
+              <small>p95 9m 40s</small>
+            </div>
+          </div>
+          <DeployCard fix={fix} settle={settle} refs={refs} />
+          <div className="card incidents">
+            <div className="card-head">
+              <h4>Incidents</h4>
+              <span>1 open</span>
+            </div>
+            <ul>
+              <li>
+                <i className="sev-high" />
+                billing-worker exited with code 137<em>9m</em>
+              </li>
+              <li>
+                <i className="sev-low" />
+                web-console p95 latency above 800 ms<em>2h</em>
+              </li>
+              <li>
+                <i />
+                api-gateway certificate renewed<em>1d</em>
+              </li>
+            </ul>
+          </div>
         </div>
-        <DeployCard fix={fix} settle={settle} refs={refs} />
       </div>
+    </div>
+  )
+}
+
+function PhoneStatus() {
+  return (
+    <div className="phone-status">
+      <b>9:41</b>
+      <span className="phone-island" />
+      <span className="phone-glyphs" aria-hidden>
+        <svg viewBox="0 0 18 12">
+          <rect x="0" y="8" width="3" height="4" rx="0.8" />
+          <rect x="5" y="5.5" width="3" height="6.5" rx="0.8" />
+          <rect x="10" y="3" width="3" height="9" rx="0.8" />
+          <rect x="15" y="0" width="3" height="12" rx="0.8" />
+        </svg>
+        <svg viewBox="0 0 16 12">
+          <path d="M8 11.4l2-2.3a2.9 2.9 0 00-4 0zM3.6 6.6l1.3 1.5a4.7 4.7 0 016.2 0l1.3-1.5a6.6 6.6 0 00-8.8 0zM.8 3.6l1.3 1.5a8.6 8.6 0 0111.8 0l1.3-1.5a10.6 10.6 0 00-14.4 0z" />
+        </svg>
+        <span className="phone-battery">
+          <i />
+        </span>
+      </span>
     </div>
   )
 }
@@ -96,20 +218,15 @@ export function PhoneMirror({ fix, settle, refs, live }: { fix: number; settle: 
         top: PHONE.y,
         width: PHONE.w,
         height: PHONE.h,
-        boxShadow: live ? `0 0 0 ${2 * live}px rgba(255,59,48,${0.85 * live}), 0 30px 80px rgba(0,0,0,.55)` : undefined,
+        boxShadow: live
+          ? `0 0 0 ${2 * live}px rgba(255,59,48,${0.85 * live}), 0 0 0 1px #3a3a3e, 0 30px 80px rgba(0,0,0,.55)`
+          : undefined,
       }}
     >
       <div className="phone-screen">
-        <div className="phone-status">
-          <b>9:41</b>
-          <span className="phone-island" />
-          <span className="phone-glyphs">
-            <i />
-            <i />
-          </span>
-        </div>
+        <PhoneStatus />
         <div className="phone-nav">
-          <span>Pulse</span>
+          <span>‹ Pulse</span>
           <h2>Deploys</h2>
         </div>
         <DeployCard fix={fix} settle={settle} refs={refs} compact />
@@ -122,16 +239,19 @@ export function PhoneMirror({ fix, settle, refs, live }: { fix: number; settle: 
           </div>
           <div className="phone-incident ok">
             <i />
-            <span>web-console latency</span>
+            <span>web-console p95 latency</span>
             <em>2h</em>
           </div>
         </div>
         <div className="phone-tabs">
-          <span />
-          <span className="on" />
-          <span />
-          <span />
+          {["Overview", "Deploys", "Alerts", "Settings"].map((t) => (
+            <span key={t} className={t === "Deploys" ? "on" : ""}>
+              <i />
+              {t}
+            </span>
+          ))}
         </div>
+        <span className="phone-home" />
       </div>
     </div>
   )

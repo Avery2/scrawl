@@ -3,7 +3,7 @@ import { Copy } from "./Copy"
 import { MacWindow } from "./demo/apps"
 import { measureAnchors } from "./demo/measure"
 import { AREA, type Anchors, buildScript, clock, type Point, type Script, STAGE, summaryText, T, WORDS } from "./demo/script"
-import { ContactSheet, KeyframeScene } from "./demo/stage-parts"
+import { ContactSheet, FrameBadge, KeyframeScene } from "./demo/stage-parts"
 
 const BUNDLE = "scrawl-2026-10-13.scrawl"
 const ID = "scrawl-1791924018273-3a1f"
@@ -231,11 +231,7 @@ function Frame({ script, n, width, height, children }: { script: Script; n: numb
   return (
     <div className="bundle-frame" style={{ width: AREA.w * s, height: AREA.h * s }}>
       <KeyframeScene mode="mac" script={script} frame={frame} scale={s} />
-      {children ?? (
-        <span className="sheet-badge">
-          #{frame.n} · {clock(frame.t)}
-        </span>
-      )}
+      {children ?? <FrameBadge n={frame.n} k={s * (AREA.w / 640)} />}
     </div>
   )
 }

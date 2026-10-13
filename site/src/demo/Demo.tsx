@@ -2,8 +2,9 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { MacWindow, PhoneMirror } from "./apps"
 import { InkPath, inkPath } from "./ink"
 import { measureAnchors, sameAnchors } from "./measure"
-import { type Anchors, BEATS, buildScript, cursorAt, type Mode, STAGE, T } from "./script"
-import { Agent, Caption, Cursor, fixAmount, Island, Ink, Keys, MenuBar, phoneLive, Ripples, Selection } from "./stage-parts"
+import { AGENT, type Anchors, BEATS, buildScript, cursorAt, type Mode, STAGE, T } from "./script"
+import { Caption, Cursor, fixAmount, Island, Ink, Keys, MenuBar, phoneLive, Ripples, Selection, terminalActive } from "./stage-parts"
+import { Terminal } from "./terminal"
 
 type UserStroke = { points: [number, number, number][]; done: boolean }
 
@@ -184,6 +185,8 @@ export function Demo() {
   const live = mode === "iphone" ? phoneLive(t) : 0
   const refs = { badge: badgeRef, actions: actionsRef, title: titleRef }
   const drawing = shiftDown || drawMode
+  const overTerminal =
+    !!cursor && cursor.at[0] > AGENT.x && cursor.at[0] < AGENT.x + AGENT.w && cursor.at[1] > AGENT.y + 28 && cursor.at[1] < AGENT.y + AGENT.h
 
   return (
     <div className="demo">
@@ -201,8 +204,12 @@ export function Demo() {
       >
         <div ref={stageRef} className="stage wallpaper" style={{ width: STAGE.w, height: STAGE.h, transform: `scale(${scale})` }}>
           <MenuBar t={t} />
-          {mode === "mac" ? <MacWindow fix={fix} settle={settle} refs={refs} /> : <PhoneMirror fix={fix} settle={settle} refs={refs} live={live} />}
-          {script && <Agent t={t} mode={mode} script={script} />}
+          {mode === "mac" ? (
+            <MacWindow fix={fix} settle={settle} refs={refs} inactive={terminalActive(t)} />
+          ) : (
+            <PhoneMirror fix={fix} settle={settle} refs={refs} live={live} />
+          )}
+          {script && <Terminal t={t} mode={mode} script={script} />}
           {script && <Selection t={t} script={script} cursor={cursor} />}
           {script && <Ink t={t} script={script} />}
           <Caption t={t} mode={mode} />
@@ -214,7 +221,7 @@ export function Demo() {
               <InkPath key={i} d={inkPath(s.points.length > 1 ? s.points : [...s.points, s.points[0]], s.done)} />
             ))}
           </svg>
-          {cursor && <Cursor c={cursor} crosshair={mode === "mac" && t >= T.select && t < T.record} />}
+          {cursor && <Cursor c={cursor} crosshair={mode === "mac" && t >= T.select && t < T.record} ibeam={overTerminal && t >= T.promptClick - 400} />}
         </div>
       </div>
       <Controls
