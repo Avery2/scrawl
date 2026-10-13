@@ -75,6 +75,9 @@ case "audio":
 case "probe":
   guard arguments.count >= 2 else { fail("probe needs MOVIE") }
   runAsync { emit(try await Media.probe(URL(filePath: arguments[1]))) }
+case "guide":
+  let kind = (arguments.count >= 2 ? GuidePermission(rawValue: arguments[1]) : nil) ?? .accessibility
+  PermissionGuide.run(permission: kind, bundlePath: option("--bundle", in: arguments))
 default:
-  fail("usage: scrawl-helper devices|mirror|transcribe|frames|audio|probe …")
+  fail("usage: scrawl-helper devices|mirror|transcribe|frames|audio|probe|guide …")
 }

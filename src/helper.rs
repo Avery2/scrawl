@@ -79,6 +79,21 @@ pub struct PhoneDevice {
     pub height: u32,
 }
 
+/// Spawns the floating drag-into-System-Settings guide for `"accessibility"`,
+/// `"input-monitoring"`, or `"screen-recording"`.
+pub fn show_permission_guide(permission: &str) {
+    let Ok(helper_bin) = path() else {
+        return;
+    };
+    let mut cmd = Command::new(helper_bin);
+    cmd.arg("guide")
+        .arg(permission)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _ = cmd.spawn();
+}
+
 /// Cabled iPhones and iPads, from the USB registry (no camera permission needed). `id` is the
 /// USB serial and the size is unknown until the mirror attaches.
 pub fn devices() -> Result<Vec<PhoneDevice>> {

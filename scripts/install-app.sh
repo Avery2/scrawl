@@ -108,6 +108,6 @@ for _ in {1..20}; do
   pgrep -f "Scrawl.app/Contents/MacOS/scrawl" >/dev/null || break
   sleep 0.05
 done
-open -a "${APP_DIR}"
+open -a "${APP_DIR}" || (sleep 0.3 && open -n -a "${APP_DIR}")
 sleep 0.3
 pgrep -fl "Scrawl.app/Contents/MacOS/scrawl"

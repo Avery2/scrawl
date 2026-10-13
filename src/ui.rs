@@ -222,6 +222,7 @@ enum MenuAction {
     RecordIphone,
     OpenLatest,
     RunDemo,
+    PermissionGuide,
     CheckForUpdates,
     Quit,
 }
@@ -257,6 +258,11 @@ objc2::define_class!(
         #[unsafe(method(runDemo:))]
         fn run_demo(&self, _sender: &AnyObject) {
             let _ = self.ivars().sender.try_send(MenuAction::RunDemo);
+        }
+
+        #[unsafe(method(permissionGuide:))]
+        fn permission_guide(&self, _sender: &AnyObject) {
+            let _ = self.ivars().sender.try_send(MenuAction::PermissionGuide);
         }
 
         #[unsafe(method(checkForUpdates:))]
@@ -312,6 +318,7 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
     add("Open Latest Bundle", sel!(openLatest:));
     add("Generate Demo Bundle", sel!(runDemo:));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add("Permissions Guide…", sel!(permissionGuide:));
     add("Check for Updates…", sel!(checkForUpdates:));
     add("Quit Scrawl", sel!(quitApp:));
 
@@ -3438,6 +3445,9 @@ pub fn run_app(
                                         });
                                         open_review_window(&loop_coord, cx);
                                     }
+                                }
+                                MenuAction::PermissionGuide => {
+                                    crate::helper::show_permission_guide("accessibility");
                                 }
                                 MenuAction::CheckForUpdates => {
                                     crate::sparkle::check_for_updates();
