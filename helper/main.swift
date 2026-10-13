@@ -52,9 +52,10 @@ case "devices":
   emit(Phone.cabled())
 case "mirror":
   let preview = arguments.contains("--preview")
+  let hidden = arguments.contains("--hidden")
   let out = option("--out", in: arguments).map { URL(filePath: $0) }
   if !preview && out == nil { fail("mirror needs --out FILE.mov or --preview") }
-  Mirror.run(output: out, previewOnly: preview, deviceID: option("--device", in: arguments))
+  Mirror.run(output: out, previewOnly: preview, hiddenPreview: hidden, deviceID: option("--device", in: arguments))
 case "transcribe":
   guard arguments.count >= 2 else { fail("transcribe needs a file") }
   runAsync { emit(try await Transcriber.transcribe(URL(filePath: arguments[1]))) }

@@ -138,7 +138,7 @@ fragment float4 laser_fragment(
         bool is_device = u._pad1 > 2.5;
         bool is_window = u._pad1 > 1.5 && !is_device;
         float corner_r = is_device
-            ? (min(u.target_rect.z, u.target_rect.w) * 0.11)
+            ? (min(u.target_rect.z, u.target_rect.w) * 0.135)
             : (is_window ? 10.0 : 0.0);
         float2 box_min = u.target_rect.xy;
         float2 box_max = u.target_rect.xy + u.target_rect.zw;
@@ -166,14 +166,17 @@ fragment float4 laser_fragment(
 
         // 3. Inset border (`sdf in [-border_w, 0.0]`): rendered by this exact same Metal layer during
         //    BOTH Selecting (`now_sec == 0`) and Recording (`now_sec > 0`), so there is zero window swap or jump.
-        float border_w = is_window ? mix(2.0, 1.0, intro_ease) : 1.0;
-        float border_cov = clamp(border_w + 0.5 + sdf, 0.0, 1.0) * clamp(0.5 - sdf, 0.0, 1.0);
-        if (border_cov > 0.001) {
-            float3 picker_border = is_window ? float3(0.357, 0.486, 0.980) : float3(1.0, 1.0, 1.0);
-            float3 border_col = mix(picker_border, float3(1.0, 1.0, 1.0), intro_ease);
-            float border_alpha = border_cov * mix(is_window ? 0.93 : 0.92, 0.28, intro_ease) * picker_fade;
-            out.rgb = border_col * border_alpha + out.rgb * (1.0 - border_alpha);
-            out.a = border_alpha + out.a * (1.0 - border_alpha);
+        //    (`is_device` already renders its own titanium PhoneCaseView bezel.)
+        if (!is_device) {
+            float border_w = is_window ? mix(2.0, 1.0, intro_ease) : 1.0;
+            float border_cov = clamp(border_w + 0.5 + sdf, 0.0, 1.0) * clamp(0.5 - sdf, 0.0, 1.0);
+            if (border_cov > 0.001) {
+                float3 picker_border = is_window ? float3(0.357, 0.486, 0.980) : float3(1.0, 1.0, 1.0);
+                float3 border_col = mix(picker_border, float3(1.0, 1.0, 1.0), intro_ease);
+                float border_alpha = border_cov * mix(is_window ? 0.93 : 0.92, 0.28, intro_ease) * picker_fade;
+                out.rgb = border_col * border_alpha + out.rgb * (1.0 - border_alpha);
+                out.a = border_alpha + out.a * (1.0 - border_alpha);
+            }
         }
     } else if (u._pad1 < -0.0001) {
         // Picker open before any drag starts: uniform 0.32 * picker_fade dim.

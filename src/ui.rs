@@ -758,6 +758,24 @@ impl ScrawlCoordinator {
                     coord.iphone = found;
                     cx.notify();
                 }
+                if coord.iphone.is_some() && coord.is_selecting() && coord.iphone_preview.is_none()
+                {
+                    let hidden = !matches!(
+                        coord.island_phase,
+                        IslandPhase::Selecting {
+                            mode: SelectionMode::Iphone
+                        }
+                    );
+                    if let Ok(session) = PhoneSession::start_preview(
+                        None,
+                        hidden,
+                        Some(Arc::clone(&coord.telemetry)),
+                    ) {
+                        coord.iphone_preview = Some(session);
+                        coord.sync_picker_overlay();
+                        cx.notify();
+                    }
+                }
             });
         })
         .detach();
@@ -835,8 +853,10 @@ impl ScrawlCoordinator {
                 // Crisp tactile Dynamic Island scale micro-pulse when Space toggles camera/crosshair mode.
                 self.island_scale_velocity += 1.25;
             }
-            if mode != SelectionMode::Iphone {
-                self.iphone_preview = None;
+            if mode != SelectionMode::Iphone
+                && let Some(ref mut preview) = self.iphone_preview
+            {
+                preview.hide_preview();
             }
             self.island_phase = IslandPhase::Selecting { mode };
             self.selection_drag = None;
@@ -874,8 +894,10 @@ impl ScrawlCoordinator {
         }
         scrawl_log("preview_iphone invoked");
         self.set_selection_mode(SelectionMode::Iphone, cx);
-        if self.iphone_preview.is_none() {
-            match PhoneSession::start_preview(None, Some(Arc::clone(&self.telemetry))) {
+        if let Some(ref mut preview) = self.iphone_preview {
+            preview.show_preview();
+        } else {
+            match PhoneSession::start_preview(None, false, Some(Arc::clone(&self.telemetry))) {
                 Ok(session) => {
                     self.iphone_preview = Some(session);
                 }

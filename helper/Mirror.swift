@@ -2,6 +2,7 @@
 import AppKit
 import CoreMediaIO
 import IOKit
+import QuartzCore
 
 /// Cabled iPhones and iPads, which macOS publishes as muxed capture devices once an app sets
 /// `kCMIOHardwarePropertyAllowScreenCaptureDevices` (the switch QuickTime flips for New Movie
@@ -65,11 +66,11 @@ enum Phone {
 ///   {"event":"marker", "at": epochMs}                    M pressed in the mirror window
 ///   {"event":"finished", path, durationMs}               movie finalized; the helper then exits
 ///   {"event":"cancelled"} / {"event":"error", message}
-/// Commands on stdin: `start [PATH]`, `stop`, `cancel`. End of input means stop.
+/// Commands on stdin: `show`, `hide`, `start [PATH]`, `stop`, `cancel`. End of input means stop.
 final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCaptureFileOutputRecordingDelegate {
-  static func run(output: URL?, previewOnly: Bool = false, deviceID: String?) -> Never {
+  static func run(output: URL?, previewOnly: Bool = false, hiddenPreview: Bool = false, deviceID: String?) -> Never {
     let app = NSApplication.shared
-    let mirror = Mirror(output: output, previewOnly: previewOnly, deviceID: deviceID)
+    let mirror = Mirror(output: output, previewOnly: previewOnly, hiddenPreview: hiddenPreview, deviceID: deviceID)
     app.setActivationPolicy(.accessory)
     app.delegate = mirror
     withExtendedLifetime(mirror) { app.run() }
@@ -78,20 +79,23 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
 
   var output: URL?
   var previewOnly: Bool
+  var hiddenPreview: Bool
   let deviceID: String?
   let session = AVCaptureSession()
   let movieOutput = AVCaptureMovieFileOutput()
   let queue = DispatchQueue(label: "dev.kitlangton.scrawl.helper.session")
   var phoneInput: AVCaptureDeviceInput?
   var window: MirrorPanel?
+  var caseView: PhoneCaseView?
   var aspect: CGFloat = 2868.0 / 1320.0
   var stopping = false
   var cancelled = false
   var finished = false
 
-  init(output: URL?, previewOnly: Bool, deviceID: String?) {
+  init(output: URL?, previewOnly: Bool, hiddenPreview: Bool, deviceID: String?) {
     self.output = output
     self.previewOnly = previewOnly
+    self.hiddenPreview = hiddenPreview
     self.deviceID = deviceID
   }
 
@@ -101,12 +105,13 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
 
   func applicationDidFinishLaunching(_: Notification) {
     readCommands()
+    Phone.publishScreenCaptureDevices()
+    showWindow(title: "iPhone", orderFront: !hiddenPreview)
     AVCaptureDevice.requestAccess(for: .video) { granted in
       DispatchQueue.main.async {
         guard granted else { return self.die("Camera access denied; allow Scrawl in System Settings › Privacy & Security › Camera") }
-        AVCaptureDevice.requestAccess(for: .audio) { _ in
-          DispatchQueue.main.async { self.findPhone(deadline: Date().addingTimeInterval(10)) }
-        }
+        self.findPhone(deadline: Date().addingTimeInterval(12))
+        AVCaptureDevice.requestAccess(for: .audio) { _ in }
       }
     }
   }
@@ -121,7 +126,7 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
     if let phone = match {
       attach(phone)
     } else if Date() < deadline, !stopping {
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.findPhone(deadline: deadline) }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.findPhone(deadline: deadline) }
     } else {
       die(stopping ? "Stopped before the iPhone appeared" : "No iPhone found; connect one with a cable and unlock it")
     }
@@ -134,6 +139,9 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
     let size = Phone.size(of: device)
     if size.width > 0, size.height > 0 { aspect = CGFloat(size.height) / CGFloat(size.width) }
     emit(["event": "device"].merging(Phone.describe(device)) { a, _ in a })
+    window?.title = device.localizedName
+    caseView?.statusField.isHidden = true
+    fitWindow()
 
     let mic = AVCaptureDevice.default(for: .audio).flatMap { try? AVCaptureDeviceInput(device: $0) }
     let session = session, movieOutput = movieOutput, output = output, shouldRecord = !previewOnly
@@ -153,7 +161,6 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
         movieOutput.startRecording(to: output, recordingDelegate: self)
       }
     }
-    showWindow(title: device.localizedName)
     NotificationCenter.default.addObserver(forName: AVCaptureInput.Port.formatDescriptionDidChangeNotification, object: nil, queue: .main) { [weak self] note in
       guard let self, let port = note.object as? AVCaptureInput.Port, port.input === self.phoneInput, port.mediaType == .video,
             let format = port.formatDescription else { return }
@@ -173,19 +180,26 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
 
   // MARK: Window
 
-  private func showWindow(title: String) {
-    guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+  private func showWindow(title: String, orderFront: Bool) {
+    guard let screen = NSScreen.screens.first ?? NSScreen.main else { return }
     let visible = screen.visibleFrame
-    let height = (visible.height * 0.78).rounded()
+    let height = (visible.height * 0.76).rounded()
     let width = (height / aspect).rounded()
-    let frame = NSRect(x: visible.maxX - width - 48, y: visible.midY - height / 2, width: width, height: height)
-    let panel = MirrorPanel(contentRect: frame, styleMask: [.titled, .fullSizeContentView, .resizable, .nonactivatingPanel], backing: .buffered, defer: false)
+    let frame = NSRect(
+      x: (visible.midX - width / 2).rounded(),
+      y: (visible.midY - height / 2 - 12).rounded(),
+      width: width,
+      height: height
+    )
+    let panel = MirrorPanel(
+      contentRect: frame,
+      styleMask: [.borderless, .resizable, .nonactivatingPanel],
+      backing: .buffered,
+      defer: false
+    )
     panel.title = title
-    panel.titleVisibility = .hidden
-    panel.titlebarAppearsTransparent = true
-    for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] { panel.standardWindowButton(button)?.isHidden = true }
     panel.isMovableByWindowBackground = true
-    panel.level = .floating
+    panel.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue)
     panel.isOpaque = false
     panel.backgroundColor = .clear
     panel.hasShadow = true
@@ -195,41 +209,42 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
     panel.delegate = self
     panel.onMarker = { emit(["event": "marker", "at": nowMs()]) }
 
-    let view = NSView(frame: NSRect(origin: .zero, size: frame.size))
-    view.wantsLayer = true
-    let root = CALayer()
-    root.backgroundColor = NSColor.black.cgColor
-    root.cornerRadius = width * 0.11
-    root.cornerCurve = .continuous
-    root.masksToBounds = true
-    let preview = AVCaptureVideoPreviewLayer(session: session)
-    preview.videoGravity = .resizeAspect
-    preview.frame = root.bounds
-    preview.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-    root.addSublayer(preview)
-    view.layer = root
+    let view = PhoneCaseView(frame: NSRect(origin: .zero, size: frame.size), session: session)
+    view.autoresizingMask = [.width, .height]
     panel.contentView = view
-    panel.orderFrontRegardless()
+    view.needsLayout = true
+    view.layoutSubtreeIfNeeded()
     window = panel
-    emitRect()
+    caseView = view
+    if orderFront {
+      panel.orderFrontRegardless()
+      emitRect()
+    }
   }
 
   private func fitWindow() {
     guard let window else { return }
     var frame = window.frame
     let width = (frame.height / aspect).rounded()
-    frame.origin.x += frame.width - width
+    frame.origin.x = (frame.midX - width / 2).rounded()
     frame.size.width = width
     window.contentAspectRatio = NSSize(width: 1, height: aspect)
     window.setFrame(frame, display: true)
-    window.contentView?.layer?.cornerRadius = min(frame.width, frame.height) * 0.11
-    emitRect()
+    caseView?.needsLayout = true
+    caseView?.layoutSubtreeIfNeeded()
+    if !hiddenPreview {
+      emitRect()
+    }
   }
 
-  func windowDidMove(_: Notification) { emitRect() }
+  func windowDidMove(_: Notification) {
+    if !hiddenPreview { emitRect() }
+  }
+
   func windowDidResize(_: Notification) {
-    if let window { window.contentView?.layer?.cornerRadius = min(window.frame.width, window.frame.height) * 0.11 }
-    emitRect()
+    caseView?.needsLayout = true
+    caseView?.layoutSubtreeIfNeeded()
+    if !hiddenPreview { emitRect() }
   }
 
   /// The picture's frame in global display coordinates with a top-left origin, the space
@@ -251,6 +266,13 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
             self.stop()
           } else if command == "cancel" {
             self.cancel()
+          } else if command == "show" {
+            self.hiddenPreview = false
+            self.window?.orderFrontRegardless()
+            self.emitRect()
+          } else if command == "hide" {
+            self.hiddenPreview = true
+            self.window?.orderOut(nil)
           } else if command == "start" {
             self.startRecording(path: nil)
           } else if command.hasPrefix("start ") {
@@ -268,6 +290,11 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
       output = URL(filePath: path)
     }
     previewOnly = false
+    if hiddenPreview {
+      hiddenPreview = false
+      window?.orderFrontRegardless()
+      emitRect()
+    }
     guard phoneInput != nil, let output else { return }
     try? FileManager.default.removeItem(at: output)
     let movieOutput = movieOutput
@@ -355,6 +382,66 @@ final class MirrorPanel: NSPanel {
     } else {
       super.keyDown(with: event)
     }
+  }
+}
+
+/// Phone-shaped bezel + screen container that explicitly lays out `AVCaptureVideoPreviewLayer`
+/// on every resize/rotation so the live video layer is never 0x0.
+final class PhoneCaseView: NSView {
+  let bezelInset: CGFloat = 8
+  let caseLayer = CALayer()
+  let screenLayer = CALayer()
+  let previewLayer: AVCaptureVideoPreviewLayer
+  let statusField: NSTextField
+
+  init(frame: NSRect, session: AVCaptureSession) {
+    previewLayer = AVCaptureVideoPreviewLayer(session: session)
+    statusField = NSTextField(labelWithString: "Connecting iPhone…")
+    super.init(frame: frame)
+    wantsLayer = true
+
+    caseLayer.backgroundColor = NSColor(srgbRed: 0.11, green: 0.11, blue: 0.12, alpha: 0.98).cgColor
+    caseLayer.borderColor = NSColor(calibratedWhite: 1.0, alpha: 0.24).cgColor
+    caseLayer.borderWidth = 1.5
+    caseLayer.cornerCurve = .continuous
+
+    screenLayer.backgroundColor = NSColor.black.cgColor
+    screenLayer.cornerCurve = .continuous
+    screenLayer.masksToBounds = true
+
+    previewLayer.videoGravity = .resizeAspectFill
+    screenLayer.addSublayer(previewLayer)
+    caseLayer.addSublayer(screenLayer)
+
+    statusField.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+    statusField.textColor = NSColor(calibratedWhite: 0.58, alpha: 1.0)
+    statusField.alignment = .center
+    statusField.drawsBackground = false
+    statusField.isBezeled = false
+    statusField.isEditable = false
+    statusField.isSelectable = false
+    addSubview(statusField)
+  }
+
+  @available(*, unavailable)
+  required init?(coder _: NSCoder) { fatalError() }
+
+  override func makeBackingLayer() -> CALayer {
+    caseLayer
+  }
+
+  override func layout() {
+    super.layout()
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    let outerRadius = (min(bounds.width, bounds.height) * 0.135).rounded()
+    caseLayer.cornerRadius = outerRadius
+    let inner = bounds.insetBy(dx: bezelInset, dy: bezelInset)
+    screenLayer.frame = inner
+    screenLayer.cornerRadius = max(outerRadius - bezelInset, 24)
+    previewLayer.frame = screenLayer.bounds
+    statusField.frame = NSRect(x: 16, y: bounds.midY - 10, width: max(bounds.width - 32, 0), height: 20)
+    CATransaction.commit()
   }
 }
 

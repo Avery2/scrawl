@@ -90,9 +90,10 @@ impl PhoneSession {
     /// Opens the live iPhone mirror window in preview mode without recording to disk yet.
     pub fn start_preview(
         device_id: Option<&str>,
+        hidden: bool,
         telemetry: Option<Arc<SharedCaptureTelemetry>>,
     ) -> Result<Self> {
-        Self::spawn_mirror(None, device_id, telemetry)
+        Self::spawn_mirror(None, hidden, device_id, telemetry)
     }
 
     /// `telemetry` (when capturing through the app) receives the mirror's on-screen rect as the
@@ -102,11 +103,12 @@ impl PhoneSession {
         device_id: Option<&str>,
         telemetry: Option<Arc<SharedCaptureTelemetry>>,
     ) -> Result<Self> {
-        Self::spawn_mirror(Some(movie), device_id, telemetry)
+        Self::spawn_mirror(Some(movie), false, device_id, telemetry)
     }
 
     fn spawn_mirror(
         movie: Option<&Path>,
+        hidden: bool,
         device_id: Option<&str>,
         telemetry: Option<Arc<SharedCaptureTelemetry>>,
     ) -> Result<Self> {
@@ -117,6 +119,9 @@ impl PhoneSession {
             command.arg("--out").arg(movie);
         } else {
             command.arg("--preview");
+            if hidden {
+                command.arg("--hidden");
+            }
         }
         if let Some(id) = device_id
             && !id.is_empty()
@@ -222,6 +227,14 @@ impl PhoneSession {
         self.session_epoch_ms = crate::now_epoch_ms();
         self.lock().markers_epoch_ms.clear();
         self.send(&format!("start {}", movie.display()));
+    }
+
+    pub fn show_preview(&mut self) {
+        self.send("show");
+    }
+
+    pub fn hide_preview(&mut self) {
+        self.send("hide");
     }
 
     pub fn device(&self) -> Option<PhoneDevice> {
