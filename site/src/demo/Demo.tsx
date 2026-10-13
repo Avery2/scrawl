@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { MacWindow, PhoneMirror } from "./apps"
 import { InkPath, inkPath } from "./ink"
-import { type Anchors, BEATS, buildScript, cursorAt, type Mode, type Rect, STAGE, T } from "./script"
+import { measureAnchors, sameAnchors } from "./measure"
+import { type Anchors, BEATS, buildScript, cursorAt, type Mode, STAGE, T } from "./script"
 import { Agent, Caption, Cursor, fixAmount, Island, Ink, Keys, MenuBar, phoneLive, Ripples, Selection } from "./stage-parts"
 
 type UserStroke = { points: [number, number, number][]; done: boolean }
@@ -71,22 +72,22 @@ export function Demo() {
     return () => ro.disconnect()
   }, [])
 
+  const { fix, settle } = fixAmount(t)
+  const broken = fix === 0
+  const fixRef = useRef(fix)
+  fixRef.current = fix
+
+  // Strokes target the broken layout, so only measure while nothing has been fixed yet.
   useLayoutEffect(() => {
+    if (!broken) return
     const measure = () => {
-      const stage = stageRef.current
-      const els = [badgeRef.current, actionsRef.current, titleRef.current]
-      if (!stage || els.some((e) => !e)) return
-      const base = stage.getBoundingClientRect()
-      const s = base.width / STAGE.w
-      const rect = (el: Element): Rect => {
-        const r = el.getBoundingClientRect()
-        return { x: (r.left - base.left) / s, y: (r.top - base.top) / s, w: r.width / s, h: r.height / s }
-      }
-      setAnchors({ badge: rect(els[0]!), actions: rect(els[1]!), title: rect(els[2]!) })
+      if (fixRef.current !== 0 || !stageRef.current || !badgeRef.current || !actionsRef.current || !titleRef.current) return
+      const next = measureAnchors(stageRef.current, badgeRef.current, actionsRef.current, titleRef.current)
+      setAnchors((prev) => (prev && sameAnchors(prev, next) ? prev : next))
     }
     measure()
     document.fonts?.ready.then(measure)
-  }, [mode])
+  }, [mode, broken])
 
   useEffect(() => {
     const el = wrapRef.current
@@ -179,7 +180,6 @@ export function Demo() {
     }
   }
 
-  const { fix, settle } = fixAmount(t)
   const cursor = script ? cursorAt(script, t) : null
   const live = mode === "iphone" ? phoneLive(t) : 0
   const refs = { badge: badgeRef, actions: actionsRef, title: titleRef }
@@ -203,7 +203,7 @@ export function Demo() {
           <MenuBar t={t} />
           {mode === "mac" ? <MacWindow fix={fix} settle={settle} refs={refs} /> : <PhoneMirror fix={fix} settle={settle} refs={refs} live={live} />}
           {script && <Agent t={t} mode={mode} script={script} />}
-          {script && <Selection t={t} script={script} />}
+          {script && <Selection t={t} script={script} cursor={cursor} />}
           {script && <Ink t={t} script={script} />}
           <Caption t={t} mode={mode} />
           <Keys t={t} mode={mode} />
@@ -214,7 +214,7 @@ export function Demo() {
               <InkPath key={i} d={inkPath(s.points.length > 1 ? s.points : [...s.points, s.points[0]], s.done)} />
             ))}
           </svg>
-          {cursor && <Cursor c={cursor} />}
+          {cursor && <Cursor c={cursor} crosshair={mode === "mac" && t >= T.select && t < T.record} />}
         </div>
       </div>
       <Controls

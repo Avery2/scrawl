@@ -1,6 +1,9 @@
-import { useState } from "react"
+import { lazy, Suspense } from "react"
+import { BundleExplorer } from "./Bundle"
+import { Copy } from "./Copy"
 import { Demo } from "./demo/Demo"
-import { summaryText } from "./demo/script"
+
+const Brush3D = lazy(() => import("./Brush3D").then((m) => ({ default: m.Brush3D })))
 
 const REPO = "https://github.com/kitlangton/scrawl"
 const BASE = "https://scrawl.kitlangton.com"
@@ -12,39 +15,14 @@ unzip Scrawl-latest-arm64.zip -d ~/Applications
 open ~/Applications/Scrawl.app`
 
 const CONTROLS: [string[], string][] = [
-  [["⌃", "⌥", "⇧", "S"], "Start or finish"],
+  [["⌥", "⇧", "S"], "Start or finish"],
   [["⇧"], "Hold and drag to draw"],
   [["⇧", "click"], "Drop a numbered pin"],
   [["⌘", "Z"], "Undo"],
   [["esc"], "Cancel"],
-  [["⌃", "⌥", "⇧", "V"], "Paste the latest capture"],
+  [["⌥", "⇧", "V"], "Paste the latest capture"],
   [["M"], "Flag a moment on iPhone"],
 ]
-
-const FILES: [string, string][] = [
-  ["contact-sheet.png", "Annotated keyframes"],
-  ["frames/frame-01.png", "Full-resolution keyframes"],
-  ["summary.md", "Transcript by keyframe"],
-  ["scrawl.json", "Strokes, clicks, word timings"],
-  ["recording.mp4", "Video"],
-  ["audio.wav", "Voice"],
-]
-
-function Copy({ text }: { text: string }) {
-  const [done, setDone] = useState(false)
-  return (
-    <button
-      className="copy"
-      onClick={() => {
-        navigator.clipboard?.writeText(text)
-        setDone(true)
-        setTimeout(() => setDone(false), 1400)
-      }}
-    >
-      {done ? "Copied" : "Copy"}
-    </button>
-  )
-}
 
 function Download() {
   return (
@@ -82,11 +60,18 @@ export function App() {
 
       <main>
         <section className="hero">
-          <img className="hero-icon" src="/app-icon.png" alt="Scrawl" />
+          <Suspense
+            fallback={
+              <div className="hero-brush">
+                <img className="hero-icon" src="/app-icon.png" alt="Scrawl" />
+              </div>
+            }
+          >
+            <Brush3D />
+          </Suspense>
           <h1>Show an agent the problem.</h1>
           <p className="lede">
-            Press <kbd>⌃</kbd>
-            <kbd>⌥</kbd>
+            Press <kbd>⌥</kbd>
             <kbd>⇧</kbd>
             <kbd>S</kbd>, talk, click, and draw. Paste the result into your agent.
           </p>
@@ -97,26 +82,11 @@ export function App() {
           <Demo />
         </section>
 
-        <section id="bundle" className="split">
-          <div>
-            <h2>
-              <code>.scrawl</code> bundle
-            </h2>
-            <ul className="files">
-              {FILES.map(([name, desc]) => (
-                <li key={name}>
-                  <code>{name}</code>
-                  <span>{desc}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
-          <div className="code-block">
-            <div className="code-head">
-              <span>summary.md</span>
-            </div>
-            <pre>{summaryText("mac").join("\n")}</pre>
-          </div>
+        <section id="bundle" className="bundle-section">
+          <h2>
+            <code>.scrawl</code> bundle
+          </h2>
+          <BundleExplorer />
         </section>
 
         <section className="split">

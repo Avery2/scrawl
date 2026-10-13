@@ -170,10 +170,10 @@ export function buildScript(mode: Mode, a: Anchors): Script {
 
   const tip: Point =
     mode === "mac"
-      ? [a.actions.x + a.actions.w + 6, a.actions.y + a.actions.h * 0.55]
+      ? [a.actions.x - 8, a.actions.y + a.actions.h * 0.55]
       : [a.actions.x + a.actions.w * 0.62, a.actions.y + a.actions.h + 6]
-  const start: Point = mode === "mac" ? [tip[0] + 74, tip[1] + 70] : [tip[0] + 34, tip[1] + 92]
-  const ctrl: Point = mode === "mac" ? [start[0] + 4, tip[1] + 10] : [tip[0] + 44, tip[1] + 34]
+  const start: Point = mode === "mac" ? [tip[0] - 88, tip[1] - 56] : [tip[0] + 34, tip[1] + 92]
+  const ctrl: Point = mode === "mac" ? [tip[0] - 28, tip[1] - 48] : [tip[0] + 44, tip[1] + 34]
   const shaft = curvePoints(start, ctrl, tip)
   const before = shaft[shaft.length - 5]
   const angle = Math.atan2(tip[1] - before[1], tip[0] - before[0])
@@ -210,7 +210,7 @@ export function buildScript(mode: Mode, a: Anchors): Script {
   let drag: Script["drag"]
   if (mode === "mac") {
     drag = { from: [AREA.x, AREA.y], to: [AREA.x + AREA.w, AREA.y + AREA.h] }
-    path.push({ t: T.dragStart - 50, at: drag.from }, { t: T.dragEnd, at: drag.to })
+    path.push({ t: T.dragStart, at: drag.from }, { t: T.dragEnd, at: drag.to })
   } else {
     const phoneChip = chipCenter(PILL.cols.select, 2)
     clicks.push({ t: T.phoneClick, at: phoneChip })

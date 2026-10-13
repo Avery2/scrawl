@@ -126,25 +126,35 @@ export function Island({ t, mode }: { t: number; mode: Mode }) {
   )
 }
 
-export function Selection({ t, script }: { t: number; script: Script }) {
+export function Selection({ t, script, cursor }: { t: number; script: Script; cursor: CursorState | null }) {
   if (!script.drag || t < T.select || t > T.finish + 300) return null
   let rect: Rect | null = null
-  if (t >= T.dragStart) {
-    const k = easeOut(progress(t, T.dragStart, T.dragEnd))
-    const [fx, fy] = script.drag.from
-    rect = { x: fx, y: fy, w: AREA.w * k, h: AREA.h * k }
+  const [fx, fy] = script.drag.from
+  const dragging = t >= T.dragStart && t < T.dragEnd
+  if (dragging && cursor) {
+    // The corner is the cursor tip, so the box can never lead or lag the pointer.
+    rect = { x: fx, y: fy, w: Math.max(0, cursor.at[0] - fx), h: Math.max(0, cursor.at[1] - fy) }
+  } else if (t >= T.dragEnd) {
+    rect = { x: fx, y: fy, w: AREA.w, h: AREA.h }
   }
   const recording = t >= T.record
   const dim = recording ? 0.16 : 0.5
   const fade = 1 - progress(t, T.finish, T.finish + 300)
+  const sizeOpacity = Math.min(progress(t, T.dragStart, T.dragStart + 120), 1 - progress(t, T.dragEnd, T.dragEnd + 220))
   return (
     <div className="selection" style={{ opacity: fade }}>
       {rect ? (
-        <div
-          className={`selection-rect${recording ? " rec" : ""}`}
-          style={{ left: rect.x, top: rect.y, width: rect.w, height: rect.h, boxShadow: `0 0 0 4000px rgba(0,0,0,${dim})` }}
-        >
-        </div>
+        <>
+          <div
+            className={`selection-rect${recording ? " rec" : ""}`}
+            style={{ left: rect.x, top: rect.y, width: rect.w, height: rect.h, boxShadow: `0 0 0 4000px rgba(0,0,0,${dim})` }}
+          />
+          {sizeOpacity > 0 && (
+            <span className="selection-size" style={{ left: rect.x + rect.w, top: rect.y + rect.h, opacity: sizeOpacity }}>
+              {Math.round(rect.w)} × {Math.round(rect.h)}
+            </span>
+          )}
+        </>
       ) : (
         <div className="selection-dim" />
       )}
@@ -181,18 +191,23 @@ export function Ripples({ t, script }: { t: number; script: Script }) {
   )
 }
 
-export function Cursor({ c }: { c: CursorState }) {
+export function Cursor({ c, crosshair }: { c: CursorState; crosshair?: boolean }) {
   const [x, y] = c.at
   return (
     <div className="cursor" style={{ transform: `translate(${x}px, ${y}px)` }}>
-      {c.shift ? (
+      {crosshair && !c.shift ? (
+        <svg width="25" height="25" viewBox="-12.5 -12.5 25 25" style={{ transform: "translate(-12.5px, -12.5px)" }}>
+          <path d="M0 -11V11M-11 0H11" stroke="#fff" strokeWidth="3" strokeLinecap="square" />
+          <path d="M0 -10V10M-10 0H10" stroke="#000" strokeWidth="1" shapeRendering="crispEdges" />
+        </svg>
+      ) : c.shift ? (
         <svg width="26" height="26" viewBox="0 0 26 26" style={{ transform: `translate(-2px, -24px) scale(${c.pressed ? 0.94 : 1})` }}>
           <path d="M3 23l2-7L18 3l5 5L10 21z" fill="#f2f2f2" stroke="#111" strokeWidth="1.3" strokeLinejoin="round" />
           <path d="M3 23l2-7 5 5z" fill="#ff3b30" stroke="#111" strokeWidth="1.3" strokeLinejoin="round" />
           <path d="M15.5 5.5l5 5" stroke="#111" strokeWidth="1.3" />
         </svg>
       ) : (
-        <svg width="22" height="28" viewBox="0 0 22 28" style={{ transform: `scale(${c.pressed ? 0.88 : 1})`, transformOrigin: "2px 2px" }}>
+        <svg width="22" height="28" viewBox="0 0 22 28" style={{ transform: `translate(-2px, -2px) scale(${c.pressed ? 0.88 : 1})`, transformOrigin: "2px 2px" }}>
           <path d="M2 2v20.5l5.2-5 3.4 8 3.6-1.5-3.4-7.8h7.3z" fill="#000" stroke="#fff" strokeWidth="1.6" strokeLinejoin="round" />
         </svg>
       )}
@@ -201,7 +216,7 @@ export function Cursor({ c }: { c: CursorState }) {
   )
 }
 
-const KEYS = ["⌃", "⌥", "⇧", "S"]
+const KEYS = ["⌥", "⇧", "S"]
 
 export function Keys({ t, mode }: { t: number; mode: Mode }) {
   const cx = mode === "mac" ? MAC_WINDOW.x + MAC_WINDOW.w / 2 : PHONE.x + PHONE.w / 2
@@ -257,11 +272,37 @@ export function Caption({ t, mode }: { t: number; mode: Mode }) {
   )
 }
 
-export function ContactSheet({ mode, script, width }: { mode: Mode; script: Script; width: number }) {
-  const area = mode === "mac" ? AREA : { x: PHONE.x - 6, y: PHONE.y - 6, w: PHONE.w + 12, h: PHONE.h + 12 }
+export const captureArea = (mode: Mode): Rect => (mode === "mac" ? AREA : { x: PHONE.x - 6, y: PHONE.y - 6, w: PHONE.w + 12, h: PHONE.h + 12 })
+
+export function KeyframeScene({ mode, script, frame, scale }: { mode: Mode; script: Script; frame: Script["frames"][number]; scale: number }) {
+  const area = captureArea(mode)
+  return (
+    <div
+      className="sheet-scene wallpaper"
+      style={{ width: STAGE.w, height: STAGE.h, transform: `scale(${scale}) translate(${-area.x}px, ${-area.y}px)` }}
+    >
+      {mode === "mac" ? <MacWindow fix={0} settle={0} /> : <PhoneMirror fix={0} settle={0} />}
+      <svg className="ink" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`}>
+        {script.strokes
+          .filter((st) => frame.strokes.includes(st.id))
+          .map((st) => (
+            <InkPath key={st.id} d={inkPath(st.points, true, 10)} />
+          ))}
+        {script.pins
+          .filter((p) => frame.pins.includes(p.n))
+          .map((p) => (
+            <PinMark key={p.n} n={p.n} at={p.at} scale={1.7} />
+          ))}
+      </svg>
+    </div>
+  )
+}
+
+export function ContactSheet({ mode, script, width, height }: { mode: Mode; script: Script; width: number; height?: number }) {
+  const area = captureArea(mode)
   const gap = 3
   const maxW = (width - gap - 6) / 2
-  const maxH = mode === "mac" ? 150 : 176
+  const maxH = height ?? (mode === "mac" ? 150 : 176)
   const s = Math.min(maxW / area.w, maxH / area.h)
   const fw = area.w * s
   const fh = area.h * s
@@ -269,24 +310,7 @@ export function ContactSheet({ mode, script, width }: { mode: Mode; script: Scri
     <div className="sheet" style={{ gridTemplateColumns: `repeat(2, ${fw}px)`, gap }}>
       {script.frames.map((f) => (
         <div key={f.n} className="sheet-frame" style={{ width: fw, height: fh }}>
-          <div
-            className="sheet-scene wallpaper"
-            style={{ width: STAGE.w, height: STAGE.h, transform: `scale(${s}) translate(${-area.x}px, ${-area.y}px)` }}
-          >
-            {mode === "mac" ? <MacWindow fix={0} settle={0} /> : <PhoneMirror fix={0} settle={0} />}
-            <svg className="ink" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`}>
-              {script.strokes
-                .filter((st) => f.strokes.includes(st.id))
-                .map((st) => (
-                  <InkPath key={st.id} d={inkPath(st.points, true, 10)} />
-                ))}
-              {script.pins
-                .filter((p) => f.pins.includes(p.n))
-                .map((p) => (
-                  <PinMark key={p.n} n={p.n} at={p.at} scale={1.7} />
-                ))}
-            </svg>
-          </div>
+          <KeyframeScene mode={mode} script={script} frame={f} scale={s} />
           <span className="sheet-badge">
             #{f.n} · {clock(f.t)}
           </span>
