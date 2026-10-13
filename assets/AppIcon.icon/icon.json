@@ -1,0 +1,84 @@
+{
+  "color-space-for-untagged-svg-colors": "display-p3",
+  "fill": {
+    "linear-gradient": [
+      "display-p3:0.17000,0.17500,0.20000,1.00000",
+      "display-p3:0.03500,0.03600,0.04500,1.00000"
+    ],
+    "orientation": {
+      "start": {
+        "x": 0.3,
+        "y": 0
+      },
+      "stop": {
+        "x": 0.7,
+        "y": 1
+      }
+    }
+  },
+  "groups": [
+    {
+      "name": "Handle",
+      "layers": [
+        {
+          "glass": true,
+          "image-name": "handle.svg",
+          "name": "Handle"
+        }
+      ],
+      "lighting": "individual",
+      "specular": true,
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.35
+      }
+    },
+    {
+      "name": "Bristles",
+      "layers": [
+        {
+          "glass": true,
+          "image-name": "bristles.svg",
+          "name": "Bristles"
+        }
+      ],
+      "lighting": "individual",
+      "specular": true,
+      "shadow": {
+        "kind": "layer-color",
+        "opacity": 0.6
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.15
+      }
+    },
+    {
+      "name": "Glow",
+      "layers": [
+        {
+          "image-name": "glow.svg",
+          "name": "Glow"
+        }
+      ],
+      "shadow": {
+        "kind": "none",
+        "opacity": 0.0
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      }
+    }
+  ],
+  "supported-platforms": {
+    "circles": [
+      "watchOS"
+    ],
+    "squares": "shared"
+  }
+}
