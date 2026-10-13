@@ -101,9 +101,24 @@ fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
 }
 
+fn tabular_nums() -> gpui::FontFeatures {
+    gpui::FontFeatures(Arc::new(vec![("tnum".into(), 1)]))
+}
+
+fn tabular_font(weight: FontWeight) -> gpui::Font {
+    gpui::Font {
+        family: ".SystemUIFont".into(),
+        features: tabular_nums(),
+        fallbacks: None,
+        weight,
+        style: gpui::FontStyle::Normal,
+    }
+}
+
 fn measure_text(window: &Window, text: &str, size: f32, weight: FontWeight) -> f32 {
     let mut font = window.text_style().font();
     font.weight = weight;
+    font.features = tabular_nums();
     let run = TextRun {
         len: text.len(),
         font,
@@ -610,6 +625,7 @@ struct ActiveRecording {
 pub struct ScrawlCoordinator {
     telemetry: Arc<SharedCaptureTelemetry>,
     active_recording: Option<ActiveRecording>,
+    picker_metal_overlay: Option<MetalLaserOverlay>,
     island_phase: IslandPhase,
     island_prev_phase: IslandPhase,
     island_phase_since: Instant,
@@ -651,6 +667,7 @@ impl ScrawlCoordinator {
         Self {
             telemetry,
             active_recording: None,
+            picker_metal_overlay: None,
             island_phase: IslandPhase::Hidden,
             island_prev_phase: IslandPhase::Hidden,
             island_phase_since: Instant::now(),
@@ -711,6 +728,33 @@ impl ScrawlCoordinator {
         self.selected_keyframe = 0;
     }
 
+    fn sync_picker_overlay(&self) {
+        let rect = match self.island_phase {
+            IslandPhase::Selecting {
+                mode: SelectionMode::Area,
+            } => self.selection_drag.and_then(|(a, b)| {
+                let w = (a[0] - b[0]).abs();
+                let h = (a[1] - b[1]).abs();
+                (w >= 1.0 && h >= 1.0).then_some(([a[0].min(b[0]), a[1].min(b[1]), w, h], false))
+            }),
+            IslandPhase::Selecting {
+                mode: SelectionMode::Window,
+            } => self.hovered_window.as_ref().map(|t| {
+                (
+                    [
+                        t.frame.x as f32,
+                        t.frame.y as f32,
+                        t.frame.width as f32,
+                        t.frame.height as f32,
+                    ],
+                    true,
+                )
+            }),
+            _ => None,
+        };
+        self.telemetry.set_picker_rect(rect);
+    }
+
     pub fn set_selection_mode(&mut self, mode: SelectionMode, cx: &mut Context<Self>) {
         if let IslandPhase::Selecting { mode: prev_mode } = self.island_phase {
             if prev_mode != mode {
@@ -740,6 +784,7 @@ impl ScrawlCoordinator {
                     self.animated_window_rect = None;
                 }
             }
+            self.sync_picker_overlay();
             cx.notify();
         }
     }
@@ -799,6 +844,11 @@ impl ScrawlCoordinator {
         ) {
             return;
         }
+        self.telemetry
+            .selecting
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.telemetry.set_picker_rect(None);
+        self.picker_metal_overlay = None;
         self.selection_drag = None;
         self.hovered_window = None;
         self.animated_window_rect = None;
@@ -867,19 +917,11 @@ impl ScrawlCoordinator {
                     win.frame.width as f32,
                     win.frame.height as f32,
                 ];
-                let blend = (28.0 * dt).min(1.0);
-                self.animated_window_rect = Some(match self.animated_window_rect {
-                    Some(cur) => [
-                        cur[0] + (target_rect[0] - cur[0]) * blend,
-                        cur[1] + (target_rect[1] - cur[1]) * blend,
-                        cur[2] + (target_rect[2] - cur[2]) * blend,
-                        cur[3] + (target_rect[3] - cur[3]) * blend,
-                    ],
-                    None => target_rect,
-                });
+                self.animated_window_rect = Some(target_rect);
             } else {
                 self.animated_window_rect = None;
             }
+            self.sync_picker_overlay();
         }
 
         // Keep layout width at `island_target_width` during open and dismiss so the capsule never
@@ -974,6 +1016,7 @@ impl ScrawlCoordinator {
                     });
                 }
                 coord.selectable_windows = windows;
+                coord.sync_picker_overlay();
                 start_metric("picker_ready_ms", started);
                 cx.notify();
             });
@@ -998,6 +1041,21 @@ impl ScrawlCoordinator {
         self.set_island_phase(IslandPhase::Selecting {
             mode: SelectionMode::Area,
         });
+        self.telemetry.begin_picker_session();
+        self.sync_picker_overlay();
+        if self.picker_metal_overlay.is_none() {
+            let overlay = MetalLaserOverlay::open(Arc::clone(&self.telemetry))
+                .map_err(|error| scrawl_log(format!("Metal overlay failed: {error}")))
+                .ok();
+            if let Some(ref ov) = overlay {
+                self.telemetry
+                    .excluded_window_ids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(ov.window_number());
+            }
+            self.picker_metal_overlay = overlay;
+        }
 
         let entity = cx.entity().clone();
         cx.defer(move |cx| {
@@ -1043,17 +1101,22 @@ impl ScrawlCoordinator {
         self.telemetry.reset_for_session(target.frame);
         set_escape_hotkey_enabled(true);
         let stage = Instant::now();
-        let metal_overlay = MetalLaserOverlay::open(Arc::clone(&self.telemetry))
-            .map_err(|error| scrawl_log(format!("Metal overlay failed: {error}")))
-            .ok();
+        // Reuse the continuous 120Hz Metal overlay opened in `begin_target_selection` so the
+        // cutout and border never swap windows or jump a single pixel when recording starts.
+        let metal_overlay = self.picker_metal_overlay.take().or_else(|| {
+            let ov = MetalLaserOverlay::open(Arc::clone(&self.telemetry))
+                .map_err(|error| scrawl_log(format!("Metal overlay failed: {error}")))
+                .ok();
+            if let Some(ref o) = ov {
+                self.telemetry
+                    .excluded_window_ids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(o.window_number());
+            }
+            ov
+        });
         start_metric("metal_open_ms", stage);
-        if let Some(ref overlay) = metal_overlay {
-            self.telemetry
-                .excluded_window_ids
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(overlay.window_number());
-        }
         let stage = Instant::now();
         let audio_recorder = AudioRecorder::start().ok();
         start_metric("audio_start_ms", stage);
@@ -1415,7 +1478,7 @@ impl Render for HudPillWindow {
                         .child(
                             div()
                                 .w(px(clock_w))
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .font(tabular_font(FontWeight::SEMIBOLD))
                                 .child(clock),
                         ),
                 )
@@ -1693,10 +1756,7 @@ impl Render for TargetPickerWindow {
         let c_key = self.coordinator.clone();
 
         let win_bounds = window.bounds();
-        let origin = [
-            f32::from(win_bounds.origin.x),
-            f32::from(win_bounds.origin.y),
-        ];
+        let origin = [0.0_f32, 0.0_f32];
         let screen = [
             f32::from(win_bounds.size.width),
             f32::from(win_bounds.size.height),
@@ -1737,7 +1797,13 @@ impl Render for TargetPickerWindow {
 
         let badge = highlight.as_ref().map(|(rect, label)| {
             let max_text = (screen[0] - 2.0 * BADGE_MARGIN - 2.0 * BADGE_PX - 2.0).min(480.0);
-            let text_w = measure_text(window, label, BADGE_TEXT, FontWeight::MEDIUM).min(max_text);
+            let measured_label = if mode == SelectionMode::Area {
+                clock_template(label)
+            } else {
+                label.clone()
+            };
+            let text_w =
+                measure_text(window, &measured_label, BADGE_TEXT, FontWeight::MEDIUM).min(max_text);
             let size = [text_w + 2.0 * BADGE_PX + 2.0, BADGE_H];
             let anchor = match mode {
                 SelectionMode::Area => BadgeAnchor::BelowTrailing,
@@ -1750,49 +1816,20 @@ impl Render for TargetPickerWindow {
             )
         });
 
-        let dim = with_alpha(0x000000, 0.32 * picker_fade);
+        // The 120Hz `MetalLaserOverlay` draws the backdrop dim, selection cutout, window tint,
+        // and inset border continuously across both `Selecting` and `Recording` so there is zero
+        // window swap or border jump on recording start. `TargetPickerWindow` only provides the
+        // hit-test surface, cursor style, camera cursor follower, and tabular dimension badge.
+        let _ = picker_fade;
         let mut root = div()
             .id("scrawl-target-picker")
             .track_focus(&self.focus)
             .size_full()
             .relative()
-            .when(highlight.is_none(), |d| d.bg(dim))
             .when(mode == SelectionMode::Area, |d| d.cursor_crosshair())
             .when(mode == SelectionMode::Window, |d| {
                 d.cursor(gpui::CursorStyle::None)
             });
-
-        if let Some(([x, y, w, h], _)) = highlight {
-            // Dim everything around the selection so the target itself stays untouched.
-            for [dx, dy, dw, dh] in [
-                [0.0, 0.0, screen[0], y],
-                [0.0, y + h, screen[0], screen[1] - y - h],
-                [0.0, y, x, h],
-                [x + w, y, screen[0] - x - w, h],
-            ] {
-                if dw > 0.0 && dh > 0.0 {
-                    root = root.child(
-                        div()
-                            .absolute()
-                            .left(px(dx))
-                            .top(px(dy))
-                            .w(px(dw))
-                            .h(px(dh))
-                            .bg(dim),
-                    );
-                }
-            }
-            let frame = div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h));
-            root = root.child(match mode {
-                // Crisp 1px white edge; no BoxShadow (GPUI BoxShadow fills the interior of transparent divs!).
-                SelectionMode::Area => frame.border_1().border_color(rgba(0xffffffeb)),
-                SelectionMode::Window => frame
-                    .rounded(px(10.0))
-                    .bg(rgba(0x3b5cf621))
-                    .border_2()
-                    .border_color(rgba(0x5b7cfaee)),
-            });
-        }
 
         if mode == SelectionMode::Window
             && let Some([px_screen, py_screen]) = pointer
@@ -1823,7 +1860,7 @@ impl Render for TargetPickerWindow {
                         spread_radius: px(0.0),
                     }])
                     .text_size(px(BADGE_TEXT))
-                    .font_weight(FontWeight::MEDIUM)
+                    .font(tabular_font(FontWeight::MEDIUM))
                     .text_color(rgb(TEXT_COLOR))
                     .child(div().w(px(text_w)).truncate().child(label)),
             )
@@ -1840,10 +1877,9 @@ impl Render for TargetPickerWindow {
         })
         .on_mouse_down(
             MouseButton::Left,
-            move |event: &MouseDownEvent, window, cx| {
-                let win_bounds = window.bounds();
-                let sx = f32::from(win_bounds.origin.x) + f32::from(event.position.x);
-                let sy = f32::from(win_bounds.origin.y) + f32::from(event.position.y);
+            move |event: &MouseDownEvent, _window, cx| {
+                let [sx, sy] = current_mouse_screen()
+                    .unwrap_or([f32::from(event.position.x), f32::from(event.position.y)]);
                 c_down.update(cx, |coord, cx| {
                     let cur_mode = match coord.island_phase {
                         IslandPhase::Selecting { mode } => mode,
@@ -1852,6 +1888,7 @@ impl Render for TargetPickerWindow {
                     match cur_mode {
                         SelectionMode::Area => {
                             coord.selection_drag = Some(([sx, sy], [sx, sy]));
+                            coord.sync_picker_overlay();
                             cx.notify();
                         }
                         SelectionMode::Window => {
@@ -1874,10 +1911,9 @@ impl Render for TargetPickerWindow {
                 });
             },
         )
-        .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
-            let win_bounds = window.bounds();
-            let sx = f32::from(win_bounds.origin.x) + f32::from(event.position.x);
-            let sy = f32::from(win_bounds.origin.y) + f32::from(event.position.y);
+        .on_mouse_move(move |event: &MouseMoveEvent, _window, cx| {
+            let [sx, sy] = current_mouse_screen()
+                .unwrap_or([f32::from(event.position.x), f32::from(event.position.y)]);
             c_move.update(cx, |coord, cx| {
                 coord.selection_pointer = Some([sx, sy]);
                 let cur_mode = match coord.island_phase {
@@ -1888,6 +1924,7 @@ impl Render for TargetPickerWindow {
                     SelectionMode::Area => {
                         if let Some((start, _)) = coord.selection_drag {
                             coord.selection_drag = Some((start, [sx, sy]));
+                            coord.sync_picker_overlay();
                             cx.notify();
                         }
                     }
@@ -1907,6 +1944,7 @@ impl Render for TargetPickerWindow {
                             != found.as_ref().and_then(|w| w.window_id)
                         {
                             coord.hovered_window = found;
+                            coord.sync_picker_overlay();
                             cx.notify();
                         }
                     }
@@ -1915,10 +1953,9 @@ impl Render for TargetPickerWindow {
         })
         .on_mouse_up(
             MouseButton::Left,
-            move |event: &MouseUpEvent, window, cx| {
-                let win_bounds = window.bounds();
-                let sx = f32::from(win_bounds.origin.x) + f32::from(event.position.x);
-                let sy = f32::from(win_bounds.origin.y) + f32::from(event.position.y);
+            move |event: &MouseUpEvent, _window, cx| {
+                let [sx, sy] = current_mouse_screen()
+                    .unwrap_or([f32::from(event.position.x), f32::from(event.position.y)]);
                 c_up.update(cx, |coord, cx| {
                     if let Some((start, _)) = coord.selection_drag.take() {
                         let x = f64::from(start[0].min(sx));
@@ -1929,6 +1966,7 @@ impl Render for TargetPickerWindow {
                             let target = region_target(x, y, w, h, &coord.selectable_windows);
                             coord.start_recording_with_target(target, cx);
                         } else {
+                            coord.sync_picker_overlay();
                             cx.notify();
                         }
                     }
@@ -2638,10 +2676,10 @@ fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
                 ns_win.setStyleMask(
                     NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
                 );
+                configure_floating_window(&ns_win, false, 1);
                 if let Some(screen) = ns_win.screen() {
                     ns_win.setFrame_display(screen.frame(), true);
                 }
-                configure_floating_window(&ns_win, false, 1);
                 let num = ns_win.windowNumber().max(0) as u32;
                 if num > 0 {
                     picker_coord

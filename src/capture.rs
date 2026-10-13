@@ -1345,10 +1345,13 @@ fn capture_sck_frame(
 /// Shared state collected by the global input monitor during an active capture session.
 pub struct SharedCaptureTelemetry {
     pub active: AtomicBool,
+    pub selecting: AtomicBool,
     pub shift_held: AtomicBool,
     pub capture_mode: AtomicU64,
     pub shortcut: Mutex<ShortcutConfig>,
     pub started_at: Mutex<Instant>,
+    pub picker_started_at: Mutex<Instant>,
+    pub picker_rect: Mutex<Option<([f32; 4], bool)>>,
     pub target_frame: Mutex<TargetFrame>,
     pub pointer_screen: Mutex<[f32; 2]>,
     pub events: Mutex<Vec<InteractionEvent>>,
@@ -1366,10 +1369,13 @@ impl SharedCaptureTelemetry {
     pub fn new(ui_sender: flume::Sender<LiveOverlayEvent>) -> Arc<Self> {
         Arc::new(Self {
             active: AtomicBool::new(false),
+            selecting: AtomicBool::new(false),
             shift_held: AtomicBool::new(false),
             capture_mode: AtomicU64::new(0),
             shortcut: Mutex::new(ShortcutConfig::load()),
             started_at: Mutex::new(Instant::now()),
+            picker_started_at: Mutex::new(Instant::now()),
+            picker_rect: Mutex::new(None),
             target_frame: Mutex::new(TargetFrame {
                 x: 0.0,
                 y: 0.0,
@@ -1467,7 +1473,32 @@ impl SharedCaptureTelemetry {
         self.capture_mode.store(code, Ordering::Release);
     }
 
+    pub fn begin_picker_session(&self) {
+        *self
+            .picker_started_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
+        *self
+            .picker_rect
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.active.store(false, Ordering::Release);
+        self.selecting.store(true, Ordering::Release);
+    }
+
+    pub fn set_picker_rect(&self, rect: Option<([f32; 4], bool)>) {
+        *self
+            .picker_rect
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = rect;
+    }
+
     pub fn reset_for_session(&self, frame: TargetFrame) {
+        self.selecting.store(false, Ordering::Release);
+        *self
+            .picker_rect
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         *self
             .started_at
             .lock()
@@ -1569,6 +1600,7 @@ impl SharedCaptureTelemetry {
 
     pub fn finish_session(&self) -> (Vec<InteractionEvent>, Vec<Stroke>) {
         self.active.store(false, Ordering::Release);
+        self.selecting.store(false, Ordering::Release);
         *self
             .drag_start
             .lock()

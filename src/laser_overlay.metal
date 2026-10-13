@@ -128,6 +128,8 @@ fragment float4 laser_fragment(
     float4 out = float4(0.0);
 
     // Smooth 240ms transition from the picker's exact border/dim geometry into active recording.
+    // `u.tail_duration` carries `picker_fade` (0..1 during the initial 150ms picker open, 1.0 during recording).
+    float picker_fade = clamp(u.tail_duration, 0.0, 1.0);
     float t_intro = clamp(u.now_sec / 0.24, 0.0, 1.0);
     float intro_ease = 1.0 - pow(1.0 - t_intro, 3.0);
     float intro_fade = 1.0 - intro_ease;
@@ -142,11 +144,10 @@ fragment float4 laser_fragment(
         float2 q = abs(p - box_center) - half_size;
         float sdf = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - corner_r;
 
-        // 1. Outside the target rect (`sdf > 0.0`): matches TargetPickerWindow's 0.32 dim at t=0
-        //    and smoothly eases to 0.22 over 240ms.
+        // 1. Outside the target rect (`sdf > 0.0`): 0.32 dim during picker -> eases to 0.22 during recording.
         float out_cov = clamp(sdf + 0.5, 0.0, 1.0);
         if (out_cov > 0.001) {
-            float dim_a = out_cov * mix(0.32, 0.22, intro_ease);
+            float dim_a = out_cov * mix(0.32, 0.22, intro_ease) * picker_fade;
             out.rgb = float3(0.0);
             out.a = dim_a;
         }
@@ -154,24 +155,27 @@ fragment float4 laser_fragment(
         // 2. Inside the selected window (`sdf <= 0.0`): dissolve the picker's blue tint (`0x3b5cf621`).
         float in_cov = 1.0 - out_cov;
         if (in_cov > 0.001 && is_window && intro_fade > 0.002) {
-            float fill_a = in_cov * 0.13 * intro_fade;
+            float fill_a = in_cov * 0.13 * intro_fade * picker_fade;
             float3 fill_col = float3(0.231, 0.361, 0.965);
             out.rgb = fill_col * fill_a + out.rgb * (1.0 - fill_a);
             out.a = fill_a + out.a * (1.0 - fill_a);
         }
 
-        // 3. Inset border (`sdf in [-border_w, 0.0]`): matches GPUI's border-box `.border_1()`
-        //    (Area, 1px white 0.92) and `.border_2()` (Window, 2px blue 0.93) at the exact same
-        //    sub-pixel position at t=0, then smoothly settles to a subtle 1px recording hairline (0.28).
+        // 3. Inset border (`sdf in [-border_w, 0.0]`): rendered by this exact same Metal layer during
+        //    BOTH Selecting (`now_sec == 0`) and Recording (`now_sec > 0`), so there is zero window swap or jump.
         float border_w = is_window ? mix(2.0, 1.0, intro_ease) : 1.0;
         float border_cov = clamp(border_w + 0.5 + sdf, 0.0, 1.0) * clamp(0.5 - sdf, 0.0, 1.0);
         if (border_cov > 0.001) {
             float3 picker_border = is_window ? float3(0.357, 0.486, 0.980) : float3(1.0, 1.0, 1.0);
             float3 border_col = mix(picker_border, float3(1.0, 1.0, 1.0), intro_ease);
-            float border_alpha = border_cov * mix(is_window ? 0.93 : 0.92, 0.28, intro_ease);
+            float border_alpha = border_cov * mix(is_window ? 0.93 : 0.92, 0.28, intro_ease) * picker_fade;
             out.rgb = border_col * border_alpha + out.rgb * (1.0 - border_alpha);
             out.a = border_alpha + out.a * (1.0 - border_alpha);
         }
+    } else if (u._pad1 < -0.0001) {
+        // Picker open before any drag starts: uniform 0.32 * picker_fade dim.
+        out.rgb = float3(0.0);
+        out.a = 0.32 * clamp(-u._pad1, 0.0, 1.0);
     } else if (intro_fade > 0.002) {
         // Full-screen recording: simple 0.15s dim fade out.
         out.rgb = float3(0.0);

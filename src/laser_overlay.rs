@@ -259,23 +259,68 @@ impl SharedMetalOverlay {
     }
 
     fn draw(&self) {
-        if !self.telemetry.active.load(Ordering::Acquire) {
+        let is_active = self.telemetry.active.load(Ordering::Acquire);
+        let is_selecting = self.telemetry.selecting.load(Ordering::Acquire);
+        if !is_active && !is_selecting {
             return;
         }
         let now_ms = self.telemetry.elapsed_ms();
-        let now_sec = now_ms as f32 / 1_000.0;
+        let now_sec = if is_selecting {
+            0.0
+        } else {
+            now_ms as f32 / 1_000.0
+        };
+        let picker_fade = if is_selecting {
+            let elapsed = self
+                .telemetry
+                .picker_started_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .elapsed()
+                .as_secs_f32();
+            let t = (elapsed / 0.15).clamp(0.0, 1.0);
+            1.0 - (1.0 - t).powi(3)
+        } else {
+            1.0
+        };
         let tail_ms = (TAIL_DURATION_SEC * 1_000.0) as u64;
         let min_laser_ms = now_ms.saturating_sub(tail_ms);
 
+        let picker_sel = if is_selecting {
+            *self
+                .telemetry
+                .picker_rect
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        } else {
+            None
+        };
         let target_frame = *self
             .telemetry
             .target_frame
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let tx = target_frame.x as f32;
-        let ty = target_frame.y as f32;
-        let tw = (target_frame.width as f32).max(1.0);
-        let th = (target_frame.height as f32).max(1.0);
+        let (tx, ty, tw, th, is_constrained, mode_code) = if is_selecting {
+            if let Some(([rx, ry, rw, rh], is_win)) = picker_sel {
+                (
+                    rx,
+                    ry,
+                    rw.max(1.0),
+                    rh.max(1.0),
+                    true,
+                    if is_win { 2.0 } else { 1.0 },
+                )
+            } else {
+                (0.0, 0.0, 1.0, 1.0, false, -picker_fade.max(0.001))
+            }
+        } else {
+            let tx = target_frame.x as f32;
+            let ty = target_frame.y as f32;
+            let tw = (target_frame.width as f32).max(1.0);
+            let th = (target_frame.height as f32).max(1.0);
+            let mode = self.telemetry.capture_mode.load(Ordering::Acquire) as f32;
+            (tx, ty, tw, th, mode > 0.5, mode)
+        };
         let to_screen = |nx: f32, ny: f32| -> [f32; 2] { [tx + nx * tw, ty + ny * th] };
 
         let committed_strokes = self
@@ -409,8 +454,6 @@ impl SharedMetalOverlay {
             attachment.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0));
             attachment.set_store_action(MTLStoreAction::Store);
 
-            let is_constrained = tw < renderer.width - 8.0 || th < renderer.height - 8.0;
-            let mode_code = self.telemetry.capture_mode.load(Ordering::Acquire) as f32;
             let uniforms = LaserUniforms {
                 resolution: [
                     renderer.width * renderer.scale,
@@ -418,15 +461,15 @@ impl SharedMetalOverlay {
                 ],
                 scale: renderer.scale,
                 now_sec,
-                tail_duration: TAIL_DURATION_SEC,
-                tip_active: if shift_held { 1.0 } else { 0.0 },
+                tail_duration: picker_fade,
+                tip_active: if is_active && shift_held { 1.0 } else { 0.0 },
                 tip_pos: pointer,
-                segment_count: if segments.len() == 1 && segments[0].width == 0.0 {
+                segment_count: if !is_active || (segments.len() == 1 && segments[0].width == 0.0) {
                     0
                 } else {
                     segments.len().min(MAX_SEGMENTS) as u32
                 },
-                pin_count: if pins.len() == 1 && pins[0].radius == 0.0 {
+                pin_count: if !is_active || (pins.len() == 1 && pins[0].radius == 0.0) {
                     0
                 } else {
                     pins.len().min(MAX_PINS) as u32
