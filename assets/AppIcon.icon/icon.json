@@ -18,43 +18,30 @@
   },
   "groups": [
     {
-      "name": "Handle",
+      "name": "Brush",
       "layers": [
         {
-          "glass": true,
-          "image-name": "handle.svg",
-          "name": "Handle"
+          "glass": false,
+          "image-name": "brush.png",
+          "name": "Brush",
+          "position": {
+            "scale": 0.53,
+            "translation-in-points": [
+              0,
+              0
+            ]
+          }
         }
       ],
       "lighting": "individual",
       "specular": true,
       "shadow": {
         "kind": "neutral",
-        "opacity": 0.5
+        "opacity": 0.55
       },
       "translucency": {
-        "enabled": true,
-        "value": 0.35
-      }
-    },
-    {
-      "name": "Bristles",
-      "layers": [
-        {
-          "glass": true,
-          "image-name": "bristles.svg",
-          "name": "Bristles"
-        }
-      ],
-      "lighting": "individual",
-      "specular": true,
-      "shadow": {
-        "kind": "layer-color",
-        "opacity": 0.6
-      },
-      "translucency": {
-        "enabled": true,
-        "value": 0.15
+        "enabled": false,
+        "value": 0.1
       }
     },
     {
