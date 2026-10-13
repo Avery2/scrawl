@@ -301,15 +301,8 @@ impl SharedMetalOverlay {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (tx, ty, tw, th, is_constrained, mode_code) = if is_selecting {
-            if let Some(([rx, ry, rw, rh], is_win)) = picker_sel {
-                (
-                    rx,
-                    ry,
-                    rw.max(1.0),
-                    rh.max(1.0),
-                    true,
-                    if is_win { 2.0 } else { 1.0 },
-                )
+            if let Some(([rx, ry, rw, rh], kind)) = picker_sel {
+                (rx, ry, rw.max(1.0), rh.max(1.0), true, f32::from(kind))
             } else {
                 (0.0, 0.0, 1.0, 1.0, false, -picker_fade.max(0.001))
             }
@@ -319,7 +312,8 @@ impl SharedMetalOverlay {
             let tw = (target_frame.width as f32).max(1.0);
             let th = (target_frame.height as f32).max(1.0);
             let mode = self.telemetry.capture_mode.load(Ordering::Acquire) as f32;
-            (tx, ty, tw, th, mode > 0.5, mode)
+            let constrained = mode > 0.5 && tx > -10_000.0;
+            (tx, ty, tw, th, constrained, mode)
         };
         let to_screen = |nx: f32, ny: f32| -> [f32; 2] { [tx + nx * tw, ty + ny * th] };
 

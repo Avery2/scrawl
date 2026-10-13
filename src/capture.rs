@@ -1353,7 +1353,7 @@ pub struct SharedCaptureTelemetry {
     pub shortcut: Mutex<ShortcutConfig>,
     pub started_at: Mutex<Instant>,
     pub picker_started_at: Mutex<Instant>,
-    pub picker_rect: Mutex<Option<([f32; 4], bool)>>,
+    pub picker_rect: Mutex<Option<([f32; 4], u8)>>,
     pub target_frame: Mutex<TargetFrame>,
     pub pointer_screen: Mutex<[f32; 2]>,
     pub events: Mutex<Vec<InteractionEvent>>,
@@ -1469,8 +1469,9 @@ impl SharedCaptureTelemetry {
     pub fn set_capture_mode(&self, mode: CaptureMode) {
         let code = match mode {
             CaptureMode::Display => 0,
-            CaptureMode::Region | CaptureMode::Device => 1,
+            CaptureMode::Region => 1,
             CaptureMode::Window => 2,
+            CaptureMode::Device => 3,
         };
         self.capture_mode.store(code, Ordering::Release);
     }
@@ -1488,7 +1489,7 @@ impl SharedCaptureTelemetry {
         self.selecting.store(true, Ordering::Release);
     }
 
-    pub fn set_picker_rect(&self, rect: Option<([f32; 4], bool)>) {
+    pub fn set_picker_rect(&self, rect: Option<([f32; 4], u8)>) {
         *self
             .picker_rect
             .lock()

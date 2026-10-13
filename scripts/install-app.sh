@@ -74,6 +74,10 @@ ln -sf "${MACOS_DIR}/scrawl" "${HOME}/bin/scrawl"
 
 pkill -f "Scrawl.app/Contents/MacOS/scrawl" 2>/dev/null || true
 pkill -f "target/debug/scrawl" 2>/dev/null || true
-nohup "${MACOS_DIR}/scrawl" app >/dev/null 2>&1 &
-sleep 0.2
+for _ in {1..20}; do
+  pgrep -f "Scrawl.app/Contents/MacOS/scrawl" >/dev/null || break
+  sleep 0.05
+done
+open -a "${APP_DIR}"
+sleep 0.3
 pgrep -fl "Scrawl.app/Contents/MacOS/scrawl"

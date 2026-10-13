@@ -65,18 +65,19 @@ enum Phone {
 ///   {"event":"marker", "at": epochMs}                    M pressed in the mirror window
 ///   {"event":"finished", path, durationMs}               movie finalized; the helper then exits
 ///   {"event":"cancelled"} / {"event":"error", message}
-/// Commands on stdin: `stop`, `cancel`. End of input means stop.
+/// Commands on stdin: `start [PATH]`, `stop`, `cancel`. End of input means stop.
 final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCaptureFileOutputRecordingDelegate {
-  static func run(output: URL, deviceID: String?) -> Never {
+  static func run(output: URL?, previewOnly: Bool = false, deviceID: String?) -> Never {
     let app = NSApplication.shared
-    let mirror = Mirror(output: output, deviceID: deviceID)
+    let mirror = Mirror(output: output, previewOnly: previewOnly, deviceID: deviceID)
     app.setActivationPolicy(.accessory)
     app.delegate = mirror
     withExtendedLifetime(mirror) { app.run() }
     exit(0)
   }
 
-  let output: URL
+  var output: URL?
+  var previewOnly: Bool
   let deviceID: String?
   let session = AVCaptureSession()
   let movieOutput = AVCaptureMovieFileOutput()
@@ -88,9 +89,14 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
   var cancelled = false
   var finished = false
 
-  init(output: URL, deviceID: String?) {
+  init(output: URL?, previewOnly: Bool, deviceID: String?) {
     self.output = output
+    self.previewOnly = previewOnly
     self.deviceID = deviceID
+  }
+
+  private static func normalizeID(_ id: String) -> String {
+    id.replacingOccurrences(of: "-", with: "").lowercased()
   }
 
   func applicationDidFinishLaunching(_: Notification) {
@@ -108,7 +114,11 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
   private func findPhone(deadline: Date) {
     Phone.publishScreenCaptureDevices()
     let phones = Phone.devices
-    if let phone = phones.first(where: { deviceID == nil || $0.uniqueID == deviceID }) {
+    let match = phones.first(where: {
+      guard let deviceID, !deviceID.isEmpty else { return true }
+      return Self.normalizeID($0.uniqueID) == Self.normalizeID(deviceID)
+    }) ?? phones.first
+    if let phone = match {
       attach(phone)
     } else if Date() < deadline, !stopping {
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.findPhone(deadline: deadline) }
@@ -126,8 +136,8 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
     emit(["event": "device"].merging(Phone.describe(device)) { a, _ in a })
 
     let mic = AVCaptureDevice.default(for: .audio).flatMap { try? AVCaptureDeviceInput(device: $0) }
-    let session = session, movieOutput = movieOutput, output = output
-    try? FileManager.default.removeItem(at: output)
+    let session = session, movieOutput = movieOutput, output = output, shouldRecord = !previewOnly
+    if shouldRecord, let output { try? FileManager.default.removeItem(at: output) }
     queue.async {
       session.beginConfiguration()
       if session.canAddInput(input) { session.addInput(input) }
@@ -139,7 +149,9 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
       }
       session.commitConfiguration()
       session.startRunning()
-      movieOutput.startRecording(to: output, recordingDelegate: self)
+      if shouldRecord, let output {
+        movieOutput.startRecording(to: output, recordingDelegate: self)
+      }
     }
     showWindow(title: device.localizedName)
     NotificationCenter.default.addObserver(forName: AVCaptureInput.Port.formatDescriptionDidChangeNotification, object: nil, queue: .main) { [weak self] note in
@@ -235,10 +247,15 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
       while let line = readLine() {
         let command = line.trimmingCharacters(in: .whitespaces)
         DispatchQueue.main.async {
-          switch command {
-          case "stop": self.stop()
-          case "cancel": self.cancel()
-          default: break
+          if command == "stop" {
+            self.stop()
+          } else if command == "cancel" {
+            self.cancel()
+          } else if command == "start" {
+            self.startRecording(path: nil)
+          } else if command.hasPrefix("start ") {
+            let path = String(command.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+            self.startRecording(path: path)
           }
         }
       }
@@ -246,11 +263,29 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
     }
   }
 
+  private func startRecording(path: String?) {
+    if let path, !path.isEmpty {
+      output = URL(filePath: path)
+    }
+    previewOnly = false
+    guard phoneInput != nil, let output else { return }
+    try? FileManager.default.removeItem(at: output)
+    let movieOutput = movieOutput
+    queue.async {
+      if !movieOutput.isRecording {
+        movieOutput.startRecording(to: output, recordingDelegate: self)
+      }
+    }
+  }
+
   private func stop() {
     guard !stopping else { return }
     stopping = true
     window?.orderOut(nil)
-    guard phoneInput != nil else { return }
+    guard phoneInput != nil, !previewOnly else {
+      finish(["event": "cancelled"])
+      return
+    }
     let movieOutput = movieOutput, session = session
     queue.async {
       if movieOutput.isRecording { movieOutput.stopRecording() } else { session.stopRunning() }

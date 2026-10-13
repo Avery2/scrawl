@@ -161,11 +161,16 @@ fn completed_meta(_duration_ms: u64, frame_count: usize) -> String {
 fn island_content_width(window: &Window, phase: IslandPhase, clock: &str, iphone: bool) -> f32 {
     let divider = 1.0 + 2.0 * DIVIDER_MX;
     let inner = match phase {
-        IslandPhase::Selecting { .. } => {
+        IslandPhase::Selecting { mode } => {
             chip_width(window, "Area", FontWeight::MEDIUM)
                 + chip_width(window, "Full Screen", FontWeight::MEDIUM)
                 + if iphone {
                     chip_width(window, "iPhone", FontWeight::MEDIUM) + CHIP_GAP
+                } else {
+                    0.0
+                }
+                + if mode == SelectionMode::Iphone {
+                    chip_width(window, "Record", FontWeight::SEMIBOLD) + CHIP_GAP
                 } else {
                     0.0
                 }
@@ -351,6 +356,9 @@ fn find_picker_ns_window() -> Option<Retained<NSWindow>> {
     let mtm = MainThreadMarker::new()?;
     let app = NSApplication::sharedApplication(mtm);
     for win in app.windows() {
+        if win.ignoresMouseEvents() {
+            continue;
+        }
         let size = win.frame().size;
         if size.width >= 600.0
             && (size.width - 1120.0).abs() > 8.0
@@ -609,6 +617,7 @@ fn apply_pill_layer_effect(
 pub enum SelectionMode {
     Area,
     Window,
+    Iphone,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -657,6 +666,7 @@ pub struct ScrawlCoordinator {
     telemetry: Arc<SharedCaptureTelemetry>,
     active_recording: Option<ActiveRecording>,
     picker_metal_overlay: Option<MetalLaserOverlay>,
+    iphone_preview: Option<PhoneSession>,
     island_phase: IslandPhase,
     island_prev_phase: IslandPhase,
     island_phase_since: Instant,
@@ -701,6 +711,7 @@ impl ScrawlCoordinator {
             telemetry,
             active_recording: None,
             picker_metal_overlay: None,
+            iphone_preview: None,
             island_phase: IslandPhase::Hidden,
             island_prev_phase: IslandPhase::Hidden,
             island_phase_since: Instant::now(),
@@ -791,7 +802,7 @@ impl ScrawlCoordinator {
             } => self.selection_drag.and_then(|(a, b)| {
                 let w = (a[0] - b[0]).abs();
                 let h = (a[1] - b[1]).abs();
-                (w >= 1.0 && h >= 1.0).then_some(([a[0].min(b[0]), a[1].min(b[1]), w, h], false))
+                (w >= 1.0 && h >= 1.0).then_some(([a[0].min(b[0]), a[1].min(b[1]), w, h], 1))
             }),
             IslandPhase::Selecting {
                 mode: SelectionMode::Window,
@@ -803,9 +814,16 @@ impl ScrawlCoordinator {
                         t.frame.width as f32,
                         t.frame.height as f32,
                     ],
-                    true,
+                    2,
                 )
             }),
+            IslandPhase::Selecting {
+                mode: SelectionMode::Iphone,
+            } => self
+                .iphone_preview
+                .as_ref()
+                .and_then(PhoneSession::rect)
+                .map(|r| (r, 3)),
             _ => None,
         };
         self.telemetry.set_picker_rect(rect);
@@ -816,6 +834,9 @@ impl ScrawlCoordinator {
             if prev_mode != mode {
                 // Crisp tactile Dynamic Island scale micro-pulse when Space toggles camera/crosshair mode.
                 self.island_scale_velocity += 1.25;
+            }
+            if mode != SelectionMode::Iphone {
+                self.iphone_preview = None;
             }
             self.island_phase = IslandPhase::Selecting { mode };
             self.selection_drag = None;
@@ -845,11 +866,35 @@ impl ScrawlCoordinator {
         }
     }
 
+    /// Opens the live iPhone mirror window in preview mode so the user can see their phone before
+    /// starting a recording. Clicking `iPhone` a second time or clicking `Record` starts recording.
+    pub fn preview_iphone(&mut self, cx: &mut Context<Self>) {
+        if self.is_recording() || self.is_processing() {
+            return;
+        }
+        scrawl_log("preview_iphone invoked");
+        self.set_selection_mode(SelectionMode::Iphone, cx);
+        if self.iphone_preview.is_none() {
+            match PhoneSession::start_preview(None, Some(Arc::clone(&self.telemetry))) {
+                Ok(session) => {
+                    self.iphone_preview = Some(session);
+                }
+                Err(error) => {
+                    scrawl_log(format!("iPhone preview could not start: {error:#}"));
+                    self.set_selection_mode(SelectionMode::Area, cx);
+                    return;
+                }
+            }
+        }
+        self.sync_picker_overlay();
+        cx.notify();
+    }
+
     pub fn toggle_selection_mode(&mut self, cx: &mut Context<Self>) {
         if let IslandPhase::Selecting { mode } = self.island_phase {
             let next = match mode {
                 SelectionMode::Area => SelectionMode::Window,
-                SelectionMode::Window => SelectionMode::Area,
+                SelectionMode::Window | SelectionMode::Iphone => SelectionMode::Area,
             };
             self.set_selection_mode(next, cx);
         }
@@ -909,6 +954,7 @@ impl ScrawlCoordinator {
             .store(false, std::sync::atomic::Ordering::Release);
         self.telemetry.set_picker_rect(None);
         self.picker_metal_overlay = None;
+        self.iphone_preview = None;
         self.selection_drag = None;
         self.hovered_window = None;
         self.animated_window_rect = None;
@@ -1147,6 +1193,7 @@ impl ScrawlCoordinator {
             target.mode, target.frame
         ));
         self.recording_shortcut_key = false;
+        self.iphone_preview = None;
         self.selection_drag = None;
         self.hovered_window = None;
         self.animated_window_rect = None;
@@ -1232,34 +1279,52 @@ impl ScrawlCoordinator {
         let bundle_dir = crate::handoff::default_captures_dir()
             .join(format!("{}.scrawl", crate::make_bundle_id()));
         let _ = std::fs::create_dir_all(&bundle_dir);
+        let movie_path = bundle_dir.join("recording.mov");
+        let existing_preview = self.iphone_preview.take();
+        if let Some(dev) = existing_preview.as_ref().and_then(PhoneSession::device) {
+            self.iphone = Some(dev);
+        }
         let device = self.iphone.clone();
         let name = device
             .as_ref()
             .map_or("iPhone", |d| d.name.as_str())
             .to_owned();
         let target = crate::phone::phone_target(&name, None, 0, 0);
+        let initial_frame = existing_preview
+            .as_ref()
+            .and_then(PhoneSession::rect)
+            .map_or(
+                TargetFrame {
+                    x: -100_000.0,
+                    y: -100_000.0,
+                    width: 1.0,
+                    height: 1.0,
+                    scale: 2.0,
+                },
+                |[rx, ry, rw, rh]| TargetFrame {
+                    x: f64::from(rx),
+                    y: f64::from(ry),
+                    width: f64::from(rw),
+                    height: f64::from(rh),
+                    scale: 2.0,
+                },
+            );
         self.telemetry.set_capture_mode(CaptureMode::Device);
-        // Off screen until the mirror window reports where it is.
-        self.telemetry.reset_for_session(TargetFrame {
-            x: -100_000.0,
-            y: -100_000.0,
-            width: 1.0,
-            height: 1.0,
-            scale: 2.0,
-        });
+        self.telemetry.reset_for_session(initial_frame);
         set_escape_hotkey_enabled(true);
-        let session = match PhoneSession::start(
-            &bundle_dir.join("recording.mov"),
-            None,
-            Some(Arc::clone(&self.telemetry)),
-        ) {
-            Ok(session) => session,
-            Err(error) => {
-                scrawl_log(format!("iPhone capture could not start: {error:#}"));
-                self.telemetry.finish_session();
-                let _ = std::fs::remove_dir_all(&bundle_dir);
-                self.dismiss_island(cx);
-                return;
+        let session = if let Some(mut preview) = existing_preview {
+            preview.begin_recording(&movie_path);
+            preview
+        } else {
+            match PhoneSession::start(&movie_path, None, Some(Arc::clone(&self.telemetry))) {
+                Ok(session) => session,
+                Err(error) => {
+                    scrawl_log(format!("iPhone capture could not start: {error:#}"));
+                    self.telemetry.finish_session();
+                    let _ = std::fs::remove_dir_all(&bundle_dir);
+                    self.dismiss_island(cx);
+                    return;
+                }
             }
         };
         let metal_overlay = self.picker_metal_overlay.take().or_else(|| {
@@ -1293,6 +1358,11 @@ impl ScrawlCoordinator {
 
     /// The mirror ended without being asked: keep what was recorded, or drop an empty capture.
     fn phone_ended(&mut self, cx: &mut Context<Self>) {
+        if self.iphone_preview.is_some() {
+            self.iphone_preview = None;
+            self.set_selection_mode(SelectionMode::Area, cx);
+            return;
+        }
         let recorded = match &self.active_recording {
             Some(ActiveRecording {
                 source: CaptureSource::Phone(session),
@@ -1516,6 +1586,7 @@ impl Render for HudPillWindow {
         let c_mode_area = self.coordinator.clone();
         let c_full = self.coordinator.clone();
         let c_iphone = self.coordinator.clone();
+        let c_record_iphone = self.coordinator.clone();
         let c_sel_cancel = self.coordinator.clone();
 
         // Keep typography (`HUD_TEXT`) and spacing (`CHIP_GAP`) 100% constant so glyphs never
@@ -1549,10 +1620,32 @@ impl Render for HudPillWindow {
                 ))
                 .when(has_iphone, |row| {
                     row.child(
-                        pill_chip("sel-iphone", "iPhone", true).on_click(move |_, _, cx| {
-                            c_iphone.update(cx, |coord, cx| coord.start_recording_iphone(cx));
-                        }),
+                        mode_chip("sel-iphone", "iPhone", mode == SelectionMode::Iphone).on_click(
+                            move |_, _, cx| {
+                                c_iphone.update(cx, |coord, cx| {
+                                    if matches!(
+                                        coord.island_phase,
+                                        IslandPhase::Selecting {
+                                            mode: SelectionMode::Iphone
+                                        }
+                                    ) {
+                                        coord.start_recording_iphone(cx);
+                                    } else {
+                                        coord.preview_iphone(cx);
+                                    }
+                                });
+                            },
+                        ),
                     )
+                })
+                .when(mode == SelectionMode::Iphone, |row| {
+                    row.child(primary_chip("sel-record-iphone", "Record").on_click(
+                        move |_, _, cx| {
+                            c_record_iphone.update(cx, |coord, cx| {
+                                coord.start_recording_iphone(cx);
+                            });
+                        },
+                    ))
                 })
                 .child(island_divider())
                 .child(
@@ -1948,6 +2041,14 @@ impl Render for TargetPickerWindow {
             f32::from(win_bounds.size.height),
         ];
 
+        let iphone_rect = coord.iphone_preview.as_ref().and_then(PhoneSession::rect);
+        let iphone_name = coord
+            .iphone_preview
+            .as_ref()
+            .and_then(PhoneSession::device)
+            .or_else(|| coord.iphone.clone())
+            .map_or_else(|| "iPhone".to_string(), |d| d.name);
+
         // Selection rect in window-local coordinates, clipped to the screen, plus its badge.
         let highlight: Option<([f32; 4], String)> = match mode {
             SelectionMode::Area => drag.map(|(a, b)| {
@@ -1978,6 +2079,12 @@ impl Render for TargetPickerWindow {
                 ]);
                 ([rx - origin[0], ry - origin[1], rw, rh], title)
             }),
+            SelectionMode::Iphone => iphone_rect.map(|[rx, ry, rw, rh]| {
+                (
+                    [rx - origin[0], ry - origin[1], rw, rh],
+                    format!("{iphone_name} · Click to record"),
+                )
+            }),
         }
         .map(|(rect, label)| (clip_rect(rect, screen), label));
 
@@ -1992,7 +2099,7 @@ impl Render for TargetPickerWindow {
                 measure_text(window, &measured_label, BADGE_TEXT, FontWeight::MEDIUM).min(max_text);
             let size = [text_w + 2.0 * BADGE_PX + 2.0, BADGE_H];
             let anchor = match mode {
-                SelectionMode::Area => BadgeAnchor::BelowTrailing,
+                SelectionMode::Area | SelectionMode::Iphone => BadgeAnchor::BelowTrailing,
                 SelectionMode::Window => BadgeAnchor::Center,
             };
             (
@@ -2013,6 +2120,7 @@ impl Render for TargetPickerWindow {
             .size_full()
             .relative()
             .when(mode == SelectionMode::Area, |d| d.cursor_crosshair())
+            .when(mode == SelectionMode::Iphone, |d| d.cursor_pointer())
             .when(mode == SelectionMode::Window, |d| {
                 d.cursor(gpui::CursorStyle::None)
             });
@@ -2058,7 +2166,18 @@ impl Render for TargetPickerWindow {
             } else if key == "escape" {
                 c_key.update(cx, |coord, cx| coord.cancel_recording(cx));
             } else if key == "enter" || key.eq_ignore_ascii_case("s") {
-                c_key.update(cx, |coord, cx| coord.start_recording_full_screen(cx));
+                c_key.update(cx, |coord, cx| {
+                    if matches!(
+                        coord.island_phase,
+                        IslandPhase::Selecting {
+                            mode: SelectionMode::Iphone
+                        }
+                    ) {
+                        coord.start_recording_iphone(cx);
+                    } else {
+                        coord.start_recording_full_screen(cx);
+                    }
+                });
             }
         })
         .on_mouse_down(
@@ -2076,6 +2195,22 @@ impl Render for TargetPickerWindow {
                             coord.selection_drag = Some(([sx, sy], [sx, sy]));
                             coord.sync_picker_overlay();
                             cx.notify();
+                        }
+                        SelectionMode::Iphone => {
+                            if let Some([rx, ry, rw, rh]) =
+                                coord.iphone_preview.as_ref().and_then(PhoneSession::rect)
+                                && sx >= rx
+                                && sx <= rx + rw
+                                && sy >= ry
+                                && sy <= ry + rh
+                            {
+                                coord.start_recording_iphone(cx);
+                            } else {
+                                coord.set_selection_mode(SelectionMode::Area, cx);
+                                coord.selection_drag = Some(([sx, sy], [sx, sy]));
+                                coord.sync_picker_overlay();
+                                cx.notify();
+                            }
                         }
                         SelectionMode::Window => {
                             if coord.windows_loading {
@@ -2113,6 +2248,9 @@ impl Render for TargetPickerWindow {
                             coord.sync_picker_overlay();
                             cx.notify();
                         }
+                    }
+                    SelectionMode::Iphone => {
+                        coord.sync_picker_overlay();
                     }
                     SelectionMode::Window => {
                         let found = coord
@@ -2895,7 +3033,13 @@ fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
 fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
     for handle in cx.windows() {
         if let Some(pill) = handle.downcast::<HudPillWindow>() {
-            let _ = pill.update(cx, |_, _, cx| cx.notify());
+            let _ = pill.update(cx, |view, _, cx| {
+                if let Some(ref ns_win) = view.ns_window {
+                    ns_win.setLevel(NSStatusWindowLevel + 3);
+                    ns_win.orderFrontRegardless();
+                }
+                cx.notify();
+            });
             return;
         }
     }
@@ -2947,7 +3091,8 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
                         let _: () = msg_send![&**ns_win, _setPreventsActivation: true];
                     }
                 }
-                configure_floating_window(ns_win, false, 2);
+                configure_floating_window(ns_win, false, 3);
+                ns_win.orderFrontRegardless();
                 apply_pill_layer_effect(
                     ns_win,
                     &mut shell_layer,
@@ -3246,7 +3391,16 @@ pub fn run_app(
                                 if coord.is_recording() {
                                     coord.finish_recording(cx);
                                 } else if coord.is_selecting() {
-                                    coord.start_recording_full_screen(cx);
+                                    if matches!(
+                                        coord.island_phase,
+                                        IslandPhase::Selecting {
+                                            mode: SelectionMode::Iphone
+                                        }
+                                    ) {
+                                        coord.start_recording_iphone(cx);
+                                    } else {
+                                        coord.start_recording_full_screen(cx);
+                                    }
                                 } else if !coord.is_processing() {
                                     coord.begin_target_selection(cx);
                                 }

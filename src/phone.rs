@@ -29,6 +29,7 @@ const MAX_CANDIDATES: u64 = 480;
 #[derive(Default)]
 struct MirrorState {
     device: Option<PhoneDevice>,
+    rect: Option<[f32; 4]>,
     recording_epoch_ms: Option<u64>,
     markers_epoch_ms: Vec<u64>,
     finished: Option<(PathBuf, u64)>,
@@ -39,10 +40,11 @@ struct MirrorState {
 /// with the Mac's microphone into the bundle, and reports where the picture is on screen so
 /// pointer and pen input normalize into phone-screen coordinates.
 pub struct PhoneSession {
-    child: Child,
+    child: Option<Child>,
     stdin: Option<ChildStdin>,
     reader: Option<JoinHandle<()>>,
     state: Arc<Mutex<MirrorState>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
     started_at: Instant,
     session_epoch_ms: u64,
 }
@@ -85,6 +87,14 @@ enum MirrorEvent {
 }
 
 impl PhoneSession {
+    /// Opens the live iPhone mirror window in preview mode without recording to disk yet.
+    pub fn start_preview(
+        device_id: Option<&str>,
+        telemetry: Option<Arc<SharedCaptureTelemetry>>,
+    ) -> Result<Self> {
+        Self::spawn_mirror(None, device_id, telemetry)
+    }
+
     /// `telemetry` (when capturing through the app) receives the mirror's on-screen rect as the
     /// capture target, and hears when the helper ends the capture on its own.
     pub fn start(
@@ -92,10 +102,25 @@ impl PhoneSession {
         device_id: Option<&str>,
         telemetry: Option<Arc<SharedCaptureTelemetry>>,
     ) -> Result<Self> {
+        Self::spawn_mirror(Some(movie), device_id, telemetry)
+    }
+
+    fn spawn_mirror(
+        movie: Option<&Path>,
+        device_id: Option<&str>,
+        telemetry: Option<Arc<SharedCaptureTelemetry>>,
+    ) -> Result<Self> {
         let session_epoch_ms = crate::now_epoch_ms();
         let mut command = Command::new(helper::path()?);
-        command.arg("mirror").arg("--out").arg(movie);
-        if let Some(id) = device_id {
+        command.arg("mirror");
+        if let Some(movie) = movie {
+            command.arg("--out").arg(movie);
+        } else {
+            command.arg("--preview");
+        }
+        if let Some(id) = device_id
+            && !id.is_empty()
+        {
             command.arg("--device").arg(id);
         }
         let mut child = command
@@ -107,7 +132,9 @@ impl PhoneSession {
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().context("No mirror output")?;
         let state = Arc::new(Mutex::new(MirrorState::default()));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader_state = Arc::clone(&state);
+        let reader_cancelled = Arc::clone(&cancelled);
         let reader = std::thread::Builder::new()
             .name("scrawl-phone".into())
             .spawn(move || {
@@ -120,13 +147,17 @@ impl PhoneSession {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     match event {
-                        MirrorEvent::Device(device) => state.device = Some(device),
+                        MirrorEvent::Device(device) => {
+                            state.device = Some(device);
+                        }
                         MirrorEvent::Rect {
                             x,
                             y,
                             width,
                             height,
                         } => {
+                            let rect = [x as f32, y as f32, width as f32, height as f32];
+                            state.rect = Some(rect);
                             if let Some(telemetry) = &telemetry {
                                 *telemetry
                                     .target_frame
@@ -139,6 +170,12 @@ impl PhoneSession {
                                         height,
                                         scale: 2.0,
                                     };
+                                if telemetry
+                                    .selecting
+                                    .load(std::sync::atomic::Ordering::Acquire)
+                                {
+                                    telemetry.set_picker_rect(Some((rect, 3)));
+                                }
                             }
                         }
                         MirrorEvent::Recording { started_at } => {
@@ -157,21 +194,42 @@ impl PhoneSession {
                 }
                 // The helper ended; if Scrawl didn't ask (phone unplugged, no phone, denied),
                 // let the app finish or cancel the capture.
-                if let Some(telemetry) = &telemetry
-                    && telemetry.active.load(std::sync::atomic::Ordering::Acquire)
+                if !reader_cancelled.load(std::sync::atomic::Ordering::Acquire)
+                    && let Some(telemetry) = &telemetry
+                    && (telemetry.active.load(std::sync::atomic::Ordering::Acquire)
+                        || telemetry
+                            .selecting
+                            .load(std::sync::atomic::Ordering::Acquire))
                 {
                     let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::PhoneEnded);
                 }
             })
             .context("Could not watch the iPhone mirror")?;
         Ok(Self {
-            child,
+            child: Some(child),
             stdin,
             reader: Some(reader),
             state,
+            cancelled,
             started_at: Instant::now(),
             session_epoch_ms,
         })
+    }
+
+    /// Transitions an open preview session into active movie recording.
+    pub fn begin_recording(&mut self, movie: &Path) {
+        self.started_at = Instant::now();
+        self.session_epoch_ms = crate::now_epoch_ms();
+        self.lock().markers_epoch_ms.clear();
+        self.send(&format!("start {}", movie.display()));
+    }
+
+    pub fn device(&self) -> Option<PhoneDevice> {
+        self.lock().device.clone()
+    }
+
+    pub fn rect(&self) -> Option<[f32; 4]> {
+        self.lock().rect
     }
 
     pub fn elapsed_ms(&self) -> u64 {
@@ -199,17 +257,46 @@ impl PhoneSession {
 
     fn wait(&mut self, timeout: Duration) {
         self.stdin.take();
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                break;
+        if let Some(ref mut child) = self.child {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
-            std::thread::sleep(Duration::from_millis(20));
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
+        }
+    }
+
+    fn cancel_async(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.send("cancel");
+        self.stdin.take();
+        let child = self.child.take();
+        let reader = self.reader.take();
+        if child.is_some() || reader.is_some() {
+            std::thread::spawn(move || {
+                if let Some(mut child) = child {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while Instant::now() < deadline {
+                        if matches!(child.try_wait(), Ok(Some(_))) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                if let Some(reader) = reader {
+                    let _ = reader.join();
+                }
+            });
         }
     }
 
@@ -241,17 +328,13 @@ impl PhoneSession {
     }
 
     pub fn cancel(mut self) {
-        self.send("cancel");
-        self.wait(Duration::from_secs(5));
+        self.cancel_async();
     }
 }
 
 impl Drop for PhoneSession {
     fn drop(&mut self) {
-        if matches!(self.child.try_wait(), Ok(None)) {
-            self.send("cancel");
-            self.wait(Duration::from_secs(3));
-        }
+        self.cancel_async();
     }
 }
 

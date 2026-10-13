@@ -135,8 +135,11 @@ fragment float4 laser_fragment(
     float intro_fade = 1.0 - intro_ease;
 
     if (u.constrain_rect > 0.5) {
-        bool is_window = u._pad1 > 1.5;
-        float corner_r = is_window ? 10.0 : 0.0;
+        bool is_device = u._pad1 > 2.5;
+        bool is_window = u._pad1 > 1.5 && !is_device;
+        float corner_r = is_device
+            ? (min(u.target_rect.z, u.target_rect.w) * 0.11)
+            : (is_window ? 10.0 : 0.0);
         float2 box_min = u.target_rect.xy;
         float2 box_max = u.target_rect.xy + u.target_rect.zw;
         float2 box_center = (box_min + box_max) * 0.5;
