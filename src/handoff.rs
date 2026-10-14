@@ -340,12 +340,21 @@ pub fn send_to_opencode_for_app(
     session_id: Option<&str>,
     app_name: Option<&str>,
 ) -> Result<(String, String)> {
-    let (directory, bundle) = load_bundle(bundle_dir)?;
-    let summary = crate::sketch::summary_markdown(&bundle, &directory);
-    let app_slug = app_name
-        .or(bundle.target.app.as_deref())
-        .map(normalize_slug)
-        .filter(|s| !s.is_empty());
+    let (_, bundle) = load_bundle(bundle_dir)?;
+    let (session, title) =
+        resolve_opencode_session(session_id, app_name.or(bundle.target.app.as_deref()))?;
+    send_bundle_to_session(bundle_dir, &session)?;
+    Ok((session, title))
+}
+
+/// Picks the session a capture goes to, and its title: an explicit ID, else the root session
+/// whose title matches the app ("UpDown" → "UP DOWN APP"), else `OPENCODE_SESSION_ID`, else the
+/// most recently updated root session.
+pub fn resolve_opencode_session(
+    session_id: Option<&str>,
+    app_name: Option<&str>,
+) -> Result<(String, String)> {
+    let app_slug = app_name.map(normalize_slug).filter(|s| !s.is_empty());
 
     let (session, session_title) = if let Some(id) = session_id.filter(|s| !s.trim().is_empty()) {
         let title = list_opencode_sessions()
@@ -394,6 +403,13 @@ pub fn send_to_opencode_for_app(
         };
         (matched.id, title)
     };
+    Ok((session, session_title))
+}
+
+/// Queues a bundle's summary and pointers into an OpenCode session.
+pub fn send_bundle_to_session(bundle_dir: &Path, session: &str) -> Result<()> {
+    let (directory, bundle) = load_bundle(bundle_dir)?;
+    let summary = crate::sketch::summary_markdown(&bundle, &directory);
     ensure!(
         session.starts_with("ses")
             && session
@@ -415,7 +431,7 @@ pub fn send_to_opencode_for_app(
         &format!("/api/session/{session}/prompt"),
         Some(&serde_json::json!({ "text": text, "delivery": "queue" })),
     )?;
-    Ok((session, session_title))
+    Ok(())
 }
 
 pub fn extract_frames_range(
