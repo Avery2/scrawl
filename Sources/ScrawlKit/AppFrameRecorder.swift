@@ -183,7 +183,7 @@
     /// Frames stop once the app is in the background and the microphone is cut off, so the
     /// recording finishes there rather than leave a gap (or a movie the system kills mid-write).
     /// Brief interruptions while still in the foreground (Control Center, a call banner, Siri)
-    /// keep recording; the microphone resumes on its own when the interruption ends.
+    /// keep recording; the microphone restarts when the interruption ends.
     private func observeBackgrounding() {
       observers.append(NotificationCenter.default.addObserver(
         forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
@@ -286,7 +286,7 @@
   // MARK: - Movie Writer
 
   /// The `AVAssetWriter` behind an app-frame recording. Video is appended on the main thread and
-  /// audio on the microphone's queue, so every use of the writer holds `lock`; once finishing
+  /// audio on the audio engine's tap thread, so every use of the writer holds `lock`; once finishing
   /// starts, late samples are dropped instead of being appended to a finished input.
   final class MovieWriter: @unchecked Sendable {
     private let lock = NSLock()
@@ -457,18 +457,28 @@
 
   // MARK: - Microphone
 
-  /// Audio-only `AVCaptureSession` feeding a `MovieWriter`. Sample buffers arrive on `queue` and
-  /// are re-stamped from the capture session's clock onto the host clock before being appended.
-  final class MicrophoneCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
-    private let session = AVCaptureSession()
+  /// The microphone through `AVAudioEngine`. AVFAudio only: AVFoundation's capture-session and
+  /// capture-device APIs would make App Store review demand a camera purpose string
+  /// (ITMS-90683) from every app that links ScrawlKit.
+  ///
+  /// A tap on the input node delivers PCM buffers stamped with host time; each becomes a
+  /// `CMSampleBuffer` on the host clock and goes to the `MovieWriter`. Starting, stopping, and
+  /// restarting run on `queue`. When the engine's configuration changes (a route or sample-rate
+  /// change) or an interruption ends, the tap is reinstalled and the engine started again.
+  final class MicrophoneCapture: @unchecked Sendable {
     private let queue = DispatchQueue(label: "dev.kitlangton.scrawl.microphone")
     private let lock = NSLock()
     private var writer: MovieWriter?
-    /// Touched only on `queue`.
+    /// Guarded by `lock`, like `writer`.
+    private let stream = MicrophoneStream()
+    /// The rest is touched only on `queue`.
+    private var engine = AVAudioEngine()
     private var audioSession: AudioSessionSnapshot?
+    private var observers: [any NSObjectProtocol] = []
+    private var isRunning = false
 
-    /// Configures the audio session and starts capture off the main thread (`startRunning`
-    /// blocks); `completion` gets whether the microphone is running.
+    /// Configures the audio session and starts the engine off the main thread; `completion` gets
+    /// whether the microphone is running.
     func start(completion: @escaping @Sendable (Bool) -> Void) {
       queue.async { [self] in
         completion(configureAndRun())
@@ -482,13 +492,21 @@
       lock.unlock()
     }
 
-    /// Stops capture and puts the app's audio session back the way it was.
+    /// Stops the engine and puts the app's audio session back the way it was.
     func stop() {
       lock.lock()
       writer = nil
       lock.unlock()
       queue.async { [self] in
-        if session.isRunning { session.stopRunning() }
+        for observer in observers {
+          NotificationCenter.default.removeObserver(observer)
+        }
+        observers = []
+        if isRunning {
+          engine.inputNode.removeTap(onBus: 0)
+          engine.stop()
+          isRunning = false
+        }
         audioSession?.restore()
         audioSession = nil
       }
@@ -502,57 +520,192 @@
         // speaker or Bluetooth headphones instead of the receiver.
         try shared.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetoothA2DP])
         try shared.setActive(true)
+        try installTapAndStart()
       } catch {
+        print("Scrawl: microphone unavailable: \(error.localizedDescription)")
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
         snapshot.restore()
         return false
       }
       audioSession = snapshot
-
-      session.automaticallyConfiguresApplicationAudioSession = false
-      guard let device = AVCaptureDevice.default(for: .audio),
-            let input = try? AVCaptureDeviceInput(device: device)
-      else {
-        snapshot.restore()
-        audioSession = nil
-        return false
-      }
-      let output = AVCaptureAudioDataOutput()
-      output.setSampleBufferDelegate(self, queue: queue)
-      session.beginConfiguration()
-      let added = session.canAddInput(input) && session.canAddOutput(output)
-      if added {
-        session.addInput(input)
-        session.addOutput(output)
-      }
-      session.commitConfiguration()
-      if added { session.startRunning() }
-      guard session.isRunning else {
-        snapshot.restore()
-        audioSession = nil
-        return false
-      }
+      isRunning = true
+      observe()
       return true
     }
 
-    func captureOutput(_: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from _: AVCaptureConnection) {
-      lock.lock()
-      let writer = writer
-      lock.unlock()
-      guard let writer, let clock = session.synchronizationClock,
-            let restamped = Self.restamp(sampleBuffer, from: clock)
-      else { return }
-      writer.appendAudio(restamped)
+    /// Taps the input node in its current hardware format and starts the engine.
+    private func installTapAndStart() throws {
+      let input = engine.inputNode
+      let format = input.outputFormat(forBus: 0)
+      guard format.sampleRate > 0, format.channelCount > 0 else {
+        throw RecorderError.cannotWrite("no microphone input")
+      }
+      input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, when in
+        self?.deliver(buffer, at: when)
+      }
+      engine.prepare()
+      try engine.start()
     }
 
-    private static func restamp(_ sampleBuffer: CMSampleBuffer, from clock: CMClock) -> CMSampleBuffer? {
-      let host = CMClockGetHostTimeClock()
-      if CFEqual(clock, host) { return sampleBuffer }
-      guard var timings = try? sampleBuffer.sampleTimingInfos() else { return nil }
-      for index in timings.indices {
-        timings[index].presentationTimeStamp = CMSyncConvertTime(timings[index].presentationTimeStamp, from: clock, to: host)
-        timings[index].decodeTimeStamp = .invalid
+    /// Runs again after the engine stopped itself (configuration change, interruption, or a
+    /// media services reset, which needs a new engine).
+    private func restart(rebuildingEngine: Bool = false) {
+      guard isRunning else { return }
+      engine.inputNode.removeTap(onBus: 0)
+      engine.stop()
+      if rebuildingEngine {
+        engine = AVAudioEngine()
+        observeConfigurationChanges()
       }
-      return try? CMSampleBuffer(copying: sampleBuffer, withNewTiming: timings)
+      do {
+        try AVAudioSession.sharedInstance().setActive(true)
+        try installTapAndStart()
+      } catch {
+        print("Scrawl: microphone could not restart: \(error.localizedDescription)")
+      }
+    }
+
+    private func observe() {
+      observeConfigurationChanges()
+      let center = NotificationCenter.default
+      observers.append(center.addObserver(
+        forName: AVAudioSession.interruptionNotification, object: AVAudioSession.sharedInstance(), queue: nil
+      ) { [weak self] notification in
+        let rawType = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+        guard let self, rawType.flatMap(AVAudioSession.InterruptionType.init) == .ended else { return }
+        queue.async { self.restart() }
+      })
+      observers.append(center.addObserver(
+        forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: nil
+      ) { [weak self] _ in
+        guard let self else { return }
+        queue.async { self.restart(rebuildingEngine: true) }
+      })
+    }
+
+    private func observeConfigurationChanges() {
+      observers.append(NotificationCenter.default.addObserver(
+        forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
+      ) { [weak self] _ in
+        guard let self else { return }
+        queue.async { self.restart() }
+      })
+    }
+
+    /// On the engine's tap thread.
+    private func deliver(_ buffer: AVAudioPCMBuffer, at when: AVAudioTime) {
+      let time = when.isHostTimeValid
+        ? CMClockMakeHostTimeFromSystemUnits(when.hostTime)
+        : CMTimeSubtract(MovieWriter.now(), CMTime(value: CMTimeValue(buffer.frameLength), timescale: CMTimeScale(buffer.format.sampleRate)))
+      lock.lock()
+      defer { lock.unlock() }
+      guard let writer, let sampleBuffer = stream.sampleBuffer(for: buffer, at: time) else { return }
+      writer.appendAudio(sampleBuffer)
+    }
+  }
+
+  // MARK: - Microphone Stream
+
+  /// Turns tap buffers into one steady stream for the writer's AAC input. That input fails the
+  /// whole movie if its source format changes midway, and a route change (AirPods, a headset)
+  /// changes the tap's sample rate or channel count, so every buffer is converted to `format`.
+  /// Timestamps run on contiguously from the first buffer, so resampling can't make audio overlap
+  /// or step backwards, and resync to the tap's host time only after a real gap (an interruption
+  /// or restart); a buffer that is more than `tolerance` early is dropped.
+  final class MicrophoneStream {
+    static let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 1)!
+    private static let tolerance = CMTime(value: 50, timescale: 1000)
+    private var converter: AVAudioConverter?
+    private var nextTime = CMTime.invalid
+
+    func sampleBuffer(for buffer: AVAudioPCMBuffer, at time: CMTime) -> CMSampleBuffer? {
+      if nextTime.isValid, time < CMTimeSubtract(nextTime, Self.tolerance) { return nil }
+      guard let converted = convert(buffer), converted.frameLength > 0 else { return nil }
+      if !nextTime.isValid || time > CMTimeAdd(nextTime, Self.tolerance) {
+        nextTime = time
+      }
+      let sampleBuffer = converted.sampleBuffer(presentationTime: nextTime)
+      nextTime = CMTimeAdd(nextTime, CMTime(value: CMTimeValue(converted.frameLength), timescale: CMTimeScale(Self.format.sampleRate)))
+      return sampleBuffer
+    }
+
+    private func convert(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+      let target = Self.format
+      if buffer.format == target { return buffer }
+      if converter?.inputFormat != buffer.format {
+        converter = AVAudioConverter(from: buffer.format, to: target)
+        converter?.downmix = true
+      }
+      guard let converter else { return nil }
+      let ratio = target.sampleRate / buffer.format.sampleRate
+      let capacity = AVAudioFrameCount((Double(buffer.frameLength) * ratio).rounded(.up)) + 64
+      guard let output = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return nil }
+      let input = ConverterInput(buffer)
+      var error: NSError?
+      let status = converter.convert(to: output, error: &error) { _, inputStatus in
+        input.next(inputStatus)
+      }
+      return status == .error ? nil : output
+    }
+  }
+
+  /// Hands one buffer to `AVAudioConverter`, then reports no more data for now (the converter
+  /// keeps its resampling state for the next buffer).
+  private final class ConverterInput {
+    private var buffer: AVAudioPCMBuffer?
+
+    init(_ buffer: AVAudioPCMBuffer) {
+      self.buffer = buffer
+    }
+
+    func next(_ status: UnsafeMutablePointer<AVAudioConverterInputStatus>) -> AVAudioBuffer? {
+      guard let buffer else {
+        status.pointee = .noDataNow
+        return nil
+      }
+      self.buffer = nil
+      status.pointee = .haveData
+      return buffer
+    }
+  }
+
+  extension AVAudioPCMBuffer {
+    /// A copy of these frames as a `CMSampleBuffer` starting at `presentationTime`, in the
+    /// buffer's own format.
+    func sampleBuffer(presentationTime: CMTime) -> CMSampleBuffer? {
+      let frames = CMItemCount(frameLength)
+      let sampleRate = format.sampleRate
+      guard frames > 0, sampleRate > 0 else { return nil }
+      var timing = CMSampleTimingInfo(
+        duration: CMTime(value: 1, timescale: CMTimeScale(sampleRate.rounded())),
+        presentationTimeStamp: presentationTime,
+        decodeTimeStamp: .invalid
+      )
+      var sampleBuffer: CMSampleBuffer?
+      guard CMSampleBufferCreate(
+        allocator: kCFAllocatorDefault,
+        dataBuffer: nil,
+        dataReady: false,
+        makeDataReadyCallback: nil,
+        refcon: nil,
+        formatDescription: format.formatDescription,
+        sampleCount: frames,
+        sampleTimingEntryCount: 1,
+        sampleTimingArray: &timing,
+        sampleSizeEntryCount: 0,
+        sampleSizeArray: nil,
+        sampleBufferOut: &sampleBuffer
+      ) == noErr, let sampleBuffer else { return nil }
+      // Copies the frames: the engine reuses the tap's buffer.
+      guard CMSampleBufferSetDataBufferFromAudioBufferList(
+        sampleBuffer,
+        blockBufferAllocator: kCFAllocatorDefault,
+        blockBufferMemoryAllocator: kCFAllocatorDefault,
+        flags: 0,
+        bufferList: audioBufferList
+      ) == noErr else { return nil }
+      return sampleBuffer
     }
   }
 
