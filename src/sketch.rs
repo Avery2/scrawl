@@ -416,6 +416,20 @@ pub fn timeline(bundle: &ScrawlBundle) -> Vec<String> {
     items.into_iter().map(|item| item.1).collect()
 }
 
+/// Longest app-provided screen name or context value shown in the summary.
+const CONTEXT_VALUE_CHARS: usize = 60;
+
+/// An app-provided string on one line, cut to `CONTEXT_VALUE_CHARS`.
+fn context_value(raw: &str) -> String {
+    let compact = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= CONTEXT_VALUE_CHARS {
+        compact
+    } else {
+        let cut: String = compact.chars().take(CONTEXT_VALUE_CHARS - 1).collect();
+        format!("{}…", cut.trim_end())
+    }
+}
+
 pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> String {
     let mut target = bundle
         .target
@@ -432,8 +446,18 @@ pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> 
         target = device.name.clone();
         if let Some(app) = &device.app {
             target.push_str(&format!(" · {app}"));
-            if let Some(version) = device.app_version.as_deref().filter(|v| !v.is_empty()) {
-                target.push_str(&format!(" ({version})"));
+            let short = device
+                .app_short_version
+                .as_deref()
+                .filter(|v| !v.is_empty());
+            let build = device.app_version.as_deref().filter(|v| !v.is_empty());
+            match (short, build) {
+                (Some(short), Some(build)) if short != build => {
+                    target.push_str(&format!(" {short} ({build})"));
+                }
+                (Some(short), _) => target.push_str(&format!(" {short}")),
+                (None, Some(build)) => target.push_str(&format!(" ({build})")),
+                (None, None) => {}
             }
         }
     }
@@ -442,28 +466,61 @@ pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> 
         format_clock(bundle.duration_ms),
         bundle_dir.display()
     );
+    // The screen at the start and the app's own values, on one line.
+    let start_screen = bundle.screen_at(0);
+    let context: Vec<String> = start_screen
+        .map(|screen| format!("Screen: {}", context_value(screen)))
+        .into_iter()
+        .chain(
+            bundle
+                .context
+                .iter()
+                .map(|(key, value)| format!("{}: {}", context_value(key), context_value(value))),
+        )
+        .collect();
+    if !context.is_empty() {
+        out.push_str(&context.join(" · "));
+        out.push('\n');
+    }
     if let Some(note) = &bundle.note
         && !note.trim().is_empty()
     {
         out.push_str(&format!("Note: {}\n", note.trim()));
     }
-    let app_events: Vec<(u64, &str)> = bundle
+    // App events and context changes nest under the keyframe on screen when they happened.
+    let mut app_events: Vec<(u64, String)> = bundle
         .events
         .iter()
         .filter_map(|event| match event {
-            InteractionEvent::AppEvent { t, label } => Some((*t, label.as_str())),
+            InteractionEvent::AppEvent { t, label } => Some((*t, format!("app: {label}"))),
             _ => None,
         })
         .collect();
+    app_events.extend(bundle.context_changes.iter().map(|change| {
+        let key = context_value(&change.key);
+        let text = match &change.value {
+            Some(value) => format!("{key} → {}", context_value(value)),
+            None => format!("{key} cleared"),
+        };
+        (change.t, text)
+    }));
+    app_events.sort_by_key(|(t, _)| *t);
     if !bundle.keyframes.is_empty() {
         let first_t = bundle.keyframes[0].t;
         for (t, label) in &app_events {
             if *t < first_t {
-                out.push_str(&format!("  · {} app: {label}\n", format_clock(*t)));
+                out.push_str(&format!("  · {} {label}\n", format_clock(*t)));
             }
         }
+        let mut shown_screen = start_screen;
         for (i, frame) in bundle.keyframes.iter().enumerate() {
             let clock = format_clock(frame.t);
+            let screen = bundle.screen_at(frame.t);
+            let screen_marker = match screen {
+                Some(name) if screen != shown_screen => format!(" ⟨{}⟩", context_value(name)),
+                _ => String::new(),
+            };
+            shown_screen = screen;
             let flag = frame
                 .mark_id
                 .as_ref()
@@ -495,26 +552,25 @@ pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> 
                         String::new()
                     };
                     out.push_str(&format!(
-                        "- #{} ({clock}){action_marker} “{said}”\n",
+                        "- #{} ({clock}){screen_marker}{action_marker} “{said}”\n",
                         frame.index
                     ));
                 }
                 None => out.push_str(&format!(
-                    "- #{} ({clock}){flag_marker} {}\n",
+                    "- #{} ({clock}){screen_marker}{flag_marker} {}\n",
                     frame.index, frame.event
                 )),
             }
-            // App events nest under the keyframe on screen when they happened.
             let next = bundle.keyframes.get(i + 1).map_or(u64::MAX, |k| k.t);
             for (t, label) in &app_events {
                 if (*t < next || i + 1 == bundle.keyframes.len()) && *t >= frame.t {
-                    out.push_str(&format!("  · {} app: {label}\n", format_clock(*t)));
+                    out.push_str(&format!("  · {} {label}\n", format_clock(*t)));
                 }
             }
         }
     } else if !app_events.is_empty() {
         for (t, label) in &app_events {
-            out.push_str(&format!("· {} app: {label}\n", format_clock(*t)));
+            out.push_str(&format!("· {} {label}\n", format_clock(*t)));
         }
     } else if !bundle.transcript.text.trim().is_empty() {
         out.push_str(&format!("“{}”\n", bundle.transcript.text.trim()));
@@ -1276,6 +1332,9 @@ mod tests {
             audio: None,
             source: None,
             device: None,
+            context: Default::default(),
+            context_changes: Vec::new(),
+            screens: Vec::new(),
         };
         let tl = timeline(&bundle).join("\n");
         assert!(tl.find("0:03 “").unwrap() < tl.find("0:04 · pressed").unwrap());
@@ -1379,5 +1438,106 @@ mod tests {
         let summary_with_action =
             summary_markdown(&phone, std::path::Path::new("/recordings/phone"));
         assert!(summary_with_action.contains("- #3 (0:11) [swiped up] “And then I scroll up.”"));
+    }
+
+    #[test]
+    fn summary_shows_app_version_context_and_screen_changes() {
+        let mut bundle: ScrawlBundle = serde_json::from_value(serde_json::json!({
+            "version": 1, "id": "t", "createdAtMs": 0, "durationMs": 25_000,
+            "target": {"mode": "device", "app": "OpenCode", "bundleId": "ai.opencode.mobilecode",
+                "displayId": 0,
+                "frame": {"x": 0.0, "y": 0.0, "width": 10.0, "height": 10.0, "scale": 1.0}},
+            "transcript": {"source": "test", "text": "", "segments": []},
+            "strokes": [], "marks": [], "events": [], "keyframes": [], "contactSheet": "c.png",
+            "source": "iphone",
+            "device": {"name": "iPhone", "capture": "scrawlkit", "width": 10, "height": 20,
+                "app": "OpenCode", "appVersion": "354", "appShortVersion": "1.4"}
+        }))
+        .unwrap();
+        let keyframe = |index: usize, t: u64, reason, event: &str, said: Option<&str>| Keyframe {
+            index,
+            t,
+            reason,
+            file: format!("frames/frame-{index:02}.png"),
+            event: event.into(),
+            said: said.map(str::to_owned),
+            mark_id: None,
+            cursor: None,
+        };
+        bundle.keyframes = vec![
+            keyframe(
+                1,
+                1_000,
+                KeyframeReason::Initial,
+                "first frame",
+                Some("So here."),
+            ),
+            keyframe(
+                2,
+                3_000,
+                KeyframeReason::Click,
+                "tapped “Settings” (x 0.10, y 0.90)",
+                None,
+            ),
+            keyframe(
+                3,
+                8_000,
+                KeyframeReason::Click,
+                "tapped “Back” (x 0.05, y 0.06)",
+                Some("Go back."),
+            ),
+            keyframe(
+                4,
+                20_000,
+                KeyframeReason::SceneChange,
+                "screen changed",
+                Some("Done."),
+            ),
+        ];
+        bundle.screens = vec![
+            ScreenSpan {
+                t0: 0,
+                t1: 5_000,
+                name: "Sessions".into(),
+            },
+            ScreenSpan {
+                t0: 5_000,
+                t1: 25_000,
+                name: "Settings › Experimental".into(),
+            },
+        ];
+        bundle.context = std::collections::BTreeMap::from([
+            ("server".to_owned(), "studio".to_owned()),
+            ("session".to_owned(), format!("ses_{}", "x".repeat(80))),
+        ]);
+        bundle.context_changes = vec![ContextChange {
+            t: 9_000,
+            key: "server".into(),
+            value: Some("mini".into()),
+        }];
+        let summary = summary_markdown(&bundle, std::path::Path::new("/recordings/phone"));
+        let session = format!("ses_{}…", "x".repeat(55));
+        assert_eq!(
+            summary,
+            format!(
+                "[scrawl 0:25 · iPhone · OpenCode 1.4 (354) · /recordings/phone]\n\
+                 Screen: Sessions · server: studio · session: {session}\n\
+                 - #1 (0:01) “So here.”\n\
+                 - #2 (0:03) tapped “Settings” (x 0.10, y 0.90)\n\
+                 - #3 (0:08) ⟨Settings › Experimental⟩ [tapped “Back”] “Go back.”\n\
+                 \x20 · 0:09 server → mini\n\
+                 - #4 (0:20) “Done.”\n"
+            )
+        );
+
+        // No screens or values: header only; a build without a marketing version stays as before.
+        bundle.screens.clear();
+        bundle.context.clear();
+        bundle.context_changes.clear();
+        bundle.device.as_mut().unwrap().app_short_version = None;
+        let summary = summary_markdown(&bundle, std::path::Path::new("/recordings/phone"));
+        assert!(summary.starts_with(
+            "[scrawl 0:25 · iPhone · OpenCode (354) · /recordings/phone]\n- #1 (0:01) “So here.”\n"
+        ));
     }
 }

@@ -1751,7 +1751,7 @@ impl ScrawlCoordinator {
             .as_ref()
             .map_or("iPhone", |d| d.name.as_str())
             .to_owned();
-        let target = crate::phone::phone_target(&name, None, 0, 0);
+        let target = crate::phone::phone_target(&name, None, None, 0, 0);
         let initial_frame = existing_preview
             .as_ref()
             .and_then(PhoneSession::rect)

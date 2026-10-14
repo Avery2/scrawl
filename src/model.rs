@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Coordinates in `Stroke::pts` are scaled to `0..=10_000` (1/10000 of target width/height).
@@ -67,6 +69,78 @@ pub struct ScrawlBundle {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<DeviceInfo>,
+    /// App-defined values when the recording started (ScrawlKit `Scrawl.context`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub context: BTreeMap<String, String>,
+    /// Changes to `context` during the recording.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_changes: Vec<ContextChange>,
+    /// Which screen the app said it was on, and when (ScrawlKit `Scrawl.screen`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub screens: Vec<ScreenSpan>,
+}
+
+impl ScrawlBundle {
+    /// The screen the app was on at `t_ms`, if it said.
+    pub fn screen_at(&self, t_ms: u64) -> Option<&str> {
+        self.screens
+            .iter()
+            .rev()
+            .find(|span| span.t0 <= t_ms && (t_ms < span.t1 || span.t1 >= self.duration_ms))
+            .map(|span| span.name.as_str())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenSpan {
+    pub t0: u64,
+    pub t1: u64,
+    pub name: String,
+}
+
+impl ScreenSpan {
+    /// Turns timed screen changes (`None` when the app stopped naming one) into spans that end at
+    /// the next change or at `duration_ms`.
+    pub fn from_changes(changes: &[(u64, Option<String>)], duration_ms: u64) -> Vec<Self> {
+        let mut sorted = changes.to_vec();
+        sorted.sort_by_key(|(t, _)| *t);
+        let mut spans: Vec<Self> = Vec::new();
+        let mut open: Option<(u64, String)> = None;
+        for (t, name) in sorted {
+            let t = t.min(duration_ms);
+            let name = name.filter(|n| !n.trim().is_empty());
+            if open.as_ref().map(|(_, n)| n) == name.as_ref() {
+                continue;
+            }
+            if let Some((t0, name)) = open.take()
+                && t > t0
+            {
+                spans.push(Self { t0, t1: t, name });
+            }
+            open = name.map(|n| (t, n));
+        }
+        if let Some((t0, name)) = open
+            && (duration_ms > t0 || spans.is_empty())
+        {
+            spans.push(Self {
+                t0,
+                t1: duration_ms.max(t0),
+                name,
+            });
+        }
+        spans
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextChange {
+    pub t: u64,
+    pub key: String,
+    /// `None` when the key was cleared.
+    #[serde(default)]
+    pub value: Option<String>,
 }
 
 /// The phone behind an `"iphone"` bundle.
@@ -92,6 +166,9 @@ pub struct DeviceInfo {
     pub app: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_version: Option<String>,
+    /// The app's marketing version (`CFBundleShortVersionString`); `app_version` is the build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_short_version: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -419,6 +496,74 @@ impl RgbaFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn span(t0: u64, t1: u64, name: &str) -> ScreenSpan {
+        ScreenSpan {
+            t0,
+            t1,
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn screen_spans_close_at_the_next_change_and_at_the_end() {
+        let some = |s: &str| Some(s.to_owned());
+        let changes = [
+            (5_000, some("Settings")),
+            (0, some("Home")),
+            // Repeats and blank names don't open spans; `None` closes one.
+            (6_000, some("Settings")),
+            (8_000, None),
+            (9_000, some("  ")),
+            (10_000, some("Home")),
+            (10_000, some("Detail")),
+            (30_000, some("Late")),
+        ];
+        assert_eq!(
+            ScreenSpan::from_changes(&changes, 20_000),
+            vec![
+                span(0, 5_000, "Home"),
+                span(5_000, 8_000, "Settings"),
+                span(10_000, 20_000, "Detail"),
+            ]
+        );
+        assert!(ScreenSpan::from_changes(&[], 20_000).is_empty());
+    }
+
+    #[test]
+    fn old_bundles_load_without_app_context_and_new_ones_round_trip() {
+        let old = serde_json::json!({
+            "version": 1, "id": "t", "createdAtMs": 0, "durationMs": 20_000,
+            "target": {"mode": "device", "app": "OpenCode", "bundleId": "OpenCode", "displayId": 0,
+                "frame": {"x": 0.0, "y": 0.0, "width": 10.0, "height": 10.0, "scale": 1.0}},
+            "transcript": {"source": "test", "text": "", "segments": []},
+            "strokes": [], "marks": [], "events": [], "keyframes": [], "contactSheet": "c.png",
+            "source": "iphone",
+            "device": {"name": "iPhone", "capture": "scrawlkit", "width": 10, "height": 20,
+                "app": "OpenCode", "appVersion": "354"}
+        });
+        let mut bundle: ScrawlBundle = serde_json::from_value(old).unwrap();
+        assert!(bundle.context.is_empty() && bundle.screens.is_empty());
+        assert_eq!(bundle.device.as_ref().unwrap().app_short_version, None);
+        let json = serde_json::to_value(&bundle).unwrap();
+        assert!(json.get("context").is_none() && json.get("screens").is_none());
+
+        bundle.screens = vec![span(0, 5_000, "Home"), span(5_000, 20_000, "Settings")];
+        bundle.context.insert("server".into(), "studio".into());
+        bundle.context_changes.push(ContextChange {
+            t: 7_000,
+            key: "server".into(),
+            value: None,
+        });
+        assert_eq!(bundle.screen_at(0), Some("Home"));
+        assert_eq!(bundle.screen_at(5_000), Some("Settings"));
+        assert_eq!(bundle.screen_at(20_000), Some("Settings"));
+        let json = serde_json::to_value(&bundle).unwrap();
+        assert_eq!(json["screens"][1]["name"], "Settings");
+        assert_eq!(json["contextChanges"][0]["value"], serde_json::Value::Null);
+        let back: ScrawlBundle = serde_json::from_value(json).unwrap();
+        assert_eq!(back, bundle);
+    }
 
     #[test]
     fn stroke_and_event_rebase_shift_dt_and_drop_pre_offset_items() {

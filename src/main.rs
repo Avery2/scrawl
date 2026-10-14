@@ -257,6 +257,10 @@ fn merge_full_keyframes(
 pub struct SourceExtras {
     pub source: Option<String>,
     pub device: Option<DeviceInfo>,
+    /// What the recorded app said about itself: values at the start, their changes, and screens.
+    pub context: std::collections::BTreeMap<String, String>,
+    pub context_changes: Vec<model::ContextChange>,
+    pub screens: Vec<model::ScreenSpan>,
     /// Time-only markers (ms); each becomes a `Flag` mark with keyframe priority.
     pub flags: Vec<u64>,
     /// Decodes the chosen keyframes again at full quality, for sources that select on small
@@ -409,6 +413,9 @@ pub fn build_bundle_from_parts(
         audio: audio_rel,
         source: extras.source,
         device: extras.device,
+        context: extras.context,
+        context_changes: extras.context_changes,
+        screens: extras.screens,
     };
 
     let contact_sheet = render_contact_sheet(&bundle, &annotated_frames);
@@ -762,6 +769,9 @@ fn main() -> Result<()> {
                         strokes: old.strokes,
                         flags,
                         note: old.note,
+                        context: old.context,
+                        context_changes: old.context_changes,
+                        screens: old.screens,
                     },
                 )?
                 .2

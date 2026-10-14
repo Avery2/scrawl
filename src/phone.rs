@@ -2,6 +2,7 @@
 //! in-app with ScrawlKit. Both become ordinary `.scrawl` bundles whose keyframes are decoded
 //! from the phone's own video, never from a screenshot of the mirror window.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -15,8 +16,8 @@ use serde::Deserialize;
 use crate::capture::{LiveOverlayEvent, SharedCaptureTelemetry, scrawl_log};
 use crate::helper::{self, FrameTimes, PhoneDevice};
 use crate::model::{
-    CaptureMode, DeviceInfo, InteractionEvent, RgbaFrame, ScrawlBundle, Stroke, TargetFrame,
-    TargetInfo,
+    CaptureMode, ContextChange, DeviceInfo, InteractionEvent, RgbaFrame, ScrawlBundle, ScreenSpan,
+    Stroke, TargetFrame, TargetInfo,
 };
 
 /// Keyframes are decoded from the native video and fit to this long edge (736×1600 for a
@@ -403,13 +404,26 @@ pub struct MovieCapture {
     pub strokes: Vec<Stroke>,
     pub flags: Vec<u64>,
     pub note: Option<String>,
+    /// What the app said about itself (ScrawlKit context and screens).
+    pub context: BTreeMap<String, String>,
+    pub context_changes: Vec<ContextChange>,
+    pub screens: Vec<ScreenSpan>,
 }
 
-pub fn phone_target(name: &str, app: Option<&str>, width: u32, height: u32) -> TargetInfo {
+/// `app` is the display name and `bundle_id` the identifier; an old timeline without a bundle
+/// ID falls back to the name for both.
+pub fn phone_target(
+    name: &str,
+    app: Option<&str>,
+    bundle_id: Option<&str>,
+    width: u32,
+    height: u32,
+) -> TargetInfo {
+    let bundle_id = bundle_id.filter(|id| !id.is_empty()).or(app);
     TargetInfo {
         mode: CaptureMode::Device,
-        app: Some(app.unwrap_or(name).to_owned()),
-        bundle_id: app.map(str::to_owned),
+        app: Some(app.or(bundle_id).unwrap_or(name).to_owned()),
+        bundle_id: bundle_id.map(str::to_owned),
         window_title: None,
         window_id: None,
         display_id: 0,
@@ -461,6 +475,9 @@ pub fn build_movie_bundle(
     let extras = crate::SourceExtras {
         source: Some("iphone".into()),
         device: Some(capture.device),
+        context: capture.context,
+        context_changes: capture.context_changes,
+        screens: capture.screens,
         flags: capture.flags,
         full_frames: Some(Box::new(move |times: &[u64]| -> Result<Vec<RgbaFrame>> {
             helper::frames(&movie, FrameTimes::At(times), PHONE_FRAME_EDGE)
@@ -491,7 +508,7 @@ pub fn finalize_live_capture(
     events.retain_mut(|event| event.rebase(recording.offset_ms));
     strokes.retain_mut(|stroke| stroke.rebase(recording.offset_ms));
     let device = &recording.device;
-    let target = phone_target(&device.name, None, device.width, device.height);
+    let target = phone_target(&device.name, None, None, device.width, device.height);
     let info = DeviceInfo {
         name: device.name.clone(),
         capture: "mirror".into(),
@@ -511,6 +528,9 @@ pub fn finalize_live_capture(
             strokes,
             flags: recording.flags,
             note,
+            context: BTreeMap::new(),
+            context_changes: Vec::new(),
+            screens: Vec::new(),
         },
     )
 }
@@ -546,6 +566,74 @@ pub struct Timeline {
     pub touches: Vec<Touch>,
     #[serde(default)]
     pub strokes: Vec<TimelineStroke>,
+    /// `CFBundleShortVersionString`; `version` is the build.
+    #[serde(default)]
+    pub short_version: Option<String>,
+    /// App-defined values when the recording started.
+    #[serde(default)]
+    pub context: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub context_changes: Vec<TimelineContextChange>,
+    /// Screen changes; the first is at 0 when the app named a screen before recording.
+    #[serde(default)]
+    pub screens: Vec<TimelineScreen>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct TimelineContextChange {
+    pub t: f64,
+    pub key: String,
+    #[serde(default)]
+    pub value: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct TimelineScreen {
+    pub t: f64,
+    /// `null` when the app stopped naming a screen.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// A context value as text: strings as they are, numbers and booleans spelled out, `null` none.
+fn context_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
+impl Timeline {
+    fn context(&self) -> BTreeMap<String, String> {
+        self.context
+            .iter()
+            .filter_map(|(k, v)| Some((k.clone(), context_text(v)?)))
+            .collect()
+    }
+
+    fn context_changes(&self) -> Vec<ContextChange> {
+        let mut changes: Vec<ContextChange> = self
+            .context_changes
+            .iter()
+            .map(|c| ContextChange {
+                t: ms(c.t),
+                key: c.key.clone(),
+                value: context_text(&c.value),
+            })
+            .collect();
+        changes.sort_by_key(|c| c.t);
+        changes
+    }
+
+    fn screen_spans(&self, duration_ms: u64) -> Vec<ScreenSpan> {
+        let changes: Vec<(u64, Option<String>)> = self
+            .screens
+            .iter()
+            .map(|s| (ms(s.t), s.name.clone()))
+            .collect();
+        ScreenSpan::from_changes(&changes, duration_ms)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -804,6 +892,7 @@ pub fn import(
         .collect();
     let name = timeline.device.clone().unwrap_or_else(|| "iPhone".into());
     let app = timeline.app.clone().filter(|a| !a.is_empty());
+    let nonempty = |s: &Option<String>| s.clone().filter(|s| !s.is_empty());
     let device = DeviceInfo {
         name: name.clone(),
         capture: "scrawlkit".into(),
@@ -812,19 +901,30 @@ pub fn import(
         height: probe.height,
         screen: timeline.screen.map(|s| [s.width, s.height, s.scale]),
         app: app.clone(),
-        app_version: timeline.version.clone(),
+        app_version: nonempty(&timeline.version),
+        app_short_version: nonempty(&timeline.short_version),
         ..Default::default()
     };
+    let target = phone_target(
+        &name,
+        app.as_deref(),
+        timeline.bundle_id.as_deref(),
+        probe.width,
+        probe.height,
+    );
     build_movie_bundle(
         bundle_dir,
         MovieCapture {
             movie: copied,
-            target: phone_target(&name, app.as_deref(), probe.width, probe.height),
+            target,
             device,
             events,
             strokes,
             flags: timeline.markers.iter().map(|&t| ms(t)).collect(),
             note,
+            context: timeline.context(),
+            context_changes: timeline.context_changes(),
+            screens: timeline.screen_spans(probe.duration_ms),
         },
     )
 }
@@ -1484,6 +1584,78 @@ mod tests {
         assert_eq!(timeline.events[0].label, "Done tapped");
         let events = touch_events(&timeline.touches, timeline.screen.unwrap());
         assert!(matches!(events[0], InteractionEvent::Click { t: 4000, .. }));
+        // Timelines from before app context still parse, with none.
+        assert!(timeline.short_version.is_none());
+        assert!(timeline.context().is_empty() && timeline.context_changes().is_empty());
+        assert!(timeline.screen_spans(12_500).is_empty());
+    }
+
+    #[test]
+    fn timeline_parses_app_context_and_screens() {
+        let json = r#"{"app":"OpenCode","bundleId":"ai.opencode.mobilecode","version":"354",
+            "shortVersion":"1.4","duration":20,
+            "context":{"server":"studio","session":"ses_1","build":7,"gone":null},
+            "contextChanges":[{"t":9.5,"key":"session","value":null},{"t":4.25,"key":"session","value":"ses_2"}],
+            "screens":[{"t":0,"name":"Sessions"},{"t":4.2,"name":"Settings › Experimental"},
+                {"t":12,"name":null},{"t":15,"name":"Sessions"}]}"#;
+        let timeline: Timeline = serde_json::from_str(json).unwrap();
+        assert_eq!(timeline.short_version.as_deref(), Some("1.4"));
+        assert_eq!(
+            timeline.context(),
+            BTreeMap::from([
+                ("build".to_owned(), "7".to_owned()),
+                ("server".to_owned(), "studio".to_owned()),
+                ("session".to_owned(), "ses_1".to_owned()),
+            ])
+        );
+        assert_eq!(
+            timeline.context_changes(),
+            vec![
+                ContextChange {
+                    t: 4_250,
+                    key: "session".into(),
+                    value: Some("ses_2".into()),
+                },
+                ContextChange {
+                    t: 9_500,
+                    key: "session".into(),
+                    value: None,
+                },
+            ]
+        );
+        let span = |t0, t1, name: &str| ScreenSpan {
+            t0,
+            t1,
+            name: name.into(),
+        };
+        assert_eq!(
+            timeline.screen_spans(20_000),
+            vec![
+                span(0, 4_200, "Sessions"),
+                span(4_200, 12_000, "Settings › Experimental"),
+                span(15_000, 20_000, "Sessions"),
+            ]
+        );
+    }
+
+    #[test]
+    fn phone_target_keeps_the_bundle_id_apart_from_the_display_name() {
+        let target = phone_target(
+            "iPhone",
+            Some("OpenCode"),
+            Some("ai.opencode.mobilecode"),
+            10,
+            20,
+        );
+        assert_eq!(target.app.as_deref(), Some("OpenCode"));
+        assert_eq!(target.bundle_id.as_deref(), Some("ai.opencode.mobilecode"));
+        // Older timelines only had the name.
+        let old = phone_target("iPhone", Some("UpDown"), Some(""), 10, 20);
+        assert_eq!(old.app.as_deref(), Some("UpDown"));
+        assert_eq!(old.bundle_id.as_deref(), Some("UpDown"));
+        let mirror = phone_target("Kit's iPhone", None, None, 10, 20);
+        assert_eq!(mirror.app.as_deref(), Some("Kit's iPhone"));
+        assert_eq!(mirror.bundle_id, None);
     }
 
     #[test]

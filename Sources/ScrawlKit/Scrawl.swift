@@ -431,6 +431,7 @@
         switch result {
         case let .success(startedAt):
           self.startedAt = startedAt
+          ScrawlAppContext.shared.begin(at: startedAt)
           self.isRecording = true
         case let .failure(error):
           print("Scrawl: could not start recording: \(error.localizedDescription)")
@@ -507,6 +508,7 @@
       if let sessionID, !sessionID.isEmpty {
         info["session"] = sessionID
       }
+      info.merge(ScrawlAppContext.shared.end()) { current, _ in current }
       self.startedAt = nil
       completedStrokes = []
       activeStroke = []

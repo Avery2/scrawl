@@ -1336,6 +1336,9 @@ mod tests {
             audio: None,
             source: None,
             device: None,
+            context: Default::default(),
+            context_changes: Vec::new(),
+            screens: Vec::new(),
         }
     }
 

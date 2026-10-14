@@ -147,6 +147,32 @@ You can also AirDrop the `.mp4` and `.json` pair to the Mac and run `scrawl impo
 - App events (`Scrawl.event("Done tapped")`) appear in `summary.md` under the keyframe that was on
   screen when they happened (`  · 0:12 app: Done tapped`).
 
+#### App context
+
+The app can say which screen it's on and add its own key/values, so the agent doesn't have to guess
+from pixels. ScrawlKit sends only what the app passes in, plus its bundle ID, name, version, and build.
+
+```swift
+SettingsView().scrawlScreen("Settings › Experimental")   // while visible; restores the previous on disappear
+SessionView().scrawlContext("session", session.id)       // follows the value; nil leaves it to enclosing views
+Scrawl.screen("Onboarding")                              // or set either one directly (nil clears)
+Scrawl.context("server", "studio")
+```
+
+The most recently appeared screen that is still visible wins, so pushed screens, sheets, and tabs
+work. The timeline gets `shortVersion`, `context` (values at the start), `contextChanges`
+(`[{"t", "key", "value"}]`, `null` when cleared), and `screens` (`[{"t", "name"}]`, the first at `0`).
+The bundle keeps them as `context`, `contextChanges`, and `screens` spans (`{t0, t1, name}`), and
+`summary.md` (and the prompt queued into OpenCode) shows them:
+
+```
+[scrawl 0:25 · iPhone · OpenCode 1.4 (354) · /…/20261014-101500.scrawl]
+Screen: Sessions · server: studio · session: ses_3f…
+- #1 (0:01) “So here.”
+- #3 (0:08) ⟨Settings › Experimental⟩ [tapped “Back”] “Go back.”
+  · 0:09 server → mini
+```
+
 ### Headless ingest server (`scrawl serve`)
 
 On an always-on Mac (such as a Mac Studio reachable over Tailscale), run `scrawl serve` to accept
