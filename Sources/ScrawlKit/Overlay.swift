@@ -70,23 +70,29 @@
     func clear() { dots = [] }
   }
 
-  /// A window above the app for the touch dots, freehand red strokes, and the recording pill.
-  /// It's part of the app, so the recording includes it; every touch except one on the pill (or
-  /// single-finger drawing when `isDrawing` is active) passes through to the app below.
+  /// A window above the app for the touch dots, freehand red strokes, and the recording strip.
+  /// It's part of the app, so the recording includes it; every touch except one on the strip or its
+  /// bubbles (or a drawing finger while `isDrawing` is active) passes through to the app below.
+  ///
+  /// The pencil is handled here rather than in SwiftUI: holding it is one touch and drawing with
+  /// another finger is a second, so the window takes multiple touches and tracks each one.
   final class OverlayWindow: UIWindow {
-    private var pillFrame: CGRect = .zero
+    private var regions: [OverlayRegion: CGRect] = [:]
     private unowned let scrawl: Scrawl
     private var drawingTouch: UITouch?
+    private var pencilTouch: UITouch?
 
     init(windowScene: UIWindowScene, scrawl: Scrawl) {
       self.scrawl = scrawl
       super.init(windowScene: windowScene)
       windowLevel = .alert + 10
       backgroundColor = .clear
-      let host = UIHostingController(rootView: OverlayView(scrawl: scrawl, touches: scrawl.touches) { [weak self] frame in
-        self?.pillFrame = frame
+      isMultipleTouchEnabled = true
+      let host = UIHostingController(rootView: OverlayView(scrawl: scrawl, touches: scrawl.touches) { [weak self] region, frame in
+        self?.regions[region] = frame.isEmpty ? nil : frame
       })
       host.view.backgroundColor = .clear
+      host.view.isMultipleTouchEnabled = true
       rootViewController = host
       isHidden = false
     }
@@ -94,8 +100,17 @@
     @available(*, unavailable)
     required init?(coder _: NSCoder) { fatalError() }
 
+    /// The pencil's 44pt-wide touch target.
+    private func isOnPencil(_ point: CGPoint) -> Bool {
+      guard scrawl.isRecording, let pencil = regions[.pencil] else { return false }
+      return pencil.insetBy(dx: -4, dy: 0).contains(point)
+    }
+
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-      if pillFrame.insetBy(dx: -10, dy: -10).contains(point) {
+      if isOnPencil(point) {
+        return self
+      }
+      if regions.contains(where: { $0.key != .pencil && $0.value.insetBy(dx: -8, dy: -8).contains(point) }) {
         return super.hitTest(point, with: event)
       }
       if scrawl.isRecording, scrawl.isDrawing {
@@ -105,52 +120,79 @@
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-      guard scrawl.isRecording, scrawl.isDrawing, let touch = touches.first else {
-        super.touchesBegan(touches, with: event)
-        return
+      var unhandled = touches
+      for touch in touches {
+        let point = touch.location(in: self)
+        if pencilTouch == nil, isOnPencil(point) {
+          pencilTouch = touch
+          unhandled.remove(touch)
+          scrawl.pressPencil()
+        } else if drawingTouch == nil, scrawl.isRecording, scrawl.isDrawing {
+          drawingTouch = touch
+          unhandled.remove(touch)
+          scrawl.beginDrawStroke(at: point)
+        }
       }
-      drawingTouch = touch
-      scrawl.beginDrawStroke(at: touch.location(in: self))
+      if !unhandled.isEmpty {
+        super.touchesBegan(unhandled, with: event)
+      }
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-      guard let active = drawingTouch, touches.contains(active) else {
-        super.touchesMoved(touches, with: event)
-        return
+      var unhandled = touches
+      if let pencilTouch { unhandled.remove(pencilTouch) }
+      if let drawingTouch, touches.contains(drawingTouch) {
+        unhandled.remove(drawingTouch)
+        scrawl.moveDrawStroke(to: drawingTouch.location(in: self))
       }
-      scrawl.moveDrawStroke(to: active.location(in: self))
+      if !unhandled.isEmpty {
+        super.touchesMoved(unhandled, with: event)
+      }
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-      guard let active = drawingTouch, touches.contains(active) else {
-        super.touchesEnded(touches, with: event)
-        return
+      let unhandled = lift(touches, cancelled: false)
+      if !unhandled.isEmpty {
+        super.touchesEnded(unhandled, with: event)
       }
-      scrawl.endDrawStroke(at: active.location(in: self))
-      drawingTouch = nil
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-      guard let active = drawingTouch, touches.contains(active) else {
-        super.touchesCancelled(touches, with: event)
-        return
+      let unhandled = lift(touches, cancelled: true)
+      if !unhandled.isEmpty {
+        super.touchesCancelled(unhandled, with: event)
       }
-      scrawl.endDrawStroke(at: active.location(in: self))
-      drawingTouch = nil
+    }
+
+    /// Ends the drawing finger's stroke and/or releases the pencil; returns the touches left over.
+    private func lift(_ touches: Set<UITouch>, cancelled: Bool) -> Set<UITouch> {
+      var unhandled = touches
+      if let drawingTouch, touches.contains(drawingTouch) {
+        unhandled.remove(drawingTouch)
+        scrawl.endDrawStroke(at: drawingTouch.location(in: self))
+        self.drawingTouch = nil
+      }
+      if let pencilTouch, touches.contains(pencilTouch) {
+        unhandled.remove(pencilTouch)
+        self.pencilTouch = nil
+        scrawl.releasePencil(cancelled: cancelled)
+        // Drawing held by the pencil ends with it: keep what the other finger has drawn so far.
+        if !scrawl.isDrawing, let drawingTouch {
+          scrawl.endDrawStroke(at: drawingTouch.location(in: self))
+          self.drawingTouch = nil
+        }
+      }
+      return unhandled
     }
   }
 
   private struct OverlayView: View {
     let scrawl: Scrawl
     let touches: TouchModel
-    let onPillFrame: (CGRect) -> Void
-
-    private let scrawlRed = Color(red: 1.0, green: 0.231, blue: 0.188)
+    let reportFrame: @MainActor (OverlayRegion, CGRect) -> Void
 
     var body: some View {
-      ZStack(alignment: .top) {
-        Color.clear
-
+      ZStack {
         // Freehand red strokes drawn on the screen while `isDrawing` is active.
         Canvas { context, _ in
           for stroke in scrawl.completedStrokes where stroke.count >= 2 {
@@ -158,7 +200,7 @@
             path.addLines(stroke)
             context.stroke(
               path,
-              with: .color(scrawlRed),
+              with: .color(.scrawlRed),
               style: StrokeStyle(lineWidth: 4.5, lineCap: .round, lineJoin: .round)
             )
           }
@@ -167,7 +209,7 @@
             path.addLines(scrawl.activeStroke)
             context.stroke(
               path,
-              with: .color(scrawlRed),
+              with: .color(.scrawlRed),
               style: StrokeStyle(lineWidth: 4.5, lineCap: .round, lineJoin: .round)
             )
           }
@@ -175,179 +217,88 @@
         .ignoresSafeArea()
         .allowsHitTesting(false)
 
-        ForEach(touches.dots) { dot in
-          ZStack {
-            if dot.holding {
-              Circle()
-                .strokeBorder(scrawlRed, lineWidth: 2.5)
-                .background(Circle().fill(scrawlRed.opacity(0.18)))
-                .frame(width: 68, height: 68)
-                .transition(.scale(scale: 0.5).combined(with: .opacity))
-            }
-            Circle()
-              .fill(dot.holding ? scrawlRed.opacity(0.45) : .white.opacity(0.35))
-              .overlay(
-                Circle().strokeBorder(dot.holding ? scrawlRed : .white.opacity(0.85), lineWidth: 2)
-              )
-              .frame(width: 44, height: 44)
-
-            if dot.holding, let label = dot.label, !label.isEmpty {
-              Text(label)
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(.black.opacity(0.78), in: .capsule)
-                .overlay(Capsule().strokeBorder(scrawlRed.opacity(0.75), lineWidth: 1))
-                .offset(y: -48)
-                .transition(.scale(scale: 0.85).combined(with: .opacity))
-            }
+        // Touch points are in window coordinates, so the dots ignore the safe area like the strokes.
+        ZStack {
+          Color.clear
+          ForEach(touches.dots) { dot in
+            TouchDot(dot: dot)
           }
-          .scaleEffect(dot.lifting ? 1.35 : 1)
-          .opacity(dot.lifting ? 0 : 1)
-          .position(dot.point)
-          .animation(.snappy(duration: 0.2), value: dot.holding)
-          .animation(.easeOut(duration: 0.18), value: dot.lifting)
-          .allowsHitTesting(false)
         }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
 
-        if scrawl.isRecording, let started = scrawl.startedAt {
-          RecordingPill(
-            started: started,
-            markers: scrawl.markers.count,
-            isDrawing: scrawl.isDrawing,
-            onMark: scrawl.mark,
-            onToggleDraw: scrawl.toggleDrawing,
-            onStop: scrawl.stop
+        StripPlacement(mode: stripMode, actions: actions)
+      }
+    }
+
+    private var stripMode: ScrawlStrip.Mode? {
+      if scrawl.isRecording, let startedAt = scrawl.startedAt {
+        return .recording(startedAt: startedAt, markers: scrawl.markers.count, isDrawing: scrawl.isDrawing)
+      }
+      if scrawl.isDiscardPending {
+        return .discarded
+      }
+      switch scrawl.uploadStatus {
+      case .idle: return nil
+      case .sending: return .sending
+      case let .sent(target): return .sent(target)
+      case .failed: return .failed
+      }
+    }
+
+    private var actions: ScrawlStrip.Actions {
+      ScrawlStrip.Actions(
+        mark: { scrawl.mark() },
+        toggleDrawing: { scrawl.toggleDrawing() },
+        discard: { scrawl.discard() },
+        send: {
+          UIImpactFeedbackGenerator(style: .light).impactOccurred()
+          scrawl.stop()
+        },
+        undoDiscard: { scrawl.undoDiscard() },
+        share: { scrawl.shareFailedRecording() },
+        reportFrame: reportFrame
+      )
+    }
+  }
+
+  /// A finger's dot, with a red lock-on ring and the element's label while it's held still.
+  private struct TouchDot: View {
+    let dot: TouchModel.Dot
+
+    var body: some View {
+      ZStack {
+        if dot.holding {
+          Circle()
+            .strokeBorder(Color.scrawlRed, lineWidth: 2.5)
+            .background(Circle().fill(Color.scrawlRed.opacity(0.18)))
+            .frame(width: 68, height: 68)
+            .transition(.scale(scale: 0.5).combined(with: .opacity))
+        }
+        Circle()
+          .fill(dot.holding ? Color.scrawlRed.opacity(0.45) : .white.opacity(0.35))
+          .overlay(
+            Circle().strokeBorder(dot.holding ? Color.scrawlRed : .white.opacity(0.85), lineWidth: 2)
           )
-          .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .global) }, action: onPillFrame)
-          .transition(.scale(scale: 0.8).combined(with: .opacity))
-        } else if scrawl.uploadStatus != .idle {
-          UploadPill(status: scrawl.uploadStatus, onShare: scrawl.shareFailedRecording)
-            .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .global) }, action: onPillFrame)
+          .frame(width: 44, height: 44)
+
+        if dot.holding, let label = dot.label, !label.isEmpty {
+          Text(label)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(.black.opacity(0.78), in: .capsule)
+            .overlay(Capsule().strokeBorder(Color.scrawlRed.opacity(0.75), lineWidth: 1))
+            .offset(y: -48)
             .transition(.scale(scale: 0.85).combined(with: .opacity))
         }
       }
-      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-      .ignoresSafeArea(edges: .bottom)
-      .animation(.snappy(duration: 0.25), value: scrawl.isRecording)
-      .animation(.snappy(duration: 0.25), value: scrawl.uploadStatus)
-    }
-  }
-
-  /// The time and marker count (tap to mark this moment), draw toggle, and stop button.
-  private struct RecordingPill: View {
-    let started: Date
-    let markers: Int
-    let isDrawing: Bool
-    let onMark: () -> Void
-    let onToggleDraw: () -> Void
-    let onStop: () -> Void
-
-    var body: some View {
-      HStack(spacing: 2) {
-        Button(action: onMark) { content.padding(.horizontal, 12).padding(.vertical, 7) }
-          .buttonStyle(.plain)
-          .accessibilityLabel("Mark this moment")
-        Button(action: onToggleDraw) {
-          Image(systemName: isDrawing ? "pencil.tip.crop.circle.fill" : "pencil.tip")
-            .font(.footnote.weight(.bold))
-            .foregroundStyle(isDrawing ? Color(red: 1.0, green: 0.231, blue: 0.188) : .white.opacity(0.85))
-            .frame(width: 30, height: 30)
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(isDrawing ? "Stop drawing" : "Draw red strokes")
-        Button(action: onStop) {
-          Image(systemName: "stop.fill")
-            .font(.footnote.weight(.bold))
-            .foregroundStyle(.red)
-            .frame(width: 30, height: 30)
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Stop recording")
-      }
-      .padding(.trailing, 2)
-      .modifier(PillBackground(tint: 0.45))
-      .animation(.snappy(duration: 0.2), value: markers)
-      .animation(.snappy(duration: 0.18), value: isDrawing)
-    }
-
-    private var content: some View {
-      HStack(spacing: 6) {
-        Circle().fill(.red).frame(width: 8, height: 8)
-        TimelineView(.periodic(from: started, by: 1)) { context in
-          Text(Duration.seconds(context.date.timeIntervalSince(started)).formatted(.time(pattern: .minuteSecond)))
-            .monospacedDigit()
-        }
-        if markers > 0 {
-          Label("\(markers)", systemImage: "flag.fill")
-            .labelStyle(.titleAndIcon)
-            .monospacedDigit()
-            .contentTransition(.numericText(value: Double(markers)))
-        }
-      }
-      .font(.footnote.weight(.semibold))
-      .foregroundStyle(.white)
-    }
-  }
-
-  private struct UploadPill: View {
-    let status: Scrawl.UploadStatus
-    let onShare: () -> Void
-
-    var body: some View {
-      HStack(spacing: 7) {
-        switch status {
-        case .idle:
-          EmptyView()
-        case .sending:
-          ProgressView()
-            .controlSize(.small)
-            .tint(.white)
-          Text("Sending to Mac…")
-        case let .sent(target):
-          Image(systemName: "checkmark.circle.fill")
-            .foregroundStyle(.green)
-          Text("Sent to \(target)")
-        case .failed:
-          Image(systemName: "exclamationmark.triangle.fill")
-            .foregroundStyle(.yellow)
-          Text("Mac didn't answer")
-          Button(action: onShare) {
-            Label("Share", systemImage: "square.and.arrow.up")
-              .padding(.horizontal, 9)
-              .padding(.vertical, 4)
-              .background(.white.opacity(0.18), in: .capsule)
-          }
-          .buttonStyle(.plain)
-        }
-      }
-      .font(.footnote.weight(.semibold))
-      .foregroundStyle(.white)
-      .padding(.horizontal, 14)
-      .padding(.vertical, 8)
-      .modifier(PillBackground(tint: 0.5))
-    }
-  }
-
-  /// Tinted interactive Liquid Glass on iOS 26; a dark material capsule with a hairline before it.
-  private struct PillBackground: ViewModifier {
-    let tint: Double
-    @Environment(\.displayScale) private var displayScale
-
-    func body(content: Content) -> some View {
-      if #available(iOS 26, *) {
-        content.glassEffect(.regular.tint(.black.opacity(tint)).interactive(), in: .capsule)
-      } else {
-        content
-          .background {
-            Capsule()
-              .fill(.ultraThinMaterial)
-              .overlay(Capsule().fill(.black.opacity(tint)))
-              .environment(\.colorScheme, .dark)
-          }
-          .overlay(Capsule().strokeBorder(.white.opacity(0.22), lineWidth: 1 / displayScale))
-      }
+      .scaleEffect(dot.lifting ? 1.35 : 1)
+      .opacity(dot.lifting ? 0 : 1)
+      .position(dot.point)
+      .animation(.snappy(duration: 0.2), value: dot.holding)
+      .animation(.easeOut(duration: 0.18), value: dot.lifting)
     }
   }
 #endif
