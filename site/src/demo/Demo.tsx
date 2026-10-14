@@ -176,7 +176,7 @@ export function Demo() {
     return () => ro.disconnect()
   }, [])
 
-  const { fix, settle } = fixAmount(t)
+  const { fix, rowFix, settle } = fixAmount(t)
   const broken = fix === 0
   const fixRef = useRef(fix)
   fixRef.current = fix
@@ -333,9 +333,9 @@ export function Demo() {
         <div ref={stageRef} className="stage wallpaper" style={{ width: STAGE.w, height: STAGE.h, transform: `scale(${scale})` }}>
           <MenuBar t={t} />
           {mode === "mac" ? (
-            <MacWindow fix={fix} settle={settle} refs={refs} inactive={terminalActive(t)} />
+            <MacWindow fix={fix} rowFix={rowFix} settle={settle} refs={refs} inactive={terminalActive(t)} />
           ) : (
-            <PhoneMirror fix={fix} settle={settle} refs={refs} live={live} />
+            <PhoneMirror fix={fix} rowFix={rowFix} settle={settle} refs={refs} live={live} />
           )}
           {script && <Terminal t={t} mode={mode} script={script} />}
           {script && <Selection t={t} script={script} cursor={cursor} />}
@@ -346,7 +346,7 @@ export function Demo() {
           {script && <Ripples t={t} script={script} />}
           <svg className="ink" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`} style={INK_SHADOW}>
             {user.map((s, i) => (
-              <InkPath key={i} d={inkPath(s.points)} />
+              <InkPath key={i} d={inkPath(s.points, 4.5, 0.5)} />
             ))}
           </svg>
           {cursor && <Cursor c={cursor} crosshair={mode === "mac" && t >= T.select && t < T.record} ibeam={overTerminal && t >= T.promptClick - 400 && t < T.paste + 120} />}

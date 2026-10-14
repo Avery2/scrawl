@@ -1,4 +1,4 @@
-import { type ReactNode, useLayoutEffect, useRef, useState } from "react"
+import { memo, type ReactNode, useLayoutEffect, useRef, useState } from "react"
 import { TrafficLights } from "./apps"
 import { AGENT, type Mode, type Script, summaryText, T } from "./script"
 import { ContactSheet, terminalActive } from "./stage-parts"
@@ -23,7 +23,7 @@ function LogoLine({ line, cls }: { line: string; cls: string }) {
   )
 }
 
-function Logo() {
+const Logo = memo(function Logo() {
   return (
     <div className="tui-logo" aria-label="opencode">
       {LOGO_LEFT.map((l, i) => (
@@ -35,7 +35,7 @@ function Logo() {
       ))}
     </div>
   )
-}
+})
 
 function Cursor({ focused }: { focused: boolean }) {
   return <i className={`tcur${focused ? " on" : ""}`} />
@@ -45,8 +45,8 @@ function Cursor({ focused }: { focused: boolean }) {
 // scanner at 40ms per frame, holding 9 frames at the end and 30 at the start.
 const TRAIL = [1, 0.82, 0.66, 0.52, 0.4, 0.32]
 
-function Spinner({ t }: { t: number }) {
-  const f = Math.floor(t / 40) % 54
+const Spinner = memo(function Spinner({ frame }: { frame: number }) {
+  const f = frame % 54
   const forward = f < 8 || (f >= 24 && f < 54)
   const pos = f < 8 ? f : f < 17 ? 7 : f < 24 ? 6 - (f - 17) : 0
   const held = f >= 8 && f < 17 ? f - 7 : f >= 24 ? f - 23 : 0
@@ -63,17 +63,33 @@ function Spinner({ t }: { t: number }) {
       })}
     </span>
   )
-}
+})
 
 const BRAILLE = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
-function Braille({ t }: { t: number }) {
-  return <span className="tbraille">{BRAILLE[Math.floor(t / 80) % BRAILLE.length]}</span>
-}
+const Braille = memo(function Braille({ frame }: { frame: number }) {
+  return <span className="tbraille">{BRAILLE[frame % BRAILLE.length]}</span>
+})
 
-function Prompt({ t, mode, focused, running }: { t: number; mode: Mode; focused: boolean; running: boolean }) {
-  const image = t >= T.paste && t < T.submit
-  const text = t >= T.paste + 160 && t < T.submit
+function Prompt({
+  mode,
+  image,
+  text,
+  submitted,
+  done,
+  focused,
+  running,
+  spinFrame,
+}: {
+  mode: Mode
+  image: boolean
+  text: boolean
+  submitted: boolean
+  done: boolean
+  focused: boolean
+  running: boolean
+  spinFrame: number
+}) {
   return (
     <div className="tp">
       <div className="tp-box">
@@ -89,7 +105,7 @@ function Prompt({ t, mode, focused, running }: { t: number; mode: Mode; focused:
             ) : (
               <span className="tp-ph">
                 <Cursor focused={focused} />
-                {t >= T.submit ? "" : "Ask anything… \"Fix a TODO in the codebase\""}
+                {submitted ? "" : 'Ask anything… "Fix a TODO in the codebase"'}
               </span>
             )}
           </div>
@@ -105,7 +121,7 @@ function Prompt({ t, mode, focused, running }: { t: number; mode: Mode; focused:
       <div className="tp-footer">
         {running ? (
           <span className="tp-status">
-            <Spinner t={t} />
+            <Spinner frame={spinFrame} />
             <span>
               esc <span className="tx-mute">interrupt</span>
             </span>
@@ -114,9 +130,9 @@ function Prompt({ t, mode, focused, running }: { t: number; mode: Mode; focused:
           <span className="tx-mute">~/code/pulse:main</span>
         )}
         <span className="tp-keys">
-          {t >= T.done ? (
+          {done ? (
             <span className="tx-mute">18.4K (9%) · $0.11</span>
-          ) : t < T.submit ? (
+          ) : !submitted ? (
             <span>
               tab <span className="tx-mute">agents</span>
             </span>
@@ -152,25 +168,27 @@ const tsx = (src: string): Tok[] => {
   return out
 }
 
-const DIFF: [number, " " | "-" | "+", string][] = [
-  [13, " ", `<h3 className="title">Deploy Activity</h3>`],
-  [14, "-", `<Badge className="absolute -left-14 -top-2">`],
-  [14, "+", `<Badge className="ml-2.5">`],
-  [31, "-", `<ul className="space-y-0 py-px">`],
-  [31, "+", `<ul className="divide-y [&>li]:py-2.5">`],
-  [44, "-", `<div className="h-8 overflow-hidden pt-3.5">`],
-  [44, "+", `<div className="flex h-8 justify-end gap-2">`],
-]
+const DIFF: [number, " " | "-" | "+", Tok[]][] = (
+  [
+    [13, " ", `<h3 className="title">Deploy Activity</h3>`],
+    [14, "-", `<Badge className="absolute -left-14 -top-2">`],
+    [14, "+", `<Badge className="ml-2.5">`],
+    [31, "-", `<ul className="space-y-0 py-px">`],
+    [31, "+", `<ul className="divide-y [&>li]:py-2.5">`],
+    [44, "-", `<div className="h-8 overflow-hidden pt-3.5">`],
+    [44, "+", `<div className="flex h-8 justify-end gap-2">`],
+  ] as const
+).map(([n, sign, code]) => [n, sign, tsx(code)])
 
-function Diff() {
+const Diff = memo(function Diff() {
   return (
     <div className="tdiff">
-      {DIFF.map(([n, sign, code], i) => (
+      {DIFF.map(([n, sign, tokens], i) => (
         <div key={i} className={`td-line${sign === "+" ? " add" : sign === "-" ? " del" : ""}`}>
           <span className="td-num">{n}</span>
           <span className="td-sign">{sign === " " ? " " : sign}</span>
           <span className="td-code">
-            {tsx(code).map(([s, c], j) =>
+            {tokens.map(([s, c], j) =>
               c ? (
                 <span key={j} className={c}>
                   {s}
@@ -184,14 +202,25 @@ function Diff() {
       ))}
     </div>
   )
-}
+})
 
-function Session({ t, mode, script, children }: { t: number; mode: Mode; script: Script; children: ReactNode }) {
+function Session({
+  step,
+  brailleFrame,
+  mode,
+  script,
+  children,
+}: {
+  step: number
+  brailleFrame: number
+  mode: Mode
+  script: Script
+  children: ReactNode
+}) {
   const summary = summaryText(mode, true)
   const viewRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
   const [offset, setOffset] = useState(0)
-  const step = t >= T.done ? 4 : t >= T.diff ? 3 : t >= T.edit ? 2 : t >= T.read ? 1 : 0
 
   // Sticky-bottom scrollbox: content starts at the top and scrolls once it overflows.
   useLayoutEffect(() => {
@@ -204,7 +233,7 @@ function Session({ t, mode, script, children }: { t: number; mode: Mode; script:
   return (
     <div className="tui-session">
       <div ref={viewRef} className="ts-view">
-        <div ref={contentRef} className="ts-content" style={{ transform: `translateY(${offset}px)` }}>
+        <div ref={contentRef} className="ts-content" style={{ transform: `translate3d(0, ${offset}px, 0)` }}>
           <div className="tu-msg">
             <span className="tu-bar" />
             <div className="tu-inner">
@@ -221,18 +250,18 @@ function Session({ t, mode, script, children }: { t: number; mode: Mode; script:
             </div>
           </div>
           {step >= 1 && (
-            <div className="tt-inline">
+            <div className="tt-inline enter">
               <span className="tt-icon">→</span>Read src/components/HeaderCard.tsx
             </div>
           )}
           {step >= 2 && (
-            <div className="tt-block">
+            <div className="tt-block enter">
               <span className="tt-bar" />
               <div className="tt-inner">
                 <div className="tt-head">
                   {step === 2 ? (
                     <>
-                      <Braille t={t} />
+                      <Braille frame={brailleFrame} />
                       Preparing edit…
                     </>
                   ) : (
@@ -245,11 +274,11 @@ function Session({ t, mode, script, children }: { t: number; mode: Mode; script:
           )}
           {step >= 4 && (
             <>
-              <div className="ta-text">
+              <div className="ta-text enter">
                 The <span className="tx-code">Live</span> badge now sits in the title row's flex flow, rows are back to{" "}
                 <span className="tx-code">py-2.5</span>, and the action row lost its stray 14px top padding.
               </div>
-              <div className="ta-foot">
+              <div className="ta-foot enter">
                 <span className="tx-build">Build</span>
                 <span className="tx-mute"> · Claude Opus 4.6 · 4.1s</span>
               </div>
@@ -281,12 +310,42 @@ function Home({ children }: { children: ReactNode }) {
   )
 }
 
-export function Terminal({ t, mode, script }: { t: number; mode: Mode; script: Script }) {
-  const active = terminalActive(t)
-  const submitted = t >= T.submit
-  const running = submitted && t < T.done
-  const title = t >= T.read ? "OC | Fix header badge and button row" : "OpenCode"
-  const prompt = <Prompt t={t} mode={mode} focused={active && !running} running={running} />
+const TerminalInner = memo(function TerminalInner({
+  active,
+  image,
+  text,
+  submitted,
+  step,
+  spinFrame,
+  brailleFrame,
+  mode,
+  script,
+}: {
+  active: boolean
+  image: boolean
+  text: boolean
+  submitted: boolean
+  step: number
+  spinFrame: number
+  brailleFrame: number
+  mode: Mode
+  script: Script
+}) {
+  const done = step >= 4
+  const running = submitted && !done
+  const title = step >= 1 ? "OC | Fix header badge and button row" : "OpenCode"
+  const prompt = (
+    <Prompt
+      mode={mode}
+      image={image}
+      text={text}
+      submitted={submitted}
+      done={done}
+      focused={active && !running}
+      running={running}
+      spinFrame={spinFrame}
+    />
+  )
   return (
     <div className={`term${active ? "" : " inactive"}`} style={{ left: AGENT.x, top: AGENT.y, width: AGENT.w, height: AGENT.h }}>
       <div className="term-bar">
@@ -295,7 +354,7 @@ export function Terminal({ t, mode, script }: { t: number; mode: Mode; script: S
       </div>
       <div className="tui">
         {submitted ? (
-          <Session t={t} mode={mode} script={script}>
+          <Session step={step} brailleFrame={brailleFrame} mode={mode} script={script}>
             {prompt}
           </Session>
         ) : (
@@ -303,5 +362,29 @@ export function Terminal({ t, mode, script }: { t: number; mode: Mode; script: S
         )}
       </div>
     </div>
+  )
+})
+
+export function Terminal({ t, mode, script }: { t: number; mode: Mode; script: Script }) {
+  const active = terminalActive(t)
+  const submitted = t >= T.submit
+  const step = t >= T.done ? 4 : t >= T.diff ? 3 : t >= T.edit ? 2 : t >= T.read ? 1 : 0
+  const running = submitted && step < 4
+  const image = t >= T.paste && t < T.submit
+  const text = t >= T.paste + 160 && t < T.submit
+  const spinFrame = running ? Math.floor(t / 40) % 54 : 0
+  const brailleFrame = step === 2 ? Math.floor(t / 80) % BRAILLE.length : 0
+  return (
+    <TerminalInner
+      active={active}
+      image={image}
+      text={text}
+      submitted={submitted}
+      step={step}
+      spinFrame={spinFrame}
+      brailleFrame={brailleFrame}
+      mode={mode}
+      script={script}
+    />
   )
 }

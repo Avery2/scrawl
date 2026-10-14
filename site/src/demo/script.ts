@@ -1,3 +1,5 @@
+import { inkPath } from "./ink"
+
 export type Mode = "mac" | "iphone"
 export type Point = [number, number]
 export type Rect = { x: number; y: number; w: number; h: number }
@@ -196,10 +198,10 @@ export const PROMPT_AT: Point = [AGENT.x + 150, AGENT.y + 356]
 
 export type Anchors = { badge: Rect; actions: Rect; title: Rect }
 
-export type Stroke = { id: string; points: Point[]; t0: number; t1: number }
+export type Stroke = { id: string; points: Point[]; t0: number; t1: number; fullPath: string; sheetPath: string }
 export type Pin = { n: number; t: number; at: Point }
 export type Click = { t: number; at: Point }
-export type Waypoint = { t: number; at: Point }
+export type Waypoint = { t: number; at: Point; arc?: number }
 
 export type Script = {
   strokes: Stroke[]
@@ -243,6 +245,15 @@ const line = (a: Point, b: Point, n = 10): Point[] =>
 
 const center = (r: Rect): Point => [r.x + r.w / 2, r.y + r.h / 2]
 
+const makeStroke = (id: string, points: Point[], t0: number, t1: number): Stroke => ({
+  id,
+  points,
+  t0,
+  t1,
+  fullPath: inkPath(points, 4.5, 0),
+  sheetPath: inkPath(points, 10, 0),
+})
+
 export function buildScript(mode: Mode, a: Anchors): Script {
   const badge = center(a.badge)
   const circle = circlePoints(badge[0] - 10, badge[1], a.badge.w / 2 + 40, a.badge.h / 2 + 15)
@@ -261,12 +272,15 @@ export function buildScript(mode: Mode, a: Anchors): Script {
   const wing = (side: number): Point => [tip[0] - Math.cos(angle + side * 0.5) * 19, tip[1] - Math.sin(angle + side * 0.5) * 19]
   const wing1 = wing(1)
   const wing2 = wing(-1)
-  const head = [...line(wing1, tip, 12), ...line(tip, wing2, 12).slice(1)]
+  // Round the chevron apex slightly so the stroke outline turns cleanly without twisting.
+  const preTip: Point = [lerp(wing1[0], tip[0], 0.88), lerp(wing1[1], tip[1], 0.88)]
+  const postTip: Point = [lerp(tip[0], wing2[0], 0.12), lerp(tip[1], wing2[1], 0.12)]
+  const head = [...line(wing1, preTip, 10), ...curvePoints(preTip, tip, postTip, 5).slice(1), ...line(postTip, wing2, 10).slice(1)]
 
   const strokes: Stroke[] = [
-    { id: "circle", points: circle, t0: T.circle[0], t1: T.circle[1] },
-    { id: "shaft", points: shaft, t0: T.arrow[0], t1: T.arrow[1] },
-    { id: "head", points: head, t0: T.head[0], t1: T.head[1] },
+    makeStroke("circle", circle, T.circle[0], T.circle[1]),
+    makeStroke("shaft", shaft, T.arrow[0], T.arrow[1]),
+    makeStroke("head", head, T.head[0], T.head[1]),
   ]
 
   // The pill rides to the left of each mark, so it never covers the ink or the thing being
@@ -296,38 +310,56 @@ export function buildScript(mode: Mode, a: Anchors): Script {
   const clicks: Click[] = [...pins.map((p) => ({ t: p.t, at: p.at })), { t: T.finish, at: finish }, { t: T.promptClick, at: prompt }]
 
   const path: Waypoint[] = [
-    { t: 0, at: [880, 560] },
-    { t: 1400, at: [560, 330] },
-    { t: 2400, at: [520, 300] },
+    { t: 0, at: [840, 540] },
+    { t: 320, at: [840, 540], arc: -0.07 },
+    { t: 1650, at: [520, 300], arc: 0 },
+    { t: 3150, at: [520, 300], arc: 0.06 },
   ]
 
   let drag: Script["drag"]
   if (mode === "mac") {
     drag = { from: [AREA.x, AREA.y], to: [AREA.x + AREA.w, AREA.y + AREA.h] }
-    path.push({ t: T.dragStart, at: drag.from }, { t: T.dragEnd, at: drag.to })
+    path.push(
+      { t: T.dragStart - 80, at: drag.from, arc: 0 },
+      { t: T.dragStart, at: drag.from, arc: 0 },
+      { t: T.dragEnd, at: drag.to, arc: 0 },
+      { t: T.dragEnd + 1500, at: drag.to, arc: -0.08 },
+    )
   } else {
     const phoneChip = chipCenter(PILL.items.select, 2)
     const recordChip = chipCenter(PILL.items.selectPhone, 3)
     clicks.push({ t: T.phoneClick, at: phoneChip }, { t: T.phoneRecord, at: recordChip })
-    path.push({ t: T.phoneClick, at: phoneChip }, { t: T.phoneRecord - 250, at: recordChip }, { t: T.phoneRecord, at: recordChip })
+    path.push(
+      { t: T.phoneClick - 80, at: phoneChip, arc: 0 },
+      { t: T.phoneClick + 120, at: phoneChip, arc: 0.04 },
+      { t: T.phoneRecord - 80, at: recordChip, arc: 0 },
+      { t: T.phoneRecord + 160, at: recordChip, arc: 0 },
+      { t: 6400, at: recordChip, arc: -0.07 },
+    )
   }
 
+  const restAfterPin2: Point = [pin2[0] + 28, pin2[1] + 34]
+
   path.push(
-    { t: T.circle[0], at: circle[0] },
-    { t: T.circle[1], at: circle[circle.length - 1] },
-    { t: T.pin1, at: pin1 },
-    { t: T.pin1 + 500, at: [pin1[0] + 30, pin1[1] + 40] },
-    { t: T.arrow[0], at: shaft[0] },
-    { t: T.arrow[1], at: tip },
-    { t: T.head[0], at: wing1 },
-    { t: T.head[1], at: wing2 },
-    { t: T.pin2, at: pin2 },
-    { t: T.pin2 + 700, at: [pin2[0] + 40, pin2[1] + 50] },
-    { t: T.finish - 120, at: finish },
-    { t: T.finish + 200, at: finish },
-    { t: T.promptClick, at: prompt },
-    { t: T.read, at: prompt },
-    { t: T.read + 1400, at: [AGENT.x - 18, AGENT.y + AGENT.h - 10] },
+    { t: T.circle[0] - 80, at: circle[0], arc: 0 },
+    { t: T.circle[0], at: circle[0], arc: 0 },
+    { t: T.circle[1], at: circle[circle.length - 1], arc: 0.05 },
+    { t: T.pin1 - 70, at: pin1, arc: 0 },
+    { t: T.pin1 + 160, at: pin1, arc: -0.06 },
+    { t: T.arrow[0] - 80, at: shaft[0], arc: 0 },
+    { t: T.arrow[0], at: shaft[0], arc: 0 },
+    { t: T.arrow[1], at: tip, arc: 0 },
+    { t: T.head[0], at: wing1, arc: 0 },
+    { t: T.head[1], at: wing2, arc: 0.05 },
+    { t: T.pin2 - 70, at: pin2, arc: 0 },
+    { t: T.pin2 + 160, at: pin2, arc: 0.04 },
+    { t: T.pin2 + 650, at: restAfterPin2, arc: 0 },
+    { t: T.finish - 850, at: restAfterPin2, arc: -0.07 },
+    { t: T.finish - 90, at: finish, arc: 0 },
+    { t: T.finish + 170, at: finish, arc: 0.06 },
+    { t: T.promptClick - 90, at: prompt, arc: 0 },
+    { t: T.promptClick + 130, at: prompt, arc: 0.06 },
+    { t: T.paste + 680, at: [AGENT.x - 18, AGENT.y + AGENT.h - 10], arc: 0 },
   )
 
   return {
@@ -348,15 +380,19 @@ export function buildScript(mode: Mode, a: Anchors): Script {
 // The tip is interpolated between samples so the stroke grows continuously every frame.
 export function strokeAt(s: Stroke, t: number) {
   if (t <= s.t0) return null
+  if (t >= s.t1) return { points: s.points, tip: s.points[s.points.length - 1], done: true, d: s.fullPath }
   const p = easeInOut(progress(t, s.t0, s.t1))
   const last = s.points.length - 1
   const at = p * last
   const i = Math.floor(at)
-  if (i >= last) return { points: s.points, tip: s.points[last], done: true }
+  if (i >= last) return { points: s.points, tip: s.points[last], done: true, d: s.fullPath }
+  const frac = at - i
   const a = s.points[i]
   const b = s.points[i + 1]
-  const tip: Point = [lerp(a[0], b[0], at - i), lerp(a[1], b[1], at - i)]
-  return { points: [...s.points.slice(0, i + 1), tip], tip, done: false }
+  const tip: Point = [lerp(a[0], b[0], frac), lerp(a[1], b[1], frac)]
+  const head = i > 0 && frac < 0.2 ? s.points.slice(0, i) : s.points.slice(0, i + 1)
+  const pts = [...head, tip]
+  return { points: pts, tip, done: false, d: inkPath(pts, 4.5, 0) }
 }
 
 export type Cursor = { at: Point; drawing: boolean; pressed: boolean; shift: boolean }
@@ -375,8 +411,23 @@ export function cursorAt(script: Script, t: number): Cursor {
     const b = path[i]
     if (t <= b.t) {
       const k = easeInOut(progress(t, a.t, b.t))
+      const dx = b.at[0] - a.at[0]
+      const dy = b.at[1] - a.at[1]
+      const dist = Math.hypot(dx, dy)
+      const isDrag = !!script.drag && t >= T.dragStart && t <= T.dragEnd
+      const arc = a.arc ?? 0
+      let at: Point
+      if (dist > 8 && !isDrag && arc !== 0) {
+        const bend = arc * Math.min(240, dist)
+        const nx = -dy / dist
+        const ny = dx / dist
+        const s = 4 * k * (1 - k)
+        at = [lerp(a.at[0], b.at[0], k) + nx * bend * s, lerp(a.at[1], b.at[1], k) + ny * bend * s]
+      } else {
+        at = [lerp(a.at[0], b.at[0], k), lerp(a.at[1], b.at[1], k)]
+      }
       return {
-        at: [lerp(a.at[0], b.at[0], k), lerp(a.at[1], b.at[1], k)],
+        at,
         drawing: false,
         pressed: pressed || (!!script.drag && t > T.dragStart && t < T.dragEnd),
         shift,

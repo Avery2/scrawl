@@ -1,16 +1,16 @@
+import { memo } from "react"
 import {
   AGENT,
   AREA,
   clock,
-  easeInOut,
   easeOut,
   easeOutBack,
   type Mode,
   PHONE,
   PILL,
+  type Pill,
   pillState,
   pillWidth,
-  lerp,
   progress,
   type Rect,
   type Script,
@@ -20,7 +20,7 @@ import {
   type Cursor as CursorState,
   MAC_WINDOW,
 } from "./script"
-import { INK_SHADOW, InkPath, inkPath, PinMark } from "./ink"
+import { INK_SHADOW, InkPath, PinMark } from "./ink"
 import { MacWindow, PhoneMirror } from "./apps"
 
 const pressedAt = (t: number, at: number) => t >= at - 60 && t < at + 160
@@ -31,8 +31,8 @@ export const terminalActive = (t: number) => t >= T.promptClick
 const APPLE =
   "M11.2 4.3c.6-.8 1-1.8.9-2.8-.9 0-2 .6-2.6 1.4-.6.7-1.1 1.7-.9 2.7 1 .1 2-.5 2.6-1.3zM12.1 5.8c-1.4-.1-2.7.8-3.3.8-.7 0-1.7-.8-2.9-.8C4.4 5.9 3 6.8 2.2 8.1c-1.6 2.7-.4 6.8 1.1 9 .8 1.1 1.7 2.3 2.8 2.3 1.1 0 1.6-.7 2.9-.7 1.4 0 1.8.7 2.9.7 1.2 0 2-1.1 2.7-2.2.9-1.3 1.2-2.5 1.2-2.6 0 0-2.4-.9-2.4-3.6 0-2.2 1.8-3.3 1.9-3.4-1-1.5-2.6-1.7-3.2-1.7z"
 
-export function MenuBar({ t }: { t: number }) {
-  const app = terminalActive(t) ? "Ghostty" : "Pulse"
+const MenuBarInner = memo(function MenuBarInner({ active }: { active: boolean }) {
+  const app = active ? "Ghostty" : "Pulse"
   return (
     <div className="menubar">
       <div className="menubar-left">
@@ -78,9 +78,29 @@ export function MenuBar({ t }: { t: number }) {
       </div>
     </div>
   )
+})
+
+export function MenuBar({ t }: { t: number }) {
+  return <MenuBarInner active={terminalActive(t)} />
 }
 
-function Chip({ w, children, on, primary, dim, pressed, round }: { w: number; children: React.ReactNode; on?: boolean; primary?: boolean; dim?: boolean; pressed?: boolean; round?: boolean }) {
+function Chip({
+  w,
+  children,
+  on,
+  primary,
+  dim,
+  pressed,
+  round,
+}: {
+  w: number
+  children: React.ReactNode
+  on?: boolean
+  primary?: boolean
+  dim?: boolean
+  pressed?: boolean
+  round?: boolean
+}) {
   const cls = ["chip", on && "on", primary && "primary", dim && "dim", pressed && "pressed", round && "round"].filter(Boolean).join(" ")
   return (
     <span className={cls} style={{ width: w }}>
@@ -91,11 +111,26 @@ function Chip({ w, children, on, primary, dim, pressed, round }: { w: number; ch
 
 const Divider = () => <span className="island-divider" />
 
-export function Island({ t, mode }: { t: number; mode: Mode }) {
-  const state = pillState(t)
-  const phoneOn = mode === "iphone" && t >= T.phoneClick
+const IslandInner = memo(function IslandInner({
+  state,
+  phoneOn,
+  phonePressed,
+  recordPressed,
+  finishPressed,
+  undoDim,
+  recText,
+  gone,
+}: {
+  state: Pill
+  phoneOn: boolean
+  phonePressed: boolean
+  recordPressed: boolean
+  finishPressed: boolean
+  undoDim: boolean
+  recText: string
+  gone: boolean
+}) {
   const items = state === "notch" ? PILL.items.select : state === "select" && phoneOn ? PILL.items.selectPhone : PILL.items[state]
-  const gone = state === "notch" || t >= T.paste
   const width = pillWidth(items)
   const [lead, , c2, c3, c4, c5] = items
   return (
@@ -111,11 +146,11 @@ export function Island({ t, mode }: { t: number; mode: Mode }) {
               Area
             </Chip>
             <Chip w={items[1]}>Full Screen</Chip>
-            <Chip w={c2} on={phoneOn} pressed={mode === "iphone" && pressedAt(t, T.phoneClick)}>
+            <Chip w={c2} on={phoneOn} pressed={phonePressed}>
               iPhone
             </Chip>
             {phoneOn && (
-              <Chip w={c3} primary pressed={pressedAt(t, T.phoneRecord)}>
+              <Chip w={c3} primary pressed={recordPressed}>
                 Record
               </Chip>
             )}
@@ -134,14 +169,14 @@ export function Island({ t, mode }: { t: number; mode: Mode }) {
                 <i className="rec-halo" />
                 <i className="rec-dot" />
               </span>
-              <b>{clock(t - T.record)}</b>
+              <b>{recText}</b>
             </span>
             <Divider />
-            <Chip w={c2} dim={t < T.circle[1]}>
+            <Chip w={c2} dim={undoDim}>
               Undo
             </Chip>
             <Chip w={c3}>Cancel</Chip>
-            <Chip w={c4} primary pressed={pressedAt(t, T.finish)}>
+            <Chip w={c4} primary pressed={finishPressed}>
               Finish
             </Chip>
           </>
@@ -181,6 +216,24 @@ export function Island({ t, mode }: { t: number; mode: Mode }) {
       </div>
     </div>
   )
+})
+
+export function Island({ t, mode }: { t: number; mode: Mode }) {
+  const state = pillState(t)
+  const phoneOn = mode === "iphone" && t >= T.phoneClick
+  const gone = state === "notch" || t >= T.paste
+  return (
+    <IslandInner
+      state={state}
+      phoneOn={phoneOn}
+      phonePressed={mode === "iphone" && pressedAt(t, T.phoneClick)}
+      recordPressed={mode === "iphone" && pressedAt(t, T.phoneRecord)}
+      finishPressed={pressedAt(t, T.finish)}
+      undoDim={t < T.circle[1]}
+      recText={state === "recording" ? clock(t - T.record) : "0:00"}
+      gone={gone}
+    />
+  )
 }
 
 export function Selection({ t, script, cursor }: { t: number; script: Script; cursor: CursorState | null }) {
@@ -200,28 +253,35 @@ export function Selection({ t, script, cursor }: { t: number; script: Script; cu
   const border = 0.92 + (0.28 - 0.92) * intro
   const fade = 1 - progress(t, T.finish, T.finish + 300)
   const sizeOpacity = Math.min(progress(t, T.dragStart, T.dragStart + 120), 1 - progress(t, T.dragEnd, T.dragEnd + 220))
+  const maskD = rect
+    ? `M0 0H${STAGE.w}V${STAGE.h}H0ZM${rect.x.toFixed(2)} ${rect.y.toFixed(2)}h${rect.w.toFixed(2)}v${rect.h.toFixed(2)}H${rect.x.toFixed(2)}Z`
+    : `M0 0H${STAGE.w}V${STAGE.h}H0Z`
   return (
     <div className="selection" style={{ opacity: fade }}>
-      {rect ? (
-        <>
-          <div
-            className="selection-rect"
-            style={{
-              left: rect.x,
-              top: rect.y,
-              width: rect.w,
-              height: rect.h,
-              boxShadow: `0 0 0 4000px rgba(0,0,0,${dim}), inset 0 0 0 1px rgba(255,255,255,${border})`,
-            }}
+      <svg className="selection-svg" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`} aria-hidden>
+        <path fillRule="evenodd" d={maskD} fill={`rgba(0,0,0,${dim.toFixed(3)})`} />
+        {rect && rect.w > 1 && rect.h > 1 && (
+          <rect
+            x={rect.x + 0.5}
+            y={rect.y + 0.5}
+            width={Math.max(0, rect.w - 1)}
+            height={Math.max(0, rect.h - 1)}
+            fill="none"
+            stroke={`rgba(255,255,255,${border.toFixed(3)})`}
+            strokeWidth={1}
           />
-          {sizeOpacity > 0 && (
-            <span className="selection-size" style={{ left: rect.x + rect.w, top: rect.y + rect.h, opacity: sizeOpacity }}>
-              {Math.round(rect.w)} × {Math.round(rect.h)}
-            </span>
-          )}
-        </>
-      ) : (
-        <div className="selection-dim" />
+        )}
+      </svg>
+      {rect && sizeOpacity > 0 && (
+        <span
+          className="selection-size"
+          style={{
+            transform: `translate3d(${(rect.x + rect.w).toFixed(2)}px, ${(rect.y + rect.h + 10).toFixed(2)}px, 0) translateX(-100%)`,
+            opacity: sizeOpacity,
+          }}
+        >
+          {Math.round(rect.w)} × {Math.round(rect.h)}
+        </span>
       )}
     </div>
   )
@@ -235,22 +295,26 @@ export function Ink({ t, script }: { t: number; script: Script }) {
     <svg className="ink" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`} style={{ opacity: fade, ...INK_SHADOW }}>
       {script.strokes.map((s) => {
         const live = strokeAt(s, t)
-        return live ? <InkPath key={s.id} d={inkPath(live.points)} /> : null
+        return live ? <InkPath key={s.id} d={live.d} /> : null
       })}
-      {script.pins.map((p) =>
-        t >= p.t ? <PinMark key={p.n} n={p.n} at={p.at} scale={Math.max(0, easeOutBack(progress(t, p.t, p.t + 260)))} /> : null,
-      )}
+      {script.pins.map((p) => {
+        if (t < p.t) return null
+        const prog = progress(t, p.t, p.t + 260)
+        const scale = prog >= 1 ? 1 : Math.max(0, easeOutBack(prog))
+        return <PinMark key={p.n} n={p.n} at={p.at} scale={scale} />
+      })}
     </svg>
   )
 }
 
 export function Ripples({ t, script }: { t: number; script: Script }) {
+  const active = script.clicks.filter((c) => t > c.t && t < c.t + 650)
+  if (!active.length) return null
   return (
     <svg className="ink" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`}>
-      {script.clicks.map((c, i) => {
+      {active.map((c) => {
         const p = progress(t, c.t, c.t + 650)
-        if (p <= 0 || p >= 1) return null
-        return <circle key={i} cx={c.at[0]} cy={c.at[1]} r={6 + 22 * easeOut(p)} fill="none" stroke="#fff" strokeWidth={2} opacity={0.7 * (1 - p)} />
+        return <circle key={c.t} cx={c.at[0]} cy={c.at[1]} r={6 + 22 * easeOut(p)} fill="none" stroke="#fff" strokeWidth={2} opacity={0.7 * (1 - p)} />
       })}
     </svg>
   )
@@ -259,14 +323,14 @@ export function Ripples({ t, script }: { t: number; script: Script }) {
 export function Cursor({ c, crosshair, ibeam }: { c: CursorState; crosshair?: boolean; ibeam?: boolean }) {
   const [x, y] = c.at
   return (
-    <div className="cursor" style={{ transform: `translate(${x}px, ${y}px)` }}>
+    <div className="cursor" style={{ transform: `translate3d(${x.toFixed(2)}px, ${y.toFixed(2)}px, 0)` }}>
       {crosshair && !c.shift ? (
         <svg width="25" height="25" viewBox="-12.5 -12.5 25 25" style={{ transform: "translate(-12.5px, -12.5px)" }}>
           <path d="M0 -11V11M-11 0H11" stroke="#fff" strokeWidth="3" strokeLinecap="square" />
           <path d="M0 -10V10M-10 0H10" stroke="#000" strokeWidth="1" shapeRendering="crispEdges" />
         </svg>
       ) : c.shift ? (
-        <svg width="26" height="26" viewBox="0 0 26 26" style={{ transform: `translate(-2px, -24px) scale(${c.pressed ? 0.94 : 1})` }}>
+        <svg className="cursor-glyph" width="26" height="26" viewBox="0 0 26 26" style={{ transform: `translate(-2px, -24px) scale(${c.pressed ? 0.94 : 1})` }}>
           <path d="M3 23l2-7L18 3l5 5L10 21z" fill="#f2f2f2" stroke="#111" strokeWidth="1.3" strokeLinejoin="round" />
           <path d="M3 23l2-7 5 5z" fill="#ff3b30" stroke="#111" strokeWidth="1.3" strokeLinejoin="round" />
           <path d="M15.5 5.5l5 5" stroke="#111" strokeWidth="1.3" />
@@ -277,7 +341,7 @@ export function Cursor({ c, crosshair, ibeam }: { c: CursorState; crosshair?: bo
           <path d="M1.5 1.5c2 0 3.5.6 3.5 2v13c0 1.4-1.5 2-3.5 2M8.5 1.5c-2 0-3.5.6-3.5 2v13c0 1.4 1.5 2 3.5 2M3 10h4" fill="none" stroke="#000" strokeWidth="1.1" strokeLinecap="round" />
         </svg>
       ) : (
-        <svg width="22" height="28" viewBox="0 0 22 28" style={{ transform: `translate(-2px, -2px) scale(${c.pressed ? 0.88 : 1})`, transformOrigin: "2px 2px" }}>
+        <svg className="cursor-glyph" width="22" height="28" viewBox="0 0 22 28" style={{ transform: `translate(-2px, -2px) scale(${c.pressed ? 0.88 : 1})`, transformOrigin: "2px 2px" }}>
           <path d="M2 2v20.5l5.2-5 3.4 8 3.6-1.5-3.4-7.8h7.3z" fill="#000" stroke="#fff" strokeWidth="1.6" strokeLinejoin="round" />
         </svg>
       )}
@@ -322,21 +386,25 @@ export function Caption({ t, script }: { t: number; script: Script }) {
   const { words: all, clause2 } = script.narration
   const first = all[0][1]
   if (t < first - 300 || t > T.finish + 400) return null
-  const swap = all[clause2][1] - 20
+  const swap = all[clause2][1] - 60
   const second = t >= swap
   const words = second ? all.slice(clause2) : all.slice(0, clause2)
-  const opacity = Math.min(
-    progress(t, first - 300, first),
-    1 - progress(t, T.finish, T.finish + 400),
-    second ? 0.25 + 0.75 * progress(t, swap, swap + 140) : 1 - 0.75 * progress(t, swap - 140, swap),
-  )
-  const glide = easeInOut(progress(t, swap - 100, swap + 520))
-  const [a, b] = script.speech
-  const pos = (i: 0 | 1) => lerp(a[i], b[i], glide)
+  // Dip opacity cleanly to 0 across `swap` so the text/box-height change between clauses never snaps visibly.
+  const clauseFade = second ? easeOut(progress(t, swap, swap + 180)) : 1 - easeOut(progress(t, swap - 160, swap))
+  const opacity = Math.min(progress(t, first - 300, first), 1 - progress(t, T.finish, T.finish + 400), clauseFade)
+  if (opacity <= 0.005) return null
+  const pos = second ? script.speech[1] : script.speech[0]
+  const liftY = second ? (1 - easeOut(progress(t, swap, swap + 220))) * 6 : -easeOut(progress(t, swap - 160, swap)) * 4
   const now = words.findIndex(([, at, end]) => t >= at && t < end + 120)
   const talking = now >= 0
   return (
-    <div className="caption" style={{ left: pos(0), top: pos(1), opacity }}>
+    <div
+      className="caption"
+      style={{
+        transform: `translate3d(${pos[0].toFixed(2)}px, ${(pos[1] + liftY).toFixed(2)}px, 0) translate(-100%, -50%)`,
+        opacity,
+      }}
+    >
       <span className="wave">
         {[0, 1, 2, 3, 4].map((i) => {
           const amp = talking ? 0.35 + 0.65 * Math.abs(Math.sin(t / (90 + i * 23) + i * 1.7)) : 0.16
@@ -356,7 +424,17 @@ export function Caption({ t, script }: { t: number; script: Script }) {
 
 export const captureArea = (mode: Mode): Rect => (mode === "mac" ? AREA : { x: PHONE.x - 6, y: PHONE.y - 6, w: PHONE.w + 12, h: PHONE.h + 12 })
 
-export function KeyframeScene({ mode, script, frame, scale }: { mode: Mode; script: Script; frame: Script["frames"][number]; scale: number }) {
+export const KeyframeScene = memo(function KeyframeScene({
+  mode,
+  script,
+  frame,
+  scale,
+}: {
+  mode: Mode
+  script: Script
+  frame: Script["frames"][number]
+  scale: number
+}) {
   const area = captureArea(mode)
   return (
     <div className="sheet-scene wallpaper" style={{ width: STAGE.w, height: STAGE.h, transform: `scale(${scale}) translate(${-area.x}px, ${-area.y}px)` }}>
@@ -365,7 +443,7 @@ export function KeyframeScene({ mode, script, frame, scale }: { mode: Mode; scri
         {script.strokes
           .filter((st) => frame.strokes.includes(st.id))
           .map((st) => (
-            <InkPath key={st.id} d={inkPath(st.points, 10)} />
+            <InkPath key={st.id} d={st.sheetPath} />
           ))}
         {script.pins
           .filter((p) => frame.pins.includes(p.n))
@@ -375,7 +453,7 @@ export function KeyframeScene({ mode, script, frame, scale }: { mode: Mode; scri
       </svg>
     </div>
   )
-}
+})
 
 // Corner index badge drawn by render.rs: a 22px dark pill with a faint ring, top-right.
 export function FrameBadge({ n, k }: { n: number; k: number }) {
@@ -389,7 +467,17 @@ export function FrameBadge({ n, k }: { n: number; k: number }) {
 
 // Same geometry as render_contact_sheet: 640px cells (440 for portrait), 16px padding, 14px gaps,
 // 10px card radius with a 1px #2e2e30 rim on a #141414 sheet.
-export function ContactSheet({ mode, script, width, height }: { mode: Mode; script: Script; width: number; height?: number }) {
+export const ContactSheet = memo(function ContactSheet({
+  mode,
+  script,
+  width,
+  height,
+}: {
+  mode: Mode
+  script: Script
+  width: number
+  height?: number
+}) {
   const area = captureArea(mode)
   const portrait = area.h > area.w
   const cell = portrait ? 440 : 640
@@ -411,11 +499,13 @@ export function ContactSheet({ mode, script, width, height }: { mode: Mode; scri
       ))}
     </div>
   )
-}
+})
 
 export function fixAmount(t: number) {
   const p = progress(t, T.fix[0], T.fix[1])
-  return { fix: easeOutBack(p), settle: progress(t, T.fix[1] - 150, T.fix[1] + 1100), p }
+  // Row padding uses a crisp monotonic easeOut without overshoot so sibling rows never shiver across pixel boundaries.
+  const rowFix = easeOut(progress(t, T.fix[0], T.fix[0] + 380))
+  return { fix: easeOutBack(p), rowFix, settle: progress(t, T.fix[1] - 150, T.fix[1] + 1100), p }
 }
 
 export const phoneLive = (t: number) => Math.min(progress(t, T.phoneRecord, T.phoneRecord + 300), 1 - progress(t, T.finish, T.finish + 300))

@@ -1,4 +1,4 @@
-import type { ReactNode, Ref } from "react"
+import { memo, type ReactNode, type Ref } from "react"
 import { lerp, MAC_WINDOW, PHONE } from "./script"
 
 export type CardRefs = {
@@ -24,16 +24,28 @@ export function TrafficLights({ inactive }: { inactive?: boolean }) {
   )
 }
 
-export function DeployCard({ fix, settle, refs, compact }: { fix: number; settle: number; refs?: CardRefs; compact?: boolean }) {
+export function DeployCard({
+  fix,
+  rowFix,
+  settle,
+  refs,
+  compact,
+}: {
+  fix: number
+  rowFix?: number
+  settle: number
+  refs?: CardRefs
+  compact?: boolean
+}) {
   const badgeX = compact ? -46 : -60
-  const f = Math.min(1, Math.max(0, fix))
+  const rf = Math.min(1, Math.max(0, rowFix ?? fix))
   return (
     <div className={`card${compact ? " compact" : ""}`} style={{ boxShadow: settle > 0 && settle < 1 ? `0 0 0 1.5px rgba(48,209,88,${0.55 * (1 - settle)})` : undefined }}>
       <div className="card-head">
         <h3 ref={refs?.title} className="card-title">
           Deploy Activity
         </h3>
-        <span ref={refs?.badge} className="badge" style={{ transform: `translate(${lerp(badgeX, 0, fix)}px, ${lerp(-8, 0, fix)}px)` }}>
+        <span ref={refs?.badge} className="badge" style={{ transform: `translate3d(${lerp(badgeX, 0, fix)}px, ${lerp(-8, 0, fix)}px, 0)` }}>
           <i />
           Live
         </span>
@@ -41,7 +53,7 @@ export function DeployCard({ fix, settle, refs, compact }: { fix: number; settle
       <p className="card-sub">Last 24 hours · 128 deploys</p>
       <ul className="rows">
         {ROWS.map(([name, sha, env, status, ago]) => (
-          <li key={name} style={{ paddingBlock: lerp(1, compact ? 8 : 9, f) }}>
+          <li key={name} style={{ paddingBlock: lerp(1, compact ? 5 : 6.5, rf) }}>
             <span className="row-name">
               {name}
               {!compact && <em>{sha}</em>}
@@ -56,7 +68,7 @@ export function DeployCard({ fix, settle, refs, compact }: { fix: number; settle
         ))}
       </ul>
       <div ref={refs?.actions} className="actions">
-        <div className="actions-inner" style={{ transform: `translateY(${lerp(14, 0, fix)}px)` }}>
+        <div className="actions-inner" style={{ transform: `translate3d(0, ${lerp(14, 0, fix)}px, 0)` }}>
           <button>Retry failed</button>
           <button className="primary">Promote</button>
         </div>
@@ -85,7 +97,7 @@ const ENVS: [string, string][] = [
   ["preview", "#8e8e93"],
 ]
 
-function Spark() {
+const Spark = memo(function Spark() {
   const pts = [9, 12, 10, 14, 13, 17, 15, 19, 16, 21, 18, 22]
   const d = pts.map((v, i) => `${i ? "L" : "M"}${(i / (pts.length - 1)) * 64},${24 - v}`).join(" ")
   return (
@@ -94,9 +106,21 @@ function Spark() {
       <path d={d} fill="none" stroke="#0a84ff" strokeWidth="1.4" strokeLinejoin="round" />
     </svg>
   )
-}
+})
 
-export function MacWindow({ fix, settle, refs, inactive }: { fix: number; settle: number; refs?: CardRefs; inactive?: boolean }) {
+export const MacWindow = memo(function MacWindow({
+  fix,
+  rowFix,
+  settle,
+  refs,
+  inactive,
+}: {
+  fix: number
+  rowFix?: number
+  settle: number
+  refs?: CardRefs
+  inactive?: boolean
+}) {
   return (
     <div className={`win${inactive ? " inactive" : ""}`} style={{ left: MAC_WINDOW.x, top: MAC_WINDOW.y, width: MAC_WINDOW.w, height: MAC_WINDOW.h }}>
       <aside className="win-side">
@@ -159,7 +183,7 @@ export function MacWindow({ fix, settle, refs, inactive }: { fix: number; settle
               <small>p95 9m 40s</small>
             </div>
           </div>
-          <DeployCard fix={fix} settle={settle} refs={refs} />
+          <DeployCard fix={fix} rowFix={rowFix} settle={settle} refs={refs} />
           <div className="card incidents">
             <div className="card-head">
               <h4>Incidents</h4>
@@ -184,9 +208,9 @@ export function MacWindow({ fix, settle, refs, inactive }: { fix: number; settle
       </div>
     </div>
   )
-}
+})
 
-function PhoneStatus() {
+const PhoneStatus = memo(function PhoneStatus() {
   return (
     <div className="phone-status">
       <b>9:41</b>
@@ -207,9 +231,21 @@ function PhoneStatus() {
       </span>
     </div>
   )
-}
+})
 
-export function PhoneMirror({ fix, settle, refs, live }: { fix: number; settle: number; refs?: CardRefs; live?: number }) {
+export const PhoneMirror = memo(function PhoneMirror({
+  fix,
+  rowFix,
+  settle,
+  refs,
+  live,
+}: {
+  fix: number
+  rowFix?: number
+  settle: number
+  refs?: CardRefs
+  live?: number
+}) {
   return (
     <div
       className="phone"
@@ -229,7 +265,7 @@ export function PhoneMirror({ fix, settle, refs, live }: { fix: number; settle: 
           <span>‹ Pulse</span>
           <h2>Deploys</h2>
         </div>
-        <DeployCard fix={fix} settle={settle} refs={refs} compact />
+        <DeployCard fix={fix} rowFix={rowFix} settle={settle} refs={refs} compact />
         <div className="phone-section">
           <b>Incidents</b>
           <div className="phone-incident">
@@ -255,4 +291,4 @@ export function PhoneMirror({ fix, settle, refs, live }: { fix: number; settle: 
       </div>
     </div>
   )
-}
+})

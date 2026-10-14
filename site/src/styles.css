@@ -1070,7 +1070,7 @@ kbd {
   padding: 4px;
   border-radius: 20px;
   overflow: hidden;
-  transform: translateX(-50%);
+  transform: translate3d(-50%, 0, 0);
   background: rgba(20, 20, 22, 0.96);
   color: #f2f2f2;
   font-size: 13px;
@@ -1079,19 +1079,19 @@ kbd {
     inset 0 0 0 1px rgba(255, 255, 255, 0.12),
     0 5px 14px rgba(0, 0, 0, 0.4);
   transition:
-    width 0.5s cubic-bezier(0.3, 1.3, 0.45, 1),
+    width 0.42s cubic-bezier(0.22, 1, 0.36, 1),
     opacity 0.16s ease,
-    transform 0.45s cubic-bezier(0.3, 1.4, 0.45, 1),
+    transform 0.38s cubic-bezier(0.22, 1, 0.36, 1),
     box-shadow 0.3s ease;
 }
 
 .island.gone {
   opacity: 0;
-  transform: translateX(-50%) translateY(-6px) scale(0.86);
+  transform: translate3d(-50%, -6px, 0) scale(0.86);
   transition:
-    width 0.5s cubic-bezier(0.3, 1.3, 0.45, 1),
+    width 0.42s cubic-bezier(0.22, 1, 0.36, 1),
     opacity 0.2s ease,
-    transform 0.3s ease;
+    transform 0.26s ease;
 }
 
 .island.copied {
@@ -1104,13 +1104,17 @@ kbd {
   display: flex;
   align-items: center;
   gap: 2px;
-  animation: island-in 0.15s 0.05s both cubic-bezier(0.2, 0.8, 0.3, 1);
+  animation: island-in 0.16s 0.03s both cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 @keyframes island-in {
   from {
     opacity: 0.15;
     filter: blur(3.5px);
+  }
+  to {
+    opacity: 1;
+    filter: blur(0px);
   }
 }
 
@@ -1208,6 +1212,10 @@ kbd {
 }
 
 @keyframes breath {
+  0%,
+  100% {
+    opacity: 1;
+  }
   50% {
     opacity: 0.72;
   }
@@ -1284,19 +1292,19 @@ kbd {
   pointer-events: none;
 }
 
-.selection-dim {
+.selection-svg {
   position: absolute;
   inset: 0;
-  background: rgba(0, 0, 0, 0.32);
-}
-
-.selection-rect {
-  position: absolute;
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 
 .selection-size {
   position: absolute;
-  transform: translate(-100%, 10px);
+  left: 0;
+  top: 0;
+  will-change: transform, opacity;
   padding: 3px 7px;
   border-radius: 6px;
   font-size: 11px;
@@ -1326,6 +1334,10 @@ kbd {
   filter: drop-shadow(0 1.5px 2px rgba(0, 0, 0, 0.45));
 }
 
+.cursor-glyph {
+  transition: transform 0.09s ease-out;
+}
+
 .cursor-key {
   position: absolute;
   left: 20px;
@@ -1350,7 +1362,7 @@ kbd {
   gap: 7px;
   padding: 9px;
   border-radius: 15px;
-  transform: translateX(-50%);
+  transform: translate3d(-50%, 0, 0);
   background: rgba(24, 24, 28, 0.78);
   backdrop-filter: blur(20px) saturate(1.5);
   -webkit-backdrop-filter: blur(20px) saturate(1.5);
@@ -1372,7 +1384,11 @@ kbd {
     inset 0 0.5px 0 rgba(255, 255, 255, 0.16),
     0 2.5px 0 #0c0c0d,
     0 3px 6px rgba(0, 0, 0, 0.3);
-  transition: all 0.09s ease;
+  transition:
+    transform 0.09s ease-out,
+    color 0.09s ease,
+    background 0.09s ease,
+    box-shadow 0.09s ease;
 }
 
 .keys kbd.down {
@@ -1394,6 +1410,8 @@ kbd {
 
 .caption {
   position: absolute;
+  left: 0;
+  top: 0;
   z-index: 7;
   display: flex;
   align-items: flex-start;
@@ -1402,9 +1420,8 @@ kbd {
   max-width: 236px;
   padding: 8px 15px 8px 12px;
   border-radius: 14px;
-  transform: translate(-100%, -50%);
   pointer-events: none;
-  will-change: left, top;
+  will-change: transform, opacity;
   background: rgba(24, 24, 28, 0.8);
   backdrop-filter: blur(24px) saturate(1.5);
   -webkit-backdrop-filter: blur(24px) saturate(1.5);
@@ -2537,6 +2554,8 @@ kbd {
   display: flex;
   flex-direction: column;
   gap: var(--row);
+  will-change: transform;
+  transition: transform 0.24s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .ts-content > * {
@@ -2706,13 +2725,17 @@ kbd {
 }
 
 .enter {
-  animation: enter 0.35s both cubic-bezier(0.2, 0.8, 0.3, 1);
+  animation: enter 0.26s both cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 @keyframes enter {
   from {
     opacity: 0;
-    transform: translateY(6px);
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }
 
@@ -2784,6 +2807,7 @@ kbd {
   inset: 0;
   background: #f5f5f7;
   transform-origin: 0 0;
+  will-change: transform;
 }
 
 .beats {
@@ -3112,6 +3136,9 @@ kbd {
 @keyframes stage-end-in {
   from {
     opacity: 0;
+  }
+  to {
+    opacity: 1;
   }
 }
 
@@ -3586,8 +3613,16 @@ kbd {
 @media (prefers-reduced-motion: reduce) {
   .island,
   .enter,
-  .island-content {
-    transition: none;
-    animation: none;
+  .island-content,
+  .bundle-preview-inner,
+  .mode-thumb,
+  .ts-content,
+  .sound-wave,
+  .stage-sound-hint,
+  .rec-dot,
+  .rec-halo,
+  .orbit i {
+    transition: none !important;
+    animation: none !important;
   }
 }

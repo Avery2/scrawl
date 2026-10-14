@@ -461,13 +461,16 @@ function paintTrail() {
   const paint = new THREE.Color(PAINT)
   const samples: { p: THREE.Vector3; t: number; ink: number }[] = []
   const side = new THREE.Vector2()
+  let hadSamples = false
 
   const update = (tip: THREE.Vector3, ink: number, now: number) => {
     if (ink > 0.01) samples.push({ p: tip.clone(), t: now, ink })
     while (samples.length && (now - samples[0].t > TRAIL_LIFE || samples.length > TRAIL_MAX)) samples.shift()
+    const n = samples.length
+    if (n === 0 && !hadSamples) return
+    hadSamples = n > 0
     const pos = geometry.getAttribute("position") as THREE.BufferAttribute
     const col = geometry.getAttribute("color") as THREE.BufferAttribute
-    const n = samples.length
     samples.forEach((s, i) => {
       const a = samples[Math.max(0, i - 1)].p
       const b = samples[Math.min(n - 1, i + 1)].p
@@ -502,7 +505,10 @@ function droplets() {
   const m = new THREE.Matrix4()
   const q = new THREE.Quaternion()
   const s = new THREE.Vector3()
+  const up = new THREE.Vector3(0, 1, 0)
+  const dir = new THREE.Vector3()
   let next = 0
+  let hadActive = true
   const emit = (at: THREE.Vector3, vel: THREE.Vector3) => {
     const d = drops[next]
     next = (next + 1) % DROPS
@@ -510,11 +516,21 @@ function droplets() {
     d.v
       .copy(vel)
       .multiplyScalar(0.55 + Math.random() * 0.35)
-      .add(new THREE.Vector3((Math.random() - 0.5) * 1.2, Math.random() * 1.4, (Math.random() - 0.5) * 0.6))
+      .add(dir.set((Math.random() - 0.5) * 1.2, Math.random() * 1.4, (Math.random() - 0.5) * 0.6))
     d.life = 1
     d.size = 0.045 + Math.random() * 0.04
+    hadActive = true
   }
   const update = (dt: number) => {
+    let anyActive = false
+    for (let i = 0; i < drops.length; i++) {
+      if (drops[i].life > 0) {
+        anyActive = true
+        break
+      }
+    }
+    if (!anyActive && !hadActive) return
+    hadActive = anyActive
     drops.forEach((d, i) => {
       if (d.life > 0) {
         d.life -= dt / 0.55
@@ -524,7 +540,7 @@ function droplets() {
       const k = Math.max(0, d.life)
       s.setScalar(d.size * Math.sqrt(k))
       // Stretch each drop along its flight path.
-      q.setFromUnitVectors(new THREE.Vector3(0, 1, 0), d.v.lengthSq() > 1e-6 ? d.v.clone().normalize() : new THREE.Vector3(0, 1, 0))
+      q.setFromUnitVectors(up, d.v.lengthSq() > 1e-6 ? dir.copy(d.v).normalize() : up)
       s.y *= 1 + Math.min(1.4, d.v.length() * 0.25)
       m.compose(d.p, q, s)
       mesh.setMatrixAt(i, m)
