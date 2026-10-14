@@ -82,7 +82,7 @@ or `scrawl-helper frames`) when you need every pixel.
 ### ScrawlKit (iOS)
 
 `ScrawlKit` (`Sources/ScrawlKit`) is a Swift package (iOS 18+) for recording inside your own iOS app:
-ReplayKit video with narration, touch dots and freehand red strokes, markers, and app events on the
+video of the app with narration, touch dots and freehand red strokes, markers, and app events on the
 same clock, sent straight to Scrawl on your Mac.
 
 Add this repo as a Swift package dependency (product `ScrawlKit`) and attach `.scrawl()` to your root
@@ -94,6 +94,25 @@ import ScrawlKit
 WindowGroup { ContentView().scrawl() }   // three-finger long press starts and stops
 Scrawl.event("Done tapped")              // optional: what the app did, on the timeline
 ```
+
+The host app needs `NSMicrophoneUsageDescription` in its Info.plist for narration (both capture
+methods use the microphone). Set `Scrawl.shared.narration = false` to record without it.
+
+`Scrawl.shared.captureMethod` picks how the video is made:
+
+- **`.appFrames`** (default): ScrawlKit draws the app's own windows into an H.264 `.mp4` at 30 fps
+  and 2× (880×1912 on a 440×956-point phone), with the microphone recorded alongside. There is no
+  screen-recording prompt; the microphone asks once and iOS remembers the answer. If it's denied, the
+  recording is video only and the timeline says `"audio": false`. The strip, touch dots, and ink are
+  left out of the video (Scrawl on the Mac draws touches and strokes from the timeline), but so is
+  anything the app doesn't draw itself: the system keyboard, system alerts and permission prompts,
+  and some layers (video players, camera previews, some Metal or backdrop effects) may be blank or
+  look different. Sending the app to the background finishes and sends the recording.
+- **`.replayKit`**: ReplayKit's in-app screen recording, the exact pixels on screen with the strip and
+  dots in them. iOS asks "Record screen and microphone?" unless you allowed it in the last ~8
+  minutes, and again after every reinstall.
+
+The timeline records which was used (`"capture": "appFrames"` or `"replayKit"`).
 
 While recording, a slim strip sits on the right edge (drag its dot to move it up or down or over to
 the left edge; it remembers where you left it). From top to bottom: the recording dot (hold it to see

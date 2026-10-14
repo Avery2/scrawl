@@ -71,8 +71,9 @@
   }
 
   /// A window above the app for the touch dots, freehand red strokes, and the recording strip.
-  /// It's part of the app, so the recording includes it; every touch except one on the strip or its
-  /// bubbles (or single-finger drawing when `isDrawing` is active) passes through to the app below.
+  /// ReplayKit recordings include it; app-frame recordings leave it out. Every touch except one on
+  /// the strip or its bubbles (or single-finger drawing when `isDrawing` is active) passes through
+  /// to the app below.
   final class OverlayWindow: UIWindow {
     private var regions: [OverlayRegion: CGRect] = [:]
     private unowned let scrawl: Scrawl

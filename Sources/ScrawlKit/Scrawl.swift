@@ -1,5 +1,4 @@
 #if os(iOS)
-  import ReplayKit
   import Security
   import SwiftUI
   import UIKit
@@ -274,11 +273,13 @@
     @ObservationIgnored weak var touchWindow: UIWindow?
     @ObservationIgnored private var overlay: OverlayWindow?
     @ObservationIgnored private var failedRecording: Recording?
-    /// ReplayKit is starting (or asking permission) and the overlay is already up.
+    /// The current recording's recorder.
+    @ObservationIgnored private var recorder: (any ScrawlRecorder)?
+    /// The recorder is starting (or asking permission) and the overlay is already up.
     @ObservationIgnored private var isStarting = false
     @ObservationIgnored private var discardID = 0
     @ObservationIgnored private var discarded: FinishedRecording?
-    /// Undo was tapped before ReplayKit finished writing this discard's movie.
+    /// Undo was tapped before the recorder finished writing this discard's movie.
     @ObservationIgnored private var undoneDiscardID: Int?
     /// The Scrawl address that answered when the current recording started.
     @ObservationIgnored private var reachableURL: URL?
@@ -287,6 +288,10 @@
 
     /// Whether to record the microphone with the screen.
     public var narration = true
+    /// How recordings are captured: the app's own windows (the default; no screen-recording
+    /// prompt) or ReplayKit (exact screen pixels, behind iOS's consent alert). Takes effect on the
+    /// next recording.
+    public var captureMethod: ScrawlCaptureMethod = .appFrames
     /// Whether to show the share sheet when a recording stops (used as fallback if Mac ingest is unreachable).
     public var sharesWhenDone = true
     /// Candidate Scrawl ingest URLs on the Mac (from Keychain or launch args / env).
@@ -352,11 +357,13 @@
       token = config?.token
       sessionID = config?.sessionID
       if !isConfigured {
-        if isRecording {
+        if isRecording || isStarting {
           isRecording = false
+          isStarting = false
           isDrawing = false
           startedAt = nil
-          RPScreenRecorder.shared().stopRecording { _, _ in }
+          recorder?.cancel()
+          recorder = nil
         }
         if isDiscardPending { finalizeDiscard() }
         hideOverlay()
@@ -391,11 +398,10 @@
     }
 
     public func start() {
-      guard isConfigured, !isRecording else { return }
-      let recorder = RPScreenRecorder.shared()
+      guard isConfigured, !isRecording, !isStarting else { return }
+      let recorder = captureMethod.makeRecorder()
       guard recorder.isAvailable else { return }
       if isDiscardPending { finalizeDiscard() }
-      recorder.isMicrophoneEnabled = narration
       markers = []
       events = []
       touchLog = []
@@ -417,16 +423,19 @@
       showOverlay()
       // Reaching the Mac now raises iOS's local network prompt at the start, not at stop time.
       Task { await self.findMac() }
-      recorder.startRecording { [weak self] error in
-        Task { @MainActor in
-          guard let self else { return }
-          self.isStarting = false
-          if error != nil {
-            self.hideOverlay()
-            return
-          }
-          self.startedAt = .now
+      self.recorder = recorder
+      recorder.onInterruption = { [weak self] in self?.stop() }
+      recorder.start(microphone: narration) { [weak self, weak recorder] result in
+        guard let self, let recorder, self.recorder === recorder, self.isStarting else { return }
+        self.isStarting = false
+        switch result {
+        case let .success(startedAt):
+          self.startedAt = startedAt
           self.isRecording = true
+        case let .failure(error):
+          print("Scrawl: could not start recording: \(error.localizedDescription)")
+          self.recorder = nil
+          self.hideOverlay()
         }
       }
     }
@@ -459,7 +468,8 @@
     }
 
     private func finish(discarding: Bool) {
-      guard isRecording, let startedAt else { return }
+      guard isRecording, let startedAt, let recorder else { return }
+      self.recorder = nil
       isRecording = false
       isDrawing = false
       let discardToken = discarding ? beginUndoWindow() : nil
@@ -493,6 +503,7 @@
         "events": events,
         "touches": touchLog,
         "strokes": strokeLog,
+        "capture": recorder.method.rawValue,
       ]
       if let sessionID, !sessionID.isEmpty {
         info["session"] = sessionID
@@ -500,9 +511,7 @@
       self.startedAt = nil
       completedStrokes = []
       activeStroke = []
-      // ReplayKit refuses to write over an existing file; never lose a recording to a name clash.
-      try? FileManager.default.removeItem(at: movie)
-      RPScreenRecorder.shared().stopRecording(withOutput: movie) { [weak self] error in
+      recorder.stop(writingTo: movie) { [weak self] error in
         Task { @MainActor in
           guard let self else { return }
           if let error {
@@ -512,6 +521,8 @@
             self.hideOverlay()
             return
           }
+          var info = info
+          info["audio"] = recorder.recordsAudio
           let timelineData = (try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys])) ?? Data()
           try? timelineData.write(to: timeline)
           let finished = FinishedRecording(
@@ -553,7 +564,7 @@
       return id
     }
 
-    /// Ends the Undo window now. A recording ReplayKit is still writing is deleted when it lands.
+    /// Ends the Undo window now. A recording still being written is deleted when it lands.
     private func finalizeDiscard() {
       isDiscardPending = false
       if let discarded { Self.delete(discarded) }
