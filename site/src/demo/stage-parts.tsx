@@ -48,7 +48,7 @@ const MenuBarInner = memo(function MenuBarInner({ active }: { active: boolean })
       </div>
       <div className="menubar-right">
         <span className="menubar-extra menubar-scrawl">
-          <img src="/menubar-icon@2x.png" alt="" />
+          <img src="/menubar-icon@2x.png" width={16} height={16} decoding="async" alt="" />
         </span>
         <span className="menubar-extra">
           <span className="battery">

@@ -347,7 +347,7 @@ export function BundleExplorer() {
           <i />
         </span>
         <span className="bundle-title">
-          <img src="/app-icon.png" alt="" />
+          <img src="/app-icon.png" width={17} height={17} decoding="async" alt="" />
           {BUNDLE}
         </span>
       </div>

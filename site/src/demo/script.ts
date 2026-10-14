@@ -272,15 +272,15 @@ export function buildScript(mode: Mode, a: Anchors): Script {
   const wing = (side: number): Point => [tip[0] - Math.cos(angle + side * 0.5) * 19, tip[1] - Math.sin(angle + side * 0.5) * 19]
   const wing1 = wing(1)
   const wing2 = wing(-1)
-  // Round the chevron apex slightly so the stroke outline turns cleanly without twisting.
-  const preTip: Point = [lerp(wing1[0], tip[0], 0.88), lerp(wing1[1], tip[1], 0.88)]
-  const postTip: Point = [lerp(tip[0], wing2[0], 0.12), lerp(tip[1], wing2[1], 0.12)]
-  const head = [...line(wing1, preTip, 10), ...curvePoints(preTip, tip, postTip, 5).slice(1), ...line(postTip, wing2, 10).slice(1)]
+  const head1 = line(tip, wing1, 12)
+  const head2 = line(tip, wing2, 12)
+  const headMid = Math.round((T.head[0] + T.head[1]) / 2)
 
   const strokes: Stroke[] = [
     makeStroke("circle", circle, T.circle[0], T.circle[1]),
     makeStroke("shaft", shaft, T.arrow[0], T.arrow[1]),
-    makeStroke("head", head, T.head[0], T.head[1]),
+    makeStroke("wing1", head1, T.head[0], headMid - 15),
+    makeStroke("wing2", head2, headMid + 15, T.head[1]),
   ]
 
   // The pill rides to the left of each mark, so it never covers the ink or the thing being
@@ -349,7 +349,9 @@ export function buildScript(mode: Mode, a: Anchors): Script {
     { t: T.arrow[0] - 80, at: shaft[0], arc: 0 },
     { t: T.arrow[0], at: shaft[0], arc: 0 },
     { t: T.arrow[1], at: tip, arc: 0 },
-    { t: T.head[0], at: wing1, arc: 0 },
+    { t: T.head[0], at: tip, arc: 0 },
+    { t: headMid - 15, at: wing1, arc: 0 },
+    { t: headMid + 15, at: tip, arc: 0 },
     { t: T.head[1], at: wing2, arc: 0.05 },
     { t: T.pin2 - 70, at: pin2, arc: 0 },
     { t: T.pin2 + 160, at: pin2, arc: 0.04 },
@@ -372,7 +374,7 @@ export function buildScript(mode: Mode, a: Anchors): Script {
     narration: NARRATION[mode],
     frames: [
       { n: 1, t: T.pin1 - T.record, strokes: ["circle"], pins: [1] },
-      { n: 2, t: T.pin2 - T.record, strokes: ["shaft", "head"], pins: [2] },
+      { n: 2, t: T.pin2 - T.record, strokes: ["shaft", "wing1", "wing2"], pins: [2] },
     ],
   }
 }

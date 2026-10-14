@@ -618,7 +618,7 @@ export function Brush3D() {
       setFailed(true)
       return
     }
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 3))
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     renderer.toneMapping = THREE.NeutralToneMapping
     renderer.toneMappingExposure = 1.05
     renderer.setClearColor(0x000000, 0)
@@ -749,7 +749,7 @@ export function Brush3D() {
       // The host is scaled with CSS; render at the matching resolution so it stays crisp.
       if (v.scale !== pixelScale) {
         pixelScale = v.scale
-        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 3) * pixelScale)
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2) * pixelScale)
         resize()
       }
     }

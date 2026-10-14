@@ -344,15 +344,24 @@ export function Demo() {
           <Keys t={t} mode={mode} />
           <Island t={t} mode={mode} />
           {script && <Ripples t={t} script={script} />}
-          <svg className="ink" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`} style={INK_SHADOW}>
-            {user.map((s, i) => (
-              <InkPath key={i} d={inkPath(s.points, 4.5, 0.5)} />
-            ))}
-          </svg>
+          {user.length > 0 && (
+            <svg className="ink" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`} style={INK_SHADOW}>
+              {user.map((s, i) => (
+                <InkPath key={i} d={inkPath(s.points, 4.5, 0.5)} />
+              ))}
+            </svg>
+          )}
           {cursor && <Cursor c={cursor} crosshair={mode === "mac" && t >= T.select && t < T.record} ibeam={overTerminal && t >= T.promptClick - 400 && t < T.paste + 120} />}
         </div>
         {!started && (
-          <button className="stage-play" onPointerDown={(e) => e.stopPropagation()} onClick={() => start(true, "start")}>
+          <button
+            className="stage-play"
+            onPointerDown={(e) => {
+              e.stopPropagation()
+              sfx.unlock()
+            }}
+            onClick={() => start(true, "start")}
+          >
             <svg viewBox="0 0 16 16" aria-hidden>
               <path d="M4.5 2.8v10.4a.6.6 0 00.9.5l8.3-5.2a.6.6 0 000-1L5.4 2.3a.6.6 0 00-.9.5z" />
             </svg>
@@ -362,7 +371,10 @@ export function Demo() {
         {started && playing && !sound && (
           <button
             className="stage-sound-hint"
-            onPointerDown={(e) => e.stopPropagation()}
+            onPointerDown={(e) => {
+              e.stopPropagation()
+              sfx.unlock()
+            }}
             onClick={() => {
               sfx.setEnabled(true)
               sfx.unlock()

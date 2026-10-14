@@ -47,7 +47,7 @@ export function App() {
     <>
       <header className="nav">
         <a className="brand" href="#">
-          <img src="/app-icon.png" alt="" />
+          <img src="/app-icon.png" width={26} height={26} decoding="async" alt="" />
           Scrawl
         </a>
         <nav>
@@ -129,7 +129,7 @@ export function App() {
       </main>
 
       <footer className="foot">
-        <img src="/app-icon.png" alt="" />
+        <img src="/app-icon.png" width={20} height={20} decoding="async" alt="" />
         <span>Scrawl</span>
         <a href={REPO}>GitHub</a>
       </footer>
