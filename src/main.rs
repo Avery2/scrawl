@@ -2,6 +2,7 @@ mod capture;
 mod handoff;
 mod helper;
 mod hex;
+mod icons;
 mod inbox;
 mod keyframes;
 mod laser_overlay;

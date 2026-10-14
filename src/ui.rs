@@ -5,10 +5,10 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Application, Bounds, BoxShadow, Context, Div, Entity, FocusHandle, FontWeight,
-    Image, ImageFormat, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, SharedString, Size, TextRun, Window,
+    Image, ImageFormat, IntoElement, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Size, TextRun, Window,
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, img, point,
-    prelude::*, px, relative, rgb, rgba, size,
+    prelude::*, px, relative, rgb, rgba, size, svg,
 };
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
@@ -63,6 +63,10 @@ const CHIP_GAP: f32 = 2.0;
 const DIVIDER_MX: f32 = 6.0;
 const LEAD_TRAIL: f32 = 8.0;
 const HUD_TEXT: f32 = 13.0;
+// Selection-mode segments: line icon, then label.
+const SEG_PX: f32 = 10.0;
+const SEG_ICON: f32 = 14.0;
+const SEG_ICON_GAP: f32 = 5.0;
 const PILL_WINDOW_W: f32 = 520.0;
 const PILL_WINDOW_H: f32 = 84.0;
 
@@ -168,26 +172,34 @@ fn completed_label(inbox_count: usize) -> String {
     }
 }
 
+/// Inner width of the Selecting row: mode segments, an optional Record chip, divider, and ✕.
+fn selecting_row_width(label_widths: &[f32], record_width: Option<f32>) -> f32 {
+    let segments: f32 = label_widths
+        .iter()
+        .map(|label| label + 2.0 * SEG_PX + SEG_ICON + SEG_ICON_GAP)
+        .sum();
+    let items = label_widths.len() + usize::from(record_width.is_some()) + 2;
+    segments
+        + record_width.unwrap_or(0.0)
+        + 1.0
+        + 2.0 * DIVIDER_MX
+        + CHIP_H
+        + (items - 1) as f32 * CHIP_GAP
+}
+
 /// Intrinsic outer width of the capsule for a phase, mirroring the layout in `HudPillWindow`.
 fn island_content_width(window: &Window, phase: IslandPhase, clock: &str, iphone: bool) -> f32 {
     let divider = 1.0 + 2.0 * DIVIDER_MX;
     let inner = match phase {
         IslandPhase::Selecting { mode } => {
-            chip_width(window, "Area", FontWeight::MEDIUM)
-                + chip_width(window, "Full Screen", FontWeight::MEDIUM)
-                + if iphone {
-                    chip_width(window, "iPhone", FontWeight::MEDIUM) + CHIP_GAP
-                } else {
-                    0.0
-                }
-                + if mode == SelectionMode::Iphone {
-                    chip_width(window, "Record", FontWeight::SEMIBOLD) + CHIP_GAP
-                } else {
-                    0.0
-                }
-                + divider
-                + CHIP_H
-                + 3.0 * CHIP_GAP
+            let labels: Vec<f32> = SelectionMode::available(iphone)
+                .iter()
+                .map(|m| measure_text(window, m.label(), HUD_TEXT, FontWeight::MEDIUM))
+                .collect();
+            let record = mode
+                .shows_record()
+                .then(|| chip_width(window, "Record", FontWeight::SEMIBOLD));
+            selecting_row_width(&labels, record)
         }
         IslandPhase::Recording => {
             CHIP_H
@@ -759,7 +771,111 @@ fn apply_pill_layer_effect(
 pub enum SelectionMode {
     Area,
     Window,
+    /// The whole display the picker covers.
+    Screen,
     Iphone,
+}
+
+impl SelectionMode {
+    const ALL: [SelectionMode; 4] = [Self::Area, Self::Window, Self::Screen, Self::Iphone];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Area => "area",
+            Self::Window => "window",
+            Self::Screen => "screen",
+            Self::Iphone => "iphone",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.key() == key.trim())
+    }
+
+    fn last_used_path() -> Option<PathBuf> {
+        crate::handoff::default_captures_dir()
+            .parent()
+            .map(|dir| dir.join("last-mode"))
+    }
+
+    /// The mode the last recording used; the picker opens on it.
+    fn load_last_used() -> Self {
+        Self::last_used_path()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| Self::from_key(&text))
+            .unwrap_or(Self::Area)
+    }
+
+    fn save_last_used(self) {
+        if let Some(path) = Self::last_used_path() {
+            let _ = std::fs::write(path, self.key());
+        }
+    }
+
+    /// Modes shown in the HUD, in order; iPhone only while one is cabled.
+    fn available(has_iphone: bool) -> &'static [SelectionMode] {
+        if has_iphone {
+            &Self::ALL
+        } else {
+            &Self::ALL[..3]
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Area => "Area",
+            Self::Window => "Window",
+            Self::Screen => "Screen",
+            Self::Iphone => "iPhone",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Area => crate::icons::AREA,
+            Self::Window => crate::icons::WINDOW,
+            Self::Screen => crate::icons::SCREEN,
+            Self::Iphone => crate::icons::IPHONE,
+        }
+    }
+
+    fn chip_id(self) -> &'static str {
+        match self {
+            Self::Area => "sel-area",
+            Self::Window => "sel-window",
+            Self::Screen => "sel-screen",
+            Self::Iphone => "sel-iphone",
+        }
+    }
+
+    /// Screen and iPhone need no pointer gesture, so the HUD offers a Record chip for them.
+    fn shows_record(self) -> bool {
+        matches!(self, Self::Screen | Self::Iphone)
+    }
+
+    /// `1`–`4` pick a mode by its position in the HUD.
+    fn from_digit(key: &str, has_iphone: bool) -> Option<Self> {
+        let index = key.parse::<usize>().ok()?.checked_sub(1)?;
+        Self::available(has_iphone).get(index).copied()
+    }
+
+    /// The neighbouring mode in HUD order, wrapping at either end.
+    fn cycled(self, forward: bool, has_iphone: bool) -> Self {
+        let modes = Self::available(has_iphone);
+        let Some(index) = modes.iter().position(|m| *m == self) else {
+            return if forward {
+                modes[0]
+            } else {
+                modes[modes.len() - 1]
+            };
+        };
+        let next = if forward {
+            (index + 1) % modes.len()
+        } else {
+            (index + modes.len() - 1) % modes.len()
+        };
+        modes[next]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -830,6 +946,8 @@ pub struct ScrawlCoordinator {
     hovered_window: Option<TargetInfo>,
     animated_window_rect: Option<[f32; 4]>,
     selection_drag: Option<([f32; 2], [f32; 2])>,
+    /// Global frame of the display the picker covers, highlighted in `SelectionMode::Screen`.
+    display_rect: [f32; 4],
     paste_drag_start: Option<[f32; 2]>,
     recording_shortcut_key: bool,
     review_bundle: Option<(PathBuf, ScrawlBundle)>,
@@ -843,6 +961,11 @@ pub struct ScrawlCoordinator {
     /// When this Mac last finished a capture, so ⌥⇧V prefers it over older inbox items.
     last_local_capture_ms: u64,
     inbox: crate::inbox::Inbox,
+    /// The mode the last recording used; the picker opens on it.
+    last_mode: SelectionMode,
+    /// The picker opened on Area because the last recording was the iPhone and no phone had been
+    /// seen yet: switch to the phone when discovery finds one, unless Kit picked a mode himself.
+    open_iphone_when_found: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -880,6 +1003,7 @@ impl ScrawlCoordinator {
             hovered_window: None,
             animated_window_rect: None,
             selection_drag: None,
+            display_rect: [0.0, 0.0, 1440.0, 900.0],
             paste_drag_start: None,
             recording_shortcut_key: false,
             review_bundle: initial_bundle,
@@ -890,6 +1014,16 @@ impl ScrawlCoordinator {
             completed_dir: None,
             last_local_capture_ms: 0,
             inbox: crate::inbox::Inbox::load_default(),
+            last_mode: SelectionMode::load_last_used(),
+            open_iphone_when_found: false,
+        }
+    }
+
+    /// Remembers the mode a recording is starting in, so the next picker opens on it.
+    fn remember_mode(&mut self, mode: SelectionMode) {
+        if self.last_mode != mode {
+            self.last_mode = mode;
+            mode.save_last_used();
         }
     }
 
@@ -960,6 +1094,17 @@ impl ScrawlCoordinator {
                     coord.iphone = found;
                     cx.notify();
                 }
+                if std::mem::take(&mut coord.open_iphone_when_found)
+                    && coord.iphone.is_some()
+                    && matches!(
+                        coord.island_phase,
+                        IslandPhase::Selecting {
+                            mode: SelectionMode::Area
+                        }
+                    )
+                {
+                    coord.preview_iphone(cx);
+                }
             });
         })
         .detach();
@@ -1020,6 +1165,9 @@ impl ScrawlCoordinator {
                 )
             }),
             IslandPhase::Selecting {
+                mode: SelectionMode::Screen,
+            } => Some((self.display_rect, 2)),
+            IslandPhase::Selecting {
                 mode: SelectionMode::Iphone,
             } => self
                 .iphone_preview
@@ -1032,6 +1180,7 @@ impl ScrawlCoordinator {
     }
 
     pub fn set_selection_mode(&mut self, mode: SelectionMode, cx: &mut Context<Self>) {
+        self.open_iphone_when_found = false;
         if let IslandPhase::Selecting { mode: prev_mode } = self.island_phase {
             if prev_mode != mode {
                 // Crisp tactile Dynamic Island scale micro-pulse when Space toggles camera/crosshair mode.
@@ -1101,10 +1250,77 @@ impl ScrawlCoordinator {
         if let IslandPhase::Selecting { mode } = self.island_phase {
             let next = match mode {
                 SelectionMode::Area => SelectionMode::Window,
-                SelectionMode::Window | SelectionMode::Iphone => SelectionMode::Area,
+                SelectionMode::Window | SelectionMode::Screen | SelectionMode::Iphone => {
+                    SelectionMode::Area
+                }
             };
             self.set_selection_mode(next, cx);
         }
+    }
+
+    fn selection_mode(&self) -> Option<SelectionMode> {
+        match self.island_phase {
+            IslandPhase::Selecting { mode } => Some(mode),
+            _ => None,
+        }
+    }
+
+    /// Switches the picker to `mode`; choosing iPhone opens its live preview.
+    pub fn choose_selection_mode(&mut self, mode: SelectionMode, cx: &mut Context<Self>) {
+        if self.selection_mode().is_none() {
+            return;
+        }
+        if mode == SelectionMode::Iphone {
+            self.preview_iphone(cx);
+        } else {
+            self.set_selection_mode(mode, cx);
+        }
+    }
+
+    /// A HUD segment click: picks the mode, or records when Screen/iPhone is already selected.
+    pub fn click_selection_mode(&mut self, mode: SelectionMode, cx: &mut Context<Self>) {
+        if self.selection_mode() == Some(mode) && mode.shows_record() {
+            self.record_selected_mode(cx);
+        } else {
+            self.choose_selection_mode(mode, cx);
+        }
+    }
+
+    /// Return, `s`, the capture shortcut, or Record: iPhone records the phone, anything else
+    /// records the full screen.
+    pub fn record_selected_mode(&mut self, cx: &mut Context<Self>) {
+        match self.selection_mode() {
+            Some(SelectionMode::Iphone) => self.start_recording_iphone(cx),
+            Some(_) => self.start_recording_full_screen(cx),
+            None => {}
+        }
+    }
+
+    /// Picker keyboard map, shared by the picker window and the HUD pill. Returns whether the
+    /// key was handled.
+    pub fn handle_selection_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+        let Some(mode) = self.selection_mode() else {
+            return false;
+        };
+        let mods = keystroke.modifiers;
+        if mods.platform || mods.control || mods.alt {
+            return false;
+        }
+        let has_iphone = self.iphone.is_some();
+        match keystroke.key.as_str() {
+            "space" | " " => self.toggle_selection_mode(cx),
+            "escape" => self.cancel_recording(cx),
+            "enter" => self.record_selected_mode(cx),
+            key if key.eq_ignore_ascii_case("s") => self.record_selected_mode(cx),
+            "tab" => self.choose_selection_mode(mode.cycled(!mods.shift, has_iphone), cx),
+            "right" => self.choose_selection_mode(mode.cycled(true, has_iphone), cx),
+            "left" => self.choose_selection_mode(mode.cycled(false, has_iphone), cx),
+            key => match SelectionMode::from_digit(key, has_iphone) {
+                Some(next) => self.choose_selection_mode(next, cx),
+                None => return false,
+            },
+        }
+        true
     }
 
     pub fn undo_stroke(&mut self, cx: &mut Context<Self>) {
@@ -1307,6 +1523,16 @@ impl ScrawlCoordinator {
         self.hovered_window = None;
         self.animated_window_rect = None;
         self.selection_pointer = current_mouse_screen();
+        // The picker window opens on the primary display; Screen mode highlights all of it.
+        if let Some(display) = cx.primary_display() {
+            let b = display.bounds();
+            self.display_rect = [
+                f32::from(b.origin.x),
+                f32::from(b.origin.y),
+                f32::from(b.size.width),
+                f32::from(b.size.height),
+            ];
+        }
         self.selection_generation += 1;
         self.windows_loading = true;
         self.refresh_iphone(cx);
@@ -1365,9 +1591,21 @@ impl ScrawlCoordinator {
             self.island_opacity = 0.0;
             self.island_phase = IslandPhase::Hidden;
         }
-        self.set_island_phase(IslandPhase::Selecting {
-            mode: SelectionMode::Area,
-        });
+        // Open on the mode the last recording used. The phone needs a live preview, started once
+        // the picker is up; Window starts on Area's crosshair until the window list arrives.
+        let opening = match self.last_mode {
+            SelectionMode::Iphone => SelectionMode::Area,
+            mode => mode,
+        };
+        self.set_island_phase(IslandPhase::Selecting { mode: opening });
+        self.open_iphone_when_found = false;
+        if self.last_mode == SelectionMode::Iphone {
+            if self.iphone.is_some() {
+                self.preview_iphone(cx);
+            } else {
+                self.open_iphone_when_found = true;
+            }
+        }
         self.telemetry.begin_picker_session();
         self.sync_picker_overlay();
         if self.picker_metal_overlay.is_none() {
@@ -1412,6 +1650,9 @@ impl ScrawlCoordinator {
             "start_recording_with_target invoked: mode={:?} frame={:?}",
             target.mode, target.frame
         ));
+        if let IslandPhase::Selecting { mode } = self.island_phase {
+            self.remember_mode(mode);
+        }
         self.recording_shortcut_key = false;
         self.iphone_preview = None;
         self.selection_drag = None;
@@ -1492,6 +1733,7 @@ impl ScrawlCoordinator {
             return;
         }
         scrawl_log("start_recording_iphone invoked");
+        self.remember_mode(SelectionMode::Iphone);
         self.recording_shortcut_key = false;
         self.selection_drag = None;
         self.hovered_window = None;
@@ -1711,6 +1953,7 @@ impl ScrawlCoordinator {
 
 pub struct HudPillWindow {
     coordinator: Entity<ScrawlCoordinator>,
+    focus: FocusHandle,
     ns_window: Option<Retained<NSWindow>>,
     shell_layer: Option<Retained<objc2_quartz_core::CALayer>>,
 }
@@ -1812,10 +2055,7 @@ impl Render for HudPillWindow {
         let c_paste_out = self.coordinator.clone();
         let c_inspect = self.coordinator.clone();
         let c_dismiss = self.coordinator.clone();
-        let c_mode_area = self.coordinator.clone();
-        let c_full = self.coordinator.clone();
-        let c_iphone = self.coordinator.clone();
-        let c_record_iphone = self.coordinator.clone();
+        let c_record = self.coordinator.clone();
         let c_sel_cancel = self.coordinator.clone();
 
         // Keep typography (`HUD_TEXT`) and spacing (`CHIP_GAP`) 100% constant so glyphs never
@@ -1831,50 +2071,18 @@ impl Render for HudPillWindow {
 
         let capsule_content = match content_phase {
             IslandPhase::Selecting { mode } => row
-                .child(
-                    mode_chip("sel-area", "Area", mode == SelectionMode::Area).on_click(
-                        move |_, _, cx| {
-                            c_mode_area.update(cx, |coord, cx| {
-                                coord.set_selection_mode(SelectionMode::Area, cx);
-                            });
-                        },
-                    ),
-                )
-                .child(pill_chip("sel-fullscreen", "Full Screen", true).on_click(
-                    move |_, _, cx| {
-                        c_full.update(cx, |coord, cx| {
-                            coord.start_recording_full_screen(cx);
-                        });
-                    },
-                ))
-                .when(has_iphone, |row| {
+                .children(SelectionMode::available(has_iphone).iter().map(|&segment| {
+                    let c_segment = self.coordinator.clone();
+                    mode_segment(segment, segment == mode).on_click(move |_, _, cx| {
+                        c_segment.update(cx, |coord, cx| coord.click_selection_mode(segment, cx));
+                    })
+                }))
+                .when(mode.shows_record(), |row| {
                     row.child(
-                        mode_chip("sel-iphone", "iPhone", mode == SelectionMode::Iphone).on_click(
-                            move |_, _, cx| {
-                                c_iphone.update(cx, |coord, cx| {
-                                    if matches!(
-                                        coord.island_phase,
-                                        IslandPhase::Selecting {
-                                            mode: SelectionMode::Iphone
-                                        }
-                                    ) {
-                                        coord.start_recording_iphone(cx);
-                                    } else {
-                                        coord.preview_iphone(cx);
-                                    }
-                                });
-                            },
-                        ),
+                        primary_chip("sel-record", "Record").on_click(move |_, _, cx| {
+                            c_record.update(cx, |coord, cx| coord.record_selected_mode(cx));
+                        }),
                     )
-                })
-                .when(mode == SelectionMode::Iphone, |row| {
-                    row.child(primary_chip("sel-record-iphone", "Record").on_click(
-                        move |_, _, cx| {
-                            c_record_iphone.update(cx, |coord, cx| {
-                                coord.start_recording_iphone(cx);
-                            });
-                        },
-                    ))
                 })
                 .child(island_divider())
                 .child(
@@ -2049,8 +2257,16 @@ impl Render for HudPillWindow {
         };
 
         let has_shell = self.shell_layer.is_some();
+        let c_keys = self.coordinator.clone();
 
         div()
+            .track_focus(&self.focus)
+            // Clicking a chip can make the pill the key window; keep the picker's keyboard map.
+            .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                c_keys.update(cx, |coord, cx| {
+                    coord.handle_selection_key(&event.keystroke, cx)
+                });
+            })
             .size_full()
             .flex()
             .items_center()
@@ -2161,10 +2377,14 @@ fn icon_circle_chip(id: &'static str, icon: &'static str) -> gpui::Stateful<Div>
         .child(icon)
 }
 
-/// Area/Window mode toggle. Weight stays constant across states so toggling never shifts the
-/// measured capsule width.
-fn mode_chip(id: &'static str, label: &'static str, active: bool) -> gpui::Stateful<Div> {
-    hud_chip(id)
+/// One segment of the selection-mode control: line icon + label. Weight stays constant across
+/// states so switching never shifts the measured capsule width (`selecting_row_width`).
+fn mode_segment(mode: SelectionMode, active: bool) -> gpui::Stateful<Div> {
+    let group = mode.chip_id();
+    hud_chip(group)
+        .group(group)
+        .px(px(SEG_PX))
+        .gap(px(SEG_ICON_GAP))
         .font_weight(FontWeight::MEDIUM)
         .bg(if active {
             rgba(0xffffff26)
@@ -2185,7 +2405,20 @@ fn mode_chip(id: &'static str, label: &'static str, active: bool) -> gpui::State
             })
             .text_color(rgb(TEXT_COLOR))
         })
-        .child(label)
+        // `svg()` tints with its own text colour, so hover is mirrored through the group.
+        .child(
+            svg()
+                .path(mode.icon())
+                .size(px(SEG_ICON))
+                .flex_none()
+                .text_color(if active {
+                    rgb(TEXT_COLOR)
+                } else {
+                    rgb(MUTED_COLOR)
+                })
+                .group_hover(group, |s| s.text_color(rgb(TEXT_COLOR))),
+        )
+        .child(mode.label())
 }
 
 /// CleanShot-style floating camera cursor rendered at `(x, y)` in `SelectionMode::Window`.
@@ -2308,6 +2541,10 @@ impl Render for TargetPickerWindow {
                 ]);
                 ([rx - origin[0], ry - origin[1], rw, rh], title)
             }),
+            SelectionMode::Screen => Some((
+                [0.0, 0.0, screen[0], screen[1]],
+                "Full screen · Click to record".to_string(),
+            )),
             SelectionMode::Iphone => iphone_rect.map(|[rx, ry, rw, rh]| {
                 (
                     [rx - origin[0], ry - origin[1], rw, rh],
@@ -2329,7 +2566,7 @@ impl Render for TargetPickerWindow {
             let size = [text_w + 2.0 * BADGE_PX + 2.0, BADGE_H];
             let anchor = match mode {
                 SelectionMode::Area | SelectionMode::Iphone => BadgeAnchor::BelowTrailing,
-                SelectionMode::Window => BadgeAnchor::Center,
+                SelectionMode::Window | SelectionMode::Screen => BadgeAnchor::Center,
             };
             (
                 place_badge(*rect, size, screen, anchor),
@@ -2349,7 +2586,10 @@ impl Render for TargetPickerWindow {
             .size_full()
             .relative()
             .when(mode == SelectionMode::Area, |d| d.cursor_crosshair())
-            .when(mode == SelectionMode::Iphone, |d| d.cursor_pointer())
+            .when(
+                matches!(mode, SelectionMode::Iphone | SelectionMode::Screen),
+                |d| d.cursor_pointer(),
+            )
             .when(mode == SelectionMode::Window, |d| {
                 d.cursor(gpui::CursorStyle::None)
             });
@@ -2389,25 +2629,9 @@ impl Render for TargetPickerWindow {
             )
         })
         .on_key_down(move |event: &KeyDownEvent, _, cx| {
-            let key = event.keystroke.key.as_str();
-            if key == "space" || key == " " {
-                c_key.update(cx, |coord, cx| coord.toggle_selection_mode(cx));
-            } else if key == "escape" {
-                c_key.update(cx, |coord, cx| coord.cancel_recording(cx));
-            } else if key == "enter" || key.eq_ignore_ascii_case("s") {
-                c_key.update(cx, |coord, cx| {
-                    if matches!(
-                        coord.island_phase,
-                        IslandPhase::Selecting {
-                            mode: SelectionMode::Iphone
-                        }
-                    ) {
-                        coord.start_recording_iphone(cx);
-                    } else {
-                        coord.start_recording_full_screen(cx);
-                    }
-                });
-            }
+            c_key.update(cx, |coord, cx| {
+                coord.handle_selection_key(&event.keystroke, cx)
+            });
         })
         .on_mouse_down(
             MouseButton::Left,
@@ -2457,6 +2681,7 @@ impl Render for TargetPickerWindow {
                                 coord.start_recording_full_screen(cx);
                             }
                         }
+                        SelectionMode::Screen => coord.start_recording_full_screen(cx),
                     }
                 });
             },
@@ -2481,6 +2706,7 @@ impl Render for TargetPickerWindow {
                     SelectionMode::Iphone => {
                         coord.sync_picker_overlay();
                     }
+                    SelectionMode::Screen => {}
                     SelectionMode::Window => {
                         let found = coord
                             .selectable_windows
@@ -3351,7 +3577,7 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
             window_background: WindowBackgroundAppearance::Transparent,
             ..Default::default()
         },
-        move |_, cx| {
+        move |window, cx| {
             let ns_window = find_hud_pill_ns_window();
             let mut shell_layer = None;
             if let Some(ref ns_win) = ns_window {
@@ -3389,10 +3615,13 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
                         .push(num);
                 }
             }
+            let focus = cx.focus_handle();
+            window.focus(&focus);
             cx.new(|cx| {
                 cx.observe(&pill_coord, |_, _, cx| cx.notify()).detach();
                 HudPillWindow {
                     coordinator: pill_coord,
+                    focus,
                     ns_window,
                     shell_layer,
                 }
@@ -3479,7 +3708,8 @@ pub(crate) fn start_metric(name: &str, started: Instant) {
 
 /// Real startup paths, without registering hotkeys or publishing personal captures.
 pub fn run_start_benchmark() {
-    Application::new().run(|cx: &mut App| {
+    let app = Application::new().with_assets(crate::icons::Assets);
+    app.run(|cx: &mut App| {
         let quick_stop = std::env::var("SCRAWL_BENCH_QUICK_STOP").as_deref() == Ok("1");
         let (sender, _receiver) = flume::unbounded();
         let telemetry = SharedCaptureTelemetry::new(sender);
@@ -3537,7 +3767,8 @@ pub fn run_app(
     start_iphone_immediately: bool,
     screenshot_out: Option<PathBuf>,
 ) {
-    Application::new().run(move |cx: &mut App| {
+    let app = Application::new().with_assets(crate::icons::Assets);
+    app.run(move |cx: &mut App| {
         scrawl_log(format!("run_app started pid={}", std::process::id()));
         let (ui_sender, ui_receiver) = flume::unbounded();
         crate::phone::start_ingest_server(ui_sender.clone());
@@ -3903,6 +4134,63 @@ mod tests {
     }
 
     #[test]
+    fn selection_modes_cycle_in_hud_order() {
+        use SelectionMode::{Area, Iphone, Screen, Window};
+        let walk = |has_iphone: bool, forward: bool| {
+            let mut mode = Area;
+            let mut seen = Vec::new();
+            for _ in 0..5 {
+                mode = mode.cycled(forward, has_iphone);
+                seen.push(mode);
+            }
+            seen
+        };
+        assert_eq!(walk(true, true), [Window, Screen, Iphone, Area, Window]);
+        assert_eq!(walk(true, false), [Iphone, Screen, Window, Area, Iphone]);
+        assert_eq!(walk(false, true), [Window, Screen, Area, Window, Screen]);
+        assert_eq!(walk(false, false), [Screen, Window, Area, Screen, Window]);
+        // An unplugged phone leaves the picker on a mode that is no longer listed.
+        assert_eq!(Iphone.cycled(true, false), Area);
+        assert_eq!(Iphone.cycled(false, false), Screen);
+    }
+
+    #[test]
+    fn digits_pick_modes_by_hud_position() {
+        use SelectionMode::{Area, Iphone, Screen, Window};
+        let pick = |key, has_iphone| SelectionMode::from_digit(key, has_iphone);
+        assert_eq!(pick("1", true), Some(Area));
+        assert_eq!(pick("2", true), Some(Window));
+        assert_eq!(pick("3", false), Some(Screen));
+        assert_eq!(pick("4", true), Some(Iphone));
+        assert_eq!(pick("4", false), None);
+        assert_eq!(pick("0", true), None);
+        assert_eq!(pick("5", true), None);
+        assert_eq!(pick("a", true), None);
+    }
+
+    #[test]
+    fn selecting_row_width_mirrors_layout() {
+        let segment = |label: f32| label + 2.0 * SEG_PX + SEG_ICON + SEG_ICON_GAP;
+        let divider = 1.0 + 2.0 * DIVIDER_MX;
+        // Three segments, divider, ✕: four gaps between five items.
+        assert_eq!(
+            selecting_row_width(&[30.0, 50.0, 45.0], None),
+            segment(30.0) + segment(50.0) + segment(45.0) + divider + CHIP_H + 4.0 * CHIP_GAP
+        );
+        // A fourth segment and the Record chip each add their width and one gap.
+        assert_eq!(
+            selecting_row_width(&[30.0, 50.0, 45.0, 42.0], Some(70.0)),
+            selecting_row_width(&[30.0, 50.0, 45.0], None) + segment(42.0) + 70.0 + 2.0 * CHIP_GAP
+        );
+        // The widest row (generous label estimates) still fits the pill window.
+        let widest = selecting_row_width(&[34.0, 56.0, 50.0, 46.0], Some(2.0 * CHIP_PX + 52.0));
+        assert!(
+            widest + 2.0 * ISLAND_INSET <= PILL_WINDOW_W - 16.0,
+            "{widest}"
+        );
+    }
+
+    #[test]
     fn island_spring_settles_without_large_overshoot() {
         let (mut x, mut v) = (200.0_f32, 0.0_f32);
         let mut peak = x;
@@ -3979,6 +4267,15 @@ mod tests {
             split_timeline_line("0:01 “hello”"),
             ("0:01", "“hello”", false)
         );
+    }
+
+    #[test]
+    fn last_used_mode_keys_round_trip() {
+        for mode in SelectionMode::ALL {
+            assert_eq!(SelectionMode::from_key(mode.key()), Some(mode));
+        }
+        assert_eq!(SelectionMode::from_key("iphone\n"), Some(SelectionMode::Iphone));
+        assert_eq!(SelectionMode::from_key("fullscreen"), None);
     }
 
     #[test]
