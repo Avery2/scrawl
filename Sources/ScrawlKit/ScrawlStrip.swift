@@ -119,20 +119,22 @@
       }
     }
 
-    /// Invisible rectangles that tell `OverlayWindow` where touches belong to the strip.
+    /// Invisible rectangles that tell `OverlayWindow` where touches belong to the strip. Each is
+    /// measured before `.position`, which expands a view to fill its parent: measured after it, the
+    /// region was the whole screen and the overlay swallowed every tap meant for the app.
     @ViewBuilder private func regions(_ geometry: LiquidStrip.Geometry) -> some View {
       if geometry.alpha > 0.05, !geometry.body.isEmpty {
         Color.clear
           .frame(width: geometry.body.width, height: geometry.body.height)
-          .position(x: geometry.body.midX, y: geometry.body.midY)
           .reportFrame(.strip, to: actions.reportFrame)
+          .position(x: geometry.body.midX, y: geometry.body.midY)
           .allowsHitTesting(false)
       }
       if geometry.bubbleInteractive, let bubble = geometry.bubble {
         Color.clear
           .frame(width: bubble.width, height: bubble.height)
-          .position(x: bubble.midX, y: bubble.midY)
           .reportFrame(.bubble, to: actions.reportFrame)
+          .position(x: bubble.midX, y: bubble.midY)
           .allowsHitTesting(false)
       }
     }
