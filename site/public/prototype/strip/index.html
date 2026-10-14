@@ -1,0 +1,1373 @@
+<!doctype html>
+<!--
+  PROTOTYPE, throwaway. Three motion variants of ScrawlKit's recording strip
+  (Sources/ScrawlKit/ScrawlStrip.swift), switchable with ?variant=A|B|C, on a fake
+  UpDown-style workout screen. Plain HTML/CSS/JS, no build step, no network.
+  Springs use SwiftUI's mapping: .spring(duration: d, bounce: b) -> k = (2π/d)², c = 4π(1-b)/d.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#000000">
+<title>PROTOTYPE · ScrawlKit strip motion</title>
+<style>
+:root { --red: #FF3B30; --green: #30D158; --yellow: #FFD60A; --speed: 1; color-scheme: dark; }
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none; background: #000; color: #fff;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", system-ui, sans-serif;
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-font-smoothing: antialiased; }
+button { font: inherit; color: inherit; }
+
+#viewport { position: fixed; inset: 0; display: grid; place-items: center; }
+#stage { position: relative; width: 100vw; height: 100vh; height: 100dvh; overflow: hidden; background: #0a0a0d; touch-action: none; transform-origin: center; }
+#island { display: none; }
+@media (min-width: 720px) {
+  body { background: radial-gradient(1200px 800px at 30% 20%, #1d1f2b, #050507); }
+  #stage { width: 393px; height: 852px; border-radius: 56px; box-shadow: 0 0 0 11px #18181b, 0 0 0 12px #3a3a40, 0 50px 100px rgba(0,0,0,.7); }
+  #island { display: block; position: absolute; top: 11px; left: 50%; width: 124px; height: 36px; margin-left: -62px; border-radius: 20px; background: #000; z-index: 50; }
+}
+
+/* ---------- fake app ---------- */
+#app { position: absolute; inset: 0; padding: calc(var(--st, 0px) + 26px) 18px 0; overflow: hidden; }
+.nav { display: flex; align-items: center; justify-content: space-between; height: 36px; color: #0A84FF; font-size: 17px; }
+.nav b { color: #fff; font-weight: 600; }
+.nav .more { width: 32px; height: 32px; border-radius: 16px; background: #1c1c22; display: grid; place-items: center; color: #fff; font-size: 13px; letter-spacing: 1px; }
+h1 { margin: 6px 0 12px; font-size: 32px; font-weight: 700; letter-spacing: -.5px; }
+.hero { position: relative; border-radius: 26px; padding: 18px 18px 16px; overflow: hidden; background: #15151c; }
+.blob { position: absolute; border-radius: 50%; filter: blur(30px); opacity: .85; }
+.blob.b1 { width: 220px; height: 180px; left: -40px; top: -60px; background: #ff375f; }
+.blob.b2 { width: 220px; height: 200px; right: -70px; top: 30px; background: #5e5ce6; }
+.blob.b3 { width: 160px; height: 140px; left: 120px; bottom: -80px; background: #ff9f0a; }
+.nums { position: relative; display: flex; align-items: flex-end; gap: 10px; font-family: ui-rounded, "SF Pro Rounded", -apple-system, system-ui; }
+.num .roll { font-size: 84px; font-weight: 700; line-height: 1; letter-spacing: -2px; font-variant-numeric: tabular-nums; display: flex; }
+.num .unit { font-size: 13px; font-weight: 700; letter-spacing: 1.5px; opacity: .75; margin-top: 4px; }
+.nums .sep { font-size: 48px; opacity: .5; padding-bottom: 26px; }
+.dg { display: inline-block; height: 1em; overflow: hidden; }
+.dg .col { display: block; transition: transform .7s cubic-bezier(.2,.9,.2,1); }
+.dg .col i { display: block; height: 1em; font-style: normal; }
+.bars { position: relative; display: flex; align-items: flex-end; gap: 5px; height: 54px; margin-top: 14px; }
+.bars i { flex: 1; border-radius: 4px; background: linear-gradient(#fff, rgba(255,255,255,.35)); opacity: .9; transition: height .9s cubic-bezier(.2,.9,.2,1); }
+.done { display: block; width: 100%; height: 56px; margin: 14px 0 18px; border: 0; border-radius: 18px; background: var(--green); color: #00210b; font-size: 19px; font-weight: 800; letter-spacing: 1px; }
+.done:active { transform: scale(.98); }
+.lh { font-size: 13px; font-weight: 600; color: #8e8e93; letter-spacing: .5px; margin: 0 4px 8px; text-transform: uppercase; }
+.row { display: flex; align-items: center; gap: 12px; height: 58px; padding: 0 14px; margin-bottom: 8px; border-radius: 16px; background: #16161d; }
+.row .badge { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; font-weight: 800; font-size: 15px; color: #000; }
+.row .t { flex: 1; font-size: 16px; font-weight: 600; }
+.row .t small { display: block; font-size: 13px; color: #8e8e93; font-weight: 500; }
+.row .chip { padding: 6px 10px; border-radius: 10px; font-size: 13px; font-weight: 700; }
+
+#ink { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+#ink path { fill: none; stroke: var(--red); stroke-width: 4.5; stroke-linecap: round; stroke-linejoin: round; transition: opacity .35s; }
+#overlay { position: absolute; inset: 0; pointer-events: none; }
+#overlay .hit { pointer-events: auto; }
+#protoLabel { position: absolute; z-index: 60; top: calc(var(--st, 0px) + 6px); left: 50%; transform: translateX(-50%); padding: 4px 8px; border-radius: 8px; background: #FFD60A; color: #000; font: 800 10px/1 -apple-system, system-ui; letter-spacing: 1px; pointer-events: none; }
+#hint { position: absolute; z-index: 5; left: 0; right: 0; top: 44%; text-align: center; font-size: 13px; color: rgba(255,255,255,.55); pointer-events: none; transition: opacity .3s; }
+
+/* ---------- glass ---------- */
+.glass { position: absolute; left: 0; top: 0;
+  background: rgba(18,18,24,.42);
+  -webkit-backdrop-filter: blur(14px) saturate(190%) brightness(1.06);
+  backdrop-filter: blur(14px) saturate(190%) brightness(1.06);
+  box-shadow: inset 0 .5px 0 rgba(255,255,255,.55), inset 0 0 0 .5px rgba(255,255,255,.2), inset 0 -10px 18px -12px rgba(255,255,255,.22),
+              0 12px 30px -8px rgba(0,0,0,.6), 0 2px 6px rgba(0,0,0,.28); }
+.glass::after { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  background: linear-gradient(160deg, rgba(255,255,255,.22) 0%, rgba(255,255,255,.05) 26%, transparent 55%, rgba(255,255,255,.07) 100%); }
+
+/* ---------- strip parts ---------- */
+.sbtn { position: relative; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; background: none; color: rgba(255,255,255,.88); touch-action: manipulation; cursor: pointer; }
+.sbtn .ic { width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; transition: background-color .15s, color .15s, transform .15s, opacity .15s; }
+.sbtn.pressed .ic { transform: scale(.86); opacity: .7; }
+.sbtn.on { color: var(--red); }
+.sbtn.on .ic { background: rgba(255,59,48,.22); }
+.sbtn.send .ic { background: var(--red); color: #fff; }
+.divider { width: 44px; height: 9px; display: grid; place-items: center; }
+.divider::before { content: ""; width: 18px; height: 1px; transform: scaleY(.5); background: rgba(255,255,255,.35); }
+.dotrow { width: 44px; height: 42px; display: grid; place-items: center; touch-action: none; cursor: grab; }
+.rdot svg { display: block; overflow: visible; }
+.rdot .core { transform-box: fill-box; transform-origin: center; }
+.mono { font-variant-numeric: tabular-nums; }
+.bubtext { font-size: 13px; font-weight: 600; white-space: nowrap; display: inline-flex; align-items: center; gap: 7px; }
+.bubtext .dim { color: rgba(255,255,255,.72); }
+.bubtext .sep { color: rgba(255,255,255,.4); }
+.linkbtn { border: 0; background: none; padding: 10px 6px; margin: -10px -6px; font-weight: 700; color: #fff; cursor: pointer; touch-action: manipulation; }
+.chipbtn { border: 0; display: inline-flex; align-items: center; gap: 4px; padding: 4px 9px; border-radius: 99px; background: rgba(255,255,255,.18); font-size: 13px; font-weight: 600; color: #fff; cursor: pointer; touch-action: manipulation; position: relative; }
+.chipbtn::after { content: ""; position: absolute; inset: -8px; }
+.spin { width: 18px; height: 18px; position: relative; animation: spin calc(.8s / var(--speed)) steps(8) infinite; }
+.spin i { position: absolute; left: 8px; top: 0; width: 2px; height: 5px; border-radius: 1px; background: #fff; transform-origin: 1px 9px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* A */
+.a-svg { position: absolute; left: 0; top: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.a-glass { position: absolute; left: 0; top: 0; background: rgba(18,18,24,.42);
+  -webkit-backdrop-filter: blur(14px) saturate(190%) brightness(1.06); backdrop-filter: blur(14px) saturate(190%) brightness(1.06); }
+.a-col { position: absolute; left: 0; top: 0; width: 44px; }
+.a-col > * { will-change: transform, opacity; }
+.a-icon { position: absolute; left: 0; top: 0; width: 42px; height: 42px; display: grid; place-items: center; }
+.a-bubble { position: absolute; left: 0; top: 0; padding: 8px 12px; }
+
+/* B */
+.b-cap { overflow: hidden; }
+.b-label { position: absolute; top: 0; bottom: 0; display: flex; align-items: center; padding: 0 2px 0 14px; }
+.lead .b-label { padding: 0 14px 0 2px; }
+.b-row { position: absolute; left: 0; top: 0; transform-origin: center; }
+.b-core { position: absolute; left: 0; top: 0; width: 36px; height: 36px; }
+.b-core svg { display: block; overflow: visible; }
+.b-core .prog { transition: stroke .2s; }
+.b-time { height: 30px; display: flex; align-items: center; padding: 0 11px; border-radius: 15px; }
+
+/* C */
+.c-drawer { overflow: hidden; }
+.c-c { position: absolute; left: 0; top: 0; visibility: hidden; }
+.c-c.show { visibility: visible; }
+.c-hz { height: 44px; display: flex; align-items: center; white-space: nowrap; width: max-content; padding-left: 16px; }
+.lead .c-hz { flex-direction: row-reverse; padding-left: 0; padding-right: 16px; }
+.c-hz .bubtext { gap: 7px; }
+.c-hz .edgeic { width: 46px; height: 44px; display: grid; place-items: center; flex: none; }
+.c-bar { position: absolute; left: 14px; bottom: 5px; height: 2px; border-radius: 1px; background: rgba(255,255,255,.55); transform-origin: left; }
+.lead .c-bar { left: auto; right: 14px; transform-origin: right; }
+.c-glow { position: absolute; top: 0; width: 3px; height: 100%; border-radius: 2px;
+  background: linear-gradient(transparent, var(--red) 25%, var(--red) 75%, transparent);
+  box-shadow: 0 0 14px 2px rgba(255,59,48,.65); }
+.c-time { height: 30px; display: flex; align-items: center; border-radius: 15px; overflow: hidden; }
+.c-time > span { position: absolute; top: 0; line-height: 30px; padding: 0 12px; }
+
+/* ---------- prototype chrome ---------- */
+#ui { position: fixed; z-index: 100; left: 0; right: 0; bottom: 0; padding: 0 8px calc(env(safe-area-inset-bottom) + 8px); display: flex; flex-direction: column; align-items: center; gap: 8px; pointer-events: none; touch-action: manipulation; }
+@media (min-width: 900px) { #ui { left: auto; right: 24px; bottom: 24px; width: 360px; } }
+#ui > * { pointer-events: auto; }
+#panel { width: 100%; max-width: 440px; padding: 8px; border-radius: 16px; background: rgba(28,28,32,.96); border: 1px solid rgba(255,255,255,.12); box-shadow: 0 10px 40px rgba(0,0,0,.6); font-size: 12px; }
+#panel.closed { display: none; }
+.prow { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+.pbtn { flex: 1; height: 32px; border: 0; border-radius: 9px; background: #3a3a40; font-weight: 600; font-size: 13px; cursor: pointer; padding: 0 8px; white-space: nowrap; }
+.pbtn.primary { background: var(--red); }
+.pbtn.on { background: #0A84FF; }
+.ptog { display: flex; align-items: center; gap: 5px; height: 32px; padding: 0 8px; border-radius: 9px; background: #2c2c31; cursor: pointer; white-space: nowrap; }
+.ptog input { width: 16px; height: 16px; margin: 0; accent-color: #0A84FF; }
+.seg { display: flex; border-radius: 9px; overflow: hidden; background: #2c2c31; }
+.seg button { border: 0; background: none; height: 30px; padding: 0 8px; font-size: 12px; font-weight: 600; cursor: pointer; }
+.seg button.sel { background: #0A84FF; }
+.knobs { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 10px; margin-bottom: 4px; }
+.knob { display: grid; grid-template-columns: 52px 1fr 38px; align-items: center; gap: 4px; height: 28px; }
+.knob span { color: #aeaeb2; font-size: 11px; }
+.knob output { font: 600 11px ui-monospace, Menlo, monospace; text-align: right; }
+.knob input { width: 100%; height: 24px; margin: 0; accent-color: #0A84FF; }
+#readout { margin: 0; padding: 5px 7px; border-radius: 8px; background: #000; font: 10.5px/1.4 ui-monospace, Menlo, monospace; color: #d1d1d6; white-space: pre-wrap; -webkit-user-select: text; user-select: text; }
+#switcher { display: flex; align-items: center; gap: 2px; padding: 4px; border-radius: 99px; background: #fff; color: #000; box-shadow: 0 8px 30px rgba(0,0,0,.5); }
+#switcher button { border: 0; background: none; height: 40px; min-width: 40px; border-radius: 99px; font-size: 15px; font-weight: 700; cursor: pointer; color: #000; }
+#switcher #vlabel { padding: 0 10px; min-width: 170px; }
+#switcher #togglePanel { background: #e5e5ea; }
+</style>
+</head>
+<body>
+<div id="viewport">
+  <div id="stage">
+    <div id="app">
+      <div class="nav"><span>‹ Today</span><b>Push Day</b><span class="more">•••</span></div>
+      <h1>Bench Press</h1>
+      <div class="hero" id="hero">
+        <div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div>
+        <div class="nums">
+          <div class="num"><div class="roll" id="reps"></div><div class="unit">REPS</div></div>
+          <div class="sep">·</div>
+          <div class="num"><div class="roll" id="lbs"></div><div class="unit">LBS</div></div>
+        </div>
+        <div class="bars" id="bars"></div>
+      </div>
+      <button class="done" id="done">DONE</button>
+      <div class="lh">Sets</div>
+      <div class="row"><div class="badge" style="background:#ff9f0a">1</div><div class="t">80 × 165 lbs<small>Warm-up</small></div><div class="chip" style="background:#3a2a0a;color:#ff9f0a">−2 RIR</div></div>
+      <div class="row"><div class="badge" style="background:#64d2ff">2</div><div class="t">76 × 175 lbs<small>Working</small></div><div class="chip" style="background:#0a2a3a;color:#64d2ff">PR</div></div>
+      <div class="row"><div class="badge" style="background:#bf5af2">3</div><div class="t">72 × 175 lbs<small>Working</small></div><div class="chip" style="background:#2a0a3a;color:#bf5af2">1:30</div></div>
+      <div class="row"><div class="badge" style="background:#30d158">4</div><div class="t">— × 180 lbs<small>Top set</small></div><div class="chip" style="background:#0a3a1a;color:#30d158">Next</div></div>
+    </div>
+    <div id="hint">Three-finger hold, or Start recording</div>
+    <svg id="ink"></svg>
+    <div id="overlay"></div>
+    <div id="island"></div>
+    <div id="protoLabel">PROTOTYPE</div>
+  </div>
+</div>
+
+<div id="ui">
+  <div id="panel">
+    <div class="prow">
+      <button class="pbtn primary" id="bStart">● Start recording</button>
+      <button class="pbtn" id="bAuto">▶ Auto-play</button>
+      <label class="ptog"><input type="checkbox" id="cFail"> Fail next</label>
+    </div>
+    <div class="knobs">
+      <label class="knob"><span>Response</span><input type="range" id="kD" min="0.15" max="1.2" step="0.01"><output id="oD"></output></label>
+      <label class="knob"><span>Bounce</span><input type="range" id="kB" min="-0.3" max="0.7" step="0.01"><output id="oB"></output></label>
+      <label class="knob"><span>Exit</span><input type="range" id="kE" min="0.15" max="1" step="0.01"><output id="oE"></output></label>
+      <label class="knob"><span>Stagger</span><input type="range" id="kS" min="0" max="0.15" step="0.005"><output id="oS"></output></label>
+    </div>
+    <div class="prow">
+      <div class="seg" id="speed"><button data-s="0.25">0.25×</button><button data-s="0.5">0.5×</button><button data-s="1">1×</button></div>
+      <label class="ptog"><input type="checkbox" id="cReduce"> Reduce motion</label>
+      <button class="pbtn" id="bReset">Reset</button>
+    </div>
+    <pre id="readout"></pre>
+  </div>
+  <div id="switcher">
+    <button id="prev" aria-label="Previous variant">‹</button>
+    <button id="vlabel"></button>
+    <button id="next" aria-label="Next variant">›</button>
+    <button id="togglePanel" aria-label="Toggle controls">⚙︎</button>
+  </div>
+</div>
+
+<script>
+'use strict'
+// ======================================================================
+// Utilities
+// ======================================================================
+const $ = (s, r = document) => r.querySelector(s)
+function el(tag, cls, parent, html) {
+  const e = document.createElement(tag)
+  if (cls) e.className = cls
+  if (html != null) e.innerHTML = html
+  if (parent) parent.appendChild(e)
+  return e
+}
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v))
+const clamp01 = v => clamp(v, 0, 1)
+const lerp = (a, b, t) => a + (b - a) * t
+const f2 = v => (Math.round(v * 100) / 100).toFixed(2)
+const fmtTime = s => { s = Math.max(0, Math.floor(s)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}` }
+
+// ======================================================================
+// Knobs
+// ======================================================================
+const DEFAULTS = { d: 0.42, b: 0.18, e: 0.34, st: 0.045, speed: 1 }
+const K = { ...DEFAULTS }
+const qs = new URLSearchParams(location.search)
+for (const k of ['d', 'b', 'e', 'st', 'speed']) if (qs.has(k) && !isNaN(+qs.get(k))) K[k] = +qs.get(k)
+const mqReduce = matchMedia('(prefers-reduced-motion: reduce)')
+let REDUCED = mqReduce.matches || qs.get('reduce') === '1'
+
+// ======================================================================
+// Spring solver (SwiftUI's duration/bounce mapping, mass 1)
+// ======================================================================
+function springParams(duration, bounce) {
+  const k = (2 * Math.PI / duration) ** 2
+  const c = bounce >= 0 ? 4 * Math.PI * (1 - bounce) / duration : 4 * Math.PI / (duration * (1 + bounce))
+  return { k, c }
+}
+// 'change' = the knobs; 'exit' = no bounce; 'quick' = half response, no bounce;
+// { m, b } = response × m with bounce b (defaults to the knob); { abs, d, b } = absolute.
+function resolveCfg(cfg) {
+  if (!cfg || cfg === 'change') return springParams(K.d, K.b)
+  if (cfg === 'exit') return springParams(K.e, 0)
+  if (cfg === 'quick') return springParams(Math.max(0.1, K.d * 0.5), 0)
+  if (cfg.abs) return springParams(cfg.d, cfg.b ?? 0)
+  return springParams(Math.max(0.05, K.d * (cfg.m ?? 1)), cfg.b ?? K.b)
+}
+const wobble = () => clamp(K.b + 0.2, 0, 0.85)
+let INSTANT = false
+class Spring {
+  constructor(x = 0, cfg = 'change') { this.x = x; this.v = 0; this.t = x; this.cfg = cfg }
+  to(t, cfg) { if (cfg !== undefined) this.cfg = cfg; this.t = t; if (INSTANT) { this.x = t; this.v = 0 } return this }
+  set(x, v = 0) { this.x = this.t = x; this.v = v; return this }
+  step(dt) {
+    if (this.x === this.t && this.v === 0) return
+    const { k, c } = resolveCfg(this.cfg)
+    const n = Math.max(1, Math.ceil(dt / 0.004)), h = dt / n
+    for (let i = 0; i < n; i++) {
+      const a = -k * (this.x - this.t) - c * this.v
+      this.v += a * h
+      this.x += this.v * h
+    }
+    if (Math.abs(this.v) < 1e-4 && Math.abs(this.x - this.t) < 1e-4) { this.x = this.t; this.v = 0 }
+  }
+}
+
+// ======================================================================
+// Simulated clock + timers (slow-motion scales everything, timers included)
+// ======================================================================
+let simT = 0
+let timers = []
+function after(sec, fn, tag = 'app') { const t = { at: simT + sec, fn, tag, dead: false }; timers.push(t); return t }
+function clearTimers(tag) { for (const t of timers) if (t.tag === tag) t.dead = true; timers = timers.filter(t => !t.dead) }
+function runTimers() {
+  if (!timers.length) return
+  const due = timers.filter(t => t.at <= simT)
+  if (!due.length) return
+  timers = timers.filter(t => t.at > simT)
+  due.sort((a, b) => a.at - b.at).forEach(t => { if (!t.dead) t.fn() })
+}
+// Runs a tag's pending timers right now (used to jump to a state without animating).
+function flushTimers(tag) {
+  for (let i = 0; i < 200; i++) {
+    const list = timers.filter(t => t.tag === tag && !t.dead).sort((a, b) => a.at - b.at)
+    if (!list.length) return
+    const t = list[0]
+    t.dead = true
+    timers = timers.filter(x => x !== t)
+    t.fn()
+  }
+}
+
+// ======================================================================
+// Stage metrics
+// ======================================================================
+const stage = $('#stage'), overlay = $('#overlay'), ink = $('#ink'), ui = $('#ui'), panel = $('#panel')
+const M = { W: 393, H: 852, safeT: 0, safeB: 0, reserveB: 0, scale: 1, framed: false }
+const HALF_H = 91.5 // half of 42 + 44*3 + 9
+const ROW = { dot: -70.5, draw: -27.5, div: -1, discard: 25.5, send: 69.5 }
+
+function measure() {
+  M.framed = innerWidth >= 720
+  stage.style.transform = ''
+  if (M.framed) {
+    const s = Math.min(1, (innerHeight - 32) / 852, (innerWidth - (innerWidth >= 900 ? 420 : 0) - 32) / 393)
+    stage.style.transform = `scale(${Math.max(0.4, s)})`
+    if (innerWidth >= 900) stage.style.marginRight = '380px'; else stage.style.marginRight = ''
+  } else stage.style.marginRight = ''
+  M.W = stage.offsetWidth
+  M.H = stage.offsetHeight
+  const r = stage.getBoundingClientRect()
+  M.scale = r.width / M.W
+  if (M.framed) { M.safeT = 50; M.safeB = 30 } else {
+    const probe = el('div', '', document.body)
+    probe.style.cssText = 'position:fixed;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom);visibility:hidden'
+    const cs = getComputedStyle(probe)
+    M.safeT = parseFloat(cs.paddingTop) || 0
+    M.safeB = parseFloat(cs.paddingBottom) || 0
+    probe.remove()
+  }
+  stage.style.setProperty('--st', M.safeT + 'px')
+  // Keep the strip above the controls panel when it covers the stage.
+  const u = ui.getBoundingClientRect()
+  const overlapsX = u.right > r.left + 40 && u.left < r.right - 40
+  M.reserveB = overlapsX ? clamp((r.bottom - u.top) / M.scale, 0, M.H * 0.6) : 0
+}
+function toStage(e) {
+  const r = stage.getBoundingClientRect()
+  return { x: (e.clientX - r.left) / M.scale, y: (e.clientY - r.top) / M.scale }
+}
+
+// ======================================================================
+// State
+// ======================================================================
+const TARGET = 'UP DOWN APP'
+const st = { phase: 'idle', drawing: false, startedAt: 0, side: 'trailing', pos: 0.5, press: 'idle', failNext: false, discardAt: 0 }
+const dirOf = side => side === 'trailing' ? 1 : -1
+
+// Placement: the strip's centre, shared by all variants.
+const place = { x: new Spring(0), y: new Spring(0), held: false }
+function xRange() { const m = variant.metrics; return [m.inset + m.half, M.W - m.inset - m.half] }
+function yRange() {
+  const top = M.safeT + 8 + HALF_H
+  const bot = M.H - Math.max(M.safeB, M.reserveB) - 8 - HALF_H
+  return [top, Math.max(top, bot)]
+}
+const restX = side => { const [a, b] = xRange(); return side === 'trailing' ? b : a }
+const restY = pos => { const [a, b] = yRange(); return a + (b - a) * clamp01(pos) }
+const posFor = y => { const [a, b] = yRange(); return b - a > 0 ? clamp01((y - a) / (b - a)) : 0.5 }
+function settlePlacement(animated) {
+  if (place.held) return
+  if (animated && !REDUCED) { place.x.to(restX(st.side), 'change'); place.y.to(restY(st.pos), 'change') }
+  else { place.x.set(restX(st.side)); place.y.set(restY(st.pos)) }
+}
+
+// Reduced motion: state changes cross-fade the whole strip (fade multiplies every opacity,
+// because an ancestor opacity would break backdrop-filter).
+const G = { fade: 1 }
+let fadeAnim = null
+function applyInstant(fn) { INSTANT = true; try { fn(); flushTimers('v') } finally { INSTANT = false } }
+function reducedSwap(fn) {
+  if (fadeAnim) { applyInstant(fn); return }
+  fadeAnim = { from: 1, to: 0, t0: simT, dur: 0.11, done: () => {
+    applyInstant(fn)
+    fadeAnim = { from: 0, to: 1, t0: simT, dur: 0.11, done: () => { fadeAnim = null } }
+  } }
+}
+function stepFade() {
+  if (!fadeAnim) return
+  const p = clamp01((simT - fadeAnim.t0) / fadeAnim.dur)
+  const e = p < 0.5 ? 2 * p * p : 1 - (-2 * p + 2) ** 2 / 2
+  G.fade = lerp(fadeAnim.from, fadeAnim.to, e)
+  if (p >= 1) { const d = fadeAnim.done; fadeAnim = null; d() }
+}
+
+let note = ''
+function commit(patch) {
+  const prev = { ...st }
+  Object.assign(st, patch)
+  if (st.phase !== 'recording') { st.drawing = false; st.press = 'idle' }
+  const phaseChanged = prev.phase !== st.phase
+  if (phaseChanged && st.phase === 'recording' && prev.phase === 'idle') settlePlacement(false)
+  const apply = () => variant.update(st, prev)
+  if (REDUCED && phaseChanged) reducedSwap(apply)
+  else if (REDUCED) applyInstant(apply)
+  else apply()
+  syncInk(prev)
+  $('#hint').style.opacity = st.phase === 'idle' ? 1 : 0
+  renderReadout()
+}
+
+// ---------- flows (timings from Scrawl.swift) ----------
+function start() {
+  if (st.phase === 'recording') return
+  clearTimers('flow')
+  note = ''
+  commit({ phase: 'recording', drawing: false, startedAt: simT, press: 'idle' })
+}
+function toggleDraw() { if (st.phase === 'recording') commit({ drawing: !st.drawing }) }
+function beginSending() {
+  clearTimers('flow')
+  commit({ phase: 'sending' })
+  after(1.5, () => {
+    if (st.failNext) {
+      setFailNext(false)
+      commit({ phase: 'failed' })
+      after(8, () => { if (st.phase === 'failed') commit({ phase: 'idle' }) }, 'flow')
+    } else {
+      commit({ phase: 'sent' })
+      after(2.2, () => { if (st.phase === 'sent') commit({ phase: 'idle' }) }, 'flow')
+    }
+  }, 'flow')
+}
+function send() { if (st.phase === 'recording') beginSending() }
+function discard() {
+  if (st.phase !== 'recording') return
+  clearTimers('flow')
+  commit({ phase: 'discarded', discardAt: simT })
+  after(5, () => { if (st.phase === 'discarded') commit({ phase: 'idle' }) }, 'flow')
+}
+function undo() { if (st.phase === 'discarded') beginSending() }
+function share() {
+  if (st.phase !== 'failed') return
+  clearTimers('flow')
+  note = 'share sheet would open here'
+  commit({ phase: 'idle' })
+}
+const ACTIONS = { draw: toggleDraw, discard, send, undo, share }
+
+// Fling the strip to the other edge (auto-play), velocity-aware like a real throw.
+function flingToOtherSide() {
+  if (st.phase !== 'recording') return
+  const side = st.side === 'trailing' ? 'leading' : 'trailing'
+  place.x.v = dirOf(side) * 2200
+  place.y.v = -300
+  commit({ side, pos: clamp01(st.pos + (Math.random() - 0.5) * 0.3) })
+  if (REDUCED) applyInstant(() => settlePlacement(true)); else settlePlacement(true)
+}
+
+// ======================================================================
+// Shared strip pieces
+// ======================================================================
+const ICON = {
+  pencil: '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M15.2 4.2l4.6 4.6L9.2 19.4l-5.6 1 1-5.6z"/><path d="M13 6.4l4.6 4.6"/></svg>',
+  xmark: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>',
+  arrow: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19.5V5M5.5 11.2L12 4.7l6.5 6.5"/></svg>',
+  check: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#30D158" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.8l4.4 4.4L19 7.6"/></svg>',
+  warn: '<svg viewBox="0 0 24 24" width="19" height="19"><path d="M12 3.2c.5 0 1 .3 1.3.8l8.3 14.6c.6 1-.2 2.2-1.3 2.2H3.7c-1.1 0-1.9-1.2-1.3-2.2L10.7 4c.3-.5.8-.8 1.3-.8z" fill="#FFD60A"/><path d="M12 9.2v5" stroke="#000" stroke-width="2.1" stroke-linecap="round"/><circle cx="12" cy="17.3" r="1.2"/></svg>',
+  trash: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="rgba(255,255,255,.62)" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 6.5h15M9.5 6.5V4.6h5v1.9M6.6 6.5l.9 13h9l.9-13M10.2 10.2v6M13.8 10.2v6"/></svg>',
+  share: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14.5V3.8M8 7.6l4-3.8 4 3.8M7.5 10.5H5.8v9.7h12.4v-9.7h-1.7"/></svg>',
+}
+const SPINNER = '<div class="spin">' + Array.from({ length: 8 }, (_, i) => `<i style="transform:rotate(${i * 45}deg);opacity:${(1 - i * 0.1).toFixed(2)}"></i>`).join('') + '</div>'
+const BUBBLE = {
+  elapsed: () => '<span class="bubtext"><span class="mono" data-elapsed>0:00</span></span>',
+  sent: () => `<span class="bubtext">Sent to ${TARGET}</span>`,
+  failed: () => `<span class="bubtext">Mac didn't answer <button class="chipbtn" data-act="share">${ICON.share}Share</button></span>`,
+  discarded: () => '<span class="bubtext"><span class="dim">Discarded</span><span class="sep">·</span><button class="linkbtn" data-act="undo">Undo</button></span>',
+}
+
+// Pulsing red dot; the hairline ring fills once per minute.
+function makeDot() {
+  const C = 2 * Math.PI * 8.375
+  const w = el('div', 'rdot')
+  w.innerHTML = `<svg viewBox="0 0 18 18" width="18" height="18"><circle cx="9" cy="9" r="8.375" fill="none" stroke="rgba(255,255,255,.16)" stroke-width="1.25"/><circle class="ring" cx="9" cy="9" r="8.375" fill="none" stroke="rgba(255,255,255,.75)" stroke-width="1.25" stroke-linecap="round" transform="rotate(-90 9 9)" stroke-dasharray="${C}" stroke-dashoffset="${C}"/><circle class="core" cx="9" cy="9" r="4" fill="#FF3B30"/></svg>`
+  const ring = w.querySelector('.ring'), core = w.querySelector('.core')
+  return {
+    el: w,
+    update() {
+      const e = Math.max(0, simT - st.startedAt)
+      // Speeds the minute ring up 6x so you can see it move in a short session.
+      ring.setAttribute('stroke-dashoffset', C * (1 - ((e * 6) % 60) / 60))
+      const p = REDUCED ? 1 : 0.5 + 0.5 * Math.cos(e * Math.PI)
+      core.style.transform = `scale(${0.78 + 0.22 * p})`
+      core.style.opacity = 0.55 + 0.45 * p
+    },
+  }
+}
+function stripButton(kind) {
+  const b = el('button', 'sbtn hit' + (kind === 'send' ? ' send' : ''))
+  b.dataset.act = kind
+  b.setAttribute('aria-label', { draw: 'Draw', discard: 'Discard recording', send: 'Send recording' }[kind])
+  b.innerHTML = `<span class="ic">${{ draw: ICON.pencil, discard: ICON.xmark, send: ICON.arrow }[kind]}</span>`
+  return b
+}
+function dotRow(dot) { const r = el('div', 'dotrow hit'); r.appendChild(dot.el); bindDot(r); return r }
+function updateElapsed(root) {
+  const n = root.querySelector('[data-elapsed]')
+  if (n) n.textContent = fmtTime(simT - st.startedAt)
+}
+
+// Hold the dot to show the time; drag it past 8pt to move the strip; let go to snap to an edge.
+function bindDot(node) {
+  let id = null, sx = 0, sy = 0, ox = 0, oy = 0, samples = []
+  node.addEventListener('pointerdown', e => {
+    if (st.phase !== 'recording' || id !== null) return
+    e.preventDefault(); e.stopPropagation()
+    stopAuto()
+    id = e.pointerId
+    try { node.setPointerCapture(id) } catch {}
+    const p = toStage(e)
+    sx = p.x; sy = p.y; ox = place.x.x; oy = place.y.x
+    samples = [{ t: performance.now(), x: p.x, y: p.y }]
+    commit({ press: 'holding' })
+  })
+  node.addEventListener('pointermove', e => {
+    if (e.pointerId !== id) return
+    e.preventDefault()
+    const p = toStage(e), now = performance.now()
+    samples.push({ t: now, x: p.x, y: p.y })
+    while (samples.length > 2 && now - samples[0].t > 90) samples.shift()
+    const dx = p.x - sx, dy = p.y - sy
+    if (st.press !== 'dragging' && Math.hypot(dx, dy) > 8) {
+      place.held = true
+      if (navigator.vibrate) navigator.vibrate(8)
+      commit({ press: 'dragging' })
+    }
+    if (st.press === 'dragging') {
+      const [x0, x1] = xRange(), [y0, y1] = yRange()
+      const v = vel()
+      place.x.x = place.x.t = clamp(ox + dx, x0, x1)
+      place.y.x = place.y.t = clamp(oy + dy, y0, y1)
+      place.x.v = v.x / K.speed; place.y.v = v.y / K.speed
+    }
+  })
+  const vel = () => {
+    if (samples.length < 2) return { x: 0, y: 0 }
+    const a = samples[0], b = samples[samples.length - 1], dt = Math.max(0.008, (b.t - a.t) / 1000)
+    return { x: (b.x - a.x) / dt, y: (b.y - a.y) / dt }
+  }
+  const end = e => {
+    if (e.pointerId !== id) return
+    id = null
+    if (st.press === 'dragging') {
+      const v = performance.now() - samples[samples.length - 1].t > 80 ? { x: 0, y: 0 } : vel()
+      const landingX = place.x.x + v.x * 0.3
+      const landingY = place.y.x + v.y * 0.3 * 0.25
+      const side = landingX < M.W / 2 ? 'leading' : 'trailing'
+      place.held = false
+      place.x.v = v.x / K.speed; place.y.v = v.y / K.speed
+      commit({ side, pos: posFor(landingY), press: 'idle' })
+      if (REDUCED) applyInstant(() => settlePlacement(true)); else settlePlacement(true)
+    } else commit({ press: 'idle' })
+  }
+  node.addEventListener('pointerup', end)
+  node.addEventListener('pointercancel', end)
+}
+
+// Strip buttons and bubble buttons are delegated.
+overlay.addEventListener('click', e => {
+  const t = e.target.closest('[data-act]')
+  if (!t) return
+  stopAuto()
+  ACTIONS[t.dataset.act]?.()
+})
+document.addEventListener('pointerdown', e => {
+  const b = e.target.closest('.sbtn')
+  if (b) b.classList.add('pressed')
+}, true)
+const unpress = () => document.querySelectorAll('.sbtn.pressed').forEach(b => b.classList.remove('pressed'))
+document.addEventListener('pointerup', unpress, true)
+document.addEventListener('pointercancel', unpress, true)
+
+// ======================================================================
+// Variant A · Liquid morph
+// One glass body (a single clip-path) that pours into the button you pressed;
+// bubbles bud off it as droplets joined by a metaball neck.
+// ======================================================================
+function capsulePath(x, y, w, h, ox, oy) {
+  if (w <= 0.5 || h <= 0.5) return ''
+  x -= ox; y -= oy
+  const r = Math.min(w, h) / 2
+  return `M${x + r},${y}H${x + w - r}A${r},${r} 0 0 1 ${x + w},${y + r}V${y + h - r}A${r},${r} 0 0 1 ${x + w - r},${y + h}H${x + r}A${r},${r} 0 0 1 ${x},${y + h - r}V${y + r}A${r},${r} 0 0 1 ${x + r},${y}Z`
+}
+// A waisted bridge between two end caps (left cap L, right cap R), drawn clockwise so the
+// nonzero fill unions it with the capsules.
+function neckPath(L, R, half, ox, oy) {
+  const A = 0.95, sa = Math.sin(A), ca = Math.cos(A)
+  const p1x = L.x + L.r * ca - ox, p2x = R.x - R.r * ca - ox
+  if (p2x - p1x < 0.5) return ''
+  const p1t = L.y - L.r * sa - oy, p1b = L.y + L.r * sa - oy
+  const p2t = R.y - R.r * sa - oy, p2b = R.y + R.r * sa - oy
+  const mx = (p1x + p2x) / 2, my = (L.y + R.y) / 2 - oy
+  return `M${p1x},${p1t}Q${mx},${my - half} ${p2x},${p2t}L${p2x},${p2b}Q${mx},${my + half} ${p1x},${p1b}Z`
+}
+
+const VariantA = {
+  key: 'A', name: 'Liquid morph', metrics: { inset: 6, half: 21 },
+  create(root) {
+    const S = [], sp = (x, c) => { const s = new Spring(x, c); S.push(s); return s }
+    const ga = sp(0), slide = sp(16), sc = sp(1), top = sp(-21), bot = sp(21, { m: 1.12 })
+    const sx = sp(1), sy = sp(1), vsx = sp(1, { m: 0.55, b: 0.35 }), vsy = sp(1, { m: 0.55, b: 0.35 })
+    const shk = sp(0, { m: 0.45, b: 0.55 })
+    const gather = sp(0), ia = sp(0), isc = sp(1)
+    const rowA = [0, 1, 2, 3, 4].map(() => sp(0))
+    const HIDDEN_GAP = -35
+    const bw = sp(28), bh = sp(28), gap = sp(HIDDEN_GAP), ba = sp(0)
+    let bcy = 0, gatherY = 0, exiting = false, bubbleKind = null, iconKind = null, bubW = 0, bubH = 0
+
+    root.innerHTML = `
+      <svg class="a-svg"><defs><filter id="aSh" x="-50%" y="-50%" width="200%" height="200%">
+        <feGaussianBlur in="SourceAlpha" stdDeviation="9"/><feOffset dy="8" result="b"/>
+        <feComposite in="b" in2="SourceAlpha" operator="out" result="o"/>
+        <feComponentTransfer in="o"><feFuncA type="linear" slope=".6"/></feComponentTransfer></filter></defs>
+        <path class="a-shadow" filter="url(#aSh)" fill="#000"/></svg>
+      <div class="a-glass"></div>
+      <svg class="a-svg"><defs>
+        <linearGradient id="aRimG" x1="0" y1="0" x2=".35" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".75"/><stop offset=".45" stop-color="#fff" stop-opacity=".16"/><stop offset="1" stop-color="#fff" stop-opacity=".4"/></linearGradient>
+        <filter id="aRim" x="-5%" y="-5%" width="110%" height="110%">
+          <feMorphology in="SourceAlpha" operator="erode" radius=".75" result="er"/>
+          <feComposite in="SourceGraphic" in2="er" operator="out" result="ring"/>
+          <feOffset in="SourceAlpha" dy="3" result="off"/>
+          <feComposite in="SourceAlpha" in2="off" operator="out" result="cres"/>
+          <feGaussianBlur in="cres" stdDeviation="1.8" result="cb"/>
+          <feComposite in="cb" in2="SourceAlpha" operator="in" result="cbi"/>
+          <feColorMatrix in="cbi" type="matrix" values="0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 .32 0" result="shine"/>
+          <feMerge><feMergeNode in="shine"/><feMergeNode in="ring"/></feMerge></filter></defs>
+        <path class="a-rim" filter="url(#aRim)" fill="url(#aRimG)"/></svg>
+      <div class="a-col"></div>
+      <div class="a-icon"></div>
+      <div class="a-bubble"></div>`
+    const shadowP = root.querySelector('.a-shadow'), rimP = root.querySelector('.a-rim')
+    const glass = root.querySelector('.a-glass'), col = root.querySelector('.a-col')
+    const icon = root.querySelector('.a-icon'), bubble = root.querySelector('.a-bubble')
+    const dot = makeDot()
+    const rows = [dotRow(dot), stripButton('draw'), el('div', 'divider'), stripButton('discard'), stripButton('send')]
+    rows.forEach(r => col.appendChild(r))
+    const REL = [ROW.dot, ROW.draw, ROW.div, ROW.discard, ROW.send]
+
+    function setIcon(kind) {
+      iconKind = kind
+      icon.innerHTML = kind === 'sending' ? SPINNER : kind === 'sent' ? ICON.check : kind === 'failed' ? ICON.warn : kind === 'discarded' ? ICON.trash : ''
+    }
+    function showBubble(kind) {
+      bubbleKind = kind
+      bubble.innerHTML = BUBBLE[kind]()
+      updateElapsed(bubble)
+      const w = bubW = bubble.offsetWidth, h = bubH = bubble.offsetHeight
+      bcy = kind === 'elapsed' ? ROW.dot : (top.t + bot.t) / 2
+      gap.to(6, { m: 1.05, b: wobble() })
+      bw.to(w, { m: 1.0 }); bh.to(h, { m: 0.9 })
+      ba.to(1, { m: 1.25, b: 0 })
+    }
+    function hideBubble(now) {
+      bubbleKind = null
+      ba.to(0, { m: 0.35, b: 0 })
+      gap.to(HIDDEN_GAP, { m: 0.9, b: 0 }); bw.to(28, { m: 0.9, b: 0 }); bh.to(28, { m: 0.9, b: 0 })
+      if (now) { ba.set(0); gap.set(HIDDEN_GAP); bw.set(28); bh.set(28) }
+    }
+
+    function toStrip(pp) {
+      const fresh = pp === 'idle' || ga.x < 0.3
+      hideBubble(fresh)
+      if (fresh) {
+        slide.set(18); ga.set(0); sc.set(0.9); top.set(-21); bot.set(21)
+        sx.set(1.2); sy.set(0.85); gather.set(1); gatherY = 0
+        rowA.forEach(a => a.set(0)); ia.set(0)
+      } else { gatherY = (top.x + bot.x) / 2; gather.set(1); ia.to(0, 'quick') }
+      ga.to(1, 'quick'); slide.to(0, 'change'); sc.to(1, 'change')
+      sx.to(1, { m: 1.1, b: wobble() }); sy.to(1, { m: 1.1, b: wobble() })
+      top.to(-HALF_H, 'change'); bot.to(HALF_H, { m: 1.12 })
+      gather.to(0, 'change')
+      // Rows bloom from the middle outward as the drop stretches.
+      const ring = [2, 1, 0, 1, 2]
+      rowA.forEach((a, i) => after(0.04 + ring[i] * K.st, () => a.to(1, { m: 0.8, b: 0 }), 'v'))
+    }
+    function toStatus(ph, pp) {
+      const fromStrip = pp === 'recording'
+      const T = fromStrip ? (ph === 'discarded' ? ROW.discard : ROW.send) : (ga.x > 0.3 ? (top.t + bot.t) / 2 : ROW.send)
+      if (bubbleKind) hideBubble()
+      ga.to(1, 'quick'); slide.to(0, 'change'); sc.to(1, 'change')
+      // The body pours into the pressed button: the far edge travels, the near edge lags.
+      top.to(T - 21, 'change'); bot.to(T + 21, { m: 1.15 })
+      if (fromStrip) {
+        gatherY = T
+        gather.to(1, { m: 0.7, b: 0 })
+        rowA.forEach(a => a.to(0, { m: 0.4, b: 0 }))
+      } else if (pp === 'idle') { rowA.forEach(a => a.set(0)) }
+      const swap = () => {
+        setIcon(ph); ia.set(0); isc.set(0.5)
+        ia.to(1, { m: 0.7, b: 0 }); isc.to(1, { m: 0.8 })
+        if (!fromStrip && pp !== 'idle') sc.v += 1.4 // a small gulp as the content changes
+      }
+      if (fromStrip) after(0.12, swap, 'v'); else swap()
+      const bubbleAt = fromStrip ? 0.3 : 0.18
+      if (ph !== 'sending') after(bubbleAt, () => showBubble(ph), 'v')
+      if (ph === 'failed') after(0.06, () => { shk.v = -dirOf(st.side) * 900 }, 'v')
+    }
+    function toGone(pp) {
+      if (bubbleKind) hideBubble()
+      const wait = pp === 'recording' ? 0 : 0.22
+      if (pp === 'discarded') after(wait, () => {
+        exiting = true; sc.to(0.35, 'exit'); ga.to(0, 'exit'); ia.to(0, { m: 0.4, b: 0 })
+      }, 'v')
+      else after(wait, () => {
+        exiting = true
+        slide.to(90, 'exit'); sx.to(1.2, 'exit'); sy.to(0.86, 'exit')
+        ga.to(0, { abs: true, d: K.e * 1.25, b: 0 }); ia.to(0, 'exit')
+      }, 'v')
+    }
+
+    return {
+      update(st, prev) {
+        const ph = st.phase, pp = prev.phase
+        if (ph !== pp) {
+          clearTimers('v'); exiting = false
+          if (ph === 'recording') toStrip(pp)
+          else if (ph === 'idle') toGone(pp)
+          else toStatus(ph, pp)
+        }
+        if (ph === 'recording' && st.press !== prev.press) {
+          if (st.press === 'holding') showBubble('elapsed')
+          else if (bubbleKind === 'elapsed') hideBubble()
+        }
+        rows[1].classList.toggle('on', st.drawing)
+      },
+      frame(dt) {
+        S.forEach(s => s.step(dt))
+        const dir = dirOf(st.side)
+        // Squash and stretch along the direction of travel while the strip is thrown.
+        if (!REDUCED && !exiting && st.phase === 'recording') {
+          const a = Math.min(Math.abs(place.x.v) / 2600, 0.3), b = Math.min(Math.abs(place.y.v) / 2600, 0.3)
+          vsx.to(1 + a - b * 0.45); vsy.to(1 + b - a * 0.45)
+        } else { vsx.to(1); vsy.to(1) }
+        const fade = G.fade, alpha = clamp01(ga.x) * fade
+        const ax = place.x.x + dir * (slide.x + shk.x), ay = place.y.x
+        const w = 42 * sx.x * vsx.x * sc.x
+        const h = Math.max(0, (bot.x - top.x) * sy.x * vsy.x * sc.x)
+        const cy = ay + (top.x + bot.x) / 2
+        const bodyL = ax - w / 2, bodyT = cy - h / 2
+        // Bubble beside the body's inner edge.
+        const inner = ax - dir * w / 2
+        const near = inner - dir * gap.x
+        const bW = Math.max(0, bw.x), bH = Math.max(0, bh.x)
+        const bL = dir > 0 ? near - bW : near
+        const bC = ay + bcy, bT = bC - bH / 2
+        const showB = bW > 1 && (ba.x > 0.01 || gap.x > HIDDEN_GAP + 1)
+        const build = (ox, oy) => {
+          let d = capsulePath(bodyL, bodyT, w, h, ox, oy)
+          if (showB) {
+            d += capsulePath(bL, bT, bW, bH, ox, oy)
+            const NECK = 18, g = gap.x
+            if (g < NECK && g > -bH) {
+              const s = clamp01(1 - g / NECK)
+              const rb = Math.min(bW, bH) / 2, ra = w / 2
+              const capC = dir > 0 ? bL + bW - rb : bL + rb
+              const bodyY = clamp(bC, bodyT + ra, bodyT + h - ra)
+              const half = Math.min(rb, ra) * Math.sin(0.95) * (0.1 + 0.9 * s * s * s)
+              const B = { x: capC, r: rb, y: bC }, Bd = { x: ax, r: ra, y: bodyY }
+              d += dir > 0 ? neckPath(B, Bd, half, ox, oy) : neckPath(Bd, B, half, ox, oy)
+            }
+          }
+          return d
+        }
+        const dStage = build(0, 0)
+        shadowP.setAttribute('d', dStage); rimP.setAttribute('d', dStage)
+        shadowP.style.opacity = alpha; rimP.style.opacity = alpha
+        let x0 = bodyL, x1 = bodyL + w, y0 = bodyT, y1 = bodyT + h
+        if (showB) { x0 = Math.min(x0, bL); x1 = Math.max(x1, bL + bW); y0 = Math.min(y0, bT); y1 = Math.max(y1, bT + bH) }
+        x0 = Math.floor(x0 - 2); y0 = Math.floor(y0 - 2); x1 = Math.ceil(x1 + 2); y1 = Math.ceil(y1 + 2)
+        glass.style.transform = `translate(${x0}px,${y0}px)`
+        glass.style.width = (x1 - x0) + 'px'; glass.style.height = (y1 - y0) + 'px'
+        const dLocal = build(x0, y0)
+        glass.style.clipPath = glass.style.webkitClipPath = dLocal ? `path('${dLocal}')` : 'inset(50%)'
+        glass.style.opacity = alpha
+        // Controls
+        col.style.transform = `translate(${ax - 22}px,${ay - HALF_H}px)`
+        const live = st.phase === 'recording'
+        rows.forEach((r, i) => {
+          const o = rowA[i].x * alpha
+          r.style.opacity = o
+          r.style.transform = `translateY(${gather.x * (gatherY - REL[i]) * 0.7}px) scale(${1 - 0.35 * gather.x})`
+          r.style.pointerEvents = live && o > 0.3 ? 'auto' : 'none'
+        })
+        dot.update()
+        icon.style.transform = `translate(${ax - 21}px,${cy - 21}px) scale(${Math.max(0, isc.x * sc.x)})`
+        icon.style.opacity = clamp01(ia.x) * alpha
+        bubble.style.transform = `translate(${bL + bW / 2 - bubW / 2}px,${bC - bubH / 2}px)`
+        bubble.style.opacity = clamp01(ba.x) * alpha
+        bubble.style.pointerEvents = bubbleKind && ba.x > 0.5 ? 'auto' : 'none'
+        if (bubbleKind === 'elapsed') updateElapsed(bubble)
+      },
+      destroy() { root.innerHTML = '' },
+    }
+  },
+}
+
+// ======================================================================
+// Variant B · Stack & collapse
+// Controls drop one after another into the button you pressed; that button becomes a
+// progress ring, then a check; the capsule widens into a label (Dynamic Island style),
+// then retracts into a small edge tab. Rows lag behind a throw like a jelly stack.
+// ======================================================================
+const VariantB = {
+  key: 'B', name: 'Stack & collapse', metrics: { inset: 6, half: 21 },
+  create(root) {
+    const S = [], sp = (x, c) => { const s = new Spring(x, c); S.push(s); return s }
+    const ga = sp(0), ox = sp(0), cw = sp(42), top = sp(-HALF_H), bot = sp(HALF_H), shake = sp(0, { m: 0.45, b: 0.55 })
+    const show = sp(0), coreS = sp(1), fillR = sp(16), ringA = sp(0), prog = sp(0), chk = sp(0)
+    const icA = { arrow: sp(0), x: sp(0), trash: sp(0), tri: sp(0) }
+    const la = sp(0), tx = sp(0), ta = sp(0)
+    let coreY = ROW.send, countdown = false, lastPX = null, lastPY = null, labelW = 0, tw = 60
+
+    root.innerHTML = `
+      <div class="b-time glass"><span class="bubtext"><span class="mono" data-elapsed>0:00</span></span></div>
+      <div class="b-cap glass"><div class="b-label"></div></div>
+      <div class="b-rows"></div>
+      <div class="b-core"><svg viewBox="-18 -18 36 36" width="36" height="36">
+        <circle class="fill" r="16" fill="#FF3B30"/>
+        <circle class="track" r="15" fill="none" stroke="rgba(255,255,255,.18)" stroke-width="2.5"/>
+        <circle class="prog" r="15" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" transform="rotate(-90)" stroke-dasharray="94.25" stroke-dashoffset="94.25"/>
+        <g class="i-arrow" color="#fff"><svg x="-9" y="-9" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19.5V5M5.5 11.2L12 4.7l6.5 6.5"/></svg></g>
+        <g class="i-x" color="rgba(255,255,255,.88)"><svg x="-8.5" y="-8.5" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg></g>
+        <g class="i-trash"><svg x="-8" y="-8" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,.75)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 6.5h15M9.5 6.5V4.6h5v1.9M6.6 6.5l.9 13h9l.9-13M10.2 10.2v6M13.8 10.2v6"/></svg></g>
+        <g class="i-tri"><svg x="-8.5" y="-9" width="17" height="17" viewBox="0 0 24 24"><path d="M12 3.2c.5 0 1 .3 1.3.8l8.3 14.6c.6 1-.2 2.2-1.3 2.2H3.7c-1.1 0-1.9-1.2-1.3-2.2L10.7 4c.3-.5.8-.8 1.3-.8z" fill="#FFD60A"/><path d="M12 9.2v5" stroke="#000" stroke-width="2.1" stroke-linecap="round"/><circle cx="12" cy="17.3" r="1.2"/></svg></g>
+        <path class="chk" d="M-6.5 .5l4.2 4.2L7 -5" fill="none" stroke="#30D158" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="20" stroke-dashoffset="20"/>
+      </svg></div>`
+    const time = root.querySelector('.b-time'), cap = root.querySelector('.b-cap'), label = root.querySelector('.b-label')
+    const rowsEl = root.querySelector('.b-rows'), core = root.querySelector('.b-core')
+    const q = s => core.querySelector(s)
+    const cFill = q('.fill'), cTrack = q('.track'), cProg = q('.prog'), cChk = q('.chk')
+    const cIc = { arrow: q('.i-arrow'), x: q('.i-x'), trash: q('.i-trash'), tri: q('.i-tri') }
+    const dot = makeDot()
+    const FOLLOW = [0, 0.16, 0.26, 0.36, 0.46]
+    const rows = [
+      [dotRow(dot), ROW.dot, 42], [stripButton('draw'), ROW.draw, 44], [el('div', 'divider'), ROW.div, 9],
+      [stripButton('discard'), ROW.discard, 44], [stripButton('send'), ROW.send, 44],
+    ].map(([node, rel, h], i) => {
+      const wrap = el('div', 'b-row', rowsEl); wrap.appendChild(node)
+      return { el: wrap, node, rel, h, f: FOLLOW[i], y: sp(rel), s: sp(1), a: sp(0), lx: sp(0, { m: 0.6, b: 0.4 }), ly: sp(0, { m: 0.6, b: 0.4 }) }
+    })
+
+    function labelShow(kind) {
+      label.innerHTML = BUBBLE[kind]()
+      labelW = label.offsetWidth
+      cw.to(42 + labelW + 4, { m: 1.0 })
+      la.set(0); la.to(1, { m: 0.9, b: 0 })
+    }
+    function labelHide() { la.to(0, { m: 0.35, b: 0 }); cw.to(42, { m: 0.9 }) }
+    function setRing(c) { cProg.setAttribute('stroke', c) }
+    function icons(on) { for (const k in icA) icA[k].to(k === on ? 1 : 0, k === on ? { m: 0.8 } : 'quick') }
+
+    function appear(pp) {
+      labelHide(); countdown = false
+      const fresh = pp === 'idle' || ga.x < 0.3
+      const T = fresh ? ROW.send : coreY
+      if (fresh) { ga.set(0); cw.set(5); ox.set(4); top.set(T - 18); bot.set(T + 18) }
+      rows.forEach(r => { r.y.set(T); r.s.set(0.3); r.a.set(0); r.lx.set(0); r.ly.set(0) })
+      ga.to(1, 'quick')
+      show.to(0, 'quick'); coreS.to(0.6, 'quick'); ringA.to(0, 'quick'); chk.to(0, 'quick'); icons(null)
+      // 1. The tab swells into the send button.
+      after(fresh ? 0.08 : 0, () => {
+        cw.to(42, 'change'); ox.to(0, 'change'); top.to(ROW.send - 21, 'change'); bot.to(ROW.send + 21, 'change')
+        const sr = rows[4]; sr.y.to(ROW.send, 'change'); sr.a.to(1, 'quick'); sr.s.to(1, 'change')
+      }, 'v')
+      // 2. The other controls unstack upward, one after another.
+      after(fresh ? 0.2 : 0.1, () => {
+        top.to(-HALF_H, { m: 1.1 }); bot.to(HALF_H, 'change')
+        ;[3, 2, 1, 0].forEach((ri, k) => after(k * K.st, () => {
+          const r = rows[ri]; r.y.to(r.rel, { m: 0.9 }); r.s.to(1, 'change'); r.a.to(1, { m: 0.6, b: 0 })
+        }, 'v'))
+      }, 'v')
+    }
+    function coreIn(ph, T) {
+      const tr = rows.find(r => r.rel === T); tr.a.set(0)
+      show.set(1); coreS.set(1); ringA.set(0); prog.set(0); chk.set(0)
+      for (const k in icA) icA[k].set(0)
+      if (T === ROW.send) { fillR.set(16); icA.arrow.set(1) } else { fillR.set(0); icA.x.set(1) }
+      coreTo(ph, null)
+    }
+    function coreTo(ph, pp) {
+      labelHide()
+      countdown = ph === 'discarded'
+      if (ph === 'sending') {
+        if (pp === 'discarded') prog.set(clamp01(1 - (simT - st.discardAt) / 5))
+        setRing('#fff'); fillR.to(0, 'change'); icons(null); chk.to(0, 'quick'); ringA.to(1, 'quick')
+        prog.to(0.82, { abs: true, d: 2.6, b: 0 })
+      } else if (ph === 'sent') {
+        setRing('#30D158'); prog.to(1, { m: 0.6, b: 0 })
+        after(0.14, () => chk.to(1, { m: 0.9, b: 0 }), 'v')
+        after(0.32, () => labelShow('sent'), 'v')
+      } else if (ph === 'failed') {
+        setRing('#FFD60A'); prog.to(0, { m: 1.3, b: 0.1 }); icons('tri')
+        after(0.05, () => { shake.v = -dirOf(st.side) * 700 }, 'v')
+        after(0.3, () => labelShow('failed'), 'v')
+      } else if (ph === 'discarded') {
+        setRing('rgba(255,255,255,.75)'); fillR.to(0, 'change'); icons('trash'); ringA.to(1, 'quick')
+        after(0.2, () => labelShow('discarded'), 'v')
+      }
+    }
+    function status(ph, pp) {
+      if (pp === 'recording') {
+        const T = ph === 'discarded' ? ROW.discard : ROW.send
+        coreY = T
+        const others = rows.filter(r => r.rel !== T).sort((a, b) => Math.abs(b.rel - T) - Math.abs(a.rel - T))
+        others.forEach((r, k) => after(k * K.st, () => {
+          r.y.to(T, { m: 0.8, b: 0 }); r.s.to(0.3, { m: 0.8, b: 0 }); r.a.to(0, { m: 0.8, b: 0 })
+        }, 'v'))
+        top.to(T - 21, { m: 1.25 }); bot.to(T + 21, { m: 1.25 })
+        after(others.length * K.st + K.d * 0.45, () => coreIn(ph, T), 'v')
+      } else if (pp === 'idle' || show.x < 0.5) {
+        coreY = ROW.send
+        ga.to(1, 'quick'); cw.to(42); ox.to(0); top.to(ROW.send - 21); bot.to(ROW.send + 21)
+        rows.forEach(r => r.a.set(0))
+        coreIn(ph, ROW.send)
+      } else coreTo(ph, pp)
+    }
+    function gone(pp) {
+      labelHide(); countdown = false
+      after(pp === 'recording' ? 0 : 0.2, () => {
+        icons(null); chk.to(0, 'quick'); ringA.to(0, 'quick'); fillR.to(0, 'quick')
+        coreS.to(0.4, 'quick'); show.to(0, 'quick')
+        if (pp === 'recording') rows.forEach(r => r.a.to(0, 'quick'))
+        // Retract into a small handle on the screen edge, then let go of it.
+        cw.to(5, 'change'); ox.to(4, 'change'); top.to(coreY - 18, 'change'); bot.to(coreY + 18, 'change')
+        after(0.42, () => ga.to(0, { m: 0.8, b: 0 }), 'v')
+      }, 'v')
+    }
+
+    return {
+      update(st, prev) {
+        const ph = st.phase, pp = prev.phase
+        root.classList.toggle('lead', st.side === 'leading')
+        if (ph !== pp) {
+          clearTimers('v')
+          if (ph === 'recording') appear(pp)
+          else if (ph === 'idle') gone(pp)
+          else status(ph, pp)
+        }
+        if (st.press === 'holding') { updateElapsed(time); tw = time.offsetWidth; tx.to(1, { m: 0.8 }); ta.to(1, 'quick') }
+        else { tx.to(0, { m: 0.7, b: 0 }); ta.to(0, { m: 0.7, b: 0 }) }
+        rows[1].node.classList.toggle('on', st.drawing)
+      },
+      frame(dt) {
+        S.forEach(s => s.step(dt))
+        const dir = dirOf(st.side), fade = G.fade, alpha = clamp01(ga.x) * fade
+        const live = st.phase === 'recording'
+        const ax = place.x.x + dir * shake.x, ay = place.y.x
+        // Follow-through: rows further from the grabbed dot trail the strip's motion.
+        if (lastPX !== null && live && !REDUCED) {
+          const dX = place.x.x - lastPX, dY = place.y.x - lastPY
+          if (Math.abs(dX) < 80 && Math.abs(dY) < 80) rows.forEach(r => {
+            r.lx.x = clamp(r.lx.x - dX * r.f, -24, 24)
+            r.ly.x = clamp(r.ly.x - dY * r.f * 0.5, -16, 16)
+          })
+        }
+        lastPX = place.x.x; lastPY = place.y.x
+        const outerX = ax + dir * (21 + ox.x)
+        const w = Math.max(0, cw.x), innerX = outerX - dir * w
+        const left = Math.min(outerX, innerX)
+        const tY = ay + top.x, bY = ay + bot.x + (live ? rows[4].ly.x : 0)
+        const h = Math.max(0, bY - tY)
+        const skew = live ? Math.atan(rows[4].lx.x / (ROW.send - ROW.dot)) : 0
+        cap.style.transformOrigin = `50% ${clamp(ROW.dot - top.x, 0, h)}px`
+        cap.style.transform = `translate(${left}px,${tY}px) skewX(${skew}rad)`
+        cap.style.width = w + 'px'; cap.style.height = h + 'px'
+        cap.style.borderRadius = Math.min(w, h) / 2 + 'px'
+        cap.style.opacity = alpha
+        label.style[dir > 0 ? 'right' : 'left'] = '40px'; label.style[dir > 0 ? 'left' : 'right'] = 'auto'
+        label.style.opacity = clamp01(la.x)
+        label.style.pointerEvents = la.x > 0.5 ? 'auto' : 'none'
+        rows.forEach(r => {
+          const o = clamp01(r.a.x) * alpha
+          r.el.style.transform = `translate(${ax - 22 + r.lx.x}px,${ay + r.y.x - r.h / 2 + r.ly.x}px) scale(${Math.max(0, r.s.x)})`
+          r.el.style.opacity = o
+          r.node.style.pointerEvents = live && o > 0.3 ? 'auto' : 'none'
+        })
+        dot.update()
+        core.style.transform = `translate(${ax + dir * ox.x - 18}px,${ay + coreY - 18}px) scale(${Math.max(0, coreS.x)})`
+        core.style.opacity = clamp01(show.x) * alpha
+        cFill.setAttribute('r', Math.max(0, fillR.x))
+        cTrack.style.opacity = clamp01(ringA.x)
+        const p = countdown ? clamp01(1 - (simT - st.discardAt) / 5) : clamp01(prog.x)
+        cProg.setAttribute('stroke-dashoffset', 94.25 * (1 - p))
+        cProg.style.opacity = clamp01(ringA.x) * (p > 0.01 ? 1 : 0)
+        cChk.setAttribute('stroke-dashoffset', 20 * (1 - clamp01(chk.x)))
+        for (const k in cIc) {
+          const a = clamp01(icA[k].x)
+          cIc[k].style.opacity = a
+          cIc[k].setAttribute('transform', `scale(${0.5 + 0.5 * a})`)
+        }
+        // Elapsed-time pill slides out from under the dot.
+        const stripInner = ax - dir * 21
+        const shownEdge = stripInner - dir * 6, hiddenEdge = stripInner + dir * tw * 0.8
+        const e = lerp(hiddenEdge, shownEdge, tx.x)
+        time.style.transform = `translate(${dir > 0 ? e - tw : e}px,${ay + ROW.dot - 15}px)`
+        time.style.opacity = clamp01(ta.x) * alpha
+        if (st.press === 'holding') updateElapsed(time)
+      },
+      destroy() { root.innerHTML = ''; root.classList.remove('lead') },
+    }
+  },
+}
+
+// ======================================================================
+// Variant C · Edge dock
+// The strip is a drawer docked into the screen edge. Each change tucks it into the edge,
+// swaps what's inside while hidden, and pulls it out again. Messages slide out of the edge
+// horizontally. Drawing pulls the drawer out a little and lights the edge.
+// ======================================================================
+const VariantC = {
+  key: 'C', name: 'Edge dock', metrics: { inset: 0, half: 23 },
+  create(root) {
+    const S = [], sp = (x, c) => { const s = new Spring(x, c); S.push(s); return s }
+    const ga = sp(0), dk = sp(-0.4), extra = sp(0), free = sp(0), bump = sp(0, { m: 0.45, b: 0.5 })
+    const glow = sp(0), gs = sp(0.3), tExt = sp(0)
+    const PEEK = 4
+    let shown = null, pending, tw = 0
+
+    root.innerHTML = `
+      <div class="c-glow"></div>
+      <div class="c-time glass"><span class="bubtext"><span class="mono" data-elapsed>0:00</span></span></div>
+      <div class="c-drawer glass">
+        <div class="c-c" data-k="recording"></div>
+        <div class="c-c" data-k="sending" style="width:46px;height:44px;display:grid;place-items:center">${SPINNER}</div>
+        <div class="c-c c-hz" data-k="sent"><span class="bubtext">Sent to ${TARGET}</span><span class="edgeic">${ICON.check}</span></div>
+        <div class="c-c c-hz" data-k="failed"><span class="bubtext">Mac didn't answer <button class="chipbtn" data-act="share">${ICON.share}Share</button></span><span class="edgeic">${ICON.warn}</span></div>
+        <div class="c-c c-hz" data-k="discarded"><span class="bubtext"><span class="dim">Discarded</span><span class="sep">·</span><button class="linkbtn" data-act="undo">Undo</button></span><span class="edgeic">${ICON.trash}</span><i class="c-bar"></i></div>
+      </div>`
+    const glowEl = root.querySelector('.c-glow'), time = root.querySelector('.c-time'), timeText = time.firstElementChild
+    const drawer = root.querySelector('.c-drawer')
+    const nodes = {}
+    drawer.querySelectorAll('.c-c').forEach(n => { nodes[n.dataset.k] = n })
+    const bar = root.querySelector('.c-bar')
+    const dot = makeDot()
+    const strip = nodes.recording
+    strip.style.cssText = 'width:46px;display:flex;flex-direction:column;align-items:center'
+    const drawBtn = stripButton('draw')
+    ;[dotRow(dot), drawBtn, el('div', 'divider'), stripButton('discard'), stripButton('send')].forEach(n => { n.classList.remove('hit'); strip.appendChild(n) })
+    const dims = { recording: { vis: 46, h: 183 }, sending: { vis: 46, h: 44 } }
+
+    function swap(key) {
+      shown = key
+      for (const k in nodes) nodes[k].classList.toggle('show', k === key)
+      if (key && key !== 'recording' && key !== 'sending') dims[key] = { vis: nodes[key].offsetWidth, h: 44 }
+      if (key === 'failed') after(0.18, () => { bump.v = 520 }, 'v')
+    }
+    function want(key) {
+      if (INSTANT) { swap(key); dk.set(key ? 1 : -0.4); ga.set(key ? 1 : 0); pending = undefined; return }
+      if (key === null) {
+        pending = undefined
+        dk.to(-0.4, 'exit')
+        after(K.e * 1.1, () => { if (st.phase === 'idle') { ga.to(0, 'quick'); after(0.2, () => { if (st.phase === 'idle') swap(null) }, 'v') } }, 'v')
+        return
+      }
+      ga.to(1, 'quick')
+      if (!shown) { swap(key); dk.set(-0.4); dk.to(1, 'change'); return }
+      if (key === shown) { pending = undefined; dk.to(1, 'change'); return }
+      pending = key
+      dk.to(-0.02, { m: 0.5, b: 0 })
+    }
+
+    return {
+      update(st, prev) {
+        const ph = st.phase, pp = prev.phase
+        root.classList.toggle('lead', st.side === 'leading')
+        if (ph !== pp) {
+          clearTimers('v')
+          want(ph === 'idle' ? null : ph)
+        }
+        const drawing = ph === 'recording' && st.drawing
+        extra.to(drawing ? 7 : 0, 'change')
+        glow.to(drawing ? 1 : 0, { m: 0.7, b: 0 }); gs.to(drawing ? 1 : 0.3, 'change')
+        if (st.press === 'holding') { updateElapsed(time); tw = timeText.offsetWidth + 10; tExt.to(1, { m: 0.9 }) }
+        else tExt.to(0, { m: 0.6, b: 0 })
+        if (st.press === 'dragging') free.to(1, { m: 0.55, b: 0.1 })
+        else if (prev.press === 'dragging') after(0.08, () => free.to(0, { m: 0.7, b: wobble() }), 'press')
+        drawBtn.classList.toggle('on', st.drawing)
+      },
+      frame(dt) {
+        S.forEach(s => s.step(dt))
+        if (pending !== undefined && dk.x < 0.1) { swap(pending); pending = undefined; dk.to(1, 'change') }
+        const dir = dirOf(st.side), fade = G.fade, alpha = clamp01(ga.x) * fade
+        const edgeX = dir > 0 ? M.W : 0
+        const ay = place.y.x
+        // Edge light while drawing.
+        glowEl.style.left = (dir > 0 ? M.W - 3 : 0) + 'px'
+        glowEl.style.transformOrigin = `50% ${ay}px`
+        glowEl.style.transform = `scaleY(${Math.max(0, gs.x)})`
+        glowEl.style.opacity = clamp01(glow.x) * fade
+        const L = shown && dims[shown]
+        if (!L) { drawer.style.opacity = 0; time.style.opacity = 0; drawer.style.pointerEvents = 'none'; return }
+        const isStrip = shown === 'recording'
+        const vis = L.vis + (isStrip ? extra.x : 0)
+        const tuck = (1 - dk.x) * (vis - PEEK)
+        const outerVis = place.x.x + dir * 23
+        const inner = outerVis - dir * vis + dir * tuck + dir * bump.x
+        const outer = lerp(edgeX + dir * 30, outerVis, clamp01(free.x))
+        const left = Math.min(inner, outer), width = Math.abs(outer - inner)
+        const h = L.h, top = ay - h / 2
+        drawer.style.transform = `translate(${left}px,${top}px)`
+        drawer.style.width = width + 'px'; drawer.style.height = h + 'px'
+        drawer.style.borderRadius = Math.min(22, h / 2) + 'px'
+        drawer.style.opacity = alpha
+        drawer.style.pointerEvents = dk.x > 0.6 ? 'auto' : 'none'
+        // Contents ride a little behind the drawer, so they're revealed as it opens.
+        const n = nodes[shown], cwid = isStrip ? 46 : L.vis
+        const cLeft = (dir > 0 ? inner : inner - cwid) + dir * tuck * 0.35
+        n.style.transform = `translate(${cLeft - left}px,0)`
+        if (shown === 'discarded') bar.style.width = (L.vis - 28) * clamp01(1 - (simT - st.discardAt) / 5) + 'px'
+        if (isStrip) dot.update()
+        // Elapsed time slides out from under the dot.
+        const e = clamp01(tExt.x)
+        if (e > 0.001 && isStrip) {
+          const tIn = inner - dir * tw * e, tOut = inner + dir * 22
+          const tl = Math.min(tIn, tOut)
+          time.style.transform = `translate(${tl}px,${ay + ROW.dot - 15}px)`
+          time.style.width = Math.abs(tOut - tIn) + 'px'
+          timeText.style.left = dir > 0 ? '0' : 'auto'; timeText.style.right = dir > 0 ? 'auto' : '0'
+          time.style.opacity = clamp01(e * 4) * alpha
+          updateElapsed(time)
+        } else time.style.opacity = 0
+      },
+      destroy() { root.innerHTML = ''; root.classList.remove('lead') },
+    }
+  },
+}
+
+// ======================================================================
+// Variant host
+// ======================================================================
+const VARIANTS = [VariantA, VariantB, VariantC]
+let variantIndex = Math.max(0, VARIANTS.findIndex(v => v.key === (qs.get('variant') || 'A').toUpperCase()))
+let variant = null
+function mountVariant(i) {
+  variantIndex = (i + VARIANTS.length) % VARIANTS.length
+  if (variant) variant.destroy()
+  clearTimers('v'); clearTimers('press')
+  const def = VARIANTS[variantIndex]
+  overlay.innerHTML = ''
+  const root = el('div', 'vroot', overlay)
+  const inst = def.create(root)
+  variant = Object.assign(inst, { metrics: def.metrics, key: def.key, name: def.name })
+  place.held = false
+  settlePlacement(false)
+  applyInstant(() => variant.update(st, { ...st, phase: 'idle', press: 'idle', drawing: false }))
+  $('#vlabel').textContent = `${def.key} · ${def.name}`
+  writeURL()
+  renderReadout()
+}
+
+// ======================================================================
+// Ink (single-finger drawing while Draw is on)
+// ======================================================================
+const SVGNS = 'http://www.w3.org/2000/svg'
+let inkPath = null, inkPts = []
+function syncInk(prev) {
+  ink.style.pointerEvents = st.phase === 'recording' && st.drawing ? 'auto' : 'none'
+  if (prev.phase === 'recording' && st.phase !== 'recording') {
+    const paths = [...ink.querySelectorAll('path')]
+    paths.forEach(p => { p.style.opacity = 0 })
+    setTimeout(() => paths.forEach(p => p.remove()), 400)
+  }
+}
+ink.addEventListener('pointerdown', e => {
+  if (!st.drawing) return
+  e.preventDefault()
+  ink.setPointerCapture(e.pointerId)
+  const p = toStage(e)
+  inkPts = [p]
+  inkPath = document.createElementNS(SVGNS, 'path')
+  ink.appendChild(inkPath)
+})
+ink.addEventListener('pointermove', e => {
+  if (!inkPath) return
+  inkPts.push(toStage(e))
+  inkPath.setAttribute('d', 'M' + inkPts.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join('L'))
+})
+const inkEnd = () => { inkPath = null }
+ink.addEventListener('pointerup', inkEnd)
+ink.addEventListener('pointercancel', inkEnd)
+function fakeStroke() {
+  const r = $('#hero').getBoundingClientRect(), s = stage.getBoundingClientRect()
+  const cx = (r.left - s.left) / M.scale + 120, cy = (r.top - s.top) / M.scale + 58
+  const pts = []
+  for (let i = 0; i <= 48; i++) {
+    const a = -0.6 + (i / 48) * Math.PI * 2.15
+    pts.push(`${(cx + Math.cos(a) * 118 + Math.sin(i) * 1.5).toFixed(1)},${(cy + Math.sin(a) * 52).toFixed(1)}`)
+  }
+  const path = document.createElementNS(SVGNS, 'path')
+  path.setAttribute('d', 'M' + pts.join('L'))
+  ink.appendChild(path)
+  const len = path.getTotalLength()
+  path.style.strokeDasharray = len
+  path.style.strokeDashoffset = len
+  const t0 = simT
+  const tick = () => {
+    const p = clamp01((simT - t0) / 0.7)
+    path.style.strokeDashoffset = len * (1 - (1 - (1 - p) ** 3))
+    if (p < 1 && path.isConnected) requestAnimationFrame(tick)
+  }
+  tick()
+}
+
+// Three-finger hold anywhere on the stage starts recording (like the real gesture).
+let tripleTimer = null
+stage.addEventListener('touchstart', e => {
+  if (e.touches.length >= 3 && !tripleTimer) tripleTimer = setTimeout(() => { tripleTimer = null; stopAuto(); start() }, 450)
+}, { passive: true })
+stage.addEventListener('touchend', () => { clearTimeout(tripleTimer); tripleTimer = null }, { passive: true })
+document.addEventListener('gesturestart', e => e.preventDefault())
+document.addEventListener('touchmove', e => { if (!e.target.closest('input')) e.preventDefault() }, { passive: false })
+
+// ======================================================================
+// Auto-play
+// ======================================================================
+let autoToken = 0
+function wait(sec) { return new Promise(res => after(sec, res, 'auto')) }
+async function waitFor(pred) { while (!pred()) await wait(0.05) }
+async function autoplay(token) {
+  const ok = () => token === autoToken
+  if (st.phase === 'recording') send()
+  if (st.phase !== 'idle') { await waitFor(() => !ok() || st.phase === 'idle'); await wait(0.6) }
+  while (ok()) {
+    note = 'auto: appear → draw → send'
+    start(); await wait(1.3); if (!ok()) return
+    toggleDraw(); await wait(0.4); if (!ok()) return
+    fakeStroke(); await wait(1.2); if (!ok()) return
+    toggleDraw(); await wait(0.8); if (!ok()) return
+    send(); await waitFor(() => !ok() || st.phase === 'idle'); if (!ok()) return
+    await wait(0.9); if (!ok()) return
+
+    note = 'auto: hold dot → throw to other edge → discard → undo'
+    start(); await wait(1.2); if (!ok()) return
+    commit({ press: 'holding' }); await wait(1.3); if (!ok()) return
+    commit({ press: 'idle' }); await wait(0.5); if (!ok()) return
+    flingToOtherSide(); await wait(1.3); if (!ok()) return
+    discard(); await wait(1.8); if (!ok()) return
+    undo(); await waitFor(() => !ok() || st.phase === 'idle'); if (!ok()) return
+    await wait(0.9); if (!ok()) return
+
+    note = 'auto: discard → let it expire'
+    start(); await wait(1.1); if (!ok()) return
+    discard(); await waitFor(() => !ok() || st.phase === 'idle'); if (!ok()) return
+    await wait(0.9); if (!ok()) return
+
+    note = 'auto: fail → share'
+    start(); await wait(1.1); if (!ok()) return
+    flingToOtherSide(); await wait(1.2); if (!ok()) return
+    setFailNext(true); send(); await waitFor(() => !ok() || st.phase === 'failed'); if (!ok()) return
+    await wait(2.4); if (!ok()) return
+    share(); await wait(1.0)
+  }
+}
+function setAuto(on) {
+  autoToken++
+  clearTimers('auto')
+  $('#bAuto').classList.toggle('on', on)
+  $('#bAuto').textContent = on ? '■ Stop auto-play' : '▶ Auto-play'
+  if (on) autoplay(autoToken)
+  else note = ''
+  renderReadout()
+}
+function stopAuto() { if ($('#bAuto').classList.contains('on')) setAuto(false) }
+
+// ======================================================================
+// Controls panel, switcher, readout
+// ======================================================================
+function setFailNext(v) { st.failNext = v; $('#cFail').checked = v; renderReadout() }
+function renderReadout() {
+  const { k, c } = springParams(K.d, K.b)
+  const flags = [st.phase]
+  if (st.phase === 'recording') { flags.push(st.drawing ? 'draw on' : 'draw off'); if (st.press !== 'idle') flags.push(st.press) }
+  flags.push(st.side)
+  if (st.failNext) flags.push('fail next')
+  if (REDUCED) flags.push('reduced')
+  $('#readout').textContent =
+    `${variant ? variant.key : '?'} · ${flags.join(' · ')}${note ? '\n' + note : ''}\n` +
+    `change .spring(duration: ${f2(K.d)}, bounce: ${f2(K.b)})\n` +
+    `exit .smooth(duration: ${f2(K.e)}) · k ${k.toFixed(0)} c ${c.toFixed(1)} · stagger ${Math.round(K.st * 1000)}ms · ${K.speed}×`
+}
+function writeURL() {
+  const p = new URLSearchParams()
+  p.set('variant', VARIANTS[variantIndex].key)
+  for (const k of ['d', 'b', 'e', 'st']) if (K[k] !== DEFAULTS[k]) p.set(k, K[k])
+  if (K.speed !== 1) p.set('speed', K.speed)
+  history.replaceState(null, '', '?' + p.toString())
+}
+const knobDefs = [['kD', 'oD', 'd', v => f2(v)], ['kB', 'oB', 'b', v => f2(v)], ['kE', 'oE', 'e', v => f2(v)], ['kS', 'oS', 'st', v => Math.round(v * 1000) + 'ms']]
+function syncKnobs() {
+  for (const [i, o, k, f] of knobDefs) { $('#' + i).value = K[k]; $('#' + o).textContent = f(K[k]) }
+  document.querySelectorAll('#speed button').forEach(b => b.classList.toggle('sel', +b.dataset.s === K.speed))
+  document.documentElement.style.setProperty('--speed', K.speed)
+}
+for (const [i, o, k, f] of knobDefs) $('#' + i).addEventListener('input', e => { K[k] = +e.target.value; $('#' + o).textContent = f(K[k]); writeURL(); renderReadout() })
+document.querySelectorAll('#speed button').forEach(b => b.addEventListener('click', () => { K.speed = +b.dataset.s; syncKnobs(); writeURL(); renderReadout() }))
+$('#bReset').addEventListener('click', () => { Object.assign(K, DEFAULTS); syncKnobs(); writeURL(); renderReadout() })
+$('#bStart').addEventListener('click', () => { stopAuto(); start() })
+$('#bAuto').addEventListener('click', () => setAuto(!$('#bAuto').classList.contains('on')))
+$('#cFail').addEventListener('change', e => setFailNext(e.target.checked))
+$('#cReduce').addEventListener('change', e => { REDUCED = e.target.checked; renderReadout() })
+mqReduce.addEventListener?.('change', e => { REDUCED = e.matches; $('#cReduce').checked = REDUCED; renderReadout() })
+$('#prev').addEventListener('click', () => mountVariant(variantIndex - 1))
+$('#next').addEventListener('click', () => mountVariant(variantIndex + 1))
+$('#vlabel').addEventListener('click', () => mountVariant(variantIndex + 1))
+$('#togglePanel').addEventListener('click', () => {
+  panel.classList.toggle('closed')
+  measure()
+  if (st.phase !== 'idle') settlePlacement(true)
+})
+addEventListener('keydown', e => {
+  if (e.target.closest('input, textarea, [contenteditable]')) return
+  if (e.key === 'ArrowLeft') mountVariant(variantIndex - 1)
+  else if (e.key === 'ArrowRight') mountVariant(variantIndex + 1)
+})
+addEventListener('resize', () => { measure(); settlePlacement(false) })
+
+// ======================================================================
+// Fake app motion (so the glass has something moving behind it)
+// ======================================================================
+function roller(node, value) {
+  const s = String(value)
+  if (node.children.length !== s.length) {
+    node.innerHTML = s.split('').map(() => `<span class="dg"><span class="col">${'0123456789'.split('').map(d => `<i>${d}</i>`).join('')}</span></span>`).join('')
+  }
+  ;[...node.children].forEach((dg, i) => { dg.firstChild.style.transform = `translateY(${-+s[i]}em)` })
+}
+let reps = 76, lbs = 175
+const barsEl = $('#bars')
+const BAR_COLORS = ['#ff375f', '#ff9f0a', '#ffd60a', '#30d158', '#64d2ff', '#0a84ff', '#5e5ce6', '#bf5af2']
+for (let i = 0; i < 16; i++) { const b = el('i', '', barsEl); b.style.background = `linear-gradient(${BAR_COLORS[i % 8]}, ${BAR_COLORS[(i + 3) % 8]}55)` }
+function shuffleBars() { [...barsEl.children].forEach((b, i) => { b.style.height = (18 + Math.abs(Math.sin(i * 1.7 + reps)) * 36) + 'px' }) }
+roller($('#reps'), reps); roller($('#lbs'), lbs); shuffleBars()
+setInterval(() => { reps = 72 + ((reps - 71) % 8); roller($('#reps'), reps); shuffleBars() }, 2600)
+$('#done').addEventListener('click', () => { lbs += 5; if (lbs > 195) lbs = 165; roller($('#lbs'), lbs) })
+
+// ======================================================================
+// Loop
+// ======================================================================
+let last = performance.now()
+function loop(now) {
+  const dt = Math.min(0.05, Math.max(0, (now - last) / 1000))
+  last = now
+  const sdt = dt * K.speed
+  simT += sdt
+  runTimers()
+  stepFade()
+  if (!place.held) { place.x.step(sdt); place.y.step(sdt) }
+  else { const k = Math.exp(-dt * 10); place.x.v *= k; place.y.v *= k }
+  variant.frame(sdt)
+  requestAnimationFrame(loop)
+}
+
+$('#cReduce').checked = REDUCED
+syncKnobs()
+measure()
+mountVariant(variantIndex)
+if (qs.get('auto') === '1') setAuto(true)
+requestAnimationFrame(loop)
+
+// Test hook for headless screenshots: window.__proto.goto(state)
+window.__proto = { st, place, start, toggleDraw, send, discard, undo, share, setFailNext, flingToOtherSide, commit, mountVariant, setAuto, get simT() { return simT } }
+</script>
+</body>
+</html>
