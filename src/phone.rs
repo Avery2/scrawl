@@ -525,6 +525,10 @@ pub struct Timeline {
     #[serde(default)]
     pub app: Option<String>,
     #[serde(default)]
+    pub bundle_id: Option<String>,
+    #[serde(default)]
+    pub session: Option<String>,
+    #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
     pub device: Option<String>,
@@ -538,6 +542,16 @@ pub struct Timeline {
     pub events: Vec<AppEvent>,
     #[serde(default)]
     pub touches: Vec<Touch>,
+    #[serde(default)]
+    pub strokes: Vec<TimelineStroke>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct TimelineStroke {
+    pub t0: f64,
+    pub t1: f64,
+    #[serde(default)]
+    pub points: Vec<[f64; 3]>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -565,6 +579,8 @@ pub struct Touch {
     pub x: f64,
     pub y: f64,
     pub phase: String,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 fn ms(seconds: f64) -> u64 {
@@ -576,8 +592,8 @@ fn ms(seconds: f64) -> u64 {
 }
 
 /// Finger movement under this many points, held under this long, is a tap.
-const TAP_SLOP_PT: f64 = 10.0;
-const TAP_MS: u64 = 500;
+const TAP_SLOP_PT: f64 = 12.0;
+const TAP_MS: u64 = 420;
 
 /// Turns raw touch samples into taps and swipes, normalized to the screen.
 pub fn touch_events(touches: &[Touch], screen: Screen) -> Vec<InteractionEvent> {
@@ -602,17 +618,30 @@ pub fn touch_events(touches: &[Touch], screen: Screen) -> Vec<InteractionEvent> 
             .fold(0.0, f64::max);
         let (t0, t1) = (ms(first.t), ms(last.t));
         let [x0, y0] = norm(first);
+        let hit_label = samples
+            .iter()
+            .find_map(|s| s.label.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         if travel < TAP_SLOP_PT && t1.saturating_sub(t0) < TAP_MS {
             out.push(InteractionEvent::Click {
                 t: t0,
                 x: x0,
                 y: y0,
                 button: Some("touch".into()),
-                label: None,
+                label: hit_label.map(str::to_owned),
                 role: None,
             });
         } else {
             let [x1, y1] = norm(last);
+            let drag_label = if travel < TAP_SLOP_PT {
+                Some(match hit_label {
+                    Some(l) => format!("long press: {l}"),
+                    None => "long press".into(),
+                })
+            } else {
+                hit_label.map(str::to_owned)
+            };
             out.push(InteractionEvent::Drag {
                 t: t0,
                 t1,
@@ -620,7 +649,7 @@ pub fn touch_events(touches: &[Touch], screen: Screen) -> Vec<InteractionEvent> 
                 y0,
                 x1,
                 y1,
-                label: (travel < TAP_SLOP_PT).then(|| "long press".into()),
+                label: drag_label,
                 button: Some("touch".into()),
                 path: samples.iter().map(norm).collect(),
             });
@@ -745,6 +774,32 @@ pub fn import(
         label: e.label.clone(),
     }));
     events.sort_by_key(InteractionEvent::timestamp_ms);
+    let (sw, sh) = (screen.width.max(1.0), screen.height.max(1.0));
+    let strokes: Vec<Stroke> = timeline
+        .strokes
+        .iter()
+        .filter_map(|s| {
+            let t0 = ms(s.t0);
+            let t1 = ms(s.t1).max(t0);
+            let mut pts = Vec::with_capacity(s.points.len() * 3);
+            for &[x, y, pt_t] in &s.points {
+                let nx = ((x / sw).clamp(0.0, 1.0) * f64::from(crate::model::SCALE)).round() as i32;
+                let ny = ((y / sh).clamp(0.0, 1.0) * f64::from(crate::model::SCALE)).round() as i32;
+                let dt = ms(pt_t).saturating_sub(t0) as i32;
+                pts.extend_from_slice(&[nx, ny, dt]);
+            }
+            (!pts.is_empty()).then_some(Stroke {
+                t0,
+                t1,
+                fw: probe.width,
+                fh: probe.height,
+                on: None,
+                pin: None,
+                laser: false,
+                pts,
+            })
+        })
+        .collect();
     let name = timeline.device.clone().unwrap_or_else(|| "iPhone".into());
     let app = timeline.app.clone().filter(|a| !a.is_empty());
     let device = DeviceInfo {
@@ -765,11 +820,307 @@ pub fn import(
             target: phone_target(&name, app.as_deref(), probe.width, probe.height),
             device,
             events,
-            strokes: Vec::new(),
+            strokes,
             flags: timeline.markers.iter().map(|&t| ms(t)).collect(),
             note,
         },
     )
+}
+
+/// Starts Scrawl's background TetherKit ingest server (`0.0.0.0:47777/ingest`) and cabled USB
+/// `devicectl` watcher so recordings stopped on an iPhone automatically compile into `.scrawl`
+/// bundles on the Mac, copy to clipboard, and queue into the matching OpenCode session.
+pub fn start_ingest_server(ui_sender: flume::Sender<LiveOverlayEvent>) {
+    let http_sender = ui_sender.clone();
+    let _ = std::thread::Builder::new()
+        .name("scrawl-ingest-http".into())
+        .spawn(move || {
+            let Ok(listener) = std::net::TcpListener::bind("0.0.0.0:47777") else {
+                scrawl_log("ingest server: port 47777 already in use");
+                return;
+            };
+            scrawl_log("ingest server listening on 0.0.0.0:47777");
+            for stream in listener.incoming().flatten() {
+                let tx = http_sender.clone();
+                let _ = std::thread::spawn(move || {
+                    let _ = handle_ingest_connection(stream, &tx);
+                });
+            }
+        });
+
+    let _ = std::thread::Builder::new()
+        .name("scrawl-ingest-usb".into())
+        .spawn(move || {
+            let mut processed = std::collections::HashSet::<String>::new();
+            loop {
+                std::thread::sleep(Duration::from_millis(2500));
+                // Fast IOKit USB check (<1ms) so we never spawn `xcrun` unless an iPhone is cabled.
+                if helper::devices().map_or(true, |d| d.is_empty()) {
+                    continue;
+                }
+                let _ = poll_usb_tether_containers(&ui_sender, &mut processed);
+            }
+        });
+}
+
+fn process_ingested_pair(
+    movie_path: &Path,
+    timeline_path: &Path,
+    ui_sender: &flume::Sender<LiveOverlayEvent>,
+) -> Result<(PathBuf, String)> {
+    let timeline: Timeline = serde_json::from_slice(&std::fs::read(timeline_path)?)
+        .unwrap_or_default();
+    let bundle_dir =
+        crate::handoff::default_captures_dir().join(format!("{}.scrawl", crate::make_bundle_id()));
+    let (dir, bundle, _) = import(movie_path, Some(timeline_path), &bundle_dir, None)?;
+    let _ = crate::handoff::copy_bundle_to_clipboard(&dir);
+    let app_hint = timeline
+        .app
+        .as_deref()
+        .or(timeline.bundle_id.as_deref());
+    let session_title = match crate::handoff::send_to_opencode_for_app(
+        &dir,
+        timeline.session.as_deref(),
+        app_hint,
+    ) {
+        Ok((_id, title)) => title,
+        Err(err) => {
+            scrawl_log(format!("ingest send_to_opencode skipped: {err}"));
+            "Mac".to_owned()
+        }
+    };
+    let status = Some(format!("Sent to {session_title}"));
+    let _ = ui_sender.send(LiveOverlayEvent::IngestedBundle {
+        dir: dir.clone(),
+        bundle: Box::new(bundle),
+        status,
+    });
+    Ok((dir, session_title))
+}
+
+fn handle_ingest_connection(
+    mut stream: std::net::TcpStream,
+    ui_sender: &flume::Sender<LiveOverlayEvent>,
+) -> Result<()> {
+    use std::io::Read;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(20)));
+
+    let mut header_buf = Vec::with_capacity(2048);
+    let mut byte = [0_u8; 1];
+    while header_buf.len() < 16_384 {
+        if stream.read(&mut byte)? == 0 {
+            break;
+        }
+        header_buf.push(byte[0]);
+        if header_buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let header_str = String::from_utf8_lossy(&header_buf);
+    let first_line = header_str.lines().next().unwrap_or("");
+    if first_line.starts_with("GET ") {
+        let body = r#"{"ok":true}"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(resp.as_bytes())?;
+        return Ok(());
+    }
+    ensure!(first_line.starts_with("POST /ingest"), "Unsupported route");
+    let content_len: usize = header_str
+        .lines()
+        .find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse().ok())
+                .flatten()
+        })
+        .context("Missing Content-Length")?;
+    ensure!(
+        content_len > 4 && content_len <= 250 * 1024 * 1024,
+        "Invalid payload length"
+    );
+    let mut payload = vec![0_u8; content_len];
+    stream.read_exact(&mut payload)?;
+
+    let json_len = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    ensure!(4 + json_len < payload.len(), "Invalid framed payload");
+    let json_bytes = &payload[4..4 + json_len];
+    let movie_bytes = &payload[4 + json_len..];
+
+    let staging = std::env::temp_dir().join(format!("scrawl-ingest-{}", crate::make_bundle_id()));
+    std::fs::create_dir_all(&staging)?;
+    let timeline_path = staging.join("timeline.json");
+    let movie_path = staging.join("recording.mp4");
+    std::fs::write(&timeline_path, json_bytes)?;
+    std::fs::write(&movie_path, movie_bytes)?;
+
+    let res = process_ingested_pair(&movie_path, &timeline_path, ui_sender);
+    let _ = std::fs::remove_dir_all(&staging);
+
+    match res {
+        Ok((dir, session_title)) => {
+            let body = serde_json::json!({
+                "ok": true,
+                "bundle": dir.display().to_string(),
+                "sessionTitle": session_title,
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes())?;
+        }
+        Err(err) => {
+            let body = serde_json::json!({
+                "ok": false,
+                "error": err.to_string(),
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn poll_usb_tether_containers(
+    ui_sender: &flume::Sender<LiveOverlayEvent>,
+    processed: &mut std::collections::HashSet<String>,
+) -> Result<()> {
+    // Check paired physical iPhone for ready TetherKit recordings in UpDown.
+    let list_out = Command::new("xcrun")
+        .args(["devicectl", "list", "devices"])
+        .output()?;
+    let list_text = String::from_utf8_lossy(&list_out.stdout);
+    let Some(device_udid) = list_text.lines().find_map(|line| {
+        if line.contains("physical")
+            && line.contains("available (paired)")
+            && !line.contains("unavailable")
+            && line.contains("iPhone")
+        {
+            line.split_whitespace()
+                .find(|tok| tok.len() >= 20 && tok.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+                .map(str::to_owned)
+        } else {
+            None
+        }
+    }) else {
+        return Ok(());
+    };
+
+    for bundle_id in ["com.kitlangton.UpDown"] {
+        let files_out = Command::new("xcrun")
+            .args([
+                "devicectl",
+                "device",
+                "info",
+                "files",
+                "--device",
+                &device_udid,
+                "--domain-type",
+                "appDataContainer",
+                "--domain-identifier",
+                bundle_id,
+                "--subdirectory",
+                "Documents/Tether",
+            ])
+            .output()?;
+        if !files_out.status.success() {
+            continue;
+        }
+        let files_text = String::from_utf8_lossy(&files_out.stdout);
+        for line in files_text.lines() {
+            let Some(name) = line.split_whitespace().next() else {
+                continue;
+            };
+            let Some(stem) = name.strip_suffix(".ready") else {
+                continue;
+            };
+            let key = format!("{bundle_id}:{stem}");
+            if !processed.insert(key) {
+                continue;
+            }
+            let staging =
+                std::env::temp_dir().join(format!("scrawl-usb-{}", crate::make_bundle_id()));
+            let _ = std::fs::create_dir_all(&staging);
+            let local_mp4 = staging.join(format!("{stem}.mp4"));
+            let local_json = staging.join(format!("{stem}.json"));
+            let copy_mp4 = Command::new("xcrun")
+                .args([
+                    "devicectl",
+                    "device",
+                    "copy",
+                    "from",
+                    "--device",
+                    &device_udid,
+                    "--domain-type",
+                    "appDataContainer",
+                    "--domain-identifier",
+                    bundle_id,
+                    "--source",
+                    &format!("Documents/Tether/{stem}.mp4"),
+                    "--destination",
+                    &local_mp4.to_string_lossy(),
+                ])
+                .output();
+            let copy_json = Command::new("xcrun")
+                .args([
+                    "devicectl",
+                    "device",
+                    "copy",
+                    "from",
+                    "--device",
+                    &device_udid,
+                    "--domain-type",
+                    "appDataContainer",
+                    "--domain-identifier",
+                    bundle_id,
+                    "--source",
+                    &format!("Documents/Tether/{stem}.json"),
+                    "--destination",
+                    &local_json.to_string_lossy(),
+                ])
+                .output();
+            if copy_mp4.is_ok_and(|o| o.status.success())
+                && copy_json.is_ok_and(|o| o.status.success())
+            {
+                if let Ok((_, session_title)) =
+                    process_ingested_pair(&local_mp4, &local_json, ui_sender)
+                {
+                    let sent_file = staging.join(format!("{stem}.sent"));
+                    let _ = std::fs::write(&sent_file, session_title.as_bytes());
+                    let _ = Command::new("xcrun")
+                        .args([
+                            "devicectl",
+                            "device",
+                            "copy",
+                            "to",
+                            "--device",
+                            &device_udid,
+                            "--domain-type",
+                            "appDataContainer",
+                            "--domain-identifier",
+                            bundle_id,
+                            "--source",
+                            &sent_file.to_string_lossy(),
+                            "--destination",
+                            &format!("Documents/Tether/{stem}.sent"),
+                        ])
+                        .output();
+                }
+            }
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -783,6 +1134,7 @@ mod tests {
             x,
             y,
             phase: phase.into(),
+            label: None,
         }
     }
 

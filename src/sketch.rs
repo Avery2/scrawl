@@ -330,6 +330,13 @@ pub fn describe_event(event: &InteractionEvent) -> String {
         } => {
             if label.as_deref() == Some("long press") {
                 format!("long-pressed ({})", at([*x0, *y0]))
+            } else if let Some(target) = label
+                .as_deref()
+                .and_then(|l| l.strip_prefix("long press:"))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                format!("long-pressed “{target}” ({})", at([*x0, *y0]))
             } else {
                 format!(
                     "{}{} {} ({} → {})",

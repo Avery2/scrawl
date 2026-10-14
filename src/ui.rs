@@ -3333,6 +3333,7 @@ pub fn run_app(
     Application::new().run(move |cx: &mut App| {
         scrawl_log(format!("run_app started pid={}", std::process::id()));
         let (ui_sender, ui_receiver) = flume::unbounded();
+        crate::phone::start_ingest_server(ui_sender.clone());
         let telemetry = SharedCaptureTelemetry::new(ui_sender);
         install_global_hotkeys(&telemetry);
         start_global_input_tap(Arc::clone(&telemetry));
@@ -3459,6 +3460,7 @@ pub fn run_app(
                         }
                     }
 
+                    let mut should_open_pill = false;
                     while let Ok(ev) = ui_receiver.try_recv() {
                         loop_coord.update(cx, |coord, cx| match ev {
                             LiveOverlayEvent::ToggleCaptureShortcut => {
@@ -3505,7 +3507,26 @@ pub fn run_app(
                                 cx.notify();
                             }
                             LiveOverlayEvent::PhoneEnded => coord.phone_ended(cx),
+                            LiveOverlayEvent::IngestedBundle {
+                                dir,
+                                bundle,
+                                status,
+                            } => {
+                                let frame_count = bundle.keyframes.len();
+                                let duration_ms = bundle.duration_ms;
+                                coord.set_review_bundle((dir, *bundle), status);
+                                coord.set_island_phase(IslandPhase::Completed {
+                                    finished_at: Instant::now(),
+                                    frame_count,
+                                    duration_ms,
+                                });
+                                should_open_pill = true;
+                                cx.notify();
+                            }
                         });
+                    }
+                    if should_open_pill {
+                        ensure_hud_pill_open(&loop_coord, cx);
                     }
 
                     if loop_coord.read(cx).is_island_visible() {

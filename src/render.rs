@@ -388,7 +388,9 @@ pub fn annotate_keyframe_in_place(
             label,
         } = event
             && button.as_deref() == Some("touch")
-            && label.as_deref() != Some("long press")
+            && !label
+                .as_deref()
+                .is_some_and(|l| l == "long press" || l.starts_with("long press:"))
             && *t <= keyframe.t
             && keyframe.t.saturating_sub(*t1) <= 900
         {
@@ -413,7 +415,9 @@ pub fn annotate_keyframe_in_place(
                 y0,
                 label,
                 ..
-            } if label.as_deref() == Some("long press")
+            } if label
+                .as_deref()
+                .is_some_and(|l| l == "long press" || l.starts_with("long press:"))
                 && ((*t <= keyframe.t && keyframe.t.saturating_sub(*t1) <= 600)
                     || t.abs_diff(keyframe.t) <= 600) =>
             {

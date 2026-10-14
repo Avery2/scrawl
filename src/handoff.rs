@@ -323,22 +323,76 @@ pub fn list_opencode_sessions() -> Result<Vec<OpenCodeSession>> {
     Ok(sessions)
 }
 
+fn normalize_slug(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
 pub fn send_to_opencode(bundle_dir: &Path, session_id: Option<&str>) -> Result<String> {
+    let (id, _) = send_to_opencode_for_app(bundle_dir, session_id, None)?;
+    Ok(id)
+}
+
+pub fn send_to_opencode_for_app(
+    bundle_dir: &Path,
+    session_id: Option<&str>,
+    app_name: Option<&str>,
+) -> Result<(String, String)> {
     let (directory, bundle) = load_bundle(bundle_dir)?;
     let summary = crate::sketch::summary_markdown(&bundle, &directory);
-    let session = if let Some(id) = session_id {
-        id.to_owned()
-    } else if let Some(id) = std::env::var("OPENCODE_SESSION_ID")
-        .ok()
-        .filter(|id| !id.trim().is_empty())
-    {
-        id
+    let app_slug = app_name
+        .or(bundle.target.app.as_deref())
+        .map(normalize_slug)
+        .filter(|s| !s.is_empty());
+
+    let (session, session_title) = if let Some(id) = session_id.filter(|s| !s.trim().is_empty()) {
+        let title = list_opencode_sessions()
+            .ok()
+            .and_then(|list| list.into_iter().find(|s| s.id == id).map(|s| s.title))
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| id.to_owned());
+        (id.to_owned(), title)
     } else {
-        list_opencode_sessions()?
+        let roots: Vec<OpenCodeSession> = list_opencode_sessions()?
             .into_iter()
-            .find(|session| session.parent_id.is_none() && session.time.archived.is_none())
-            .context("No root OpenCode session found; pass a session ID")?
-            .id
+            .filter(|session| session.parent_id.is_none() && session.time.archived.is_none())
+            .collect();
+        let matched = app_slug
+            .as_deref()
+            .and_then(|slug| {
+                // Match against the last component if bundle identifier was passed (e.g. com.kitlangton.UpDown -> updown).
+                let short = app_name
+                    .and_then(|a| a.rsplit('.').next())
+                    .map(normalize_slug)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| slug.to_owned());
+                roots.iter().find(|s| {
+                    let title_slug = normalize_slug(&s.title);
+                    !title_slug.is_empty()
+                        && (title_slug.contains(&short) || short.contains(&title_slug))
+                })
+            })
+            .cloned()
+            .or_else(|| {
+                if let Some(id) = std::env::var("OPENCODE_SESSION_ID")
+                    .ok()
+                    .filter(|id| !id.trim().is_empty())
+                {
+                    roots.iter().find(|s| s.id == id).cloned()
+                } else {
+                    None
+                }
+            })
+            .or_else(|| roots.into_iter().next())
+            .context("No root OpenCode session found; pass a session ID")?;
+        let title = if matched.title.is_empty() {
+            matched.id.clone()
+        } else {
+            matched.title
+        };
+        (matched.id, title)
     };
     ensure!(
         session.starts_with("ses")
@@ -361,7 +415,7 @@ pub fn send_to_opencode(bundle_dir: &Path, session_id: Option<&str>) -> Result<S
         &format!("/api/session/{session}/prompt"),
         Some(&serde_json::json!({ "text": text, "delivery": "queue" })),
     )?;
-    Ok(session)
+    Ok((session, session_title))
 }
 
 pub fn extract_frames_range(
