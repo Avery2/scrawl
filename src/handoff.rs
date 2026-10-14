@@ -262,12 +262,111 @@ fn opencode_binary() -> Result<PathBuf> {
     bail!("Could not find opencode2; set OPENCODE_BIN or add it to PATH")
 }
 
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Config {
+    #[serde(default)]
+    agent_host: Option<String>,
+    #[serde(default)]
+    agent_opencode: Option<String>,
+}
+
+fn config() -> Config {
+    dirs::home_dir()
+        .and_then(|home| fs::read(home.join(".config/scrawl/config.json")).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Safe to put unquoted in a remote shell command (host names, `~/bin/tool` paths).
+fn safe_word(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.@/~".contains(&b))
+}
+
+/// The Mac whose OpenCode server holds Kit's sessions when it isn't this one: an SSH host from
+/// `SCRAWL_AGENT_HOST` or `~/.config/scrawl/config.json` (`{"agentHost": "studio"}`).
+pub fn agent_host() -> Option<String> {
+    std::env::var("SCRAWL_AGENT_HOST")
+        .ok()
+        .or_else(|| config().agent_host)
+        .filter(|h| safe_word(h))
+}
+
+/// The `opencode2` command to run on the agent host (`agentOpencode`, default `opencode2`).
+fn agent_opencode() -> String {
+    config()
+        .agent_opencode
+        .filter(|c| safe_word(c))
+        .unwrap_or_else(|| "opencode2".to_owned())
+}
+
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+fn ssh(host: &str) -> Command {
+    let mut command = Command::new("/usr/bin/ssh");
+    command.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host]);
+    command
+}
+
+/// Copies a bundle to the same path on `host`, so the agent there can open its files.
+pub fn sync_bundle_to(host: &str, bundle_dir: &Path) -> Result<()> {
+    use std::process::Stdio;
+    let parent = bundle_dir.parent().context("Bundle has no parent")?;
+    let name = bundle_dir.file_name().context("Bundle has no name")?;
+    let mut tar = Command::new("/usr/bin/tar")
+        .arg("-C")
+        .arg(parent)
+        .arg("-cf")
+        .arg("-")
+        .arg(name)
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("Could not start tar")?;
+    let parent_q = shell_quote(&parent.to_string_lossy());
+    let output = ssh(host)
+        .arg(format!("mkdir -p {parent_q} && tar -C {parent_q} -xf -"))
+        .stdin(tar.stdout.take().context("No tar output")?)
+        .output()
+        .context("Could not start ssh")?;
+    let _ = tar.wait();
+    ensure!(
+        output.status.success(),
+        "Copying the bundle to {host} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
 fn opencode_api(method: &str, path: &str, data: Option<&serde_json::Value>) -> Result<Vec<u8>> {
-    let mut command = Command::new(opencode_binary()?);
-    command.args(["api", method, path]);
-    if let Some(data) = data {
-        command.args(["--data", &serde_json::to_string(data)?]);
-    }
+    let mut command = if let Some(host) = agent_host() {
+        let mut remote = format!(
+            "PATH=\"$HOME/bin:$HOME/.opencode/bin:/opt/homebrew/bin:$PATH\" {} api {} {}",
+            agent_opencode(),
+            shell_quote(method),
+            shell_quote(path)
+        );
+        if let Some(data) = data {
+            remote.push_str(&format!(
+                " --data {}",
+                shell_quote(&serde_json::to_string(data)?)
+            ));
+        }
+        let mut command = ssh(&host);
+        command.arg(remote);
+        command
+    } else {
+        let mut command = Command::new(opencode_binary()?);
+        command.args(["api", method, path]);
+        if let Some(data) = data {
+            command.args(["--data", &serde_json::to_string(data)?]);
+        }
+        command
+    };
     let output = command.output().context("Could not launch opencode2")?;
     ensure!(
         output.status.success(),
@@ -417,9 +516,12 @@ pub fn send_bundle_to_session(bundle_dir: &Path, session: &str) -> Result<()> {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
         "Invalid OpenCode session ID"
     );
-    let quoted_directory = format!("'{}'", directory.to_string_lossy().replace('\'', "'\\''"));
+    if let Some(host) = agent_host() {
+        sync_bundle_to(&host, &directory)?;
+    }
+    let quoted_directory = shell_quote(&directory.to_string_lossy());
     let text = format!(
-        "{}\n\nOpen the contact sheet at {} and read {} for timestamped transcript, marks, and interactions.\nFor a closer look at any interval, run:\nscrawl frames {} --from <start> --to <end> --fps 4\nReplace <start> and <end> with M:SS.mmm timestamps within this {} ms capture. Inspect the returned PNG files before acting on the feedback.",
+        "{}\n\nOpen the contact sheet at {} and read {} for timestamped transcript, marks, and interactions.\nTo look closely at a moment (an animation, a glitch, what the narration points at), run:\nscrawl zoom {} --at <M:SS or \"a phrase that was said\"> [--span 2] [--frames 12]\nIt saves a dense contact sheet of that moment with each frame's time and prints what was said; open the PNG before acting on the feedback. This capture is {} ms long.",
         summary.trim_end(),
         directory.join(&bundle.contact_sheet).display(),
         directory.join("scrawl.json").display(),

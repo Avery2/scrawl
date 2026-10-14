@@ -14,8 +14,9 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSColor, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
-    NSStatusWindowLevel, NSWindow, NSWindowButton, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSApplication, NSCellImagePosition, NSColor, NSImage, NSMenu, NSMenuDelegate, NSMenuItem,
+    NSStatusBar, NSStatusItem, NSStatusWindowLevel, NSWindow, NSWindowButton,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{MainThreadMarker, NSData, NSObject, NSSize, NSString};
 use screencapturekit::prelude::*;
@@ -158,6 +159,15 @@ fn completed_meta(_duration_ms: u64, frame_count: usize) -> String {
     )
 }
 
+/// Lead text of the Completed island: local captures were copied; iPhone ones count the inbox.
+fn completed_label(inbox_count: usize) -> String {
+    match inbox_count {
+        0 => "Copied".to_owned(),
+        1 => "From iPhone".to_owned(),
+        n => format!("{n} from iPhone"),
+    }
+}
+
 /// Intrinsic outer width of the capsule for a phase, mirroring the layout in `HudPillWindow`.
 fn island_content_width(window: &Window, phase: IslandPhase, clock: &str, iphone: bool) -> f32 {
     let divider = 1.0 + 2.0 * DIVIDER_MX;
@@ -200,10 +210,15 @@ fn island_content_width(window: &Window, phase: IslandPhase, clock: &str, iphone
                 + measure_text(window, "Processing…", HUD_TEXT, FontWeight::SEMIBOLD)
                 + CHIP_PX
         }
-        IslandPhase::Completed { .. } => {
+        IslandPhase::Completed { inbox_count, .. } => {
             CHIP_H
                 + 8.0
-                + measure_text(window, "Copied", HUD_TEXT, FontWeight::SEMIBOLD)
+                + measure_text(
+                    window,
+                    &completed_label(inbox_count),
+                    HUD_TEXT,
+                    FontWeight::SEMIBOLD,
+                )
                 + LEAD_TRAIL
                 + divider
                 + chip_width(window, "Paste", FontWeight::SEMIBOLD)
@@ -216,11 +231,12 @@ fn island_content_width(window: &Window, phase: IslandPhase, clock: &str, iphone
     inner + 2.0 * ISLAND_INSET
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum MenuAction {
     ToggleCapture,
     RecordIphone,
     OpenLatest,
+    OpenInbox(PathBuf),
     RunDemo,
     PermissionGuide,
     CheckForUpdates,
@@ -274,8 +290,117 @@ objc2::define_class!(
         fn quit_app(&self, _sender: &AnyObject) {
             let _ = self.ivars().sender.try_send(MenuAction::Quit);
         }
+
+        #[unsafe(method(openInboxItem:))]
+        fn open_inbox_item(&self, sender: &NSMenuItem) {
+            let path = sender
+                .representedObject()
+                .and_then(|object| object.downcast::<NSString>().ok())
+                .map(|path| PathBuf::from(path.to_string()));
+            if let Some(path) = path {
+                let _ = self.ivars().sender.try_send(MenuAction::OpenInbox(path));
+            }
+        }
+    }
+
+    unsafe impl NSMenuDelegate for ScrawlMenuTarget {
+        #[unsafe(method(menuNeedsUpdate:))]
+        fn menu_needs_update(&self, menu: &NSMenu) {
+            rebuild_inbox_menu_items(menu, self);
+        }
     }
 );
+
+/// Tag on the status menu's inbox rows, so each open can replace them.
+const INBOX_MENU_TAG: isize = 0x5c4a;
+
+/// Lists unhandled iPhone captures at the top of the status menu, read fresh from disk so the
+/// ages are current.
+fn rebuild_inbox_menu_items(menu: &NSMenu, target: &ScrawlMenuTarget) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    for index in (0..menu.numberOfItems()).rev() {
+        if menu
+            .itemAtIndex(index)
+            .is_some_and(|item| item.tag() == INBOX_MENU_TAG)
+        {
+            menu.removeItemAtIndex(index);
+        }
+    }
+    let inbox = crate::inbox::Inbox::load_default();
+    if inbox.len() == 0 {
+        return;
+    }
+    let now = crate::now_epoch_ms();
+    let mut rows = Vec::new();
+    let has_section_header: bool = unsafe {
+        msg_send![objc2::class!(NSMenuItem), respondsToSelector: sel!(sectionHeaderWithTitle:)]
+    };
+    let title = NSString::from_str("From iPhone");
+    rows.push(if has_section_header {
+        NSMenuItem::sectionHeaderWithTitle(&title, mtm)
+    } else {
+        let header = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &title,
+                None,
+                &NSString::new(),
+            )
+        };
+        header.setEnabled(false);
+        header
+    });
+    let icon = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str("iphone"),
+        None,
+    );
+    for entry in inbox.entries() {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(&entry.label(now)),
+                Some(sel!(openInboxItem:)),
+                &NSString::new(),
+            )
+        };
+        unsafe {
+            item.setTarget(Some(target));
+            item.setRepresentedObject(Some(&NSString::from_str(&entry.dir.display().to_string())));
+        }
+        item.setImage(icon.as_deref());
+        rows.push(item);
+    }
+    rows.push(NSMenuItem::separatorItem(mtm));
+    for (index, item) in rows.iter().enumerate() {
+        item.setTag(INBOX_MENU_TAG);
+        menu.insertItem_atIndex(item, index as isize);
+    }
+}
+
+/// Shows the unhandled iPhone capture count beside the menu bar icon.
+fn set_status_inbox_count(count: usize) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    STATUS_BAR.with(|slot| {
+        let slot = slot.borrow();
+        let Some(button) = slot.as_ref().and_then(|bar| bar._item.button(mtm)) else {
+            return;
+        };
+        button.setImagePosition(if count == 0 {
+            NSCellImagePosition::ImageOnly
+        } else {
+            NSCellImagePosition::ImageLeft
+        });
+        button.setTitle(&NSString::from_str(&if count == 0 {
+            String::new()
+        } else {
+            count.to_string()
+        }));
+    });
+}
 
 impl ScrawlMenuTarget {
     fn new(sender: flume::Sender<MenuAction>, mtm: MainThreadMarker) -> Retained<Self> {
@@ -321,6 +446,8 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
     add("Permissions Guide…", sel!(permissionGuide:));
     add("Check for Updates…", sel!(checkForUpdates:));
     add("Quit Scrawl", sel!(quitApp:));
+
+    menu.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*target)));
 
     let item = NSStatusBar::systemStatusBar().statusItemWithLength(-1.0);
     if let Some(button) = item.button(mtm) {
@@ -647,6 +774,8 @@ pub enum IslandPhase {
         finished_at: Instant,
         frame_count: usize,
         duration_ms: u64,
+        /// Unhandled iPhone captures including this one; 0 for a local capture.
+        inbox_count: usize,
     },
     Dismissing,
 }
@@ -709,6 +838,11 @@ pub struct ScrawlCoordinator {
     selected_keyframe: usize,
     /// A cabled iPhone, refreshed each time the picker opens.
     iphone: Option<PhoneDevice>,
+    /// The bundle the Completed island is showing.
+    completed_dir: Option<PathBuf>,
+    /// When this Mac last finished a capture, so ⌥⇧V prefers it over older inbox items.
+    last_local_capture_ms: u64,
+    inbox: crate::inbox::Inbox,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -753,7 +887,60 @@ impl ScrawlCoordinator {
             selected_tab: ReviewTab::ContactSheet,
             selected_keyframe: 0,
             iphone: None,
+            completed_dir: None,
+            last_local_capture_ms: 0,
+            inbox: crate::inbox::Inbox::load_default(),
         }
+    }
+
+    /// Records a capture received from elsewhere; returns the unhandled count.
+    fn add_to_inbox(&mut self, dir: &std::path::Path, bundle: &ScrawlBundle) -> usize {
+        let source = bundle.source.as_deref().unwrap_or("iphone");
+        self.inbox.add(crate::inbox::InboxEntry::new(
+            dir,
+            bundle,
+            source,
+            crate::now_epoch_ms(),
+        ));
+        set_status_inbox_count(self.inbox.len());
+        self.inbox.len()
+    }
+
+    /// Kit opened, copied, pasted or dismissed `dir`, so it leaves the inbox.
+    fn mark_handled(&mut self, dir: &std::path::Path) {
+        if self.inbox.remove(dir) {
+            set_status_inbox_count(self.inbox.len());
+        }
+    }
+
+    /// What ⌥⇧V pastes: the bundle on the Completed island, else the newest unhandled iPhone
+    /// capture unless this Mac captured something since, else the latest bundle.
+    fn take_paste_target(&mut self) -> PathBuf {
+        let showing = matches!(self.island_phase, IslandPhase::Completed { .. })
+            .then(|| self.completed_dir.clone())
+            .flatten();
+        let dir = showing
+            .or_else(|| {
+                self.inbox
+                    .newest()
+                    .filter(|entry| entry.received_at_ms > self.last_local_capture_ms)
+                    .map(|entry| entry.dir.clone())
+            })
+            .unwrap_or_else(|| PathBuf::from("latest"));
+        self.mark_handled(&dir);
+        dir
+    }
+
+    pub fn paste_latest(&mut self, cx: &mut Context<Self>) {
+        let dir = self.take_paste_target();
+        if matches!(self.island_phase, IslandPhase::Completed { .. }) {
+            self.dismiss_island(cx);
+        }
+        std::thread::spawn(move || {
+            if let Err(err) = crate::handoff::paste_bundle_image_and_text(&dir) {
+                scrawl_log(format!("paste_bundle_image_and_text error: {err}"));
+            }
+        });
     }
 
     /// Looks for a cabled iPhone in the background; the picker shows "iPhone" when one is there.
@@ -983,7 +1170,17 @@ impl ScrawlCoordinator {
         cx.notify();
     }
 
+    pub fn dismiss_completed_bundle(&mut self, cx: &mut Context<Self>) {
+        if let Some(dir) = self.completed_dir.clone() {
+            self.mark_handled(&dir);
+        }
+        self.dismiss_island(cx);
+    }
+
     pub fn inspect_completed_bundle(&mut self, cx: &mut Context<Self>) {
+        if let Some(dir) = self.completed_dir.clone() {
+            self.mark_handled(&dir);
+        }
         self.set_island_phase(IslandPhase::Hidden);
         self.island_opacity = 0.0;
         let entity = cx.entity().clone();
@@ -999,11 +1196,14 @@ impl ScrawlCoordinator {
         click_target: Option<[f32; 2]>,
         cx: &mut Context<Self>,
     ) {
+        let dir = self
+            .completed_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("latest"));
+        self.mark_handled(&dir);
         self.dismiss_island(cx);
         std::thread::spawn(move || {
-            if let Err(err) =
-                crate::handoff::paste_bundle_at_target(std::path::Path::new("latest"), click_target)
-            {
+            if let Err(err) = crate::handoff::paste_bundle_at_target(&dir, click_target) {
                 scrawl_log(format!("paste_bundle_at_target error: {err}"));
             }
         });
@@ -1488,15 +1688,19 @@ impl ScrawlCoordinator {
             let _ = entity.update(cx, |coord, cx| {
                 let (finalized, duration_ms) = result;
                 let mut frame_count = 1;
+                coord.completed_dir = None;
                 if let Ok((dir, bundle, _)) = finalized {
                     frame_count = bundle.keyframes.len();
                     let _ = crate::handoff::copy_bundle_to_clipboard(&dir);
+                    coord.completed_dir = Some(dir.clone());
+                    coord.last_local_capture_ms = crate::now_epoch_ms();
                     coord.set_review_bundle((dir, bundle), None);
                 }
                 coord.set_island_phase(IslandPhase::Completed {
                     finished_at: Instant::now(),
                     frame_count,
                     duration_ms,
+                    inbox_count: 0,
                 });
                 cx.notify();
             });
@@ -1678,7 +1882,7 @@ impl Render for HudPillWindow {
                         c_sel_cancel.update(cx, |coord, cx| coord.cancel_recording(cx));
                     }),
                 ),
-            IslandPhase::Completed { .. } => row
+            IslandPhase::Completed { inbox_count, .. } => row
                 .child(
                     island_lead()
                         .child(
@@ -1700,7 +1904,7 @@ impl Render for HudPillWindow {
                                 .ml(px(8.0))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(TEXT_COLOR))
-                                .child("Copied"),
+                                .child(completed_label(inbox_count)),
                         ),
                 )
                 .child(island_divider())
@@ -1739,7 +1943,7 @@ impl Render for HudPillWindow {
                 )
                 .child(
                     icon_circle_chip("hud-dismiss", "✕").on_click(move |_, _, cx| {
-                        c_dismiss.update(cx, |coord, cx| coord.dismiss_island(cx));
+                        c_dismiss.update(cx, |coord, cx| coord.dismiss_completed_bundle(cx));
                     }),
                 ),
             IslandPhase::Recording => {
@@ -2685,6 +2889,9 @@ impl Render for BundleReviewWindow {
                                 .on_click(move |_, _, cx| {
                                     let res = crate::handoff::copy_bundle_to_clipboard(&copy_dir);
                                     c_copy.update(cx, |coord, cx| {
+                                        if res.is_ok() {
+                                            coord.mark_handled(&copy_dir);
+                                        }
                                         coord.review_status = Some(match res {
                                             Ok(()) => "Copied ✓".into(),
                                             Err(e) => format!("Copy failed: {e}"),
@@ -3342,6 +3549,7 @@ pub fn run_app(
 
         let has_initial = initial_bundle.is_some();
         let coordinator = cx.new(|_| ScrawlCoordinator::new(telemetry, initial_bundle));
+        set_status_inbox_count(coordinator.read(cx).inbox.len());
 
         if has_initial {
             open_review_window(&coordinator, cx);
@@ -3428,9 +3636,24 @@ pub fn run_app(
                                         crate::handoff::load_bundle(std::path::Path::new("latest"))
                                     {
                                         loop_coord.update(cx, |coord, cx| {
+                                            coord.mark_handled(&dir);
                                             coord.set_review_bundle((dir, bundle), None);
                                             cx.notify();
                                         });
+                                        open_review_window(&loop_coord, cx);
+                                    }
+                                }
+                                MenuAction::OpenInbox(path) => {
+                                    let loaded = crate::handoff::load_bundle(&path).ok();
+                                    let opened = loaded.is_some();
+                                    loop_coord.update(cx, |coord, cx| {
+                                        coord.mark_handled(&path);
+                                        if let Some(bundle) = loaded {
+                                            coord.set_review_bundle(bundle, None);
+                                        }
+                                        cx.notify();
+                                    });
+                                    if opened {
                                         open_review_window(&loop_coord, cx);
                                     }
                                 }
@@ -3483,17 +3706,7 @@ pub fn run_app(
                             }
                             LiveOverlayEvent::PasteLatestShortcut => {
                                 if !coord.is_recording() && !coord.is_selecting() {
-                                    std::thread::spawn(|| {
-                                        if let Err(err) =
-                                            crate::handoff::paste_bundle_image_and_text(
-                                                std::path::Path::new("latest"),
-                                            )
-                                        {
-                                            scrawl_log(format!(
-                                                "paste_bundle_image_and_text error: {err}"
-                                            ));
-                                        }
-                                    });
+                                    coord.paste_latest(cx);
                                 }
                             }
                             LiveOverlayEvent::UndoStroke => {
@@ -3514,11 +3727,14 @@ pub fn run_app(
                             } => {
                                 let frame_count = bundle.keyframes.len();
                                 let duration_ms = bundle.duration_ms;
+                                let inbox_count = coord.add_to_inbox(&dir, &bundle);
+                                coord.completed_dir = Some(dir.clone());
                                 coord.set_review_bundle((dir, *bundle), status);
                                 coord.set_island_phase(IslandPhase::Completed {
                                     finished_at: Instant::now(),
                                     frame_count,
                                     duration_ms,
+                                    inbox_count,
                                 });
                                 should_open_pill = true;
                                 cx.notify();
@@ -3769,6 +3985,9 @@ mod tests {
     fn clock_template_is_width_stable() {
         assert_eq!(clock_template("12:34"), "00:00");
         assert_eq!(completed_meta(8_000, 1), "· 1 frame · ⌥⇧V");
+        assert_eq!(completed_label(0), "Copied");
+        assert_eq!(completed_label(1), "From iPhone");
+        assert_eq!(completed_label(3), "3 from iPhone");
     }
 
     #[test]

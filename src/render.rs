@@ -656,6 +656,90 @@ pub fn render_contact_sheet(
     sheet
 }
 
+/// An `M:SS.mmm` pill in the bottom-left corner, for `scrawl zoom` cells; `k` is how many frame
+/// pixels make one pixel of the finished sheet.
+pub fn draw_time_label(frame: &mut RgbaFrame, text: &str, k: f32) {
+    let (w, h) = (frame.width as f32, frame.height as f32);
+    if w == 0.0 || h == 0.0 {
+        return;
+    }
+    let k = k.max(0.5);
+    let font_size = 13.0 * k;
+    let pill_h = 22.0 * k;
+    let text_w = text_width(text, font_size, true);
+    let pill_w = text_w + 14.0 * k;
+    let margin = 6.0 * k;
+    let (x, y) = (margin, h - pill_h - margin);
+    rounded(
+        frame,
+        [x, y, pill_w, pill_h],
+        pill_h * 0.5,
+        [255, 255, 255, 42],
+    );
+    rounded(
+        frame,
+        [x + 1.0, y + 1.0, pill_w - 2.0, pill_h - 2.0],
+        pill_h * 0.5 - 1.0,
+        [18, 18, 20, 218],
+    );
+    draw_text(
+        frame,
+        text,
+        x + 7.0 * k,
+        y + 5.0 * k,
+        font_size,
+        WHITE,
+        true,
+    );
+}
+
+/// A tight grid of every frame of a `scrawl zoom` burst, in time order: four portrait or three
+/// landscape frames to a row.
+pub fn render_zoom_sheet(frames: &[RgbaFrame]) -> RgbaFrame {
+    const PAD: f32 = 12.0;
+    const GAP: f32 = 10.0;
+    if frames.is_empty() {
+        return solid(640, 360, [20, 20, 20, 255]);
+    }
+    let portrait = frames.iter().all(|f| f.height > f.width);
+    let (cell, columns) = if portrait { (300.0, 4) } else { (480.0, 3) };
+    let columns = frames.len().min(columns);
+    let sizes: Vec<[f32; 2]> = frames
+        .iter()
+        .map(|f| {
+            let scale = cell / f.width.max(1) as f32;
+            [cell, f.height as f32 * scale]
+        })
+        .collect();
+    let rows: Vec<f32> = sizes
+        .chunks(columns)
+        .map(|row| row.iter().map(|s| s[1]).fold(0.0, f32::max))
+        .collect();
+    let width = (PAD * 2.0 + cell * columns as f32 + GAP * (columns - 1) as f32) as u32;
+    let height = (PAD * 2.0 + rows.iter().sum::<f32>() + GAP * rows.len().saturating_sub(1) as f32)
+        .ceil() as u32;
+    let mut sheet = solid(width, height, [20, 20, 20, 255]);
+    let mut y = PAD;
+    for (row, row_h) in rows.iter().enumerate() {
+        for col in 0..columns {
+            let i = row * columns + col;
+            let (Some(size), Some(frame)) = (sizes.get(i), frames.get(i)) else {
+                continue;
+            };
+            let x = PAD + col as f32 * (cell + GAP);
+            rounded(&mut sheet, [x, y, size[0], size[1]], 8.0, [46, 46, 48, 255]);
+            blit_scaled(
+                &mut sheet,
+                frame,
+                [x + 1.0, y + 1.0, size[0] - 2.0, size[1] - 2.0],
+                7.0,
+            );
+        }
+        y += row_h + GAP;
+    }
+    sheet
+}
+
 fn blit_scaled(dst: &mut RgbaFrame, src: &RgbaFrame, rect: [f32; 4], radius: f32) {
     let [x, y, w, h] = rect;
     if src.width == 0 || src.height == 0 || w <= 0.0 || h <= 0.0 {

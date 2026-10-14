@@ -2,6 +2,7 @@ mod capture;
 mod handoff;
 mod helper;
 mod hex;
+mod inbox;
 mod keyframes;
 mod laser_overlay;
 mod model;
@@ -11,6 +12,7 @@ mod sketch;
 mod sparkle;
 mod transcribe;
 mod ui;
+mod zoom;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -130,6 +132,22 @@ enum Command {
         /// Frames per second to extract when the bundle has a video.
         #[arg(long, default_value_t = 4)]
         fps: u32,
+    },
+    /// Zoom into one moment: a dense contact sheet of frames around a time or a spoken phrase,
+    /// with the bundle's ink and touches drawn in and each frame's time, plus what was said.
+    Zoom {
+        /// Path to `.scrawl` bundle directory or `latest`.
+        #[arg(default_value = "latest")]
+        bundle: PathBuf,
+        /// The moment: a time (`0:12`, `12.5`) or a phrase from the narration ("width changes").
+        #[arg(long)]
+        at: String,
+        /// Seconds of video to cover (a quarter before the moment, the rest after).
+        #[arg(long, default_value_t = 2.0)]
+        span: f64,
+        /// Frames in the sheet.
+        #[arg(long, default_value_t = 12)]
+        frames: usize,
     },
     /// Copy a `.scrawl` bundle to the clipboard or send it to an OpenCode V2 session.
     Send {
@@ -775,6 +793,33 @@ fn main() -> Result<()> {
             let extracted = handoff::extract_frames_range(&bundle, from_ms, to_ms, fps)?;
             for path in extracted {
                 println!("{}", path.display());
+            }
+            Ok(())
+        }
+        Command::Zoom {
+            bundle,
+            at,
+            span,
+            frames,
+        } => {
+            let (dir, loaded) = handoff::load_bundle(&bundle)?;
+            ensure!(span.is_finite() && span > 0.0, "--span must be positive");
+            let sheet = zoom::zoom(&dir, &loaded, &at, (span * 1_000.0) as u64, frames)?;
+            println!("{}", sheet.path.display());
+            println!(
+                "{} → {}, {} frames: {}",
+                zoom::clock(sheet.from_ms),
+                zoom::clock(sheet.to_ms),
+                sheet.cells.len(),
+                sheet
+                    .cells
+                    .iter()
+                    .map(|(i, t)| format!("#{i} {}", zoom::clock(*t)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if !sheet.said.is_empty() {
+                println!("Said: “{}”", sheet.said);
             }
             Ok(())
         }
