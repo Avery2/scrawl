@@ -93,20 +93,42 @@ else
   IDENTITY="-"
 fi
 
+ENTITLEMENTS="${REPO_DIR}/scripts/Scrawl.entitlements"
+# Notarization requires the hardened runtime and a secure timestamp on every signed binary.
+SIGN=(codesign --force --options runtime --timestamp --sign "${IDENTITY}")
+if [[ "${IDENTITY}" == "-" ]]; then
+  SIGN=(codesign --force --sign "-")
+fi
+
 SPARKLE_VER="${APP_BUNDLE}/Contents/Frameworks/Sparkle.framework/Versions/B"
-codesign --force --sign "${IDENTITY}" "${SPARKLE_VER}/XPCServices/Installer.xpc"
-codesign --force --sign "${IDENTITY}" --preserve-metadata=entitlements "${SPARKLE_VER}/XPCServices/Downloader.xpc"
-codesign --force --sign "${IDENTITY}" "${SPARKLE_VER}/Autoupdate"
-codesign --force --sign "${IDENTITY}" "${SPARKLE_VER}/Updater.app"
-codesign --force --sign "${IDENTITY}" "${APP_BUNDLE}/Contents/Frameworks/Sparkle.framework"
-codesign --force --sign "${IDENTITY}" --identifier "dev.kitlangton.scrawl.helper" "${APP_BUNDLE}/Contents/MacOS/scrawl-helper"
-codesign --force --sign "${IDENTITY}" --identifier "dev.kitlangton.scrawl" "${APP_BUNDLE}"
+"${SIGN[@]}" "${SPARKLE_VER}/XPCServices/Installer.xpc"
+"${SIGN[@]}" --preserve-metadata=entitlements "${SPARKLE_VER}/XPCServices/Downloader.xpc"
+"${SIGN[@]}" "${SPARKLE_VER}/Autoupdate"
+"${SIGN[@]}" "${SPARKLE_VER}/Updater.app"
+"${SIGN[@]}" "${APP_BUNDLE}/Contents/Frameworks/Sparkle.framework"
+"${SIGN[@]}" --entitlements "${ENTITLEMENTS}" --identifier "dev.kitlangton.scrawl.helper" "${APP_BUNDLE}/Contents/MacOS/scrawl-helper"
+"${SIGN[@]}" --entitlements "${ENTITLEMENTS}" --identifier "dev.kitlangton.scrawl" "${APP_BUNDLE}"
 
 /usr/bin/ditto "${APP_BUNDLE}" "${DIST_DIR}/staging/Scrawl.app"
 ln -s /Applications "${DIST_DIR}/staging/Applications"
 rm -f "${DIST_DIR}/${DMG_NAME}" "${DIST_DIR}/${LATEST_DMG}" "${DIST_DIR}/${ZIP_NAME}"
 hdiutil create -quiet -fs APFS -format ULFO -volname Scrawl -srcfolder "${DIST_DIR}/staging" "${DIST_DIR}/${DMG_NAME}"
-codesign --force --sign "${IDENTITY}" "${DIST_DIR}/${DMG_NAME}"
+codesign --force --timestamp --sign "${IDENTITY}" "${DIST_DIR}/${DMG_NAME}"
+
+# Notarize the DMG (it carries the app), then staple the tickets to both so Gatekeeper accepts
+# them offline. Uses the App Store Connect API key for the same team.
+NOTARY_KEY_ID="${SCRAWL_NOTARY_KEY_ID:-JC52MN949W}"
+NOTARY_ISSUER="${SCRAWL_NOTARY_ISSUER:-69a6de84-f0e3-47e3-e053-5b8c7c11a4d1}"
+NOTARY_KEY="${SCRAWL_NOTARY_KEY:-${HOME}/.appstoreconnect/private_keys/AuthKey_${NOTARY_KEY_ID}.p8}"
+if [[ "${IDENTITY}" != "-" && -f "${NOTARY_KEY}" ]]; then
+  xcrun notarytool submit "${DIST_DIR}/${DMG_NAME}" --key "${NOTARY_KEY}" --key-id "${NOTARY_KEY_ID}" \
+    --issuer "${NOTARY_ISSUER}" --wait --timeout 30m
+  xcrun stapler staple "${DIST_DIR}/${DMG_NAME}"
+  xcrun stapler staple "${APP_BUNDLE}"
+  spctl -a -vv -t install "${DIST_DIR}/${DMG_NAME}"
+else
+  echo "warning: not notarized (no Developer ID identity or notary key); downloads will be blocked by Gatekeeper" >&2
+fi
 cp -f "${DIST_DIR}/${DMG_NAME}" "${DIST_DIR}/${LATEST_DMG}"
 
 /usr/bin/ditto -c -k --sequesterRsrc --keepParent "${APP_BUNDLE}" "${DIST_DIR}/${ZIP_NAME}"
