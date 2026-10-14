@@ -10,7 +10,7 @@
 
   /// Parts of the overlay that take touches; everything else passes through to the app.
   enum OverlayRegion: Hashable {
-    case strip, pencil, toast, status
+    case strip, toast, status
   }
 
   /// The screen edge the strip sits on.
@@ -22,13 +22,12 @@
   ///
   /// - Dot: pulses while recording; its ring fills once a minute. Hold it to see the elapsed time,
   ///   drag it to move the strip.
-  /// - Mark (tap), Draw (tap latches, hold draws while held; touches handled by `OverlayWindow`),
-  ///   Discard (with Undo), Send.
+  /// - Draw (toggles drawing), Discard (with Undo), Send.
   ///
   /// While a recording is delivered it collapses to one status circle with a bubble beside it.
   struct ScrawlStrip: View {
     enum Mode: Equatable {
-      case recording(startedAt: Date, markers: Int, isDrawing: Bool)
+      case recording(startedAt: Date, isDrawing: Bool)
       case sending
       case sent(String)
       case failed
@@ -50,7 +49,6 @@
     }
 
     struct Actions {
-      var mark: @MainActor () -> Void = {}
       var toggleDrawing: @MainActor () -> Void = {}
       var discard: @MainActor () -> Void = {}
       var send: @MainActor () -> Void = {}
@@ -64,7 +62,7 @@
     }
 
     static let width: CGFloat = 42
-    static let expandedHeight: CGFloat = Metrics.dotRow + Metrics.row * 4 + Metrics.divider
+    static let expandedHeight: CGFloat = Metrics.dotRow + Metrics.row * 3 + Metrics.divider
     /// How far the dot moves before a hold becomes a drag.
     static let dragThreshold: CGFloat = 8
 
@@ -85,7 +83,7 @@
         .modifier(PillBackground(tint: 0.45))
         .reportFrame(.strip, to: actions.reportFrame)
         .overlay(alignment: Alignment(horizontal: side.inner, vertical: .top)) {
-          if case let .recording(startedAt, _, _) = mode, dotPress == .holding {
+          if case let .recording(startedAt, _) = mode, dotPress == .holding {
             ElapsedText(startedAt: startedAt)
               .bubble()
               .outside(side)
@@ -101,8 +99,8 @@
     }
 
     @ViewBuilder private var content: some View {
-      if case let .recording(startedAt, markers, isDrawing) = mode {
-        controls(startedAt: startedAt, markers: markers, isDrawing: isDrawing)
+      if case let .recording(startedAt, isDrawing) = mode {
+        controls(startedAt: startedAt, isDrawing: isDrawing)
           .transition(.opacity)
       } else {
         statusIcon
@@ -112,7 +110,7 @@
       }
     }
 
-    private func controls(startedAt: Date, markers: Int, isDrawing: Bool) -> some View {
+    private func controls(startedAt: Date, isDrawing: Bool) -> some View {
       VStack(spacing: 0) {
         RecordingDot(startedAt: startedAt)
           .frame(width: Metrics.hit, height: Metrics.dotRow)
@@ -120,12 +118,14 @@
           .gesture(grip)
           .accessibilityHint("Hold to show the time. Drag to move the controls.")
 
-        StripButton(label: "Mark this moment", value: markers > 0 ? "\(markers) marked" : "", action: actions.mark) {
-          MarkIcon(markers: markers)
+        StripButton(
+          label: "Draw",
+          value: isDrawing ? "On" : "Off",
+          isActive: isDrawing,
+          action: actions.toggleDrawing
+        ) {
+          Image(systemName: "pencil.tip")
         }
-
-        PencilControl(isDrawing: isDrawing, toggle: actions.toggleDrawing)
-          .reportFrame(.pencil, to: actions.reportFrame)
 
         Rectangle()
           .fill(.white.opacity(0.2))
@@ -305,57 +305,11 @@
     }
   }
 
-  private struct MarkIcon: View {
-    let markers: Int
-
-    var body: some View {
-      Image(systemName: "flag")
-        .symbolEffect(.bounce, value: markers)
-        .overlay(alignment: .topTrailing) {
-          if markers > 0 {
-            Text("\(markers)")
-              .font(.system(size: 9, weight: .bold).monospacedDigit())
-              .foregroundStyle(.white)
-              .contentTransition(.numericText(value: Double(markers)))
-              .padding(.horizontal, 3)
-              .frame(minWidth: 13, minHeight: 13)
-              .background(Color.scrawlRed, in: .capsule)
-              .fixedSize()
-              .offset(x: 8, y: -6)
-              .transition(.scale.combined(with: .opacity))
-          }
-        }
-        .animation(.snappy(duration: 0.2), value: markers)
-    }
-  }
-
-  /// The draw toggle. Only drawn here: `OverlayWindow` takes its touches directly so a held pencil
-  /// and a drawing finger can be down at once. VoiceOver activates it as a latch.
-  private struct PencilControl: View {
-    let isDrawing: Bool
-    let toggle: @MainActor () -> Void
-
-    var body: some View {
-      Image(systemName: "pencil.tip")
-        .font(.system(size: 17, weight: .medium))
-        .foregroundStyle(isDrawing ? Color.scrawlRed : .white.opacity(0.85))
-        .frame(width: 32, height: 32)
-        .background(Color.scrawlRed.opacity(isDrawing ? 0.22 : 0), in: .circle)
-        .frame(width: Metrics.hit, height: Metrics.row)
-        .contentShape(Rectangle())
-        .animation(.snappy(duration: 0.15), value: isDrawing)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Draw")
-        .accessibilityValue(isDrawing ? "On" : "Off")
-        .accessibilityHint("Tap to keep drawing on. Hold and draw with another finger to draw while held.")
-        .accessibilityAddTraits(.isButton)
-        .accessibilityAction { toggle() }
-    }
-  }
-
   private struct StripButton<Icon: View>: View {
     let label: String
     var value = ""
+    /// Tinted Scrawl red while on (the draw toggle).
+    var isActive = false
     let action: @MainActor () -> Void
     @ViewBuilder let icon: Icon
 
@@ -363,9 +317,12 @@
       Button { action() } label: {
         icon
           .font(.system(size: 17, weight: .medium))
-          .foregroundStyle(.white.opacity(0.85))
+          .foregroundStyle(isActive ? Color.scrawlRed : .white.opacity(0.85))
+          .frame(width: 32, height: 32)
+          .background(Color.scrawlRed.opacity(isActive ? 0.22 : 0), in: .circle)
           .frame(width: Metrics.hit, height: Metrics.row)
           .contentShape(Rectangle())
+          .animation(.snappy(duration: 0.15), value: isActive)
       }
       .buttonStyle(StripButtonStyle())
       .accessibilityLabel(label)
@@ -557,15 +514,15 @@
     }
 
     #Preview("Recording") {
-      StripPreview(mode: .recording(startedAt: .now.addingTimeInterval(-42), markers: 2, isDrawing: false))
+      StripPreview(mode: .recording(startedAt: .now.addingTimeInterval(-42), isDrawing: false))
     }
 
     #Preview("Drawing latched") {
-      StripPreview(mode: .recording(startedAt: .now.addingTimeInterval(-75), markers: 0, isDrawing: true))
+      StripPreview(mode: .recording(startedAt: .now.addingTimeInterval(-75), isDrawing: true))
     }
 
     #Preview("Left edge") {
-      StripPreview(mode: .recording(startedAt: .now.addingTimeInterval(-12), markers: 1, isDrawing: false), side: .leading)
+      StripPreview(mode: .recording(startedAt: .now.addingTimeInterval(-12), isDrawing: false), side: .leading)
     }
 
     #Preview("Sending") {

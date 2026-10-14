@@ -97,9 +97,8 @@ Scrawl.event("Done tapped")              // optional: what the app did, on the t
 
 While recording, a slim strip sits on the right edge (drag its dot to move it up or down or over to
 the left edge; it remembers where you left it). From top to bottom: the recording dot (hold it to see
-the elapsed time), Mark, Draw (tap to keep drawing on, or hold it with one thumb and draw with another
-finger), Discard (with a few seconds to Undo), and Send. Doing the three-finger trigger again also
-sends.
+the elapsed time), Draw (tap to turn drawing red strokes on or off), Discard (with a few seconds to
+Undo), and Send. Doing the three-finger trigger again also sends.
 
 ScrawlKit stays completely inert on devices that haven't been configured (no gesture recognizers,
 overlay window, or network calls). To pair your iPhone with this Mac, print a setup link (and

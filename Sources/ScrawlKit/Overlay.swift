@@ -72,27 +72,21 @@
 
   /// A window above the app for the touch dots, freehand red strokes, and the recording strip.
   /// It's part of the app, so the recording includes it; every touch except one on the strip or its
-  /// bubbles (or a drawing finger while `isDrawing` is active) passes through to the app below.
-  ///
-  /// The pencil is handled here rather than in SwiftUI: holding it is one touch and drawing with
-  /// another finger is a second, so the window takes multiple touches and tracks each one.
+  /// bubbles (or single-finger drawing when `isDrawing` is active) passes through to the app below.
   final class OverlayWindow: UIWindow {
     private var regions: [OverlayRegion: CGRect] = [:]
     private unowned let scrawl: Scrawl
     private var drawingTouch: UITouch?
-    private var pencilTouch: UITouch?
 
     init(windowScene: UIWindowScene, scrawl: Scrawl) {
       self.scrawl = scrawl
       super.init(windowScene: windowScene)
       windowLevel = .alert + 10
       backgroundColor = .clear
-      isMultipleTouchEnabled = true
       let host = UIHostingController(rootView: OverlayView(scrawl: scrawl, touches: scrawl.touches) { [weak self] region, frame in
         self?.regions[region] = frame.isEmpty ? nil : frame
       })
       host.view.backgroundColor = .clear
-      host.view.isMultipleTouchEnabled = true
       rootViewController = host
       isHidden = false
     }
@@ -100,17 +94,8 @@
     @available(*, unavailable)
     required init?(coder _: NSCoder) { fatalError() }
 
-    /// The pencil's 44pt-wide touch target.
-    private func isOnPencil(_ point: CGPoint) -> Bool {
-      guard scrawl.isRecording, let pencil = regions[.pencil] else { return false }
-      return pencil.insetBy(dx: -4, dy: 0).contains(point)
-    }
-
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-      if isOnPencil(point) {
-        return self
-      }
-      if regions.contains(where: { $0.key != .pencil && $0.value.insetBy(dx: -8, dy: -8).contains(point) }) {
+      if regions.values.contains(where: { $0.insetBy(dx: -8, dy: -8).contains(point) }) {
         return super.hitTest(point, with: event)
       }
       if scrawl.isRecording, scrawl.isDrawing {
@@ -120,69 +105,38 @@
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-      var unhandled = touches
-      for touch in touches {
-        let point = touch.location(in: self)
-        if pencilTouch == nil, isOnPencil(point) {
-          pencilTouch = touch
-          unhandled.remove(touch)
-          scrawl.pressPencil()
-        } else if drawingTouch == nil, scrawl.isRecording, scrawl.isDrawing {
-          drawingTouch = touch
-          unhandled.remove(touch)
-          scrawl.beginDrawStroke(at: point)
-        }
+      guard scrawl.isRecording, scrawl.isDrawing, let touch = touches.first else {
+        super.touchesBegan(touches, with: event)
+        return
       }
-      if !unhandled.isEmpty {
-        super.touchesBegan(unhandled, with: event)
-      }
+      drawingTouch = touch
+      scrawl.beginDrawStroke(at: touch.location(in: self))
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-      var unhandled = touches
-      if let pencilTouch { unhandled.remove(pencilTouch) }
-      if let drawingTouch, touches.contains(drawingTouch) {
-        unhandled.remove(drawingTouch)
-        scrawl.moveDrawStroke(to: drawingTouch.location(in: self))
+      guard let active = drawingTouch, touches.contains(active) else {
+        super.touchesMoved(touches, with: event)
+        return
       }
-      if !unhandled.isEmpty {
-        super.touchesMoved(unhandled, with: event)
-      }
+      scrawl.moveDrawStroke(to: active.location(in: self))
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-      let unhandled = lift(touches, cancelled: false)
-      if !unhandled.isEmpty {
-        super.touchesEnded(unhandled, with: event)
+      guard let active = drawingTouch, touches.contains(active) else {
+        super.touchesEnded(touches, with: event)
+        return
       }
+      scrawl.endDrawStroke(at: active.location(in: self))
+      drawingTouch = nil
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-      let unhandled = lift(touches, cancelled: true)
-      if !unhandled.isEmpty {
-        super.touchesCancelled(unhandled, with: event)
+      guard let active = drawingTouch, touches.contains(active) else {
+        super.touchesCancelled(touches, with: event)
+        return
       }
-    }
-
-    /// Ends the drawing finger's stroke and/or releases the pencil; returns the touches left over.
-    private func lift(_ touches: Set<UITouch>, cancelled: Bool) -> Set<UITouch> {
-      var unhandled = touches
-      if let drawingTouch, touches.contains(drawingTouch) {
-        unhandled.remove(drawingTouch)
-        scrawl.endDrawStroke(at: drawingTouch.location(in: self))
-        self.drawingTouch = nil
-      }
-      if let pencilTouch, touches.contains(pencilTouch) {
-        unhandled.remove(pencilTouch)
-        self.pencilTouch = nil
-        scrawl.releasePencil(cancelled: cancelled)
-        // Drawing held by the pencil ends with it: keep what the other finger has drawn so far.
-        if !scrawl.isDrawing, let drawingTouch {
-          scrawl.endDrawStroke(at: drawingTouch.location(in: self))
-          self.drawingTouch = nil
-        }
-      }
-      return unhandled
+      scrawl.endDrawStroke(at: active.location(in: self))
+      drawingTouch = nil
     }
   }
 
@@ -233,7 +187,7 @@
 
     private var stripMode: ScrawlStrip.Mode? {
       if scrawl.isRecording, let startedAt = scrawl.startedAt {
-        return .recording(startedAt: startedAt, markers: scrawl.markers.count, isDrawing: scrawl.isDrawing)
+        return .recording(startedAt: startedAt, isDrawing: scrawl.isDrawing)
       }
       if scrawl.isDiscardPending {
         return .discarded
@@ -248,7 +202,6 @@
 
     private var actions: ScrawlStrip.Actions {
       ScrawlStrip.Actions(
-        mark: { scrawl.mark() },
         toggleDrawing: { scrawl.toggleDrawing() },
         discard: { scrawl.discard() },
         send: {
