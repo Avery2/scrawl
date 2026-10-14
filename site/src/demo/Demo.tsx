@@ -2,109 +2,84 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { MacWindow, PhoneMirror } from "./apps"
 import { INK_SHADOW, InkPath, inkPath } from "./ink"
 import { measureAnchors, sameAnchors } from "./measure"
-import { AGENT, type Anchors, BEATS, buildScript, cursorAt, type Mode, NARRATION, STAGE, T } from "./script"
+import { AGENT, type Anchors, BEATS, buildScript, cursorAt, type Mode, STAGE, T } from "./script"
 import * as sfx from "./sfx"
 import { Caption, Cursor, fixAmount, Island, Ink, Keys, MenuBar, phoneLive, Ripples, Selection, terminalActive } from "./stage-parts"
 import { Terminal } from "./terminal"
 
 type UserStroke = { points: [number, number, number][]; done: boolean }
 
-// `clock` can report an authoritative time (the narration while it plays); otherwise frames advance t.
-function usePlayback(duration: number, clock: React.RefObject<() => number | null>) {
+function initialScale() {
+  if (typeof window === "undefined") return 1
+  const pad = window.innerWidth <= 760 ? 20 : 40
+  const avail = Math.min(window.innerWidth, 1240) - pad
+  return Math.min(1, Math.max(0.25, avail / STAGE.w))
+}
+
+// `stepClock` advances t each animation frame and locks to the WebAudio narration clock while it plays.
+function usePlayback(duration: number, stepClock: (prevT: number, dt: number) => number, onSync: (t: number, playing: boolean) => void) {
   const [t, setT] = useState(0)
   const [playing, setPlaying] = useState(false)
   const tRef = useRef(0)
+  const playingRef = useRef(false)
+  const stepRef = useRef(stepClock)
+  const syncRef = useRef(onSync)
+  stepRef.current = stepClock
+  syncRef.current = onSync
+  playingRef.current = playing
 
   useEffect(() => {
-    if (!playing) return
+    if (!playing) {
+      syncRef.current(tRef.current, false)
+      return
+    }
     let raf = 0
     let last = performance.now()
     const tick = (now: number) => {
-      const master = clock.current()
-      const next = Math.min(duration, master !== null ? Math.max(tRef.current, master) : tRef.current + Math.min(64, now - last))
+      const dt = document.hidden ? 0 : Math.min(200, Math.max(0, now - last))
       last = now
+      const next = Math.min(duration, stepRef.current(tRef.current, dt))
       tRef.current = next
       setT(next)
-      if (next >= duration) setPlaying(false)
-      else raf = requestAnimationFrame(tick)
+      if (next >= duration) {
+        playingRef.current = false
+        setPlaying(false)
+        syncRef.current(next, false)
+      } else {
+        raf = requestAnimationFrame(tick)
+      }
     }
     raf = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(raf)
-  }, [playing, duration, clock])
+  }, [playing, duration])
 
-  const seek = useCallback((v: number) => {
-    tRef.current = Math.max(0, Math.min(duration, v))
-    setT(tRef.current)
-  }, [duration])
+  const seek = useCallback(
+    (v: number) => {
+      const next = Math.max(0, Math.min(duration, v))
+      tRef.current = next
+      setT(next)
+      syncRef.current(next, playingRef.current)
+    },
+    [duration],
+  )
 
   const play = useCallback(() => {
-    if (tRef.current >= duration) seek(0)
+    if (tRef.current >= duration) {
+      tRef.current = 0
+      setT(0)
+    }
+    playingRef.current = true
     setPlaying(true)
-  }, [duration, seek])
+    syncRef.current(tRef.current, true)
+  }, [duration])
 
-  return { t, playing, setPlaying, seek, play }
-}
-
-// Plays Kit's narration from the moment recording starts. While it plays it drives the demo clock,
-// so dropped frames can't pull the words, ink, and voice apart.
-function useNarration(t: number, playing: boolean, sound: boolean, mode: Mode, clock: React.RefObject<() => number | null>) {
-  const audioRef = useRef<HTMLAudioElement>(null)
-  const wanted = useRef(false)
-  const live = useRef(false)
-  const end = NARRATION[mode].end
-
-  useEffect(() => {
-    const a = audioRef.current
-    if (!a) return
-    const on = () => (live.current = true)
-    const off = () => (live.current = false)
-    for (const e of ["playing", "seeked"]) a.addEventListener(e, on)
-    for (const e of ["pause", "waiting", "seeking", "ended", "emptied"]) a.addEventListener(e, off)
-    clock.current = () => (live.current && wanted.current && !a.paused ? T.record + a.currentTime * 1000 : null)
-    return () => {
-      for (const e of ["playing", "seeked"]) a.removeEventListener(e, on)
-      for (const e of ["pause", "waiting", "seeking", "ended", "emptied"]) a.removeEventListener(e, off)
-      clock.current = () => null
-    }
-  }, [clock])
-
-  useEffect(() => {
-    const a = audioRef.current
-    if (!a) return
-    wanted.current = playing && sound && t >= T.record && t < end - 20
-    if (!wanted.current) {
-      if (!a.paused) a.pause()
-      return
-    }
-    const want = (t - T.record) / 1000
-    if (a.paused) {
-      a.currentTime = want
-      a.play().catch(() => {})
-    } else if (Math.abs(a.currentTime - want) > 0.2) {
-      a.currentTime = want
-    }
-    sfx.gateNarration(a, mode)
-  }, [t, playing, sound, mode, end])
-
-  // Safari only lets audio start later if it was started once inside a user gesture.
-  const unlock = useCallback(() => {
-    sfx.unlock()
-    const a = audioRef.current
-    if (!a || a.dataset.unlocked) return
-    a.dataset.unlocked = "1"
-    sfx.routeNarration(a)
-    a.muted = true
-    a.play()
-      .then(() => {
-        if (!wanted.current) a.pause()
-        a.muted = false
-      })
-      .catch(() => {
-        a.muted = false
-      })
+  const pause = useCallback(() => {
+    playingRef.current = false
+    setPlaying(false)
+    syncRef.current(tRef.current, false)
   }, [])
 
-  return { audioRef, unlock }
+  return { t, tRef, playing, setPlaying, seek, play, pause }
 }
 
 const beatIndex = (t: number) => {
@@ -117,26 +92,64 @@ const beatIndex = (t: number) => {
 
 export function Demo() {
   const [mode, setMode] = useState<Mode>("mac")
-  const clock = useRef<() => number | null>(() => null)
-  const { t, playing, setPlaying, seek, play } = usePlayback(T.end, clock)
+  const [sound, setSound] = useState(true)
+  const [started, setStarted] = useState(false)
+  const [soundPulse, setSoundPulse] = useState(false)
+
+  const stepClock = useCallback(
+    (prevT: number, dt: number) => {
+      const candidate = prevT + dt
+      const master = sfx.syncNarration(mode, candidate, true, sound)
+      return master !== null ? master : candidate
+    },
+    [mode, sound],
+  )
+
+  const onSync = useCallback(
+    (curT: number, isPlaying: boolean) => {
+      sfx.syncNarration(mode, curT, isPlaying, sound)
+    },
+    [mode, sound],
+  )
+
+  const { t, tRef, playing, seek, play, pause } = usePlayback(T.end, stepClock, onSync)
   const wrapRef = useRef<HTMLDivElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
   const badgeRef = useRef<HTMLSpanElement>(null)
   const actionsRef = useRef<HTMLDivElement>(null)
   const titleRef = useRef<HTMLHeadingElement>(null)
-  const [scale, setScale] = useState(1)
+  const [scale, setScale] = useState(initialScale)
   const [anchors, setAnchors] = useState<Anchors | null>(null)
   const [user, setUser] = useState<UserStroke[]>([])
   const [shiftDown, setShiftDown] = useState(false)
   const [drawMode, setDrawMode] = useState(false)
-  const [started, setStarted] = useState(false)
-  const [sound, setSound] = useState(true)
-  const { audioRef, unlock } = useNarration(t, playing, sound, mode, clock)
 
-  useEffect(() => sfx.setEnabled(sound), [sound])
+  useEffect(() => {
+    const timer = window.setTimeout(() => sfx.preloadNarration(), 120)
+    return () => {
+      clearTimeout(timer)
+      sfx.stopNarration()
+    }
+  }, [])
 
-  const start = (withSound = sound) => {
-    unlock()
+  useEffect(() => {
+    sfx.setEnabled(sound)
+    sfx.syncNarration(mode, tRef.current, playing, sound)
+  }, [sound, mode, playing, tRef])
+
+  const triggerSoundPulse = useCallback(() => {
+    setSoundPulse(true)
+    const id = window.setTimeout(() => setSoundPulse(false), 900)
+    return () => clearTimeout(id)
+  }, [])
+
+  const start = (withSound = sound, cue: sfx.Sound | null = null) => {
+    sfx.setEnabled(withSound)
+    sfx.unlock()
+    if (withSound && cue) {
+      sfx.play(cue, 0.9)
+      triggerSoundPulse()
+    }
     setStarted(true)
     setSound(withSound)
     play()
@@ -151,7 +164,14 @@ export function Demo() {
   useLayoutEffect(() => {
     const el = wrapRef.current
     if (!el) return
-    const ro = new ResizeObserver(([entry]) => setScale(entry.contentRect.width / STAGE.w))
+    const update = () => {
+      const w = el.clientWidth
+      if (w > 0) setScale(w / STAGE.w)
+    }
+    update()
+    const ro = new ResizeObserver(([entry]) => {
+      if (entry.contentRect.width > 0) setScale(entry.contentRect.width / STAGE.w)
+    })
     ro.observe(el)
     return () => ro.disconnect()
   }, [])
@@ -190,19 +210,20 @@ export function Demo() {
 
   const switchMode = (next: Mode) => {
     if (next === mode) return
+    sfx.stopNarration()
     click("toggle")
-    setAnchors(null)
     setUser([])
     seek(0)
     setMode(next)
-    start()
+    start(sound)
   }
 
   const replay = () => {
+    sfx.stopNarration()
     click("pulse")
     setUser([])
     seek(0)
-    start()
+    start(sound)
   }
 
   const toStage = (e: React.PointerEvent): [number, number, number] => {
@@ -215,20 +236,19 @@ export function Demo() {
   const onPointerDown = (e: React.PointerEvent) => {
     if (!(e.shiftKey || drawMode || e.pointerType === "pen")) return
     e.preventDefault()
-    ;(e.target as Element).setPointerCapture?.(e.pointerId)
+    ;(e.currentTarget as Element).setPointerCapture?.(e.pointerId)
     sfx.unlock()
     pen.current = { x: e.clientX, y: e.clientY, at: e.timeStamp, speed: 0 }
     setUser((s) => [...s, { points: [toStage(e)], done: false }])
   }
   const onPointerMove = (e: React.PointerEvent) => {
     const p = pen.current
-    if (p) {
-      const dt = Math.max(1, e.timeStamp - p.at)
-      const v = Math.hypot(e.clientX - p.x, e.clientY - p.y) / scale / dt
-      p.speed += (v - p.speed) * 0.35
-      pen.current = { x: e.clientX, y: e.clientY, at: e.timeStamp, speed: p.speed }
-      sfx.scribble("user", "marker", p.speed / 0.9)
-    }
+    if (!p) return
+    const dt = Math.max(1, e.timeStamp - p.at)
+    const v = Math.hypot(e.clientX - p.x, e.clientY - p.y) / scale / dt
+    p.speed += (v - p.speed) * 0.35
+    pen.current = { x: e.clientX, y: e.clientY, at: e.timeStamp, speed: p.speed }
+    sfx.scribble("user", "marker", p.speed / 0.9)
     setUser((s) => {
       const last = s[s.length - 1]
       if (!last || last.done) return s
@@ -255,9 +275,12 @@ export function Demo() {
       seek(t - BEATS[i].t > 700 ? BEATS[i].t : BEATS[Math.max(0, i - 1)].t)
     } else if (e.key === " ") {
       e.preventDefault()
-      click("press")
-      if (playing) setPlaying(false)
-      else start()
+      if (playing) {
+        click("press")
+        pause()
+      } else {
+        start(sound, !started && sound ? "start" : "press")
+      }
     } else if (e.key === "z" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault()
       setUser((s) => s.slice(0, -1))
@@ -266,7 +289,7 @@ export function Demo() {
 
   const cursor = script ? cursorAt(script, t) : null
   const live = mode === "iphone" ? phoneLive(t) : 0
-  const refs = { badge: badgeRef, actions: actionsRef, title: titleRef }
+  const refs = useMemo(() => ({ badge: badgeRef, actions: actionsRef, title: titleRef }), [])
   const drawing = shiftDown || drawMode
   const cues = useMemo(() => sfx.demoCues(mode), [mode])
   const last = useRef<{ t: number; at: [number, number] | null; speed: number }>({ t: 0, at: null, speed: 0 })
@@ -284,7 +307,7 @@ export function Demo() {
     if (texture) sfx.scribble("demo", texture, speed / (texture === "marker" ? 0.45 : 1.4))
     else sfx.scribbleStop("demo")
     last.current = { t, at, speed }
-  }, [t, playing, sound])
+  }, [t, playing, sound, cues, cursor, mode])
 
   const ended = started && !playing && t >= T.end
   const other: Mode = mode === "mac" ? "iphone" : "mac"
@@ -326,14 +349,33 @@ export function Demo() {
               <InkPath key={i} d={inkPath(s.points)} />
             ))}
           </svg>
-          {cursor && <Cursor c={cursor} crosshair={mode === "mac" && t >= T.select && t < T.record} ibeam={overTerminal && t >= T.promptClick - 400} />}
+          {cursor && <Cursor c={cursor} crosshair={mode === "mac" && t >= T.select && t < T.record} ibeam={overTerminal && t >= T.promptClick - 400 && t < T.paste + 120} />}
         </div>
         {!started && (
-          <button className="stage-play" onPointerDown={(e) => e.stopPropagation()} onClick={() => start(true)}>
+          <button className="stage-play" onPointerDown={(e) => e.stopPropagation()} onClick={() => start(true, "start")}>
             <svg viewBox="0 0 16 16" aria-hidden>
               <path d="M4.5 2.8v10.4a.6.6 0 00.9.5l8.3-5.2a.6.6 0 000-1L5.4 2.3a.6.6 0 00-.9.5z" />
             </svg>
             Play with sound
+          </button>
+        )}
+        {started && playing && !sound && (
+          <button
+            className="stage-sound-hint"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={() => {
+              sfx.setEnabled(true)
+              sfx.unlock()
+              sfx.play("start", 0.85)
+              triggerSoundPulse()
+              setSound(true)
+            }}
+          >
+            <svg viewBox="0 0 16 16" aria-hidden>
+              <path d="M2.5 6h2.2L8 3.2v9.6L4.7 10H2.5z" fill="currentColor" />
+              <path d="M10.5 6l4 4M14.5 6l-4 4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
+            Tap for sound
           </button>
         )}
         {ended && (
@@ -349,38 +391,43 @@ export function Demo() {
             </button>
           </div>
         )}
-        <audio ref={audioRef} src={NARRATION[mode].src} preload="auto" />
       </div>
       <Controls
         t={t}
         playing={playing}
         drawMode={drawMode}
         sound={sound}
+        soundPulse={soundPulse}
         onToggle={() => {
-          click("press")
-          if (playing) setPlaying(false)
-          else start()
+          if (playing) {
+            click("press")
+            pause()
+          } else {
+            start(sound, !started && sound ? "start" : "press")
+          }
         }}
         onSound={() => {
-          unlock()
-          if (!sound) {
-            sfx.setEnabled(true)
-            sfx.play("toggle", 0.8)
+          const next = !sound
+          sfx.setEnabled(next)
+          sfx.unlock()
+          if (next) {
+            sfx.play("start", 0.75)
+            triggerSoundPulse()
           }
-          setSound((v) => !v)
+          setSound(next)
         }}
         onReplay={replay}
         onSeek={seek}
         onBeat={(bt) => {
           click("tick")
           seek(bt)
-          start()
+          start(sound)
         }}
         onDraw={() => {
           click("toggle")
           setDrawMode((d) => !d)
         }}
-        onPause={() => setPlaying(false)}
+        onPause={pause}
       />
     </div>
   )
@@ -391,6 +438,7 @@ function Controls(props: {
   playing: boolean
   drawMode: boolean
   sound: boolean
+  soundPulse: boolean
   onToggle: () => void
   onSound: () => void
   onReplay: () => void
@@ -399,7 +447,7 @@ function Controls(props: {
   onDraw: () => void
   onPause: () => void
 }) {
-  const { t, playing, drawMode, sound } = props
+  const { t, playing, drawMode, sound, soundPulse } = props
   const trackRef = useRef<HTMLDivElement>(null)
   const scrubbing = useRef(false)
 
@@ -428,16 +476,24 @@ function Controls(props: {
         <button className="icon-btn" onClick={props.onReplay} aria-label="Replay">
           <ReplayIcon />
         </button>
-        <button className={`sound-btn${sound ? " on" : ""}`} onClick={props.onSound} aria-pressed={sound}>
+        <button
+          className={`sound-btn${sound ? " on" : ""}${sound && playing ? " live" : ""}${soundPulse ? " pulse" : ""}`}
+          onClick={props.onSound}
+          aria-pressed={sound}
+          aria-label={sound ? "Mute sound" : "Enable sound"}
+        >
           <svg viewBox="0 0 16 16" aria-hidden>
             <path d="M2.5 6h2.2L8 3.2v9.6L4.7 10H2.5z" fill="currentColor" />
             {sound ? (
-              <path d="M10.5 5.5a3.5 3.5 0 010 5M12.3 3.7a6 6 0 010 8.6" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+              <>
+                <path className="sound-wave w1" d="M10.5 5.5a3.5 3.5 0 010 5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+                <path className="sound-wave w2" d="M12.3 3.7a6 6 0 010 8.6" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+              </>
             ) : (
-              <path d="M10.5 6l4 4M14.5 6l-4 4" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+              <path className="sound-mute" d="M10.5 6l4 4M14.5 6l-4 4" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
             )}
           </svg>
-          {sound ? "Sound" : "Muted"}
+          <span className="sound-label">{sound ? "Sound" : "Muted"}</span>
         </button>
       </div>
       <div className="scrubber">
@@ -446,12 +502,14 @@ function Controls(props: {
           className="track"
           onPointerDown={(e) => {
             scrubbing.current = true
-            ;(e.target as Element).setPointerCapture(e.pointerId)
+            e.currentTarget.setPointerCapture?.(e.pointerId)
             props.onPause()
             seekFromEvent(e)
           }}
           onPointerMove={(e) => scrubbing.current && seekFromEvent(e)}
           onPointerUp={() => (scrubbing.current = false)}
+          onPointerCancel={() => (scrubbing.current = false)}
+          onLostPointerCapture={() => (scrubbing.current = false)}
         >
           {BEATS.map((b, i) => {
             const end = BEATS[i + 1]?.t ?? T.end

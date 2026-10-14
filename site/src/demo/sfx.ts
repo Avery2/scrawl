@@ -1,5 +1,5 @@
 // Cuelume's synthesizer (cuelume/src/audio/engine.ts and sounds/recipes.ts), trimmed to the
-// sounds the demo uses, plus a continuous pen/drag friction voice and the narration mute gate.
+// sounds the demo uses, plus a continuous pen/drag friction voice and WebAudio narration playback.
 import { type Mode, NARRATION, T } from "./script"
 
 type BaseLayer = { offset?: number; attack: number; decay: number; peak: number }
@@ -9,6 +9,16 @@ type Shimmer = { delay: number; feedback: number; wet: number; lowpass: number }
 type Recipe = { masterGain: number; layers: (ToneLayer | NoiseLayer)[]; shimmer?: Shimmer }
 
 const RECIPES = {
+  start: {
+    masterGain: 0.54,
+    layers: [
+      { kind: "noise", filterType: "bandpass", filterFrequency: 2800, filterQ: 1.8, attack: 0.001, decay: 0.018, peak: 0.09 },
+      { kind: "tone", waveform: "triangle", frequency: 523.25, attack: 0.005, decay: 0.16, peak: 0.075 },
+      { kind: "tone", waveform: "sine", frequency: 783.99, offset: 0.045, attack: 0.006, decay: 0.2, peak: 0.085 },
+      { kind: "tone", waveform: "sine", frequency: 1046.5, offset: 0.095, attack: 0.008, decay: 0.26, peak: 0.07 },
+    ],
+    shimmer: { delay: 0.11, feedback: 0.22, wet: 0.16, lowpass: 3800 },
+  },
   chime: {
     masterGain: 0.5,
     layers: [
@@ -83,7 +93,24 @@ const SFX_VOLUME = 0.6
 
 let ctx: AudioContext | null = null
 let output: GainNode | null = null
+let narrationGain: GainNode | null = null
 let enabled = true
+let unlockedOnce = false
+let listenersBound = false
+
+const playedHistory: { sound: Sound; at: number }[] = []
+let startSoundCount = 0
+let lastTimelineMs = 0
+
+function syncAudioSession(play: boolean) {
+  if (typeof navigator === "undefined") return
+  try {
+    const session = (navigator as unknown as { audioSession?: { type: string } }).audioSession
+    if (session) session.type = play ? "playback" : "ambient"
+  } catch {
+    // Ignore on browsers without navigator.audioSession
+  }
+}
 
 function context(): AudioContext | null {
   if (ctx) return ctx
@@ -94,6 +121,16 @@ function context(): AudioContext | null {
     ctx = new Ctor()
   } catch {
     return null
+  }
+  if (!listenersBound) {
+    listenersBound = true
+    const resumeIfVisible = () => {
+      if (!document.hidden && ctx && ctx.state === "suspended" && unlockedOnce) {
+        ctx.resume().catch(() => {})
+      }
+    }
+    window.addEventListener("pageshow", resumeIfVisible)
+    document.addEventListener("visibilitychange", resumeIfVisible)
   }
   return ctx
 }
@@ -112,18 +149,63 @@ function out(c: AudioContext): GainNode {
   return output
 }
 
-// Must run inside a user gesture: creates or resumes the shared context.
+function narrationOut(c: AudioContext): GainNode {
+  if (narrationGain) return narrationGain
+  narrationGain = c.createGain()
+  narrationGain.gain.value = 1
+  narrationGain.connect(c.destination)
+  return narrationGain
+}
+
+// Must run inside a user gesture: creates or resumes the shared context and primes WebKit audio.
 export function unlock() {
+  syncAudioSession(enabled)
   const c = context()
-  if (c && c.state !== "running") c.resume().catch(() => {})
+  if (!c) return
+  narrationOut(c)
+  if (c.state !== "running") {
+    c.resume().catch(() => {})
+  }
+  if (!unlockedOnce) {
+    unlockedOnce = true
+    try {
+      // Starting a 1-sample buffer synchronously inside the user tap unlocks iOS WebKit's audio thread.
+      const silent = c.createBuffer(1, 1, 22050)
+      const src = c.createBufferSource()
+      src.buffer = silent
+      src.connect(c.destination)
+      src.start(0)
+    } catch {
+      // Ignore
+    }
+  }
+  preloadNarration()
 }
 
 export function setEnabled(v: boolean) {
   enabled = v
-  if (!v) for (const ch of channels.keys()) scribbleStop(ch)
+  syncAudioSession(v)
+  if (!v) {
+    for (const ch of channels.keys()) scribbleStop(ch)
+    stopNarration()
+    if (narrationGain && ctx) {
+      narrationGain.gain.cancelScheduledValues(ctx.currentTime)
+      narrationGain.gain.setValueAtTime(0, ctx.currentTime)
+    }
+  } else if (narrationGain && ctx) {
+    narrationGain.gain.cancelScheduledValues(ctx.currentTime)
+    narrationGain.gain.setValueAtTime(1, ctx.currentTime)
+  }
 }
 
-const live = () => (enabled && ctx && ctx.state === "running" ? ctx : null)
+// Allow scheduling immediately after unlock() even while ctx.resume() is transitioning from "suspended" to "running".
+function activeContext(): AudioContext | null {
+  if (!enabled || !ctx) return null
+  if (ctx.state === "suspended" && unlockedOnce) {
+    ctx.resume().catch(() => {})
+  }
+  return ctx.state === "closed" ? null : ctx
+}
 
 function noiseBuffer(c: AudioContext, seconds: number) {
   const length = Math.max(1, Math.floor(seconds * c.sampleRate))
@@ -185,8 +267,11 @@ function attachShimmer(c: AudioContext, source: AudioNode, dest: AudioNode, s: S
 }
 
 export function play(sound: Sound, volume = 1, delay = 0) {
-  const c = live()
+  const c = activeContext()
   if (!c) return
+  if (sound === "start") startSoundCount++
+  playedHistory.push({ sound, at: performance.now() })
+  if (playedHistory.length > 64) playedHistory.shift()
   const recipe: Recipe = RECIPES[sound]
   const now = c.currentTime + delay
   const dest = out(c)
@@ -286,8 +371,8 @@ function voice(c: AudioContext, ch: string, texture: Texture): Voice {
 
 // `speed` is 0..1. Each update also schedules a fade, so a pen that stops moving goes quiet.
 export function scribble(ch: string, texture: Texture, speed: number) {
-  const c = live()
-  if (!c) return
+  const c = activeContext()
+  if (!c || c.state !== "running") return
   const v = voice(c, ch, texture)
   const cfg = TEXTURE[texture]
   const s = Math.min(1, Math.max(0, speed))
@@ -316,43 +401,254 @@ export function scribbleStop(ch: string) {
   }, 400)
 }
 
-// ---------- Narration ----------
+// ---------- Narration (WebAudio AudioBufferSourceNode locked to AudioContext clock) ----------
 
-const routed = new WeakMap<HTMLMediaElement, GainNode>()
+const rawNarration = new Map<Mode, Promise<ArrayBuffer | null>>()
+const decodedNarration = new Map<Mode, AudioBuffer>()
+const decodingNarration = new Map<Mode, Promise<AudioBuffer | null>>()
 
-// Routes the narration element through a gain node so the direction-tag gaps can be held silent.
-export function routeNarration(el: HTMLMediaElement): GainNode | null {
-  const existing = routed.get(el)
-  if (existing) return existing
-  const c = context()
-  if (!c) return null
-  try {
-    const gain = c.createGain()
-    c.createMediaElementSource(el).connect(gain).connect(c.destination)
-    routed.set(el, gain)
-    return gain
-  } catch {
-    return null
+type ActiveNarration = {
+  mode: Mode
+  source: AudioBufferSourceNode
+  nodeGain: GainNode
+  startCtxTime: number
+  offsetSec: number
+  durationSec: number
+  ended: boolean
+}
+
+let activeNarration: ActiveNarration | null = null
+
+// Smoothly silences the voice model's direction-tag gaps directly in the PCM buffer with an 8ms cosine taper.
+function applyMuteWindows(buffer: AudioBuffer, windows: [number, number][]) {
+  const sr = buffer.sampleRate
+  const fade = Math.max(1, Math.floor(0.008 * sr))
+  for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+    const data = buffer.getChannelData(ch)
+    const len = data.length
+    for (const [a, b] of windows) {
+      const start = Math.max(0, Math.floor(a * sr))
+      const end = Math.min(len, Math.ceil(b * sr))
+      for (let i = start; i < end; i++) {
+        if (i < start + fade) {
+          const k = (i - start) / fade
+          data[i] *= 0.5 * (1 + Math.cos(Math.PI * k))
+        } else if (i > end - fade) {
+          const k = (end - i) / fade
+          data[i] *= 0.5 * (1 + Math.cos(Math.PI * k))
+        } else {
+          data[i] = 0
+        }
+      }
+    }
   }
 }
 
-// Called every frame. Edges in the next 400 ms are scheduled on the audio clock, because frames
-// (and media currentTime updates) are too coarse to land the unmute right before a word.
-export function gateNarration(el: HTMLMediaElement, mode: Mode) {
-  const s = el.currentTime
+function fetchNarrationBytes(mode: Mode): Promise<ArrayBuffer | null> {
+  const existing = rawNarration.get(mode)
+  if (existing) return existing
+  const p = fetch(NARRATION[mode].src)
+    .then((r) => (r.ok ? r.arrayBuffer() : null))
+    .catch(() => null)
+  rawNarration.set(mode, p)
+  return p
+}
+
+function decodeNarrationBuffer(mode: Mode): Promise<AudioBuffer | null> {
+  const ready = decodedNarration.get(mode)
+  if (ready) return Promise.resolve(ready)
+  const inflight = decodingNarration.get(mode)
+  if (inflight) return inflight
+
+  const p = fetchNarrationBytes(mode).then(async (bytes) => {
+    if (!bytes) return null
+    try {
+      const OfflineCtor =
+        typeof window !== "undefined"
+          ? window.OfflineAudioContext ?? (window as unknown as { webkitOfflineAudioContext?: typeof OfflineAudioContext }).webkitOfflineAudioContext
+          : undefined
+      const decoder: BaseAudioContext | null = ctx ?? (OfflineCtor ? new OfflineCtor(1, 1, 44100) : null)
+      if (!decoder) return null
+      const copy = bytes.slice(0)
+      const buf = await new Promise<AudioBuffer>((resolve, reject) => {
+        const res = decoder.decodeAudioData(
+          copy,
+          (b) => resolve(b),
+          (e) => reject(e),
+        )
+        if (res && typeof res.then === "function") res.then(resolve, reject)
+      })
+      applyMuteWindows(buf, NARRATION[mode].mute)
+      decodedNarration.set(mode, buf)
+      return buf
+    } catch {
+      decodingNarration.delete(mode)
+      return null
+    }
+  })
+
+  decodingNarration.set(mode, p)
+  return p
+}
+
+export function preloadNarration() {
+  void decodeNarrationBuffer("mac")
+  void decodeNarrationBuffer("iphone")
+}
+
+export function stopNarration() {
+  const cur = activeNarration
+  if (!cur) return
+  activeNarration = null
+  cur.ended = true
+  try {
+    if (ctx && ctx.state === "running") {
+      const now = ctx.currentTime
+      cur.nodeGain.gain.cancelScheduledValues(now)
+      cur.nodeGain.gain.setValueAtTime(cur.nodeGain.gain.value, now)
+      cur.nodeGain.gain.linearRampToValueAtTime(0.0001, now + 0.015)
+      cur.source.stop(now + 0.018)
+      setTimeout(() => {
+        cur.source.disconnect()
+        cur.nodeGain.disconnect()
+      }, 40)
+    } else {
+      cur.source.stop()
+      cur.source.disconnect()
+      cur.nodeGain.disconnect()
+    }
+  } catch {
+    // Ignore if already stopped
+  }
+}
+
+function updateNarrationGain(c: AudioContext, mode: Mode, sec: number) {
   const windows = NARRATION[mode].mute
-  const muted = windows.some(([a, b]) => s >= a && s < b)
-  const gain = routed.get(el)
-  if (!gain || !ctx) {
-    el.volume = muted ? 0 : 1
-    return
+  const inMuteWindow = windows.some(([a, b]) => sec >= a && sec < b)
+  const g = narrationOut(c)
+  const target = !enabled || inMuteWindow ? 0 : 1
+  g.gain.cancelScheduledValues(c.currentTime)
+  g.gain.setValueAtTime(target, c.currentTime)
+}
+
+// Synchronizes WebAudio narration playback with the demo timeline.
+// Returns the authoritative demo clock time in ms while narration is actively playing, or null otherwise.
+export function syncNarration(mode: Mode, tMs: number, playing: boolean, sound: boolean): number | null {
+  lastTimelineMs = tMs
+  const endMs = NARRATION[mode].end
+  const want = playing && sound && enabled && tMs >= T.record && tMs < endMs - 20
+  if (!want) {
+    if (activeNarration) stopNarration()
+    if (narrationGain && ctx) {
+      narrationGain.gain.cancelScheduledValues(ctx.currentTime)
+      narrationGain.gain.setValueAtTime(sound && enabled ? 1 : 0, ctx.currentTime)
+    }
+    return null
   }
-  const now = ctx.currentTime
-  glide(gain.gain, muted ? 0 : 1, now, 0.008)
-  for (const [a, b] of windows) {
-    if (a > s && a - s < 0.4) gain.gain.setTargetAtTime(0, now + (a - s), 0.008)
-    if (b > s && b - s < 0.4) gain.gain.setTargetAtTime(1, now + (b - s), 0.008)
+
+  const c = context()
+  if (!c) return null
+  if (c.state === "suspended" && unlockedOnce) {
+    c.resume().catch(() => {})
   }
+
+  const buf = decodedNarration.get(mode)
+  if (!buf) {
+    void decodeNarrationBuffer(mode)
+    return null
+  }
+
+  if (c.state !== "running") return null
+
+  const wantSec = Math.max(0, (tMs - T.record) / 1000)
+  if (activeNarration && activeNarration.mode === mode && !activeNarration.ended) {
+    const playheadSec = activeNarration.offsetSec + (c.currentTime - activeNarration.startCtxTime)
+    if (Math.abs(playheadSec - wantSec) <= 0.12) {
+      updateNarrationGain(c, mode, playheadSec)
+      const masterMs = T.record + playheadSec * 1000
+      lastTimelineMs = masterMs
+      return masterMs
+    }
+    stopNarration()
+  } else if (activeNarration) {
+    stopNarration()
+  }
+
+  if (wantSec >= buf.duration - 0.02) return null
+
+  const source = c.createBufferSource()
+  source.buffer = buf
+  const nodeGain = c.createGain()
+  const now = c.currentTime
+  if (wantSec > 0.02) {
+    nodeGain.gain.setValueAtTime(0.0001, now)
+    nodeGain.gain.linearRampToValueAtTime(1, now + 0.012)
+  } else {
+    nodeGain.gain.setValueAtTime(1, now)
+  }
+  source.connect(nodeGain).connect(narrationOut(c))
+
+  const active: ActiveNarration = {
+    mode,
+    source,
+    nodeGain,
+    startCtxTime: now,
+    offsetSec: wantSec,
+    durationSec: buf.duration,
+    ended: false,
+  }
+  source.onended = () => {
+    active.ended = true
+    if (activeNarration === active) activeNarration = null
+  }
+  source.start(now, wantSec)
+  activeNarration = active
+  updateNarrationGain(c, mode, wantSec)
+  const masterMs = T.record + wantSec * 1000
+  lastTimelineMs = masterMs
+  return masterMs
+}
+
+export type AudioDiagnostics = {
+  ctxState: AudioContextState | "uninitialized"
+  ctxCurrentTime: number
+  narrationPlaying: boolean
+  narrationMode: Mode | null
+  narrationCurrentTime: number
+  narrationDecoded: { mac: boolean; iphone: boolean }
+  narrationGain: number
+  timelineMs: number
+  driftMs: number
+  startSoundCount: number
+  playedSounds: { sound: Sound; at: number }[]
+}
+
+export function getDiagnostics(): AudioDiagnostics {
+  const c = ctx
+  const active = activeNarration && !activeNarration.ended && c ? activeNarration : null
+  const narrationCurrentTime = active && c ? active.offsetSec + (c.currentTime - active.startCtxTime) : 0
+  const expectedSec = Math.max(0, (lastTimelineMs - T.record) / 1000)
+  const driftMs = active ? Math.abs(narrationCurrentTime - expectedSec) * 1000 : 0
+  return {
+    ctxState: c ? c.state : "uninitialized",
+    ctxCurrentTime: c ? c.currentTime : 0,
+    narrationPlaying: !!active,
+    narrationMode: active ? active.mode : null,
+    narrationCurrentTime,
+    narrationDecoded: {
+      mac: decodedNarration.has("mac"),
+      iphone: decodedNarration.has("iphone"),
+    },
+    narrationGain: narrationGain ? narrationGain.gain.value : 1,
+    timelineMs: lastTimelineMs,
+    driftMs,
+    startSoundCount,
+    playedSounds: [...playedHistory],
+  }
+}
+
+if (typeof window !== "undefined") {
+  ;(window as unknown as { __scrawlAudio?: () => AudioDiagnostics }).__scrawlAudio = getDiagnostics
 }
 
 // ---------- Scripted cues ----------
