@@ -83,7 +83,7 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Build a bundle from a TetherKit in-app recording (`.mp4` + timeline `.json`).
+    /// Build a bundle from a ScrawlKit in-app recording (`.mp4` + timeline `.json`).
     Import {
         /// The recording or its timeline; defaults to the newest pair in ~/Downloads.
         recording: Option<PathBuf>,
@@ -171,8 +171,9 @@ enum Command {
         #[arg(long)]
         capture_screenshot: Option<PathBuf>,
     },
-    /// Print a `<scheme>://tether?url=…&token=…` setup link (and QR code) for TetherKit on iPhone.
-    TetherLink {
+    /// Print a `<scheme>://scrawl?url=…&token=…` setup link (and QR code) for ScrawlKit on iPhone.
+    #[command(alias = "tether-link")]
+    Link {
         /// URL scheme of the iOS app (for example `updown`).
         #[arg(long)]
         scheme: String,
@@ -186,12 +187,12 @@ enum Command {
         #[arg(long, default_value_t = phone::DEFAULT_INGEST_PORT)]
         port: u16,
     },
-    /// Run the headless TetherKit ingest server (HTTP + optional USB watcher, no GUI or clipboard).
+    /// Run the headless ScrawlKit ingest server (HTTP + optional USB watcher, no GUI or clipboard).
     Serve {
         /// TCP port to listen on.
         #[arg(long, default_value_t = phone::DEFAULT_INGEST_PORT)]
         port: u16,
-        /// Also poll cabled iPhones over USB (`devicectl`) for apps listed in `tetherApps`.
+        /// Also poll cabled iPhones over USB (`devicectl`) for apps listed in `usbApps`.
         #[arg(long)]
         usb: bool,
         /// Build bundles without posting them to an OpenCode session.
@@ -887,7 +888,7 @@ fn main() -> Result<()> {
             ui::run_app(initial, false, false, capture_screenshot);
             Ok(())
         }
-        Command::TetherLink {
+        Command::Link {
             scheme,
             urls,
             session,
@@ -904,7 +905,7 @@ fn main() -> Result<()> {
                 "Could not discover a Tailscale or LAN IP; pass --url http://<host>:{port}"
             );
             let link =
-                phone::format_tether_setup_link(&scheme, &resolved_urls, &token, session.as_deref())?;
+                phone::format_setup_link(&scheme, &resolved_urls, &token, session.as_deref())?;
             println!("{link}");
             if let Ok(qr) = helper::qr(&link) {
                 eprintln!("\n{qr}");

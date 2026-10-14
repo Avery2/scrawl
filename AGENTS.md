@@ -1,6 +1,6 @@
 # Scrawl — Agent Instructions
 
-Scrawl is a macOS shortcut-triggered (`⌃⌥⇧S`) screen, voice, cursor, and freehand drawing capture tool built in Rust + GPUI that compiles recordings into compact `.scrawl` bundles (`contact-sheet.png`, `frames/frame-XX.png`, `summary.md`, `scrawl.json`, `recording.mp4` or `recording.mov`, and `audio.wav`) in `~/Library/Application Support/scrawl/captures/`. It also captures a cabled iPhone (mirror + native video) and imports TetherKit in-app recordings (`scrawl import`); see README for both and for testing.
+Scrawl is a macOS shortcut-triggered (`⌃⌥⇧S`) screen, voice, cursor, and freehand drawing capture tool built in Rust + GPUI that compiles recordings into compact `.scrawl` bundles (`contact-sheet.png`, `frames/frame-XX.png`, `summary.md`, `scrawl.json`, `recording.mp4` or `recording.mov`, and `audio.wav`) in `~/Library/Application Support/scrawl/captures/`. It also captures a cabled iPhone (mirror + native video) and imports ScrawlKit in-app recordings (`scrawl import`, `Sources/ScrawlKit`); see README for both and for testing.
 
 ## Continuous Output Review & Proactive Recommendations
 
@@ -20,7 +20,7 @@ Scrawl is a macOS shortcut-triggered (`⌃⌥⇧S`) screen, voice, cursor, and f
   - `scrawl-helper` (Swift, built by `build.rs` into `target/<profile>/`, copied and signed into `Scrawl.app/Contents/MacOS` by `install-app.sh`) does SpeechAnalyzer, CoreMediaIO/AVFoundation phone capture with the mirror window, and movie decoding. Swift was chosen over objc2 bindings because SpeechAnalyzer has no Objective-C surface and `objc2-av-foundation` is not in the lockfile.
   - Picker discovery (`scrawl-helper devices`) reads the USB registry only: it is instant and never touches AVFoundation, so opening the picker can't raise a camera prompt or hang. Only the mirror, started when iPhone is chosen, asks for camera access.
   - Live capture: the mirror window's rect (global top-left points, streamed by the helper) is the telemetry target, so ink/laser/clicks normalize into phone coordinates; inputs are re-based onto the movie's clock (`recording.startedAt`) at finish. Keyframes are selected on 320 px candidates and re-decoded from the native video at a 1600 px long edge.
-  - Audio for transcription is always the movie's audio exported on the asset timeline (`scrawl-helper audio`). Do not feed a `.mov` straight to SpeechAnalyzer: `AVAudioFile` ignores the movie timeline and its word times drift (≈1.5 s late at 41 s on a Tether recording).
+  - Audio for transcription is always the movie's audio exported on the asset timeline (`scrawl-helper audio`). Do not feed a `.mov` straight to SpeechAnalyzer: `AVAudioFile` ignores the movie timeline and its word times drift (≈1.5 s late at 41 s on a phone recording).
 - **Fast builds & local workflow**:
   - Keep `Cargo.toml` and `Cargo.lock` stable and build/test with `taskpolicy -c utility cargo build -j 3 --offline` and `taskpolicy -c utility cargo test -j 3 --offline -- --test-threads=2`.
   - Keep everything local on `main` unless asked otherwise.

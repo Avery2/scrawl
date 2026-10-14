@@ -1293,7 +1293,7 @@ mod tests {
         phone.note = None;
         phone.device = Some(DeviceInfo {
             name: "iPhone".into(),
-            capture: "tetherkit".into(),
+            capture: "scrawlkit".into(),
             app: Some("dev.example.App".into()),
             app_version: Some("42".into()),
             ..Default::default()

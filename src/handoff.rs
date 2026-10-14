@@ -271,8 +271,8 @@ pub struct Config {
     pub agent_opencode: Option<String>,
     #[serde(default)]
     pub ingest_token: Option<String>,
-    #[serde(default)]
-    pub tether_apps: Vec<String>,
+    #[serde(default, alias = "tetherApps")]
+    pub usb_apps: Vec<String>,
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -373,11 +373,12 @@ pub fn ensure_ingest_token() -> Result<String> {
     ensure_ingest_token_in(&default_config_path())
 }
 
-/// Bundle IDs whose `Documents/Tether` container the USB watcher checks (`tetherApps` in config,
-/// default empty so USB polling is off unless configured).
-pub fn tether_apps() -> Vec<String> {
+/// Bundle IDs whose `Documents/Scrawl` (and legacy `Documents/Tether`) container the USB watcher
+/// checks (`usbApps` in config, with `tetherApps` accepted as a fallback alias; default empty so
+/// USB polling is off unless configured).
+pub fn usb_apps() -> Vec<String> {
     config()
-        .tether_apps
+        .usb_apps
         .into_iter()
         .map(|s| s.trim().to_owned())
         .filter(|s| safe_word(s))
@@ -935,7 +936,7 @@ mod tests {
         fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         fs::write(
             &config_path,
-            br#"{"agentHost":"studio","agentOpencode":"~/bin/opencode2","tetherApps":["com.kitlangton.UpDown"],"customKey":42}"#,
+            br#"{"agentHost":"studio","agentOpencode":"~/bin/opencode2","usbApps":["com.kitlangton.UpDown"],"customKey":42}"#,
         )
         .unwrap();
 
@@ -952,7 +953,14 @@ mod tests {
         assert_eq!(parsed.agent_host.as_deref(), Some("studio"));
         assert_eq!(parsed.agent_opencode.as_deref(), Some("~/bin/opencode2"));
         assert_eq!(parsed.ingest_token.as_deref(), Some(generated.as_str()));
-        assert_eq!(parsed.tether_apps, vec!["com.kitlangton.UpDown"]);
+        assert_eq!(parsed.usb_apps, vec!["com.kitlangton.UpDown"]);
+
+        let legacy_path = fixture.0.join("nested/legacy.json");
+        fs::write(&legacy_path, br#"{"tetherApps":["com.kitlangton.UpDown"]}"#).unwrap();
+        assert_eq!(
+            load_config_from(&legacy_path).usb_apps,
+            vec!["com.kitlangton.UpDown"]
+        );
 
         let raw: serde_json::Value =
             serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
@@ -972,12 +980,12 @@ mod tests {
         let missing = fixture.0.join("missing.json");
         let cfg = load_config_from(&missing);
         assert_eq!(cfg, Config::default());
-        assert!(cfg.tether_apps.is_empty());
+        assert!(cfg.usb_apps.is_empty());
 
         let token = ensure_ingest_token_in(&missing).unwrap();
         assert_eq!(token.len(), 64);
         let cfg_after = load_config_from(&missing);
         assert_eq!(cfg_after.ingest_token.as_deref(), Some(token.as_str()));
-        assert!(cfg_after.tether_apps.is_empty());
+        assert!(cfg_after.usb_apps.is_empty());
     }
 }

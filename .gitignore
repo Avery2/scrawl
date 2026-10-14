@@ -2,5 +2,7 @@
 /dist
 /site/public/releases
 /.DS_Store
+/.build
+/.swiftpm
 /artifacts
 /*.scrawl

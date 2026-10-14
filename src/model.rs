@@ -74,7 +74,7 @@ pub struct ScrawlBundle {
 #[serde(rename_all = "camelCase")]
 pub struct DeviceInfo {
     pub name: String,
-    /// `"mirror"` for a cabled capture through Scrawl, `"tetherkit"` for an in-app SDK recording.
+    /// `"mirror"` for a cabled capture through Scrawl, `"scrawlkit"` for an in-app SDK recording.
     pub capture: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -237,7 +237,7 @@ pub enum Shape {
     Tap,
     Pin,
     Mark,
-    /// A time-only "look here" marker (M in the mirror, or a TetherKit marker).
+    /// A time-only "look here" marker (M in the mirror, or a ScrawlKit marker).
     Flag,
 }
 
@@ -320,7 +320,7 @@ pub enum InteractionEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         window_title: Option<String>,
     },
-    /// Something the recorded app reported about itself (TetherKit `events[]`).
+    /// Something the recorded app reported about itself (ScrawlKit `events[]`).
     AppEvent {
         t: u64,
         label: String,

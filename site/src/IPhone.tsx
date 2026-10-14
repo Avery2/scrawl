@@ -69,7 +69,7 @@ function MirrorVisual() {
   )
 }
 
-function TetherVisual() {
+function ScrawlKitVisual() {
   return (
     <div className="ip-visual">
       <div className="ip-stack">
@@ -131,14 +131,14 @@ export function IPhoneSection() {
           </div>
         </article>
         <article className="ip-card-outer">
-          <TetherVisual />
+          <ScrawlKitVisual />
           <div className="ip-copy">
             <h3>
-              TetherKit recording <code>scrawl import</code>
+              ScrawlKit recording <code>scrawl import</code>
             </h3>
             <p>
-              Record inside your own iOS app with TetherKit. Scrawl imports the <code>.mp4</code> and its touch timeline, and turns taps, long-presses,
-              swipes, and <code>Tether.event(…)</code> logs into keyframes with touch ripples and swipe trails.
+              Record inside your own iOS app with ScrawlKit. Scrawl imports the <code>.mp4</code> and its touch timeline, and turns taps, long-presses,
+              swipes, and <code>Scrawl.event(…)</code> logs into keyframes with touch ripples and swipe trails.
             </p>
           </div>
         </article>

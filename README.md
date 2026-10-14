@@ -31,7 +31,7 @@ cargo run -- send /tmp/demo.scrawl --session ses_...
 cargo run -- record --iphone --duration 8
 cargo run -- devices
 
-# Build a bundle from a TetherKit in-app recording (newest pair in ~/Downloads by default)
+# Build a bundle from a ScrawlKit in-app recording (newest pair in ~/Downloads by default)
 cargo run -- import
 cargo run -- import ~/Downloads/20261013T164000.mp4 --timeline ~/Downloads/20261013T164000.json
 
@@ -74,42 +74,54 @@ phone on the right of the screen and starts recording:
 - Finish from the island as usual. Unplugging the phone finishes the capture with what was recorded.
 
 Phone bundles are ordinary bundles: `scrawl.json` adds `"source": "iphone"` and a `device` object
-(name, capture `mirror` or `tetherkit`, id, native size, screen points and scale, app and version
+(name, capture `mirror` or `scrawlkit`, id, native size, screen points and scale, app and version
 for SDK recordings), and the target's `mode` is `device`. Keyframes fit a 1600 px long edge
 (736×1600 for a 1320×2868 phone); `scrawl frames` extracts native-resolution frames (via `ffmpeg`
 or `scrawl-helper frames`) when you need every pixel.
 
-### TetherKit recordings
+### ScrawlKit (iOS)
 
-[TetherKit](../tether) records inside your own iOS app (ReplayKit video plus a `.json` timeline of
-touches, markers, and app events). It stays completely inert until configured on a device.
+`ScrawlKit` (`Sources/ScrawlKit`) is a Swift package (iOS 18+) for recording inside your own iOS app:
+ReplayKit video with narration, touch dots and freehand red strokes, markers, and app events on the
+same clock, sent straight to Scrawl on your Mac.
 
-To pair your iPhone with this Mac, print a setup link (and terminal QR code) and open it on the
-phone:
+Add this repo as a Swift package dependency (product `ScrawlKit`) and attach `.scrawl()` to your root
+view:
 
-```sh
-scrawl tether-link --scheme updown
-# updown://tether?url=http%3A%2F%2F100.64.0.12%3A47777&url=http%3A%2F%2F192.168.1.20%3A47777&token=…
+```swift
+import ScrawlKit
+
+WindowGroup { ContentView().scrawl() }   // three-finger long press starts and stops
+Scrawl.event("Done tapped")              // optional: what the app did, on the timeline
 ```
 
-`scrawl tether-link` reads (or generates with mode `0600`) `ingestToken` in
+ScrawlKit stays completely inert on devices that haven't been configured (no gesture recognizers,
+overlay window, or network calls). To pair your iPhone with this Mac, print a setup link (and
+terminal QR code) and open it on the phone:
+
+```sh
+scrawl link --scheme updown [--session ses_…]
+# updown://scrawl?url=http%3A%2F%2F100.64.0.12%3A47777&url=http%3A%2F%2F192.168.1.20%3A47777&token=…
+```
+
+`scrawl link` reads (or generates with mode `0600`) `ingestToken` in
 `~/.config/scrawl/config.json` and defaults to this Mac's Tailscale and LAN IPs on port `47777`.
-Opening `<scheme>://tether?reset=1` on the phone clears its Keychain config. For cabled USB
-fallback via `devicectl`, list the app bundle IDs in `~/.config/scrawl/config.json` under
-`"tetherApps": ["com.kitlangton.UpDown"]`.
+Opening `<scheme>://scrawl?reset=1` on the phone clears its Keychain config (`dev.kitlangton.scrawl`).
+For cabled USB fallback via `devicectl` (`Documents/Scrawl`), list the app bundle IDs in
+`~/.config/scrawl/config.json` under `"usbApps": ["com.kitlangton.UpDown"]`.
 
 You can also AirDrop the `.mp4` and `.json` pair to the Mac and run `scrawl import`:
 
 - Touches become taps and swipes, drawn on keyframes as ripples and finger trails and listed in the
   review timeline. Each tap or swipe is a keyframe candidate, like a click.
 - Markers become flags.
-- App events (`Tether.event("Done tapped")`) appear in `summary.md` under the keyframe that was on
+- App events (`Scrawl.event("Done tapped")`) appear in `summary.md` under the keyframe that was on
   screen when they happened (`  · 0:12 app: Done tapped`).
 
 ### Headless ingest server (`scrawl serve`)
 
 On an always-on Mac (such as a Mac Studio reachable over Tailscale), run `scrawl serve` to accept
-authenticated TetherKit uploads, build `.scrawl` bundles, and route them straight into local
+authenticated ScrawlKit uploads, build `.scrawl` bundles, and route them straight into local
 OpenCode sessions without running the GUI app:
 
 ```sh
@@ -161,10 +173,10 @@ taskpolicy -c utility cargo test -j 3 --offline -- --test-threads=2
 ./scripts/install-app.sh
 ```
 
-- **iPhone:** connect a phone, quit the standalone Tether app if it is running (`pkill -x Tether`),
-  open the picker, choose iPhone, talk, draw over the mirror, press M, Finish. Inspect the bundle's
-  `summary.md`, `scrawl.json` (`source`, `device`), contact sheet, and frames.
-- **TetherKit:** `scrawl import` on a recording and its timeline (or hand-write a timeline for any
+- **iPhone:** connect a phone, open the picker, choose iPhone, talk, draw over the mirror, press M,
+  Finish. Inspect the bundle's `summary.md`, `scrawl.json` (`source`, `device`), contact sheet, and
+  frames.
+- **ScrawlKit:** `scrawl import` on a recording and its timeline (or hand-write a timeline for any
   phone video), then check the ripples and trails on frames and the app-event lines in the summary.
 - **Transcription:** `scrawl-helper transcribe <wav or movie>` prints words with timings;
   `scrawl reprocess <bundle> --out …` reruns transcription and keyframe selection on a real bundle.

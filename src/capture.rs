@@ -205,7 +205,7 @@ pub enum LiveOverlayEvent {
     RequestSnapshot,
     /// The iPhone mirror ended on its own (unplugged, never found, or access denied).
     PhoneEnded,
-    /// A TetherKit recording was ingested from an iPhone and compiled into a `.scrawl` bundle.
+    /// A ScrawlKit recording was ingested from an iPhone and compiled into a `.scrawl` bundle.
     IngestedBundle {
         dir: PathBuf,
         bundle: Box<crate::model::ScrawlBundle>,

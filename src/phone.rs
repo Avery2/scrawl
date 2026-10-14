@@ -1,5 +1,5 @@
 //! iPhone sources: a live cabled capture mirrored through `scrawl-helper`, and recordings made
-//! in-app with TetherKit. Both become ordinary `.scrawl` bundles whose keyframes are decoded
+//! in-app with ScrawlKit. Both become ordinary `.scrawl` bundles whose keyframes are decoded
 //! from the phone's own video, never from a screenshot of the mirror window.
 
 use std::io::{BufRead, BufReader, Write};
@@ -515,9 +515,9 @@ pub fn finalize_live_capture(
     )
 }
 
-// MARK: TetherKit import
+// MARK: ScrawlKit import
 
-/// The `.json` TetherKit writes beside each in-app recording (seconds from the start, points in
+/// The `.json` ScrawlKit writes beside each in-app recording (seconds from the start, points in
 /// screen coordinates).
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -724,7 +724,7 @@ pub fn resolve_import(
                 .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
                 .with_context(|| {
                     format!(
-                        "No TetherKit recording (movie + .json) in {}",
+                        "No ScrawlKit recording (movie + .json) in {}",
                         downloads.display()
                     )
                 })?
@@ -739,7 +739,7 @@ pub fn resolve_import(
     Ok((movie, timeline))
 }
 
-/// `scrawl import`: a TetherKit recording becomes a bundle. Touches become taps and swipes
+/// `scrawl import`: a ScrawlKit recording becomes a bundle. Touches become taps and swipes
 /// (ripples and trails on keyframes), markers become flags, app events land in the summary.
 pub fn import(
     movie: &Path,
@@ -749,7 +749,7 @@ pub fn import(
 ) -> Result<(PathBuf, ScrawlBundle, String)> {
     let timeline: Timeline = match timeline_path {
         Some(path) => serde_json::from_slice(&std::fs::read(path)?)
-            .with_context(|| format!("Invalid TetherKit timeline {}", path.display()))?,
+            .with_context(|| format!("Invalid ScrawlKit timeline {}", path.display()))?,
         None => Timeline::default(),
     };
     std::fs::create_dir_all(bundle_dir)?;
@@ -806,7 +806,7 @@ pub fn import(
     let app = timeline.app.clone().filter(|a| !a.is_empty());
     let device = DeviceInfo {
         name: name.clone(),
-        capture: "tetherkit".into(),
+        capture: "scrawlkit".into(),
         system: timeline.system.clone(),
         width: probe.width,
         height: probe.height,
@@ -930,8 +930,8 @@ fn normalize_http_base_url(raw: &str) -> Result<String> {
     Ok(trimmed.to_owned())
 }
 
-/// Formats `<scheme>://tether?url=<urlencoded base>[&url=<second>]&token=<token>[&session=ses_…]`.
-pub fn format_tether_setup_link(
+/// Formats `<scheme>://scrawl?url=<urlencoded base>[&url=<second>]&token=<token>[&session=ses_…]`.
+pub fn format_setup_link(
     scheme: &str,
     urls: &[String],
     token: &str,
@@ -971,10 +971,10 @@ pub fn format_tether_setup_link(
     if let Some(session) = session.map(str::trim).filter(|s| !s.is_empty()) {
         query.push(format!("session={}", crate::handoff::query_escape(session)));
     }
-    Ok(format!("{scheme}://tether?{}", query.join("&")))
+    Ok(format!("{scheme}://scrawl?{}", query.join("&")))
 }
 
-/// Starts Scrawl's background TetherKit ingest inside the GUI app: an HTTP server on
+/// Starts Scrawl's background ScrawlKit ingest inside the GUI app: an HTTP server on
 /// `0.0.0.0:47777` the phone uploads to, and a cabled-iPhone `devicectl` watcher for when the
 /// network can't reach the Mac. Each recording becomes a `.scrawl` bundle, lands on the clipboard
 /// and is queued into the OpenCode session matching the app.
@@ -1005,7 +1005,7 @@ pub fn start_ingest_server(ui_sender: flume::Sender<LiveOverlayEvent>) {
     spawn_usb_poller(config);
 }
 
-/// Runs the headless TetherKit ingest server (`scrawl serve`): same HTTP auth, dedupe, bundle
+/// Runs the headless ScrawlKit ingest server (`scrawl serve`): same HTTP auth, dedupe, bundle
 /// building, and OpenCode routing as the GUI app, without touching the clipboard or HUD.
 pub fn run_ingest_server(port: u16, usb: bool, no_opencode: bool) -> Result<()> {
     let _ = crate::handoff::ensure_ingest_token()?;
@@ -1043,7 +1043,7 @@ fn spawn_usb_poller(config: IngestConfig) {
         .spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_millis(1500));
-                let apps = crate::handoff::tether_apps();
+                let apps = crate::handoff::usb_apps();
                 if apps.is_empty() {
                     continue;
                 }
@@ -1051,7 +1051,7 @@ fn spawn_usb_poller(config: IngestConfig) {
                 if helper::devices().map_or(true, |d| d.is_empty()) {
                     continue;
                 }
-                if let Err(err) = poll_usb_tether_containers(&apps, &config) {
+                if let Err(err) = poll_usb_app_containers(&apps, &config) {
                     scrawl_log(format!("ingest usb: {err:#}"));
                 }
             }
@@ -1287,9 +1287,10 @@ fn devicectl_copy(
         .is_ok_and(|o| o.status.success())
 }
 
-/// Takes in recordings the phone marked `.ready` but has no `.sent` for, and writes `.sent`
-/// (the session's name) back as soon as the files are on the Mac.
-fn poll_usb_tether_containers(apps: &[String], config: &IngestConfig) -> Result<()> {
+/// Takes in recordings the phone marked `.ready` but has no `.sent` for (in `Documents/Scrawl` or
+/// the legacy `Documents/Tether` directory), and writes `.sent` (the session's name) back as soon
+/// as the files are on the Mac.
+fn poll_usb_app_containers(apps: &[String], config: &IngestConfig) -> Result<()> {
     if apps.is_empty() {
         return Ok(());
     }
@@ -1315,88 +1316,90 @@ fn poll_usb_tether_containers(apps: &[String], config: &IngestConfig) -> Result<
     };
 
     for bundle_id in apps {
-        let files = Command::new("xcrun")
-            .args([
-                "devicectl",
-                "device",
-                "info",
-                "files",
-                "--device",
-                &udid,
-                "--domain-type",
-                "appDataContainer",
-                "--domain-identifier",
-                bundle_id,
-                "--subdirectory",
-                "Documents/Tether",
-            ])
-            .output()?;
-        if !files.status.success() {
-            continue;
-        }
-        let files = String::from_utf8_lossy(&files.stdout);
-        let names: Vec<&str> = files
-            .lines()
-            .filter_map(|l| l.split_whitespace().next())
-            .collect();
-        for stem in names.iter().filter_map(|n| n.strip_suffix(".ready")) {
-            if names.contains(&format!("{stem}.sent").as_str()) {
+        for subdir in ["Documents/Scrawl", "Documents/Tether"] {
+            let files = Command::new("xcrun")
+                .args([
+                    "devicectl",
+                    "device",
+                    "info",
+                    "files",
+                    "--device",
+                    &udid,
+                    "--domain-type",
+                    "appDataContainer",
+                    "--domain-identifier",
+                    bundle_id,
+                    "--subdirectory",
+                    subdir,
+                ])
+                .output()?;
+            if !files.status.success() {
                 continue;
             }
-            let staging =
-                std::env::temp_dir().join(format!("scrawl-usb-{}", crate::make_bundle_id()));
-            std::fs::create_dir_all(&staging)?;
-            let local_json = staging.join(format!("{stem}.json"));
-            let local_mp4 = staging.join(format!("{stem}.mp4"));
-            let sent = staging.join(format!("{stem}.sent"));
-            let remote = |ext: &str| format!("Documents/Tether/{stem}.{ext}");
-            if !devicectl_copy(
-                &udid,
-                bundle_id,
-                "from",
-                &remote("json"),
-                &local_json.to_string_lossy(),
-            ) {
-                let _ = std::fs::remove_dir_all(&staging);
-                continue;
-            }
-            let timeline: Timeline = std::fs::read(&local_json)
-                .ok()
-                .and_then(|b| serde_json::from_slice(&b).ok())
-                .unwrap_or_default();
-            if !devicectl_copy(
-                &udid,
-                bundle_id,
-                "from",
-                &remote("mp4"),
-                &local_mp4.to_string_lossy(),
-            ) {
-                let _ = std::fs::remove_dir_all(&staging);
-                continue;
-            }
-            let (session, title) = ingest_target(&timeline, config.route_opencode);
-            let fresh = claim_recording(&timeline);
-            // Answer the phone first: it is waiting, and the bundle takes a while to build.
-            std::fs::write(&sent, title.as_bytes())?;
-            devicectl_copy(
-                &udid,
-                bundle_id,
-                "to",
-                &sent.to_string_lossy(),
-                &remote("sent"),
-            );
-            if fresh {
-                if let Err(err) = build_ingested(
-                    &local_mp4,
-                    &local_json,
-                    session.as_deref(),
-                    &title,
-                    config,
-                ) {
-                    scrawl_log(format!("ingest usb {stem}: {err:#}"));
+            let files = String::from_utf8_lossy(&files.stdout);
+            let names: Vec<&str> = files
+                .lines()
+                .filter_map(|l| l.split_whitespace().next())
+                .collect();
+            for stem in names.iter().filter_map(|n| n.strip_suffix(".ready")) {
+                if names.contains(&format!("{stem}.sent").as_str()) {
+                    continue;
                 }
+                let staging =
+                    std::env::temp_dir().join(format!("scrawl-usb-{}", crate::make_bundle_id()));
+                std::fs::create_dir_all(&staging)?;
+                let local_json = staging.join(format!("{stem}.json"));
+                let local_mp4 = staging.join(format!("{stem}.mp4"));
+                let sent = staging.join(format!("{stem}.sent"));
+                let remote = |ext: &str| format!("{subdir}/{stem}.{ext}");
+                if !devicectl_copy(
+                    &udid,
+                    bundle_id,
+                    "from",
+                    &remote("json"),
+                    &local_json.to_string_lossy(),
+                ) {
+                    let _ = std::fs::remove_dir_all(&staging);
+                    continue;
+                }
+                let timeline: Timeline = std::fs::read(&local_json)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok())
+                    .unwrap_or_default();
+                if !devicectl_copy(
+                    &udid,
+                    bundle_id,
+                    "from",
+                    &remote("mp4"),
+                    &local_mp4.to_string_lossy(),
+                ) {
+                    let _ = std::fs::remove_dir_all(&staging);
+                    continue;
+                }
+                let (session, title) = ingest_target(&timeline, config.route_opencode);
+                let fresh = claim_recording(&timeline);
+                // Answer the phone first: it is waiting, and the bundle takes a while to build.
+                std::fs::write(&sent, title.as_bytes())?;
+                devicectl_copy(
+                    &udid,
+                    bundle_id,
+                    "to",
+                    &sent.to_string_lossy(),
+                    &remote("sent"),
+                );
+                if fresh {
+                    if let Err(err) = build_ingested(
+                        &local_mp4,
+                        &local_json,
+                        session.as_deref(),
+                        &title,
+                        config,
+                    ) {
+                        scrawl_log(format!("ingest usb {stem}: {err:#}"));
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&staging);
             }
-            let _ = std::fs::remove_dir_all(&staging);
         }
     }
     Ok(())
@@ -1471,7 +1474,7 @@ mod tests {
     }
 
     #[test]
-    fn timeline_parses_tetherkit_output() {
+    fn timeline_parses_scrawlkit_output() {
         let json = r#"{"app":"dev.kitlangton.UpDown","version":"42","device":"iPhone","system":"27.0",
             "screen":{"width":440,"height":956,"scale":3},"recordedAt":"2026-10-13T16:40:00Z",
             "duration":12.5,"markers":[3.2],"events":[{"t":4.1,"label":"Done tapped"}],
@@ -1524,7 +1527,7 @@ mod tests {
             "http://192.168.1.20:47777".to_owned(),
             "http://100.64.0.12:47777".to_owned(),
         ];
-        let link = format_tether_setup_link(
+        let link = format_setup_link(
             "updown://",
             &urls,
             "deadbeef0123",
@@ -1533,20 +1536,20 @@ mod tests {
         .unwrap();
         assert_eq!(
             link,
-            "updown://tether?url=http%3A%2F%2F100.64.0.12%3A47777&url=http%3A%2F%2F192.168.1.20%3A47777&token=deadbeef0123&session=ses_abc123"
+            "updown://scrawl?url=http%3A%2F%2F100.64.0.12%3A47777&url=http%3A%2F%2F192.168.1.20%3A47777&token=deadbeef0123&session=ses_abc123"
         );
 
-        assert!(format_tether_setup_link("updown", &[], "tok", None).is_err());
+        assert!(format_setup_link("updown", &[], "tok", None).is_err());
         assert!(
-            format_tether_setup_link("updown", &["ftp://1.2.3.4:47777".into()], "tok", None)
+            format_setup_link("updown", &["ftp://1.2.3.4:47777".into()], "tok", None)
                 .is_err()
         );
         assert!(
-            format_tether_setup_link("updown", &["http://1.2.3.4:47777".into()], "", None)
+            format_setup_link("updown", &["http://1.2.3.4:47777".into()], "", None)
                 .is_err()
         );
         assert!(
-            format_tether_setup_link("", &["http://1.2.3.4:47777".into()], "tok", None).is_err()
+            format_setup_link("", &["http://1.2.3.4:47777".into()], "tok", None).is_err()
         );
     }
 
