@@ -11,7 +11,7 @@
 
   public extension View {
     /// Adds Scrawl to this window: once configured on the device, touches are watched (for the
-    /// dots and the timeline) and the trigger starts and stops recordings. Unconfigured devices
+    /// timeline) and the trigger starts and stops recordings. Unconfigured devices
     /// stay completely inert (no gesture recognizers, overlay window, or network calls).
     ///
     /// This modifier also registers `.onOpenURL` so `<scheme>://scrawl?url=...&token=...` and
@@ -147,19 +147,17 @@
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) { forward(touches, .ended, event) }
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) { forward(touches, .cancelled, event) }
 
-    /// Called once every finger has lifted (or the system took the touches): no dot may outlive it.
+    /// Called once every finger has lifted (or the system took the touches).
     override func reset() {
       super.reset()
       Scrawl.shared.touchesReset()
     }
 
-    private func forward(_ touches: Set<UITouch>, _ phase: UITouch.Phase, _ event: UIEvent) {
+    private func forward(_ touches: Set<UITouch>, _ phase: UITouch.Phase, _: UIEvent) {
       guard let window = view as? UIWindow else { return }
       for touch in touches {
         Scrawl.shared.record(touch: touch, in: window, phase: phase)
       }
-      let live = (event.allTouches ?? []).filter { $0.phase != .ended && $0.phase != .cancelled }
-      Scrawl.shared.syncLiveTouches(live)
     }
 
     func gestureRecognizer(_: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith _: UIGestureRecognizer) -> Bool { true }

@@ -7,8 +7,8 @@
   /// Records the app's own windows, not the screen, with the microphone into an H.264 `.mp4`.
   ///
   /// No screen-recording consent is needed: the microphone asks once and iOS remembers. If it's
-  /// denied, the movie is video only. ScrawlKit's `OverlayWindow` is left out, so the strip, touch
-  /// dots, ink, and toasts never appear in the movie; Scrawl on the Mac draws touches and strokes
+  /// denied, the movie is video only. ScrawlKit's `OverlayWindow` is left out, so the strip, ink,
+  /// and toasts never appear in the movie; Scrawl on the Mac draws touches and strokes
   /// from the timeline.
   ///
   /// Frames are drawn on the main thread (UIKit requires it) by a 30 fps display link, into pixel

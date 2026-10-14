@@ -216,7 +216,8 @@
   ///
   /// While recording, a slim strip on the screen's edge (drag its dot to move it) toggles drawing
   /// red strokes, discards (with Undo), or sends to your Mac / agent. The trigger again also sends.
-  /// Pressing and holding on any element locks onto it with a red target ring and records its label.
+  /// Every touch goes on the timeline with the label of the element it hit; nothing is drawn for
+  /// it on screen (Scrawl on the Mac draws touches from the timeline). Holding still gives a tick.
   @MainActor
   @Observable
   public final class Scrawl {
@@ -256,8 +257,6 @@
       let sentMarker: URL
     }
 
-    /// How long the strip takes to slide away before the overlay window goes.
-    private static let overlayExit: Duration = .milliseconds(380)
     private static let undoWindow: Duration = .seconds(5)
     @ObservationIgnored private var events: [[String: Any]] = []
     @ObservationIgnored private var touchLog: [[String: Any]] = []
@@ -269,6 +268,8 @@
     /// Small sequential IDs per finger (1, 2, 3…), stable for a touch's lifetime.
     @ObservationIgnored private var touchIDs: [ObjectIdentifier: Int] = [:]
     @ObservationIgnored private var nextTouchID = 1
+    /// Touches that may become a press-and-hold, by ID: where each went down.
+    @ObservationIgnored private var holdStarts: [Int: CGPoint] = [:]
     /// The window the touches are measured in, for the timeline's `screen`.
     @ObservationIgnored weak var touchWindow: UIWindow?
     @ObservationIgnored private var overlay: OverlayWindow?
@@ -284,7 +285,6 @@
     /// The Scrawl address that answered when the current recording started.
     @ObservationIgnored private var reachableURL: URL?
     @ObservationIgnored private var lastSetupURLHandled: (url: URL, at: ContinuousClock.Instant)?
-    @ObservationIgnored let touches = TouchModel()
 
     /// Whether to record the microphone with the screen.
     public var narration = true
@@ -415,7 +415,7 @@
       // that begin after this point get an ID.
       touchIDs = [:]
       nextTouchID = 1
-      touches.clear()
+      holdStarts = [:]
       isDrawing = false
       uploadStatus = .idle
       failedRecording = nil
@@ -474,7 +474,6 @@
       isDrawing = false
       let discardToken = discarding ? beginUndoWindow() : nil
       if discardToken == nil { uploadStatus = .sending }
-      touches.clear()
       let directory = Self.directory
       try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
       let stamp = startedAt.formatted(.iso8601.year().month().day().timeSeparator(.omitted).time(includingFractionalSeconds: false))
@@ -518,7 +517,7 @@
             print("Scrawl: recording failed: \(error.localizedDescription)")
             self.uploadStatus = .idle
             if discardToken == self.discardID { self.isDiscardPending = false }
-            self.hideOverlay()
+            await self.hideOverlayAfterExit()
             return
           }
           var info = info
@@ -558,8 +557,7 @@
         try? await Task.sleep(for: Self.undoWindow)
         guard let self, self.isDiscardPending, self.discardID == id else { return }
         self.finalizeDiscard()
-        try? await Task.sleep(for: Self.overlayExit)
-        self.hideOverlayIfIdle()
+        await self.hideOverlayAfterExit()
       }
       return id
     }
@@ -635,23 +633,17 @@
       events.append(["t": Self.round(Date().timeIntervalSince(startedAt)), "label": label])
     }
 
-    /// Every finger has lifted: fade any dot that is still showing.
+    /// Every finger has lifted.
     func touchesReset() {
       touchIDs = [:]
       touchLabels = [:]
-      touches.liftAll()
+      holdStarts = [:]
     }
 
-    /// Fades dots whose finger is no longer on the screen, in case its end was never delivered.
-    func syncLiveTouches(_ live: Set<UITouch>) {
-      let ids = Set(live.compactMap { touchIDs[ObjectIdentifier($0)] })
-      touches.lift(except: ids)
-    }
-
-    /// While the overlay is up, touches go to the dots, and to the timeline once recording
-    /// (moves at most 30 a second). A touch that began before the overlay appeared is ignored.
+    /// Touches go to the timeline while recording (moves at most 30 a second). A touch that began
+    /// before the recording was started (the trigger's fingers) is ignored.
     func record(touch: UITouch, in window: UIWindow, phase: UITouch.Phase) {
-      guard overlay != nil else { return }
+      guard isRecording || isStarting else { return }
       touchWindow = window
       let key = ObjectIdentifier(touch)
       let id: Int
@@ -678,8 +670,8 @@
         touchIDs[key] = nil
         touchLabels.removeValue(forKey: id)
       }
-      touches.update(id: id, point: point, label: label, isRecording: isRecording, ended: ended)
       guard let startedAt else { return }
+      trackHold(id: id, at: point, phase: phase)
       let t = Date().timeIntervalSince(startedAt)
       if phase == .moved, let last = lastTouchLog[id], t - last < 1.0 / 30 { return }
       lastTouchLog[id] = t
@@ -701,6 +693,26 @@
         entry["label"] = label
       }
       touchLog.append(entry)
+    }
+
+    /// A light tick when a finger has held still for a moment, so a deliberate "this one" press
+    /// is felt.
+    private func trackHold(id: Int, at point: CGPoint, phase: UITouch.Phase) {
+      switch phase {
+      case .began:
+        holdStarts[id] = point
+        Task { [weak self] in
+          try? await Task.sleep(for: .milliseconds(420))
+          guard let self, self.isRecording, self.holdStarts.removeValue(forKey: id) != nil else { return }
+          UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+        }
+      case .moved:
+        if let start = holdStarts[id], hypot(point.x - start.x, point.y - start.y) > 12 {
+          holdStarts[id] = nil
+        }
+      default:
+        holdStarts[id] = nil
+      }
     }
 
     /// Finds a concise human-readable label for the UIView under `point` in `window`.
@@ -817,8 +829,7 @@
         try? await Task.sleep(for: .milliseconds(2200))
         guard case .sent = uploadStatus else { return }
         uploadStatus = .idle
-        try? await Task.sleep(for: Self.overlayExit)
-        hideOverlayIfIdle()
+        await hideOverlayAfterExit()
       } else {
         // Keep `.ready` so the Mac still picks the recording up the next time the phone is cabled.
         // The share sheet only opens if the strip's Share button is tapped.
@@ -829,8 +840,7 @@
         guard uploadStatus == .failed else { return }
         uploadStatus = .idle
         failedRecording = nil
-        try? await Task.sleep(for: Self.overlayExit)
-        hideOverlayIfIdle()
+        await hideOverlayAfterExit()
       }
     }
 
@@ -839,8 +849,8 @@
       guard let recording = failedRecording else { return }
       failedRecording = nil
       uploadStatus = .idle
-      hideOverlay()
       if sharesWhenDone { Self.share(recording) }
+      Task { await self.hideOverlayAfterExit() }
     }
 
     /// Checks each Scrawl address and remembers the first that answers.
@@ -904,11 +914,12 @@
     private func hideOverlay() {
       overlay?.isHidden = true
       overlay = nil
-      touches.clear()
     }
 
-    /// Hides the overlay after the strip has slid away, unless a new recording or status took over.
-    private func hideOverlayIfIdle() {
+    /// Hides the overlay once the strip has animated away (it leaves as soon as nothing is left to
+    /// show), unless a new recording or status took over in the meantime.
+    private func hideOverlayAfterExit() async {
+      try? await Task.sleep(for: StripMotion.overlayLinger)
       guard !isRecording, !isStarting, uploadStatus == .idle, !isDiscardPending else { return }
       hideOverlay()
     }

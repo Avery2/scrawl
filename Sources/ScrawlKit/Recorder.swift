@@ -5,7 +5,7 @@
   /// How ScrawlKit records the screen.
   public enum ScrawlCaptureMethod: String, Equatable, Sendable {
     /// Draws the app's own windows into the movie (`AppFrameRecorder`). No screen-recording
-    /// prompt; the microphone asks once. The strip, touch dots, and ink stay out of the video, and
+    /// prompt; the microphone asks once. The strip and ink stay out of the video, and
     /// the system keyboard, system alerts, and some layers (video players, camera previews, some
     /// Metal or backdrop effects) may not appear.
     case appFrames

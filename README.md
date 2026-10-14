@@ -82,7 +82,7 @@ or `scrawl-helper frames`) when you need every pixel.
 ### ScrawlKit (iOS)
 
 `ScrawlKit` (`Sources/ScrawlKit`) is a Swift package (iOS 18+) for recording inside your own iOS app:
-video of the app with narration, touch dots and freehand red strokes, markers, and app events on the
+video of the app with narration, touches and freehand red strokes, markers, and app events on the
 same clock, sent straight to Scrawl on your Mac.
 
 Add this repo as a Swift package dependency (product `ScrawlKit`) and attach `.scrawl()` to your root
@@ -103,13 +103,13 @@ methods use the microphone). Set `Scrawl.shared.narration = false` to record wit
 - **`.appFrames`** (default): ScrawlKit draws the app's own windows into an H.264 `.mp4` at 30 fps
   and 2× (880×1912 on a 440×956-point phone), with the microphone recorded alongside. There is no
   screen-recording prompt; the microphone asks once and iOS remembers the answer. If it's denied, the
-  recording is video only and the timeline says `"audio": false`. The strip, touch dots, and ink are
-  left out of the video (Scrawl on the Mac draws touches and strokes from the timeline), but so is
+  recording is video only and the timeline says `"audio": false`. The strip and ink are left out of
+  the video (Scrawl on the Mac draws touches and strokes from the timeline), but so is
   anything the app doesn't draw itself: the system keyboard, system alerts and permission prompts,
   and some layers (video players, camera previews, some Metal or backdrop effects) may be blank or
   look different. Sending the app to the background finishes and sends the recording.
-- **`.replayKit`**: ReplayKit's in-app screen recording, the exact pixels on screen with the strip and
-  dots in them. iOS asks "Record screen and microphone?" unless you allowed it in the last ~8
+- **`.replayKit`**: ReplayKit's in-app screen recording, the exact pixels on screen with the strip in
+  them. iOS asks "Record screen and microphone?" unless you allowed it in the last ~8
   minutes, and again after every reinstall.
 
 The timeline records which was used (`"capture": "appFrames"` or `"replayKit"`).
@@ -117,7 +117,12 @@ The timeline records which was used (`"capture": "appFrames"` or `"replayKit"`).
 While recording, a slim strip sits on the right edge (drag its dot to move it up or down or over to
 the left edge; it remembers where you left it). From top to bottom: the recording dot (hold it to see
 the elapsed time), Draw (tap to turn drawing red strokes on or off), Discard (with a few seconds to
-Undo), and Send. Doing the three-finger trigger again also sends.
+Undo), and Send. Doing the three-finger trigger again also sends. On iOS 26 the strip is Liquid
+Glass and morphs between states (it shrinks to a status circle while sending, and the "Sent to …" or
+"Discarded · Undo" bubble grows out of it); Reduce Motion cross-fades instead.
+
+Touches aren't drawn on screen in either capture method. Each touch goes on the timeline (position,
+phase, and the label of the element under it) and Scrawl on the Mac draws taps and swipes from it.
 
 ScrawlKit stays completely inert on devices that haven't been configured (no gesture recognizers,
 overlay window, or network calls). To pair your iPhone with this Mac, print a setup link (and
