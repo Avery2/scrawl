@@ -5,9 +5,9 @@
   /// How ScrawlKit records the screen.
   public enum ScrawlCaptureMethod: String, Equatable, Sendable {
     /// Draws the app's own windows into the movie (`AppFrameRecorder`). No screen-recording
-    /// prompt; the microphone asks once. The strip and ink stay out of the video, and
-    /// the system keyboard, system alerts, and some layers (video players, camera previews, some
-    /// Metal or backdrop effects) may not appear.
+    /// prompt; the microphone asks once. The strip and ink stay out of the video; the system
+    /// keyboard shows as a labelled panel (its keys are another process's); system alerts and
+    /// some layers (video players, camera previews, some Metal or backdrop effects) may not appear.
     case appFrames
     /// ReplayKit's in-app screen recording: the exact pixels on screen, overlay included, behind
     /// iOS's "Record screen and microphone?" consent alert.

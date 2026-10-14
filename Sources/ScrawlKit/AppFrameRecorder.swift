@@ -248,6 +248,11 @@
       for window in Self.recordedWindows(in: scene) {
         window.drawHierarchy(in: window.frame, afterScreenUpdates: false)
       }
+      // The keyboard is drawn by another process and comes out black, so a labelled panel stands
+      // in for it wherever it is (mid-slide too), over anything any window drew there.
+      if let keyboard = KeyboardTracker.shared.frame(in: scene) {
+        KeyboardPanel.draw(in: keyboard, dark: scene.traitCollection.userInterfaceStyle == .dark)
+      }
       return true
     }
 
@@ -255,7 +260,8 @@
       scene.windows
         .enumerated()
         .filter { _, window in
-          !(window is OverlayWindow) && !window.isHidden && window.alpha > 0.01 && !window.frame.isEmpty
+          !(window is OverlayWindow) && !isKeyboardHost(window) && !window.isHidden && window.alpha > 0.01
+            && !window.frame.isEmpty
         }
         .sorted { lhs, rhs in
           lhs.element.windowLevel == rhs.element.windowLevel
@@ -263,6 +269,16 @@
             : lhs.element.windowLevel < rhs.element.windowLevel
         }
         .map(\.element)
+    }
+
+    /// The system's keyboard window (`UIRemoteKeyboardWindow` today): its keys are another
+    /// process's layers, so drawing it costs a full-screen snapshot for black pixels. Matching by
+    /// name only saves that work; the keyboard panel covers the keyboard's frame whichever window
+    /// drew there, so a renamed class still records cleanly. `UITextEffectsWindow` is kept: it
+    /// holds in-app text UI (edit menus, the loupe). The keyboard's frame includes any input
+    /// accessory view, so the panel covers that too.
+    private static func isKeyboardHost(_ window: UIWindow) -> Bool {
+      NSStringFromClass(type(of: window)).contains("Keyboard")
     }
 
     /// H.264 wants even dimensions.

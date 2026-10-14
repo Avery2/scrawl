@@ -3,7 +3,10 @@
   import UIKit
 
   public enum ScrawlTrigger: Equatable, Sendable {
-    /// Hold three fingers on the screen for half a second to start or stop.
+    /// Hold three fingers on the screen for half a second to start or stop. On paired devices this
+    /// also turns off iOS's three-finger text-editing gestures in the app (see
+    /// `Scrawl.suppressesSystemEditingGestures`), which would otherwise open the Undo · Cut · Copy
+    /// bar when a text field is focused.
     case threeFingerLongPress
     /// No gesture: call `Scrawl.shared.start()` and `stop()` yourself.
     case none
@@ -104,6 +107,7 @@
         press.cancelsTouchesInView = false
         window.addGestureRecognizer(press)
         triggerRecognizer = press
+        Scrawl.shared.threeFingerTriggers += 1
       }
     }
 
@@ -115,6 +119,9 @@
         if let triggerRecognizer {
           installedOn.removeGestureRecognizer(triggerRecognizer)
         }
+      }
+      if triggerRecognizer != nil {
+        Scrawl.shared.threeFingerTriggers -= 1
       }
       touchObserver = nil
       triggerRecognizer = nil

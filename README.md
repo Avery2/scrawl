@@ -105,14 +105,26 @@ methods use the microphone). Set `Scrawl.shared.narration = false` to record wit
   screen-recording prompt; the microphone asks once and iOS remembers the answer. If it's denied, the
   recording is video only and the timeline says `"audio": false`. The strip and ink are left out of
   the video (Scrawl on the Mac draws touches and strokes from the timeline), but so is
-  anything the app doesn't draw itself: the system keyboard, system alerts and permission prompts,
-  and some layers (video players, camera previews, some Metal or backdrop effects) may be blank or
-  look different. Sending the app to the background finishes and sends the recording.
-- **`.replayKit`**: ReplayKit's in-app screen recording, the exact pixels on screen with the strip in
-  them. iOS asks "Record screen and microphone?" unless you allowed it in the last ~8
-  minutes, and again after every reinstall.
+  anything the app doesn't draw itself: system alerts and permission prompts, and some layers (video
+  players, camera previews, some Metal or backdrop effects) may be blank or look different. The
+  system keyboard is drawn by another process, so its keys can't be captured: a plain panel labelled
+  "Keyboard" stands in for it, following it as it slides (taps on the keyboard never reach the app,
+  so they aren't on the timeline either). Sending the app to the background finishes and sends the
+  recording.
+- **`.replayKit`**: ReplayKit's in-app screen recording, the exact pixels on screen with the strip
+  and the keyboard in them. iOS asks "Record screen and microphone?" unless you allowed it in the
+  last ~8 minutes, and again after every reinstall.
 
-The timeline records which was used (`"capture": "appFrames"` or `"replayKit"`).
+The timeline records which was used (`"capture": "appFrames"` or `"replayKit"`). With either, the
+context records the keyboard: `keyboard: visible` if it was up at the start, and
+`keyboard → visible` / `keyboard → hidden` when it comes and goes.
+
+On paired devices, the three-finger trigger turns off iOS's three-finger text-editing gestures in
+the app (UIKit's `editingInteractionConfiguration` answers `.none` for the app's windows), because
+the same press would otherwise open the Undo · Cut · Copy · Redo bar when a text field is focused.
+The cost is that three-finger undo, redo, cut, copy, and paste don't work in that app on a paired
+phone. Set `Scrawl.shared.suppressesSystemEditingGestures = false` to keep them. Unpaired devices
+are unaffected.
 
 While recording, a slim strip sits on the right edge (drag its dot to move it up or down or over to
 the left edge; it remembers where you left it). From top to bottom: the recording dot (hold it to see

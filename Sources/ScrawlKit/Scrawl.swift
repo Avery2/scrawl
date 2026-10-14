@@ -292,6 +292,17 @@
     /// prompt) or ReplayKit (exact screen pixels, behind iOS's consent alert). Takes effect on the
     /// next recording.
     public var captureMethod: ScrawlCaptureMethod = .appFrames
+    /// Whether to turn off iOS's three-finger text-editing gestures (undo, redo, cut, copy, paste,
+    /// and their Undo · Cut · Copy · Redo bar) in this app while ScrawlKit's three-finger trigger
+    /// is installed, so starting a recording with a text field focused doesn't open that bar.
+    /// Only on paired (configured) devices; set `false` to keep the system gestures.
+    public var suppressesSystemEditingGestures = true {
+      didSet { syncSystemIntegration() }
+    }
+    /// Windows with the three-finger trigger installed.
+    @ObservationIgnored var threeFingerTriggers = 0 {
+      didSet { syncSystemIntegration() }
+    }
     /// Whether to show the share sheet when a recording stops (used as fallback if Mac ingest is unreachable).
     public var sharesWhenDone = true
     /// Candidate Scrawl ingest URLs on the Mac (from Keychain or launch args / env).
@@ -376,8 +387,16 @@
     private func notifyConfigurationChanged() {
       DispatchQueue.main.async { [weak self] in
         guard let self else { return }
+        self.syncSystemIntegration()
         NotificationCenter.default.post(name: Self.configurationDidChangeNotification, object: self)
       }
+    }
+
+    /// The pieces that reach outside the app's own views (the editing-gesture override and the
+    /// keyboard tracker) run only on paired devices; unpaired, nothing is installed or observed.
+    func syncSystemIntegration() {
+      SystemEditingGestures.setSuppressed(isConfigured && suppressesSystemEditingGestures && threeFingerTriggers > 0)
+      KeyboardTracker.shared.setTracking(isConfigured)
     }
 
     /// Logs something the app did ("Done tapped", "rest started"), placed on the recording's timeline.
@@ -431,6 +450,7 @@
         switch result {
         case let .success(startedAt):
           self.startedAt = startedAt
+          KeyboardTracker.shared.recordingWillBegin()
           ScrawlAppContext.shared.begin(at: startedAt)
           self.isRecording = true
         case let .failure(error):
