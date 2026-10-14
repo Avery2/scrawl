@@ -262,20 +262,126 @@ fn opencode_binary() -> Result<PathBuf> {
     bail!("Could not find opencode2; set OPENCODE_BIN or add it to PATH")
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-struct Config {
+pub struct Config {
     #[serde(default)]
-    agent_host: Option<String>,
+    pub agent_host: Option<String>,
     #[serde(default)]
-    agent_opencode: Option<String>,
+    pub agent_opencode: Option<String>,
+    #[serde(default)]
+    pub ingest_token: Option<String>,
+    #[serde(default)]
+    pub tether_apps: Vec<String>,
+}
+
+pub fn default_config_path() -> PathBuf {
+    std::env::var_os("SCRAWL_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".config/scrawl/config.json")
+        })
+}
+
+pub fn load_config_from(path: &Path) -> Config {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
 }
 
 fn config() -> Config {
-    dirs::home_dir()
-        .and_then(|home| fs::read(home.join(".config/scrawl/config.json")).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    load_config_from(&default_config_path())
+}
+
+fn random_hex_token_32() -> Result<String> {
+    use std::fmt::Write as _;
+    use std::io::Read as _;
+    let mut file = fs::File::open("/dev/urandom").context("Could not open /dev/urandom")?;
+    let mut bytes = [0_u8; 32];
+    file.read_exact(&mut bytes)
+        .context("Could not read 32 bytes from /dev/urandom")?;
+    let mut token = String::with_capacity(64);
+    for byte in bytes {
+        let _ = write!(&mut token, "{byte:02x}");
+    }
+    Ok(token)
+}
+
+/// Returns `ingestToken` from `path`, generating a 32-byte hex token and writing `path` back with
+/// mode `0600` (while preserving all other JSON keys) if `ingestToken` is absent or empty.
+pub fn ensure_ingest_token_in(path: &Path) -> Result<String> {
+    let mut map = match fs::read(path) {
+        Ok(bytes) if !bytes.iter().all(u8::is_ascii_whitespace) => {
+            match serde_json::from_slice::<serde_json::Value>(&bytes)
+                .with_context(|| format!("Invalid JSON in {}", path.display()))?
+            {
+                serde_json::Value::Object(map) => map,
+                _ => bail!("Expected a JSON object in {}", path.display()),
+            }
+        }
+        Ok(_) | Err(_) => serde_json::Map::new(),
+    };
+
+    if let Some(existing) = map
+        .get("ingestToken")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(existing.to_owned());
+    }
+
+    let token = random_hex_token_32()?;
+    map.insert(
+        "ingestToken".to_owned(),
+        serde_json::Value::String(token.clone()),
+    );
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Could not create {}", parent.display()))?;
+    }
+    let mut body = serde_json::to_vec_pretty(&serde_json::Value::Object(map))?;
+    body.push(b'\n');
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("Could not write {}", path.display()))?;
+        file.write_all(&body)?;
+        file.sync_all()?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, &body).with_context(|| format!("Could not write {}", path.display()))?;
+    }
+    Ok(token)
+}
+
+pub fn ensure_ingest_token() -> Result<String> {
+    ensure_ingest_token_in(&default_config_path())
+}
+
+/// Bundle IDs whose `Documents/Tether` container the USB watcher checks (`tetherApps` in config,
+/// default empty so USB polling is off unless configured).
+pub fn tether_apps() -> Vec<String> {
+    config()
+        .tether_apps
+        .into_iter()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| safe_word(s))
+        .collect()
 }
 
 /// Safe to put unquoted in a remote shell command (host names, `~/bin/tool` paths).
@@ -376,7 +482,7 @@ fn opencode_api(method: &str, path: &str, data: Option<&serde_json::Value>) -> R
     Ok(output.stdout)
 }
 
-fn query_escape(value: &str) -> String {
+pub(crate) fn query_escape(value: &str) -> String {
     let mut result = String::new();
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
@@ -785,5 +891,58 @@ mod tests {
         );
         assert!(extract_frames_range(&path, 5_000, 2_000, 4).is_err());
         assert!(extract_frames_range(&path, 0, 2_000, 0).is_err());
+    }
+
+    #[test]
+    fn token_generation_persists_with_0600_and_preserves_other_keys() {
+        let fixture = Fixture::new();
+        let config_path = fixture.0.join("nested/config.json");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(
+            &config_path,
+            br#"{"agentHost":"studio","agentOpencode":"~/bin/opencode2","tetherApps":["com.kitlangton.UpDown"],"customKey":42}"#,
+        )
+        .unwrap();
+
+        let generated = ensure_ingest_token_in(&config_path).unwrap();
+        assert_eq!(generated.len(), 64);
+        assert!(generated.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        // Calling a second time returns the same token without regenerating.
+        let second = ensure_ingest_token_in(&config_path).unwrap();
+        assert_eq!(generated, second);
+
+        // Other keys are preserved and parsed properly.
+        let parsed = load_config_from(&config_path);
+        assert_eq!(parsed.agent_host.as_deref(), Some("studio"));
+        assert_eq!(parsed.agent_opencode.as_deref(), Some("~/bin/opencode2"));
+        assert_eq!(parsed.ingest_token.as_deref(), Some(generated.as_str()));
+        assert_eq!(parsed.tether_apps, vec!["com.kitlangton.UpDown"]);
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(raw["customKey"], serde_json::json!(42));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn config_defaults_when_missing_or_minimal() {
+        let fixture = Fixture::new();
+        let missing = fixture.0.join("missing.json");
+        let cfg = load_config_from(&missing);
+        assert_eq!(cfg, Config::default());
+        assert!(cfg.tether_apps.is_empty());
+
+        let token = ensure_ingest_token_in(&missing).unwrap();
+        assert_eq!(token.len(), 64);
+        let cfg_after = load_config_from(&missing);
+        assert_eq!(cfg_after.ingest_token.as_deref(), Some(token.as_str()));
+        assert!(cfg_after.tether_apps.is_empty());
     }
 }

@@ -829,41 +829,229 @@ pub fn import(
     )
 }
 
-/// Starts Scrawl's background TetherKit ingest: an HTTP server on `0.0.0.0:47777` the phone
-/// uploads to, and a cabled-iPhone `devicectl` watcher for when the network can't reach the Mac.
-/// Each recording becomes a `.scrawl` bundle, lands on the clipboard and is queued into the
-/// OpenCode session matching the app. The phone is told as soon as the files arrive; the bundle
-/// is built afterwards.
+pub const DEFAULT_INGEST_PORT: u16 = 47777;
+
+pub type IngestCallback = Arc<dyn Fn(PathBuf, ScrawlBundle, Option<String>) + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct IngestConfig {
+    pub copy_clipboard: bool,
+    pub route_opencode: bool,
+    pub on_bundle: Option<IngestCallback>,
+}
+
+/// Constant-time comparison for bearer tokens so timing does not leak token bytes.
+pub fn constant_time_eq(provided: &str, expected: &str) -> bool {
+    let a = provided.as_bytes();
+    let b = expected.as_bytes();
+    if b.is_empty() {
+        return false;
+    }
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for (i, &expected_byte) in b.iter().enumerate() {
+        let provided_byte = a.get(i).copied().unwrap_or(0);
+        diff |= provided_byte ^ expected_byte;
+    }
+    diff == 0 && a.len() == b.len()
+}
+
+fn bearer_token(header: &str) -> Option<&str> {
+    header.lines().skip(1).find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        if !k.trim().eq_ignore_ascii_case("authorization") {
+            return None;
+        }
+        let v = v.trim();
+        let rest = v
+            .strip_prefix("Bearer ")
+            .or_else(|| v.strip_prefix("bearer "))?;
+        let tok = rest.trim();
+        (!tok.is_empty()).then_some(tok)
+    })
+}
+
+/// Discovers this Mac's candidate Scrawl ingest base URLs on `port`: Tailscale IPv4 first,
+/// followed by `en0` / `en1` LAN IPs.
+pub fn discover_default_ingest_urls(port: u16) -> Vec<String> {
+    let mut urls = Vec::new();
+    let push_ip = |urls: &mut Vec<String>, raw: &str| {
+        for line in raw.lines() {
+            let ip = line.trim();
+            if !ip.is_empty()
+                && ip
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
+            {
+                let candidate = format!("http://{ip}:{port}");
+                if !urls.contains(&candidate) {
+                    urls.push(candidate);
+                }
+            }
+        }
+    };
+
+    for bin in [
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+        "tailscale",
+    ] {
+        if let Ok(out) = Command::new(bin).args(["ip", "-4"]).output()
+            && out.status.success()
+        {
+            push_ip(&mut urls, &String::from_utf8_lossy(&out.stdout));
+            if !urls.is_empty() {
+                break;
+            }
+        }
+    }
+
+    for iface in ["en0", "en1"] {
+        if let Ok(out) = Command::new("/usr/sbin/ipconfig")
+            .args(["getifaddr", iface])
+            .output()
+            && out.status.success()
+        {
+            push_ip(&mut urls, &String::from_utf8_lossy(&out.stdout));
+        }
+    }
+    urls
+}
+
+fn normalize_http_base_url(raw: &str) -> Result<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .with_context(|| format!("Base URL must start with http:// or https://: {raw}"))?;
+    ensure!(
+        !rest.is_empty() && !rest.starts_with('/'),
+        "Base URL is missing a host: {raw}"
+    );
+    Ok(trimmed.to_owned())
+}
+
+/// Formats `<scheme>://tether?url=<urlencoded base>[&url=<second>]&token=<token>[&session=ses_…]`.
+pub fn format_tether_setup_link(
+    scheme: &str,
+    urls: &[String],
+    token: &str,
+    session: Option<&str>,
+) -> Result<String> {
+    let scheme = scheme
+        .trim()
+        .trim_end_matches("://")
+        .trim_end_matches(':');
+    ensure!(
+        !scheme.is_empty()
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b)),
+        "Invalid URL scheme: {scheme}"
+    );
+    let token = token.trim();
+    ensure!(!token.is_empty(), "Missing ingest token");
+
+    let mut clean_urls = Vec::new();
+    for raw in urls {
+        let normalized = normalize_http_base_url(raw)?;
+        if !clean_urls.contains(&normalized) {
+            clean_urls.push(normalized);
+        }
+    }
+    ensure!(
+        !clean_urls.is_empty(),
+        "At least one http:// or https:// base URL is required"
+    );
+
+    let mut query = Vec::with_capacity(clean_urls.len() + 2);
+    for url in &clean_urls {
+        query.push(format!("url={}", crate::handoff::query_escape(url)));
+    }
+    query.push(format!("token={}", crate::handoff::query_escape(token)));
+    if let Some(session) = session.map(str::trim).filter(|s| !s.is_empty()) {
+        query.push(format!("session={}", crate::handoff::query_escape(session)));
+    }
+    Ok(format!("{scheme}://tether?{}", query.join("&")))
+}
+
+/// Starts Scrawl's background TetherKit ingest inside the GUI app: an HTTP server on
+/// `0.0.0.0:47777` the phone uploads to, and a cabled-iPhone `devicectl` watcher for when the
+/// network can't reach the Mac. Each recording becomes a `.scrawl` bundle, lands on the clipboard
+/// and is queued into the OpenCode session matching the app.
 pub fn start_ingest_server(ui_sender: flume::Sender<LiveOverlayEvent>) {
-    let http_sender = ui_sender.clone();
+    if let Err(err) = crate::handoff::ensure_ingest_token() {
+        scrawl_log(format!("ingest token setup failed: {err:#}"));
+    }
+    let route_opencode = std::env::var_os("SCRAWL_NO_OPENCODE").is_none();
+    let config = IngestConfig {
+        copy_clipboard: true,
+        route_opencode,
+        on_bundle: Some(Arc::new(move |dir, bundle, status| {
+            let _ = ui_sender.send(LiveOverlayEvent::IngestedBundle {
+                dir,
+                bundle: Box::new(bundle),
+                status,
+            });
+        })),
+    };
+    let http_cfg = config.clone();
     let _ = std::thread::Builder::new()
         .name("scrawl-ingest-http".into())
         .spawn(move || {
-            let Ok(listener) = std::net::TcpListener::bind("0.0.0.0:47777") else {
-                scrawl_log("ingest server: port 47777 already in use");
-                return;
-            };
-            scrawl_log("ingest server listening on 0.0.0.0:47777");
-            for stream in listener.incoming().flatten() {
-                let tx = http_sender.clone();
-                std::thread::spawn(move || {
-                    if let Err(err) = handle_ingest_connection(stream, &tx) {
-                        scrawl_log(format!("ingest http: {err:#}"));
-                    }
-                });
+            if let Err(err) = serve_http(DEFAULT_INGEST_PORT, http_cfg) {
+                scrawl_log(format!("ingest server: {err:#}"));
             }
         });
+    spawn_usb_poller(config);
+}
 
+/// Runs the headless TetherKit ingest server (`scrawl serve`): same HTTP auth, dedupe, bundle
+/// building, and OpenCode routing as the GUI app, without touching the clipboard or HUD.
+pub fn run_ingest_server(port: u16, usb: bool, no_opencode: bool) -> Result<()> {
+    let _ = crate::handoff::ensure_ingest_token()?;
+    let route_opencode = !no_opencode && std::env::var_os("SCRAWL_NO_OPENCODE").is_none();
+    let config = IngestConfig {
+        copy_clipboard: false,
+        route_opencode,
+        on_bundle: None,
+    };
+    if usb {
+        spawn_usb_poller(config.clone());
+    }
+    serve_http(port, config)
+}
+
+fn serve_http(port: u16, config: IngestConfig) -> Result<()> {
+    let addr = format!("0.0.0.0:{port}");
+    let listener = std::net::TcpListener::bind(&addr)
+        .with_context(|| format!("port {port} already in use"))?;
+    scrawl_log(format!("ingest server listening on {addr}"));
+    for stream in listener.incoming().flatten() {
+        let cfg = config.clone();
+        std::thread::spawn(move || {
+            if let Err(err) = handle_ingest_connection(stream, &cfg) {
+                scrawl_log(format!("ingest http: {err:#}"));
+            }
+        });
+    }
+    Ok(())
+}
+
+fn spawn_usb_poller(config: IngestConfig) {
     let _ = std::thread::Builder::new()
         .name("scrawl-ingest-usb".into())
         .spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_millis(1500));
+                let apps = crate::handoff::tether_apps();
+                if apps.is_empty() {
+                    continue;
+                }
                 // The USB registry check is instant, so `xcrun` only runs with an iPhone cabled.
                 if helper::devices().map_or(true, |d| d.is_empty()) {
                     continue;
                 }
-                if let Err(err) = poll_usb_tether_containers(&ui_sender) {
+                if let Err(err) = poll_usb_tether_containers(&apps, &config) {
                     scrawl_log(format!("ingest usb: {err:#}"));
                 }
             }
@@ -889,7 +1077,10 @@ fn claim_recording(timeline: &Timeline) -> bool {
 }
 
 /// The OpenCode session a recording goes to (if one resolves) and the name the phone shows.
-fn ingest_target(timeline: &Timeline) -> (Option<String>, String) {
+fn ingest_target(timeline: &Timeline, route_opencode: bool) -> (Option<String>, String) {
+    if !route_opencode {
+        return (None, "Mac".to_owned());
+    }
     let app = timeline.app.as_deref().or(timeline.bundle_id.as_deref());
     match crate::handoff::resolve_opencode_session(timeline.session.as_deref(), app) {
         Ok((id, title)) => (Some(id), title),
@@ -900,34 +1091,42 @@ fn ingest_target(timeline: &Timeline) -> (Option<String>, String) {
     }
 }
 
-/// Builds the bundle for a received recording, copies it, queues it into `session` and shows it
-/// in the HUD.
+/// Builds the bundle for a received recording, optionally copies it to the clipboard, queues it
+/// into `session`, and notifies the GUI HUD if running inside the app.
 fn build_ingested(
     movie: &Path,
     timeline_path: &Path,
     session: Option<&str>,
     title: &str,
-    ui_sender: &flume::Sender<LiveOverlayEvent>,
+    config: &IngestConfig,
 ) -> Result<()> {
     let bundle_dir =
         crate::handoff::default_captures_dir().join(format!("{}.scrawl", crate::make_bundle_id()));
     let (dir, bundle, _) = import(movie, Some(timeline_path), &bundle_dir, None)?;
-    let _ = crate::handoff::copy_bundle_to_clipboard(&dir);
-    let status = match session {
-        Some(session) => match crate::handoff::send_bundle_to_session(&dir, session) {
-            Ok(()) => format!("Sent to {title}"),
-            Err(err) => {
-                scrawl_log(format!("ingest: OpenCode send failed ({err:#})"));
-                "Copied to clipboard".to_owned()
-            }
-        },
-        None => "Copied to clipboard".to_owned(),
+    if config.copy_clipboard {
+        let _ = crate::handoff::copy_bundle_to_clipboard(&dir);
+    }
+    let fallback_status = if config.copy_clipboard {
+        "Copied to clipboard"
+    } else {
+        "Saved bundle"
     };
-    let _ = ui_sender.send(LiveOverlayEvent::IngestedBundle {
-        dir,
-        bundle: Box::new(bundle),
-        status: Some(status),
-    });
+    let status = match session {
+        Some(session) if config.route_opencode => {
+            match crate::handoff::send_bundle_to_session(&dir, session) {
+                Ok(()) => format!("Sent to {title}"),
+                Err(err) => {
+                    scrawl_log(format!("ingest: OpenCode send failed ({err:#})"));
+                    fallback_status.to_owned()
+                }
+            }
+        }
+        _ => fallback_status.to_owned(),
+    };
+    scrawl_log(format!("ingest: {} ({status})", dir.display()));
+    if let Some(ref on_bundle) = config.on_bundle {
+        on_bundle(dir, bundle, Some(status));
+    }
     Ok(())
 }
 
@@ -941,9 +1140,34 @@ fn http_json(stream: &mut std::net::TcpStream, status: &str, body: &serde_json::
     let _ = stream.flush();
 }
 
+fn http_unauthorized(stream: &mut std::net::TcpStream) {
+    use std::io::Read as _;
+    let response = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let _ = stream.write_all(response);
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut discard = [0_u8; 4096];
+    for _ in 0..16 {
+        match stream.read(&mut discard) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+}
+
 fn handle_ingest_connection(
+    stream: std::net::TcpStream,
+    config: &IngestConfig,
+) -> Result<()> {
+    let expected_token = crate::handoff::ensure_ingest_token()?;
+    handle_ingest_connection_with_token(stream, &expected_token, config)
+}
+
+fn handle_ingest_connection_with_token(
     mut stream: std::net::TcpStream,
-    ui_sender: &flume::Sender<LiveOverlayEvent>,
+    expected_token: &str,
+    config: &IngestConfig,
 ) -> Result<()> {
     use std::io::Read;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
@@ -957,7 +1181,17 @@ fn handle_ingest_connection(
         }
         header.push(byte[0]);
     }
+    if header.is_empty() {
+        return Ok(());
+    }
     let header = String::from_utf8_lossy(&header);
+    let authorized = bearer_token(&header)
+        .is_some_and(|provided| constant_time_eq(provided, expected_token));
+    if !authorized {
+        http_unauthorized(&mut stream);
+        return Ok(());
+    }
+
     let first_line = header.lines().next().unwrap_or("");
     if first_line.starts_with("GET ") {
         http_json(&mut stream, "200 OK", &serde_json::json!({ "ok": true }));
@@ -988,7 +1222,7 @@ fn handle_ingest_connection(
     ensure!(4 + json_len < payload.len(), "Invalid framed payload");
     let json_bytes = &payload[4..4 + json_len];
     let timeline: Timeline = serde_json::from_slice(json_bytes).unwrap_or_default();
-    let (session, title) = ingest_target(&timeline);
+    let (session, title) = ingest_target(&timeline, config.route_opencode);
     let staging = std::env::temp_dir().join(format!("scrawl-ingest-{}", crate::make_bundle_id()));
     std::fs::create_dir_all(&staging)?;
     let timeline_path = staging.join("timeline.json");
@@ -1019,14 +1253,11 @@ fn handle_ingest_connection(
         &timeline_path,
         session.as_deref(),
         &title,
-        ui_sender,
+        config,
     );
     let _ = std::fs::remove_dir_all(&staging);
     built
 }
-
-/// Bundle IDs whose `Documents/Tether` the USB watcher checks.
-const TETHER_APPS: &[&str] = &["com.kitlangton.UpDown"];
 
 fn devicectl_copy(
     udid: &str,
@@ -1058,7 +1289,10 @@ fn devicectl_copy(
 
 /// Takes in recordings the phone marked `.ready` but has no `.sent` for, and writes `.sent`
 /// (the session's name) back as soon as the files are on the Mac.
-fn poll_usb_tether_containers(ui_sender: &flume::Sender<LiveOverlayEvent>) -> Result<()> {
+fn poll_usb_tether_containers(apps: &[String], config: &IngestConfig) -> Result<()> {
+    if apps.is_empty() {
+        return Ok(());
+    }
     let list = Command::new("xcrun")
         .args(["devicectl", "list", "devices"])
         .output()?;
@@ -1080,7 +1314,7 @@ fn poll_usb_tether_containers(ui_sender: &flume::Sender<LiveOverlayEvent>) -> Re
         return Ok(());
     };
 
-    for &bundle_id in TETHER_APPS {
+    for bundle_id in apps {
         let files = Command::new("xcrun")
             .args([
                 "devicectl",
@@ -1140,7 +1374,7 @@ fn poll_usb_tether_containers(ui_sender: &flume::Sender<LiveOverlayEvent>) -> Re
                 let _ = std::fs::remove_dir_all(&staging);
                 continue;
             }
-            let (session, title) = ingest_target(&timeline);
+            let (session, title) = ingest_target(&timeline, config.route_opencode);
             let fresh = claim_recording(&timeline);
             // Answer the phone first: it is waiting, and the bundle takes a while to build.
             std::fs::write(&sent, title.as_bytes())?;
@@ -1157,7 +1391,7 @@ fn poll_usb_tether_containers(ui_sender: &flume::Sender<LiveOverlayEvent>) -> Re
                     &local_json,
                     session.as_deref(),
                     &title,
-                    ui_sender,
+                    config,
                 ) {
                     scrawl_log(format!("ingest usb {stem}: {err:#}"));
                 }
@@ -1266,5 +1500,110 @@ mod tests {
             (movie.clone(), Some(json.clone()))
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn constant_time_compare_rejects_mismatches_and_empty_secrets() {
+        let token = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+        assert!(constant_time_eq(token, token));
+        assert!(!constant_time_eq("", token));
+        assert!(!constant_time_eq(token, ""));
+        assert!(!constant_time_eq("", ""));
+        assert!(!constant_time_eq("short", token));
+        assert!(!constant_time_eq(
+            "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f91",
+            token
+        ));
+        assert!(!constant_time_eq(&format!("{token}extra"), token));
+    }
+
+    #[test]
+    fn setup_link_formats_and_escapes_urls_token_and_session() {
+        let urls = vec![
+            "http://100.64.0.12:47777/".to_owned(),
+            "http://192.168.1.20:47777".to_owned(),
+            "http://100.64.0.12:47777".to_owned(),
+        ];
+        let link = format_tether_setup_link(
+            "updown://",
+            &urls,
+            "deadbeef0123",
+            Some("ses_abc123"),
+        )
+        .unwrap();
+        assert_eq!(
+            link,
+            "updown://tether?url=http%3A%2F%2F100.64.0.12%3A47777&url=http%3A%2F%2F192.168.1.20%3A47777&token=deadbeef0123&session=ses_abc123"
+        );
+
+        assert!(format_tether_setup_link("updown", &[], "tok", None).is_err());
+        assert!(
+            format_tether_setup_link("updown", &["ftp://1.2.3.4:47777".into()], "tok", None)
+                .is_err()
+        );
+        assert!(
+            format_tether_setup_link("updown", &["http://1.2.3.4:47777".into()], "", None)
+                .is_err()
+        );
+        assert!(
+            format_tether_setup_link("", &["http://1.2.3.4:47777".into()], "tok", None).is_err()
+        );
+    }
+
+    fn send_raw_http_request(request: &[u8], expected_token: &str) -> String {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tok = expected_token.to_owned();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let cfg = IngestConfig::default();
+            let _ = handle_ingest_connection_with_token(stream, &tok, &cfg);
+        });
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client.write_all(request).unwrap();
+        client.flush().unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).unwrap();
+        server.join().unwrap();
+        resp
+    }
+
+    #[test]
+    fn ingest_rejects_missing_or_wrong_tokens_with_401_and_accepts_valid_token() {
+        let secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        // 1. Health without token -> 401 with empty body
+        let no_auth = send_raw_http_request(
+            b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            secret,
+        );
+        assert!(no_auth.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+        assert!(no_auth.ends_with("\r\n\r\n"));
+
+        // 2. Health with wrong token -> 401 with empty body
+        let wrong_auth = send_raw_http_request(
+            b"GET /health HTTP/1.1\r\nAuthorization: Bearer wrongtoken\r\n\r\n",
+            secret,
+        );
+        assert!(wrong_auth.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+        assert!(wrong_auth.ends_with("\r\n\r\n"));
+
+        // 3. POST /ingest with wrong token -> 401 with empty body (no sessionTitle leaked)
+        let wrong_post = send_raw_http_request(
+            b"POST /ingest HTTP/1.1\r\nAuthorization: Bearer wrongtoken\r\nContent-Length: 10\r\n\r\n0123456789",
+            secret,
+        );
+        assert!(wrong_post.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+        assert!(!wrong_post.contains("sessionTitle"));
+        assert!(wrong_post.ends_with("\r\n\r\n"));
+
+        // 4. Health with valid token -> 200 OK
+        let valid_health = send_raw_http_request(
+            format!("GET /health HTTP/1.1\r\nAuthorization: Bearer {secret}\r\n\r\n").as_bytes(),
+            secret,
+        );
+        assert!(valid_health.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(valid_health.contains(r#"{"ok":true}"#));
     }
 }

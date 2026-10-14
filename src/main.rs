@@ -170,6 +170,33 @@ enum Command {
         #[arg(long)]
         capture_screenshot: Option<PathBuf>,
     },
+    /// Print a `<scheme>://tether?url=…&token=…` setup link (and QR code) for TetherKit on iPhone.
+    TetherLink {
+        /// URL scheme of the iOS app (for example `updown`).
+        #[arg(long)]
+        scheme: String,
+        /// Scrawl ingest base URL(s); defaults to this Mac's Tailscale and LAN IPs on `--port`.
+        #[arg(long = "url")]
+        urls: Vec<String>,
+        /// Optional OpenCode session ID (`ses_...`) to route captures from this app to.
+        #[arg(long)]
+        session: Option<String>,
+        /// Ingest port used when discovering default Tailscale / LAN URLs.
+        #[arg(long, default_value_t = phone::DEFAULT_INGEST_PORT)]
+        port: u16,
+    },
+    /// Run the headless TetherKit ingest server (HTTP + optional USB watcher, no GUI or clipboard).
+    Serve {
+        /// TCP port to listen on.
+        #[arg(long, default_value_t = phone::DEFAULT_INGEST_PORT)]
+        port: u16,
+        /// Also poll cabled iPhones over USB (`devicectl`) for apps listed in `tetherApps`.
+        #[arg(long)]
+        usb: bool,
+        /// Build bundles without posting them to an OpenCode session.
+        #[arg(long)]
+        no_opencode: bool,
+    },
 }
 
 pub fn now_epoch_ms() -> u64 {
@@ -180,9 +207,15 @@ pub fn now_epoch_ms() -> u64 {
 }
 
 pub fn make_bundle_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Two IDs in the same millisecond (parallel tests, overlapping ingests) must still differ.
+    static COUNT: AtomicU64 = AtomicU64::new(0);
     let ms = now_epoch_ms();
     let pid = std::process::id();
-    format!("scrawl-{ms}-{pid:x}")
+    match COUNT.fetch_add(1, Ordering::Relaxed) {
+        0 => format!("scrawl-{ms}-{pid:x}"),
+        n => format!("scrawl-{ms}-{pid:x}-{n}"),
+    }
 }
 
 /// Matches full-resolution decoded frames back to selected keyframes by timestamp (within 250ms),
@@ -853,6 +886,35 @@ fn main() -> Result<()> {
             ui::run_app(initial, false, false, capture_screenshot);
             Ok(())
         }
+        Command::TetherLink {
+            scheme,
+            urls,
+            session,
+            port,
+        } => {
+            let token = handoff::ensure_ingest_token()?;
+            let resolved_urls = if urls.is_empty() {
+                phone::discover_default_ingest_urls(port)
+            } else {
+                urls
+            };
+            ensure!(
+                !resolved_urls.is_empty(),
+                "Could not discover a Tailscale or LAN IP; pass --url http://<host>:{port}"
+            );
+            let link =
+                phone::format_tether_setup_link(&scheme, &resolved_urls, &token, session.as_deref())?;
+            println!("{link}");
+            if let Ok(qr) = helper::qr(&link) {
+                eprintln!("\n{qr}");
+            }
+            Ok(())
+        }
+        Command::Serve {
+            port,
+            usb,
+            no_opencode,
+        } => phone::run_ingest_server(port, usb, no_opencode),
     }
 }
 

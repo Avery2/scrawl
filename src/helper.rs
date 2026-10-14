@@ -209,3 +209,14 @@ pub fn frames(movie: &Path, times: FrameTimes, max_edge: u32) -> Result<Vec<Rgba
     let _ = std::fs::remove_dir_all(&dir);
     frames
 }
+
+#[derive(Deserialize)]
+struct QrOutput {
+    qr: String,
+}
+
+/// Renders `text` as a compact Unicode half-block QR code for the terminal via CoreImage.
+pub fn qr(text: &str) -> Result<String> {
+    let out: QrOutput = run(&[os("qr"), os(text)], Duration::from_secs(5))?;
+    Ok(out.qr)
+}

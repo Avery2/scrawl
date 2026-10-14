@@ -11,7 +11,54 @@
 // `mirror` command over stdin (`stop`, `cancel`) and reads its events from stdout.
 
 import AppKit
+import CoreImage
 import Foundation
+
+func renderQR(_ message: String) -> String? {
+  guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+  filter.setValue(Data(message.utf8), forKey: "inputMessage")
+  filter.setValue("L", forKey: "inputCorrectionLevel")
+  guard let image = filter.outputImage else { return nil }
+  let extent = image.extent.integral
+  let width = Int(extent.width)
+  let height = Int(extent.height)
+  guard width > 0, height > 0 else { return nil }
+  var pixels = [UInt8](repeating: 255, count: width * height * 4)
+  let context = CIContext(options: [.useSoftwareRenderer: true])
+  context.render(
+    image,
+    toBitmap: &pixels,
+    rowBytes: width * 4,
+    bounds: extent,
+    format: .RGBA8,
+    colorSpace: CGColorSpaceCreateDeviceRGB()
+  )
+  func isDark(_ x: Int, _ y: Int) -> Bool {
+    guard x >= 0, x < width, y >= 0, y < height else { return false }
+    // CIImage origin is bottom-left; flip y so top row renders first.
+    let flippedY = (height - 1) - y
+    return pixels[(flippedY * width + x) * 4] < 128
+  }
+  let pad = 1
+  var lines: [String] = []
+  var y = -pad
+  while y < height + pad {
+    var line = ""
+    for x in -pad ..< (width + pad) {
+      let top = isDark(x, y)
+      let bottom = (y + 1 < height + pad) ? isDark(x, y + 1) : false
+      switch (top, bottom) {
+      case (true, true): line.append("█")
+      case (true, false): line.append("▀")
+      case (false, true): line.append("▄")
+      case (false, false): line.append(" ")
+      }
+    }
+    lines.append(line)
+    y += 2
+  }
+  return lines.joined(separator: "\n")
+}
 
 func emit(_ object: Any) {
   guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes]) else { return }
@@ -78,6 +125,11 @@ case "probe":
 case "guide":
   let kind = (arguments.count >= 2 ? GuidePermission(rawValue: arguments[1]) : nil) ?? .accessibility
   PermissionGuide.run(permission: kind, bundlePath: option("--bundle", in: arguments))
+case "qr":
+  guard arguments.count >= 2, let qr = renderQR(arguments[1]) else {
+    fail("qr needs a text argument")
+  }
+  emit(["qr": qr])
 default:
-  fail("usage: scrawl-helper devices|mirror|transcribe|frames|audio|probe|guide …")
+  fail("usage: scrawl-helper devices|mirror|transcribe|frames|audio|probe|guide|qr …")
 }

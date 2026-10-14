@@ -48,10 +48,18 @@ cargo run -- reprocess latest --out /tmp/again.scrawl
 - **`⌘Z`**: Undo the last stroke
 - **`Esc`**: Cancel the active selection or capture
 
+While picking a target, the island shows the modes **Area**, **Window**, **Screen**, and **iPhone**
+(when one is cabled):
+
+- `1`–`4` jump to a mode; `Tab`/`→` and `⇧Tab`/`←` step through them; `Space` toggles Area and Window
+- Area: drag a region. Window: click a window. Screen and iPhone: `⏎`, `S`, `⌥⇧S`, **Record**, or
+  clicking the selected mode again starts recording (`⏎`/`⌥⇧S` record the full screen from Area and
+  Window too)
+
 ## iPhone
 
-Plug an iPhone in with a cable (unlocked, trusted) and the picker shows **iPhone** next to Area
-and Full Screen (also **Record iPhone** in the menu bar). Choosing it opens a floating mirror of the
+Plug an iPhone in with a cable (unlocked, trusted) and the picker shows **iPhone** next to Area,
+Window, and Screen (also **Record iPhone** in the menu bar). Choosing it opens a floating mirror of the
 phone on the right of the screen and starts recording:
 
 - The phone's own video is recorded natively (1320×2868 at up to 60 fps on an iPhone Pro Max) with
@@ -74,13 +82,47 @@ or `scrawl-helper frames`) when you need every pixel.
 ### TetherKit recordings
 
 [TetherKit](../tether) records inside your own iOS app (ReplayKit video plus a `.json` timeline of
-touches, markers, and app events). AirDrop the pair to the Mac and run `scrawl import`:
+touches, markers, and app events). It stays completely inert until configured on a device.
+
+To pair your iPhone with this Mac, print a setup link (and terminal QR code) and open it on the
+phone:
+
+```sh
+scrawl tether-link --scheme updown
+# updown://tether?url=http%3A%2F%2F100.64.0.12%3A47777&url=http%3A%2F%2F192.168.1.20%3A47777&token=…
+```
+
+`scrawl tether-link` reads (or generates with mode `0600`) `ingestToken` in
+`~/.config/scrawl/config.json` and defaults to this Mac's Tailscale and LAN IPs on port `47777`.
+Opening `<scheme>://tether?reset=1` on the phone clears its Keychain config. For cabled USB
+fallback via `devicectl`, list the app bundle IDs in `~/.config/scrawl/config.json` under
+`"tetherApps": ["com.kitlangton.UpDown"]`.
+
+You can also AirDrop the `.mp4` and `.json` pair to the Mac and run `scrawl import`:
 
 - Touches become taps and swipes, drawn on keyframes as ripples and finger trails and listed in the
   review timeline. Each tap or swipe is a keyframe candidate, like a click.
 - Markers become flags.
 - App events (`Tether.event("Done tapped")`) appear in `summary.md` under the keyframe that was on
   screen when they happened (`  · 0:12 app: Done tapped`).
+
+### Headless ingest server (`scrawl serve`)
+
+On an always-on Mac (such as a Mac Studio reachable over Tailscale), run `scrawl serve` to accept
+authenticated TetherKit uploads, build `.scrawl` bundles, and route them straight into local
+OpenCode sessions without running the GUI app:
+
+```sh
+scrawl serve [--port 47777] [--usb]
+```
+
+To run `scrawl serve` under `launchd`, copy `scripts/scrawl-serve.plist` into `~/Library/LaunchAgents`
+and load it:
+
+```sh
+cp scripts/scrawl-serve.plist ~/Library/LaunchAgents/dev.kitlangton.scrawl.serve.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.kitlangton.scrawl.serve.plist
+```
 
 ## Transcription
 
