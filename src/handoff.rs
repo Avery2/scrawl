@@ -626,20 +626,45 @@ pub fn send_bundle_to_session(bundle_dir: &Path, session: &str) -> Result<()> {
         sync_bundle_to(&host, &directory)?;
     }
     let quoted_directory = shell_quote(&directory.to_string_lossy());
+    let contact_sheet = directory.join(&bundle.contact_sheet);
     let text = format!(
-        "{}\n\nOpen the contact sheet at {} and read {} for timestamped transcript, marks, and interactions.\nTo look closely at a moment (an animation, a glitch, what the narration points at), run:\nscrawl zoom {} --at <M:SS or \"a phrase that was said\"> [--span 2] [--frames 12]\nIt saves a dense contact sheet of that moment with each frame's time and prints what was said; open the PNG before acting on the feedback. This capture is {} ms long.",
+        "{}\n\nThe contact sheet is attached ({}); read {} for timestamped transcript, marks, and interactions.\nTo look closely at a moment (an animation, a glitch, what the narration points at), run:\nscrawl zoom {} --at <M:SS or \"a phrase that was said\"> [--span 2] [--frames 12]\nIt saves a dense contact sheet of that moment with each frame's time and prints what was said; open the PNG before acting on the feedback. This capture is {} ms long.",
         summary.trim_end(),
-        directory.join(&bundle.contact_sheet).display(),
+        contact_sheet.display(),
         directory.join("scrawl.json").display(),
         quoted_directory,
         bundle.duration_ms,
     );
+    // The server reads `file://` attachments from its own disk; the bundle is at the same path
+    // there (copied above when the agents run on another Mac).
     opencode_api(
         "post",
         &format!("/api/session/{session}/prompt"),
-        Some(&serde_json::json!({ "text": text, "delivery": "queue" })),
+        Some(&serde_json::json!({
+            "text": text,
+            "files": [{
+                "uri": file_uri(&contact_sheet),
+                "name": "contact-sheet.png",
+                "description": "Scrawl contact sheet: the capture's keyframes in order",
+            }],
+            "delivery": "queue",
+        })),
     )?;
     Ok(())
+}
+
+/// A `file://` URL for an absolute path, percent-encoding everything but unreserved
+/// characters and `/` ("Application Support" → "Application%20Support").
+fn file_uri(path: &Path) -> String {
+    let mut uri = String::from("file://");
+    for byte in path.to_string_lossy().bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
+            uri.push(char::from(byte));
+        } else {
+            uri.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    uri
 }
 
 pub fn extract_frames_range(
@@ -852,6 +877,16 @@ mod tests {
         );
         assert!(resolve_bundle_dir(&fixture.0).is_err());
         assert!(resolve_bundle_dir(&fixture.0.join("missing.scrawl")).is_err());
+    }
+
+    #[test]
+    fn file_uris_are_percent_encoded() {
+        assert_eq!(
+            file_uri(Path::new(
+                "/Users/kit/Library/Application Support/scrawl/captures/a b#1.scrawl/contact-sheet.png"
+            )),
+            "file:///Users/kit/Library/Application%20Support/scrawl/captures/a%20b%231.scrawl/contact-sheet.png"
+        );
     }
 
     #[test]
