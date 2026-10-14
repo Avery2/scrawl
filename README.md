@@ -117,9 +117,11 @@ The timeline records which was used (`"capture": "appFrames"` or `"replayKit"`).
 While recording, a slim strip sits on the right edge (drag its dot to move it up or down or over to
 the left edge; it remembers where you left it). From top to bottom: the recording dot (hold it to see
 the elapsed time), Draw (tap to turn drawing red strokes on or off), Discard (with a few seconds to
-Undo), and Send. Doing the three-finger trigger again also sends. On iOS 26 the strip is Liquid
-Glass and morphs between states (it shrinks to a status circle while sending, and the "Sent to …" or
-"Discarded · Undo" bubble grows out of it); Reduce Motion cross-fades instead.
+Undo), and Send. Doing the three-finger trigger again also sends. The strip moves like liquid (the
+"Liquid morph" variant of `site/public/prototype/strip`): it stretches out of a droplet, pours into
+the button you tap to become a status circle, buds the "Sent to …", "Discarded · Undo" or "Mac didn't
+answer · Share" bubble off on a neck, and stretches as you throw it. On iOS 26 it's Liquid Glass and
+the neck is the glass itself blending; Reduce Motion cross-fades instead.
 
 Touches aren't drawn on screen in either capture method. Each touch goes on the timeline (position,
 phase, and the label of the element under it) and Scrawl on the Mac draws taps and swipes from it.

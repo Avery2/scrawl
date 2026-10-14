@@ -1,5 +1,6 @@
 #if os(iOS)
   import Combine
+  import QuartzCore
   import SwiftUI
   import UIKit
 
@@ -10,7 +11,7 @@
 
   /// Parts of the overlay that take touches; everything else passes through to the app.
   enum OverlayRegion: Hashable {
-    case strip, toast, status
+    case strip, bubble
   }
 
   /// The screen edge the strip sits on.
@@ -24,7 +25,10 @@
   ///   drag it to move the strip.
   /// - Draw (toggles drawing), Discard (with Undo), Send.
   ///
-  /// While a recording is delivered it collapses to one status circle with a bubble beside it.
+  /// Its motion is the "Liquid morph" prototype Kit chose (`site/public/prototype/strip`, variant
+  /// A): one glass body that stretches out of a droplet, pours into the button you tap, buds
+  /// bubbles off a liquid neck, and squashes as it's thrown. `LiquidStrip` runs the springs; this
+  /// view draws its geometry.
   struct ScrawlStrip: View {
     enum Mode: Equatable {
       case recording(startedAt: Date, isDrawing: Bool)
@@ -46,9 +50,6 @@
         case .discarded: .discarded
         }
       }
-
-      /// The full strip, as opposed to the compact status circle.
-      var isExpanded: Bool { phase == .recording }
     }
 
     struct Actions {
@@ -58,10 +59,14 @@
       var undoDiscard: @MainActor () -> Void = {}
       var share: @MainActor () -> Void = {}
       var reportFrame: @MainActor (OverlayRegion, CGRect) -> Void = { _, _ in }
-      /// The dot is being dragged (translation since touch down, past `dragThreshold`).
-      var gripMoved: @MainActor (CGSize) -> Void = { _ in }
-      /// The dot was let go: translation and predicted end translation.
+      /// The dot moved: translation since touch down and velocity (points per second).
+      var gripMoved: @MainActor (CGSize, CGSize) -> Void = { _, _ in }
+      /// The dot was let go: translation and velocity.
       var gripEnded: @MainActor (CGSize, CGSize) -> Void = { _, _ in }
+      /// The dot's gesture ended, normally or not (called after `gripEnded`).
+      var gripFinished: @MainActor () -> Void = {}
+      /// The dot is being held still (shows the elapsed time).
+      var holdChanged: @MainActor (Bool) -> Void = { _ in }
     }
 
     static let width: CGFloat = 42
@@ -69,84 +74,99 @@
     /// How far the dot moves before a hold becomes a drag.
     static let dragThreshold: CGFloat = 8
 
-    let mode: Mode
-    var side: StripSide = .trailing
+    let model: LiquidStrip
     var actions = Actions()
-    /// Ties the strip's and bubbles' glass together so they morph into one another (iOS 26).
+    /// Identifies the glass shapes so they blend and morph together (iOS 26).
     let glass: Namespace.ID
 
     @GestureState private var dotPress = DotPress.idle
     @Environment(\.displayScale) private var displayScale
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private enum DotPress {
       case idle, holding, dragging
     }
 
     var body: some View {
-      // One glass shape whose size animates between the strip and the status circle. With Reduce
-      // Motion the two are separate shapes that cross-fade instead.
-      content
-        .frame(width: Self.width)
-        .stripGlass(.strip, in: glass, interactive: true)
-        .reportFrame(.strip, to: actions.reportFrame)
-        .id(reduceMotion ? mode.isExpanded : true)
-        .transition(.opacity)
-        .overlay(alignment: Alignment(horizontal: side.inner, vertical: .top)) {
-          if case let .recording(startedAt, _) = mode, dotPress == .holding {
-            ElapsedText(startedAt: startedAt)
-              .bubble(.elapsed, in: glass)
-              .outside(side)
-              .alignmentGuide(.top) { $0[VerticalAlignment.center] - Metrics.dotRow / 2 }
-              .transition(bubbleTransition)
-          }
+      let geometry = model.geometry
+      ZStack(alignment: .topLeading) {
+        Color.clear
+        LiquidGlass(geometry: geometry, isPresent: model.isPresent, namespace: glass)
+        regions(geometry)
+        controls(geometry)
+          .frame(width: Metrics.hit)
+          .position(geometry.column)
+          .allowsHitTesting(geometry.controlsLive)
+        if let phase = model.statusIcon {
+          statusIcon(phase)
+            .frame(width: Self.width, height: Self.width)
+            .scaleEffect(geometry.iconScale)
+            .opacity(geometry.iconOpacity)
+            .position(geometry.icon)
+            .allowsHitTesting(false)
         }
-        .overlay(alignment: Alignment(horizontal: side.inner, vertical: .center)) {
-          statusBubble
+        if let bubble = model.bubble {
+          bubbleContent(bubble)
+            .onGeometryChange(for: CGSize.self, of: { $0.size }, action: { model.measuredBubble($0, for: bubble) })
+            .opacity(geometry.bubbleOpacity)
+            .position(geometry.bubbleCenter)
+            .allowsHitTesting(geometry.bubbleInteractive)
+            .accessibilityHidden(geometry.bubbleOpacity < 0.3)
         }
-        .animation(reduceMotion ? .easeInOut(duration: 0.15) : .snappy(duration: 0.22), value: dotPress)
-    }
-
-    /// The strip's contents. Changes are animated by `StripPlacement`, which sets `mode` inside
-    /// `withAnimation`: the glass resizes while the old contents fade out and the new fade in.
-    @ViewBuilder private var content: some View {
-      if case let .recording(startedAt, isDrawing) = mode {
-        controls(startedAt: startedAt, isDrawing: isDrawing)
-          .transition(.opacity)
-      } else {
-        statusIcon
-          .frame(width: Self.width, height: Self.width)
-          .id(mode.phase)
-          .transition(reduceMotion ? .opacity : .scale(scale: 0.5).combined(with: .opacity))
+      }
+      .onChange(of: dotPress) { _, press in
+        actions.holdChanged(press == .holding)
+        if press == .idle { actions.gripFinished() }
       }
     }
 
-    private func controls(startedAt: Date, isDrawing: Bool) -> some View {
+    /// Invisible rectangles that tell `OverlayWindow` where touches belong to the strip.
+    @ViewBuilder private func regions(_ geometry: LiquidStrip.Geometry) -> some View {
+      if geometry.alpha > 0.05, !geometry.body.isEmpty {
+        Color.clear
+          .frame(width: geometry.body.width, height: geometry.body.height)
+          .position(x: geometry.body.midX, y: geometry.body.midY)
+          .reportFrame(.strip, to: actions.reportFrame)
+          .allowsHitTesting(false)
+      }
+      if geometry.bubbleInteractive, let bubble = geometry.bubble {
+        Color.clear
+          .frame(width: bubble.width, height: bubble.height)
+          .position(x: bubble.midX, y: bubble.midY)
+          .reportFrame(.bubble, to: actions.reportFrame)
+          .allowsHitTesting(false)
+      }
+    }
+
+    private func controls(_ geometry: LiquidStrip.Geometry) -> some View {
       VStack(spacing: 0) {
-        RecordingDot(startedAt: startedAt)
+        RecordingDot(startedAt: model.startedAt)
           .frame(width: Metrics.hit, height: Metrics.dotRow)
           .contentShape(Rectangle())
           .gesture(grip)
           .accessibilityHint("Hold to show the time. Drag to move the controls.")
+          .rowMotion(geometry.rows[0])
 
         StripButton(
           label: "Draw",
-          value: isDrawing ? "On" : "Off",
-          isActive: isDrawing,
+          value: model.isDrawing ? "On" : "Off",
+          isActive: model.isDrawing,
           action: actions.toggleDrawing
         ) {
           Image(systemName: "pencil.tip")
         }
+        .rowMotion(geometry.rows[1])
 
         Rectangle()
           .fill(.white.opacity(0.2))
           .frame(width: 18, height: 1 / displayScale)
           .frame(height: Metrics.divider)
           .accessibilityHidden(true)
+          .rowMotion(geometry.rows[2])
 
         StripButton(label: "Discard recording", action: actions.discard) {
           Image(systemName: "xmark")
         }
+        .rowMotion(geometry.rows[3])
 
         Button { actions.send() } label: {
           Image(systemName: "arrow.up")
@@ -159,9 +179,8 @@
         }
         .buttonStyle(StripButtonStyle())
         .accessibilityLabel("Send recording")
+        .rowMotion(geometry.rows[4])
       }
-      // Rows keep a 44pt touch target and overhang the 42pt strip by a point on each side.
-      .padding(.horizontal, (Self.width - Metrics.hit) / 2)
     }
 
     /// Press the dot to show the time; move it past `dragThreshold` to drag the strip instead.
@@ -170,12 +189,12 @@
         .updating($dotPress) { value, press, _ in
           press = press == .dragging || value.translation.magnitude > Self.dragThreshold ? .dragging : .holding
         }
-        .onChanged { value in actions.gripMoved(value.translation) }
-        .onEnded { value in actions.gripEnded(value.translation, value.predictedEndTranslation) }
+        .onChanged { value in actions.gripMoved(value.translation, value.velocity) }
+        .onEnded { value in actions.gripEnded(value.translation, value.velocity) }
     }
 
-    @ViewBuilder private var statusIcon: some View {
-      switch mode {
+    @ViewBuilder private func statusIcon(_ phase: Mode.Phase) -> some View {
+      switch phase {
       case .recording:
         EmptyView()
       case .sending:
@@ -201,60 +220,49 @@
       }
     }
 
-    @ViewBuilder private var statusBubble: some View {
-      switch mode {
-      case let .sent(target):
-        Text("Sent to \(Self.shortened(target))")
-          .bubble(.status, in: glass)
-          .reportFrame(.status, to: actions.reportFrame)
-          .outside(side)
-          .transition(bubbleTransition)
-      case .failed:
-        HStack(spacing: 8) {
-          Text("Mac didn't answer")
-          Button { actions.share() } label: {
-            Label("Share", systemImage: "square.and.arrow.up")
-              .padding(.horizontal, 9)
-              .padding(.vertical, 4)
-              .background(.white.opacity(0.18), in: .capsule)
-              .contentShape(Rectangle().inset(by: -8))
+    /// A bubble's text at its natural size; the glass behind it is drawn by `LiquidGlass`.
+    @ViewBuilder private func bubbleContent(_ bubble: LiquidStrip.Bubble) -> some View {
+      Group {
+        switch bubble {
+        case .elapsed:
+          ElapsedText(startedAt: model.startedAt)
+        case let .sent(target):
+          Text("Sent to \(Self.shortened(target))")
+        case .failed:
+          HStack(spacing: 8) {
+            Text("Mac didn't answer")
+            Button { actions.share() } label: {
+              Label("Share", systemImage: "square.and.arrow.up")
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(.white.opacity(0.18), in: .capsule)
+                .contentShape(Rectangle().inset(by: -8))
+            }
+            .buttonStyle(.plain)
           }
-          .buttonStyle(.plain)
-        }
-        .bubble(.status, in: glass)
-        .reportFrame(.status, to: actions.reportFrame)
-        .outside(side)
-        .transition(bubbleTransition)
-      case .discarded:
-        HStack(spacing: 6) {
-          Text("Discarded")
-            .foregroundStyle(.white.opacity(0.75))
-          Text("·")
-            .foregroundStyle(.white.opacity(0.4))
-            .accessibilityHidden(true)
-          Button { actions.undoDiscard() } label: {
-            Text("Undo")
-              .foregroundStyle(.white)
-              .contentShape(Rectangle().inset(by: -10))
+        case .discarded:
+          HStack(spacing: 6) {
+            Text("Discarded")
+              .foregroundStyle(.white.opacity(0.75))
+            Text("·")
+              .foregroundStyle(.white.opacity(0.4))
+              .accessibilityHidden(true)
+            Button { actions.undoDiscard() } label: {
+              Text("Undo")
+                .foregroundStyle(.white)
+                .contentShape(Rectangle().inset(by: -10))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Undo discard")
           }
-          .buttonStyle(.plain)
-          .accessibilityLabel("Undo discard")
         }
-        .bubble(.status, in: glass)
-        .reportFrame(.toast, to: actions.reportFrame)
-        .outside(side)
-        .transition(bubbleTransition)
-      case .recording, .sending:
-        EmptyView()
       }
-    }
-
-    /// On iOS 26 the bubble's glass grows out of the strip (`glassEffectTransition`), so only its
-    /// text fades; before that the whole bubble scales out of the strip's side.
-    private var bubbleTransition: AnyTransition {
-      if reduceMotion { return .opacity }
-      if #available(iOS 26, *) { return .opacity }
-      return .opacity.combined(with: .scale(scale: 0.6, anchor: side == .trailing ? .trailing : .leading))
+      .font(.footnote.weight(.semibold))
+      .foregroundStyle(.white)
+      .lineLimit(1)
+      .padding(.horizontal, 12)
+      .padding(.vertical, 8)
+      .fixedSize()
     }
 
     private static func shortened(_ target: String) -> String {
@@ -269,27 +277,769 @@
     /// The dot sits at the centre of the strip's rounded top.
     static let dotRow: CGFloat = ScrawlStrip.width
     static let divider: CGFloat = 9
-    static let bubbleGap: CGFloat = 6
-    /// Glass shapes closer than this blend, and a bubble appearing within it grows out of the
-    /// strip, so it's a little more than `bubbleGap`.
-    static let glassSpacing: CGFloat = 12
+    /// Each row's centre relative to the strip's centre: dot, draw, divider, discard, send.
+    static let rowCenters: [Double] = {
+      var top = -Double(ScrawlStrip.expandedHeight) / 2
+      return [dotRow, row, divider, row, row].map { height in
+        defer { top += Double(height) }
+        return top + Double(height) / 2
+      }
+    }()
+
+    static let dotIndex = 0, discardIndex = 3, sendIndex = 4
+    /// The droplet a hidden bubble shrinks to, tucked inside the body.
+    static let hiddenBubble = 28.0
+    static let hiddenBubbleGap = -35.0
+    /// How far a settled bubble sits from the strip.
+    static let bubbleGap = 8.0
+    /// Glass shapes closer than this blend into one (iOS 26), so a bubble shows a neck while it
+    /// buds off or is absorbed and separates once it's settled `bubbleGap` away.
+    static let glassSpacing: CGFloat = 7
+    /// The prototype's neck reach for the iOS 18 shape (`LiquidShape`).
+    static let neckReach = 18.0
+    static let glassTint = 0.45
   }
 
-  /// Timing shared by the strip's animations and the overlay window that hosts them.
-  enum StripMotion {
-    /// Appearing and changing state: a soft spring.
-    static let change = Animation.spring(duration: 0.42, bounce: 0.18)
-    /// Leaving: no bounce, so it's done when it looks done.
-    static let exit = Animation.smooth(duration: 0.34)
-    static let reduced = Animation.easeInOut(duration: 0.22)
-    /// How long the overlay window stays after the strip starts leaving: the exit animation plus
-    /// a few frames, so the window never disappears under a moving strip.
-    static let overlayLinger: Duration = .milliseconds(450)
+  // MARK: - Motion
 
-    static func animation(leaving: Bool, reduceMotion: Bool) -> Animation {
-      reduceMotion ? reduced : leaving ? exit : change
+  /// Every spring and timing of prototype variant A ("Liquid morph", chosen by Kit) at its default
+  /// knobs: response 0.42 s, bounce 0.18, exit 0.34 s, stagger 0.045 s. The prototype uses
+  /// SwiftUI's mapping (stiffness (2π/d)², damping 4π(1−b)/d), so these are its exact springs; its
+  /// "× m" configs are written out as durations.
+  enum StripMotion {
+    /// The knobs: appearing, pouring, settling.
+    static let change = Spring(duration: 0.42, bounce: 0.18)
+    /// Half the response, no bounce: the glass fading in, the icon fading out.
+    static let quick = Spring(duration: 0.21, bounce: 0)
+    /// Leaving: sliding off after send, shrinking after discard.
+    static let exit = Spring(duration: 0.34, bounce: 0)
+    /// The glass fading away after send (exit × 1.25).
+    static let exitFade = Spring(duration: 0.425, bounce: 0)
+    /// The bottom edge as the droplet stretches (× 1.12), and as it pours (× 1.15): the near
+    /// edge lags the far one.
+    static let stretchLag = Spring(duration: 0.4704, bounce: 0.18)
+    static let pourLag = Spring(duration: 0.483, bounce: 0.18)
+    /// The droplet's squash relaxing (× 1.1, bounce + 0.2).
+    static let unsquash = Spring(duration: 0.462, bounce: 0.38)
+    /// Stretch along a throw (× 0.55, bounce 0.35).
+    static let throwStretch = Spring(duration: 0.231, bounce: 0.35)
+    /// The failed send's shake (× 0.45, bounce 0.55).
+    static let shake = Spring(duration: 0.189, bounce: 0.55)
+    /// Controls fanning out (× 0.8), gathering into the tapped button (× 0.7), fading (× 0.4).
+    static let rowIn = Spring(duration: 0.336, bounce: 0)
+    static let rowGather = Spring(duration: 0.294, bounce: 0)
+    static let rowOut = Spring(duration: 0.168, bounce: 0)
+    /// The status icon fading in (× 0.7) and popping from half size (× 0.8, with bounce).
+    static let iconIn = Spring(duration: 0.294, bounce: 0)
+    static let iconPop = Spring(duration: 0.336, bounce: 0.18)
+    /// A bubble budding out (× 1.05, bounce + 0.2), growing (× 1, × 0.9), its text fading in
+    /// (× 1.25); and being absorbed (× 0.9) with its text gone first (× 0.35).
+    static let bubbleBud = Spring(duration: 0.441, bounce: 0.38)
+    static let bubbleWidth = Spring(duration: 0.42, bounce: 0.18)
+    static let bubbleHeight = Spring(duration: 0.378, bounce: 0.18)
+    static let bubbleTextIn = Spring(duration: 0.525, bounce: 0)
+    static let bubbleTextOut = Spring(duration: 0.147, bounce: 0)
+    static let bubbleAbsorb = Spring(duration: 0.378, bounce: 0)
+
+    /// Between rows fanning out from the middle.
+    static let stagger = 0.045
+    static let fanDelay = 0.04
+    /// The pour runs this long before the status icon appears in the button.
+    static let iconSwapDelay = 0.12
+    /// Bubbles bud off once the pour has landed (or sooner between statuses).
+    static let bubbleDelayAfterPour = 0.3
+    static let bubbleDelay = 0.18
+    static let shakeDelay = 0.06
+    /// Sideways kick (points per second) for the failed shake.
+    static let shakeVelocity = 900.0
+    /// Scale kick when the status changes in place.
+    static let gulpVelocity = 1.4
+    /// Before leaving from a status, its bubble is absorbed.
+    static let exitDelay = 0.22
+    /// Throw speed (points per second) at which the stretch maxes out, and how far it goes.
+    static let stretchSpeed = 2600.0
+    static let maxStretch = 0.3
+    /// Reduce Motion: fade out, change, fade in.
+    static let reducedFade = 0.11
+    /// Glass (de)materialising as the strip appears and once it has faded.
+    static let glassPresence = Animation.smooth(duration: 0.2)
+
+    /// How long the overlay window stays after the strip is told to leave: the bubble absorbed,
+    /// then the slowest exit spring settled, plus a couple of frames.
+    static var overlayLinger: Duration {
+      .milliseconds(Int(((exitDelay + exitFade.settlingDuration) + 0.05) * 1000))
     }
   }
+
+  // MARK: - Liquid strip model
+
+  /// The strip's springs, in the overlay's coordinates. A display link steps them only while
+  /// something is moving (SwiftUI's `Spring.update`), and `geometry` is what `ScrawlStrip` draws.
+  /// A hand-run spring set, rather than `withAnimation`, because the motion needs per-edge springs
+  /// (the far edge leads a pour), staggered per-row springs, velocity kicks (shake, throw), and
+  /// stretch that follows a drag's speed.
+  @MainActor
+  @Observable
+  final class LiquidStrip {
+    typealias Phase = ScrawlStrip.Mode.Phase
+
+    struct Row: Equatable {
+      var opacity = 0.0
+      var offset: CGFloat = 0
+      var scale: CGFloat = 1
+    }
+
+    struct Geometry: Equatable {
+      var alpha = 0.0
+      var body = CGRect.zero
+      var column = CGPoint.zero
+      var rows = Array(repeating: Row(), count: 5)
+      var controlsLive = false
+      var icon = CGPoint.zero
+      var iconScale: CGFloat = 1
+      var iconOpacity = 0.0
+      var bubble: CGRect?
+      var bubbleCenter = CGPoint.zero
+      var bubbleGap = 0.0
+      var bubbleOpacity = 0.0
+      var bubbleInteractive = false
+      /// +1 on the right edge, −1 on the left.
+      var direction: CGFloat = 1
+    }
+
+    enum Bubble: Equatable {
+      case elapsed, sent(String), failed, discarded
+    }
+
+    private(set) var geometry = Geometry()
+    private(set) var statusIcon: Phase?
+    /// The bubble's text (kept while it's absorbed).
+    private(set) var bubble: Bubble?
+    /// Whether the glass exists; false once an exit has faded it.
+    private(set) var isPresent = false
+    private(set) var startedAt = Date()
+    private(set) var isDrawing = false
+
+    @ObservationIgnored var side = StripSide.trailing {
+      didSet { if side != oldValue { wake() } }
+    }
+
+    @ObservationIgnored var reduceMotion = false
+
+    private enum Key: Int, CaseIterable {
+      case alpha, slide, scale, top, bottom, squashX, squashY, throwX, throwY, shake
+      case gather, iconAlpha, iconScale, row0, row1, row2, row3, row4
+      case bubbleWidth, bubbleHeight, bubbleGap, bubbleAlpha, placeX, placeY
+    }
+
+    private struct Value {
+      var value: Double
+      var velocity = 0.0
+      var target: Double
+      var spring = StripMotion.change
+
+      init(_ value: Double) {
+        self.value = value
+        target = value
+      }
+
+      var isSettled: Bool { velocity == 0 && value == target }
+
+      mutating func step(_ dt: Double) {
+        guard !isSettled else { return }
+        // Small substeps, as in the prototype, keep stiff springs stable on long frames.
+        let steps = max(1, Int((dt / 0.004).rounded(.up)))
+        for _ in 0 ..< steps {
+          spring.update(value: &value, velocity: &velocity, target: target, deltaTime: dt / Double(steps))
+        }
+        if abs(velocity) < 0.01, abs(value - target) < 0.001 {
+          value = target
+          velocity = 0
+        }
+      }
+    }
+
+    private struct Timer {
+      let at: Double
+      let run: (LiquidStrip) -> Void
+    }
+
+    private struct Fade {
+      let from: Double
+      let to: Double
+      let start: Double
+      let done: ((LiquidStrip) -> Void)?
+    }
+
+    @ObservationIgnored private var values: [Value] = Key.allCases.map { key in
+      switch key {
+      case .slide: Value(16)
+      case .scale, .squashX, .squashY, .throwX, .throwY, .iconScale: Value(1)
+      case .top: Value(-21)
+      case .bottom: Value(21)
+      case .bubbleWidth, .bubbleHeight: Value(Metrics.hiddenBubble)
+      case .bubbleGap: Value(Metrics.hiddenBubbleGap)
+      default: Value(0)
+      }
+    }
+
+    @ObservationIgnored private var phase: Phase?
+    @ObservationIgnored private var clock = 0.0
+    @ObservationIgnored private var timers: [Timer] = []
+    @ObservationIgnored private var fade: Fade?
+    @ObservationIgnored private var fadeLevel = 1.0
+    @ObservationIgnored private var instant = false
+    @ObservationIgnored private var exiting = false
+    @ObservationIgnored private var holding = false
+    /// Where the controls gather from or into, relative to the strip's centre.
+    @ObservationIgnored private var gatherY = 0.0
+    @ObservationIgnored private var bubbleActive = false
+    @ObservationIgnored private var bubbleY = 0.0
+    @ObservationIgnored private var measured: (bubble: Bubble, size: CGSize)?
+    @ObservationIgnored private var restPoint: CGPoint?
+    @ObservationIgnored private var held = false
+    @ObservationIgnored private var link: CADisplayLink?
+    @ObservationIgnored private var lastTimestamp: CFTimeInterval?
+
+    // MARK: Inputs
+
+    /// The strip's state from `Scrawl`. A new phase starts its transition.
+    func apply(_ mode: ScrawlStrip.Mode?) {
+      if case let .recording(startedAt, isDrawing) = mode {
+        if self.startedAt != startedAt { self.startedAt = startedAt }
+        if self.isDrawing != isDrawing { self.isDrawing = isDrawing }
+      }
+      let previous = phase
+      let next = mode?.phase
+      guard next != previous else { return }
+      phase = next
+      if next != .recording {
+        holding = false
+        held = false
+      }
+      if next == .recording, previous == nil, let restPoint {
+        set(.placeX, restPoint.x)
+        set(.placeY, restPoint.y)
+      }
+      let transition: (LiquidStrip) -> Void = { strip in
+        strip.timers.removeAll()
+        strip.exiting = false
+        switch next {
+        case .recording: strip.toStrip(from: previous)
+        case nil: strip.toGone(from: previous)
+        case let status?: strip.toStatus(status, mode: mode, from: previous)
+        }
+      }
+      if reduceMotion { reducedSwap(transition) } else { transition(self) }
+      wake()
+    }
+
+    /// The dot is held still (elapsed-time bubble) or not.
+    func setHolding(_ isHolding: Bool) {
+      guard phase == .recording, isHolding != holding else { return }
+      holding = isHolding
+      let change: (LiquidStrip) -> Void = { strip in
+        if isHolding {
+          strip.showBubble(.elapsed)
+        } else if strip.bubble == .elapsed, strip.bubbleActive {
+          strip.hideBubble()
+        }
+      }
+      if reduceMotion { applyInstant(change) } else { change(self) }
+      wake()
+    }
+
+    /// The bubble's text measured at its natural size.
+    func measuredBubble(_ size: CGSize, for bubble: Bubble) {
+      measured = (bubble, size)
+      guard bubbleActive, self.bubble == bubble else { return }
+      to(.bubbleWidth, size.width, StripMotion.bubbleWidth)
+      to(.bubbleHeight, size.height, StripMotion.bubbleHeight)
+      wake()
+    }
+
+    /// Where the strip rests: its edge and height in the current safe area.
+    func rest(at point: CGPoint, animated: Bool) {
+      let first = restPoint == nil
+      restPoint = point
+      guard !held else { return }
+      if animated, !first, !reduceMotion {
+        to(.placeX, point.x, StripMotion.change)
+        to(.placeY, point.y, StripMotion.change)
+      } else {
+        set(.placeX, point.x)
+        set(.placeY, point.y)
+      }
+      wake()
+    }
+
+    var place: CGPoint { CGPoint(x: self[.placeX], y: self[.placeY]) }
+
+    /// Follows a drag exactly, keeping its velocity for the stretch.
+    func drag(to point: CGPoint, velocity: CGSize) {
+      held = true
+      set(.placeX, point.x, velocity: velocity.width)
+      set(.placeY, point.y, velocity: velocity.height)
+      wake()
+    }
+
+    /// Lets go with the throw's velocity; call `rest(at:animated:)` with where it lands.
+    func release(velocity: CGSize) {
+      held = false
+      values[Key.placeX.rawValue].velocity = velocity.width
+      values[Key.placeY.rawValue].velocity = velocity.height
+      wake()
+    }
+
+    // MARK: Transitions (variant A's flows)
+
+    /// A squashed droplet stretches into the strip while the controls fan out from the middle.
+    private func toStrip(from previous: Phase?) {
+      let fresh = previous == nil || self[.alpha] < 0.3
+      hideBubble(now: fresh)
+      if fresh {
+        set(.slide, 18)
+        set(.alpha, 0)
+        set(.scale, 0.9)
+        set(.top, -21)
+        set(.bottom, 21)
+        set(.squashX, 1.2)
+        set(.squashY, 0.85)
+        set(.gather, 1)
+        gatherY = 0
+        for key in Self.rowKeys { set(key, 0) }
+        set(.iconAlpha, 0)
+        statusIcon = nil
+        present(true)
+      } else {
+        gatherY = (self[.top] + self[.bottom]) / 2
+        set(.gather, 1)
+        to(.iconAlpha, 0, StripMotion.quick)
+      }
+      to(.alpha, 1, StripMotion.quick)
+      to(.slide, 0, StripMotion.change)
+      to(.scale, 1, StripMotion.change)
+      to(.squashX, 1, StripMotion.unsquash)
+      to(.squashY, 1, StripMotion.unsquash)
+      to(.top, -Double(ScrawlStrip.expandedHeight) / 2, StripMotion.change)
+      to(.bottom, Double(ScrawlStrip.expandedHeight) / 2, StripMotion.stretchLag)
+      to(.gather, 0, StripMotion.change)
+      // Middle row first, then outward.
+      let ring = [2, 1, 0, 1, 2]
+      for (index, key) in Self.rowKeys.enumerated() {
+        after(StripMotion.fanDelay + Double(ring[index]) * StripMotion.stagger) { $0.to(key, 1, StripMotion.rowIn) }
+      }
+    }
+
+    /// The body pours into the tapped button (far edge first), becomes its status circle, and
+    /// buds the status bubble off.
+    private func toStatus(_ status: Phase, mode: ScrawlStrip.Mode?, from previous: Phase?) {
+      let fromStrip = previous == .recording
+      let target: Double = if fromStrip {
+        Metrics.rowCenters[status == .discarded ? Metrics.discardIndex : Metrics.sendIndex]
+      } else if self[.alpha] > 0.3 {
+        (values[Key.top.rawValue].target + values[Key.bottom.rawValue].target) / 2
+      } else {
+        Metrics.rowCenters[Metrics.sendIndex]
+      }
+      if bubbleActive { hideBubble() }
+      if previous == nil {
+        for key in Self.rowKeys { set(key, 0) }
+        present(true)
+      }
+      to(.alpha, 1, StripMotion.quick)
+      to(.slide, 0, StripMotion.change)
+      to(.scale, 1, StripMotion.change)
+      let radius = Double(ScrawlStrip.width) / 2
+      to(.top, target - radius, StripMotion.change)
+      to(.bottom, target + radius, StripMotion.pourLag)
+      if fromStrip {
+        gatherY = target
+        to(.gather, 1, StripMotion.rowGather)
+        for key in Self.rowKeys { to(key, 0, StripMotion.rowOut) }
+      }
+      let gulp = !fromStrip && previous != nil
+      let swap: (LiquidStrip) -> Void = { strip in
+        strip.statusIcon = status
+        strip.set(.iconAlpha, 0)
+        strip.set(.iconScale, 0.5)
+        strip.to(.iconAlpha, 1, StripMotion.iconIn)
+        strip.to(.iconScale, 1, StripMotion.iconPop)
+        if gulp { strip.values[Key.scale.rawValue].velocity += StripMotion.gulpVelocity }
+      }
+      if fromStrip { after(StripMotion.iconSwapDelay, swap) } else { swap(self) }
+      let bubble: Bubble? = switch mode {
+      case let .sent(title)?: .sent(title)
+      case .failed?: .failed
+      case .discarded?: .discarded
+      default: nil
+      }
+      if let bubble {
+        after(fromStrip ? StripMotion.bubbleDelayAfterPour : StripMotion.bubbleDelay) { $0.showBubble(bubble) }
+      }
+      if status == .failed {
+        after(StripMotion.shakeDelay) { strip in
+          strip.values[Key.shake.rawValue].velocity = -Double(strip.direction) * StripMotion.shakeVelocity
+        }
+      }
+    }
+
+    /// Absorbs any bubble, then slides off toward the edge with a squash (or shrinks away after
+    /// a discard).
+    private func toGone(from previous: Phase?) {
+      if bubbleActive { hideBubble() }
+      let wait = previous == .recording ? 0 : StripMotion.exitDelay
+      if previous == .discarded {
+        after(wait) { strip in
+          strip.exiting = true
+          strip.to(.scale, 0.35, StripMotion.exit)
+          strip.to(.alpha, 0, StripMotion.exit)
+          strip.to(.iconAlpha, 0, StripMotion.rowOut)
+        }
+      } else {
+        after(wait) { strip in
+          strip.exiting = true
+          strip.to(.slide, 90, StripMotion.exit)
+          strip.to(.squashX, 1.2, StripMotion.exit)
+          strip.to(.squashY, 0.86, StripMotion.exit)
+          strip.to(.alpha, 0, StripMotion.exitFade)
+          strip.to(.iconAlpha, 0, StripMotion.exit)
+        }
+      }
+    }
+
+    /// A bubble buds out of the body: from a droplet tucked inside it, out past the neck, growing
+    /// to fit its text.
+    private func showBubble(_ kind: Bubble) {
+      bubbleActive = true
+      bubble = kind
+      bubbleY = kind == .elapsed
+        ? Metrics.rowCenters[Metrics.dotIndex]
+        : (values[Key.top.rawValue].target + values[Key.bottom.rawValue].target) / 2
+      to(.bubbleGap, Metrics.bubbleGap, StripMotion.bubbleBud)
+      if let measured, measured.bubble == kind {
+        to(.bubbleWidth, measured.size.width, StripMotion.bubbleWidth)
+        to(.bubbleHeight, measured.size.height, StripMotion.bubbleHeight)
+      }
+      to(.bubbleAlpha, 1, StripMotion.bubbleTextIn)
+    }
+
+    /// The bubble's text goes first, then it's drawn back into the body.
+    private func hideBubble(now: Bool = false) {
+      bubbleActive = false
+      to(.bubbleAlpha, 0, StripMotion.bubbleTextOut)
+      to(.bubbleGap, Metrics.hiddenBubbleGap, StripMotion.bubbleAbsorb)
+      to(.bubbleWidth, Metrics.hiddenBubble, StripMotion.bubbleAbsorb)
+      to(.bubbleHeight, Metrics.hiddenBubble, StripMotion.bubbleAbsorb)
+      if now {
+        set(.bubbleAlpha, 0)
+        set(.bubbleGap, Metrics.hiddenBubbleGap)
+        set(.bubbleWidth, Metrics.hiddenBubble)
+        set(.bubbleHeight, Metrics.hiddenBubble)
+      }
+    }
+
+    // MARK: Reduce Motion
+
+    /// Fades the whole strip out, jumps to the new state, and fades back in.
+    private func reducedSwap(_ change: @escaping (LiquidStrip) -> Void) {
+      guard fade == nil else {
+        applyInstant(change)
+        return
+      }
+      fade = Fade(from: 1, to: 0, start: clock) { strip in
+        strip.applyInstant(change)
+        strip.fade = Fade(from: 0, to: 1, start: strip.clock, done: nil)
+      }
+    }
+
+    private func applyInstant(_ change: (LiquidStrip) -> Void) {
+      instant = true
+      defer { instant = false }
+      change(self)
+      while !timers.isEmpty {
+        let pending = timers.sorted { $0.at < $1.at }
+        timers.removeAll()
+        for timer in pending { timer.run(self) }
+      }
+    }
+
+    // MARK: Springs and the frame loop
+
+    private static let rowKeys: [Key] = [.row0, .row1, .row2, .row3, .row4]
+
+    private subscript(_ key: Key) -> Double { values[key.rawValue].value }
+
+    private var direction: CGFloat { side == .trailing ? 1 : -1 }
+
+    private func to(_ key: Key, _ target: Double, _ spring: Spring) {
+      values[key.rawValue].target = target
+      values[key.rawValue].spring = spring
+      if instant {
+        values[key.rawValue].value = target
+        values[key.rawValue].velocity = 0
+      }
+    }
+
+    private func set(_ key: Key, _ value: Double, velocity: Double = 0) {
+      values[key.rawValue].value = value
+      values[key.rawValue].target = value
+      values[key.rawValue].velocity = velocity
+    }
+
+    private func after(_ delay: Double, _ run: @escaping (LiquidStrip) -> Void) {
+      timers.append(Timer(at: clock + delay, run: run))
+    }
+
+    private func present(_ isPresent: Bool) {
+      guard self.isPresent != isPresent else { return }
+      withAnimation(StripMotion.glassPresence) { self.isPresent = isPresent }
+    }
+
+    private func wake() {
+      guard link == nil else { return }
+      let link = CADisplayLink(target: LinkTarget(self), selector: #selector(LinkTarget.tick(_:)))
+      link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 120, preferred: 120)
+      link.add(to: .main, forMode: .common)
+      self.link = link
+      lastTimestamp = nil
+      advance(0)
+    }
+
+    fileprivate func tick(_ link: CADisplayLink) {
+      let dt = lastTimestamp.map { min(max(link.timestamp - $0, 0), 1.0 / 20) } ?? 1.0 / 60
+      lastTimestamp = link.timestamp
+      advance(dt)
+      let idle = timers.isEmpty && fade == nil && values.allSatisfy(\.isSettled)
+      if idle {
+        link.invalidate()
+        self.link = nil
+      }
+    }
+
+    private func advance(_ dt: Double) {
+      clock += dt
+      let now = clock
+      let due = timers.filter { $0.at <= now }.sorted { $0.at < $1.at }
+      if !due.isEmpty {
+        timers.removeAll { $0.at <= now }
+        for timer in due { timer.run(self) }
+      }
+      if let fade {
+        let progress = min(max((clock - fade.start) / StripMotion.reducedFade, 0), 1)
+        let eased = progress < 0.5 ? 2 * progress * progress : 1 - pow(-2 * progress + 2, 2) / 2
+        fadeLevel = fade.from + (fade.to - fade.from) * eased
+        if progress >= 1 {
+          self.fade = nil
+          fade.done?(self)
+        }
+      }
+      // Stretch along the direction of a throw or drag.
+      var stretch = (x: 1.0, y: 1.0)
+      if !reduceMotion, !exiting, phase == .recording {
+        let speedX = min(abs(values[Key.placeX.rawValue].velocity) / StripMotion.stretchSpeed, StripMotion.maxStretch)
+        let speedY = min(abs(values[Key.placeY.rawValue].velocity) / StripMotion.stretchSpeed, StripMotion.maxStretch)
+        stretch = (1 + speedX - speedY * 0.45, 1 + speedY - speedX * 0.45)
+      }
+      if values[Key.throwX.rawValue].target != stretch.x { to(.throwX, stretch.x, StripMotion.throwStretch) }
+      if values[Key.throwY.rawValue].target != stretch.y { to(.throwY, stretch.y, StripMotion.throwStretch) }
+      for index in values.indices { values[index].step(dt) }
+      publish()
+      if exiting, isPresent, values[Key.alpha.rawValue].target == 0, self[.alpha] < 0.3 {
+        present(false)
+      }
+    }
+
+    /// Variant A's frame(): the body capsule, the bubble beside its inner edge, and the controls.
+    private func publish() {
+      let dir = direction
+      let alpha = min(max(self[.alpha], 0), 1) * fadeLevel
+      let ax = self[.placeX] + Double(dir) * (self[.slide] + self[.shake])
+      let ay = self[.placeY]
+      let scale = self[.scale]
+      let width = Double(ScrawlStrip.width) * self[.squashX] * self[.throwX] * scale
+      let height = max(0, (self[.bottom] - self[.top]) * self[.squashY] * self[.throwY] * scale)
+      let cy = ay + (self[.top] + self[.bottom]) / 2
+
+      var next = Geometry()
+      next.direction = dir
+      next.alpha = alpha
+      next.body = CGRect(x: ax - width / 2, y: cy - height / 2, width: width, height: height)
+      next.column = CGPoint(x: ax, y: ay)
+      next.controlsLive = phase == .recording
+      let gather = self[.gather]
+      for (index, key) in Self.rowKeys.enumerated() {
+        next.rows[index] = Row(
+          opacity: self[key] * alpha,
+          offset: gather * (gatherY - Metrics.rowCenters[index]) * 0.7,
+          scale: 1 - 0.35 * gather
+        )
+      }
+      next.icon = CGPoint(x: ax, y: cy)
+      next.iconScale = max(0, self[.iconScale] * scale)
+      next.iconOpacity = min(max(self[.iconAlpha], 0), 1) * alpha
+
+      let gap = self[.bubbleGap]
+      let bubbleWidth = max(0, self[.bubbleWidth])
+      let bubbleHeight = max(0, self[.bubbleHeight])
+      let inner = ax - Double(dir) * width / 2
+      let near = inner - Double(dir) * gap
+      let left = dir > 0 ? near - bubbleWidth : near
+      let centerY = ay + bubbleY
+      next.bubbleGap = gap
+      next.bubbleCenter = CGPoint(x: left + bubbleWidth / 2, y: centerY)
+      next.bubbleOpacity = min(max(self[.bubbleAlpha], 0), 1) * alpha
+      next.bubbleInteractive = bubbleActive && self[.bubbleAlpha] > 0.5
+      if bubbleWidth > 1, self[.bubbleAlpha] > 0.01 || gap > Metrics.hiddenBubbleGap + 1 {
+        next.bubble = CGRect(x: left, y: centerY - bubbleHeight / 2, width: bubbleWidth, height: bubbleHeight)
+      }
+      if next != geometry { geometry = next }
+    }
+  }
+
+  /// Breaks the display link's retain on the strip: once the strip is gone the link stops itself.
+  private final class LinkTarget: NSObject {
+    weak var strip: LiquidStrip?
+
+    init(_ strip: LiquidStrip) {
+      self.strip = strip
+    }
+
+    @objc func tick(_ link: CADisplayLink) {
+      MainActor.assumeIsolated {
+        guard let strip else {
+          link.invalidate()
+          return
+        }
+        strip.tick(link)
+      }
+    }
+  }
+
+  // MARK: - Glass
+
+  enum StripGlassID: Hashable, Sendable {
+    case strip, bubble
+  }
+
+  /// The strip's body and bubble. On iOS 26 they're two Liquid Glass capsules in a
+  /// `GlassEffectContainer`, which blends them into one shape with a neck while they're within
+  /// `glassSpacing` of each other. Before iOS 26 they're one material shape with the prototype's
+  /// neck drawn in (`LiquidShape`).
+  private struct LiquidGlass: View {
+    let geometry: LiquidStrip.Geometry
+    let isPresent: Bool
+    let namespace: Namespace.ID
+    @Environment(\.displayScale) private var displayScale
+
+    var body: some View {
+      Group {
+        if #available(iOS 26, *) {
+          GlassEffectContainer(spacing: Metrics.glassSpacing) {
+            ZStack(alignment: .topLeading) {
+              Color.clear
+              if isPresent {
+                if let bubble = geometry.bubble {
+                  capsule(bubble, id: .bubble)
+                }
+                capsule(geometry.body, id: .strip)
+              }
+            }
+          }
+        } else {
+          if isPresent {
+            LiquidShape(geometry: geometry)
+              .fill(.ultraThinMaterial)
+              .overlay(LiquidShape(geometry: geometry).fill(.black.opacity(Metrics.glassTint)))
+              .overlay(LiquidShape(geometry: geometry).stroke(.white.opacity(0.22), lineWidth: 1 / displayScale))
+              .environment(\.colorScheme, .dark)
+              .opacity(geometry.alpha)
+              .transition(.opacity)
+          }
+        }
+      }
+      .allowsHitTesting(false)
+    }
+
+    @available(iOS 26, *)
+    private func capsule(_ rect: CGRect, id: StripGlassID) -> some View {
+      Color.clear
+        .frame(width: rect.width, height: rect.height)
+        .glassEffect(.regular.tint(.black.opacity(Metrics.glassTint)), in: .capsule)
+        .glassEffectID(id, in: namespace)
+        // The body materialises as it appears and once it has faded; the bubble's geometry is
+        // already driven out of the body, so it needs no transition of its own.
+        .glassEffectTransition(id == .strip ? .materialize : .identity)
+        .opacity(geometry.alpha)
+        .position(x: rect.midX, y: rect.midY)
+    }
+  }
+
+  /// The body and bubble capsules unioned with variant A's metaball neck (a waisted bridge that
+  /// thins as the gap opens), for the material fallback.
+  private struct LiquidShape: Shape {
+    let geometry: LiquidStrip.Geometry
+
+    func path(in _: CGRect) -> Path {
+      let body = geometry.body
+      var path = Self.capsule(body)
+      guard let bubble = geometry.bubble else { return path }
+      path = path.union(Self.capsule(bubble))
+      let gap = geometry.bubbleGap
+      guard gap < Metrics.neckReach, gap > -Double(bubble.height) else { return path }
+      let reach = min(max(1 - gap / Metrics.neckReach, 0), 1)
+      let bubbleRadius = min(bubble.width, bubble.height) / 2
+      let bodyRadius = body.width / 2
+      let dir = geometry.direction
+      let bubbleCap = Cap(
+        x: dir > 0 ? bubble.maxX - bubbleRadius : bubble.minX + bubbleRadius,
+        y: bubble.midY,
+        r: bubbleRadius
+      )
+      let bodyCap = Cap(
+        x: body.midX,
+        y: min(max(bubble.midY, body.minY + bodyRadius), body.maxY - bodyRadius),
+        r: bodyRadius
+      )
+      let half = min(bubbleRadius, bodyRadius) * sin(Self.neckAngle) * (0.1 + 0.9 * pow(reach, 3))
+      let neck = dir > 0
+        ? Self.neck(from: bubbleCap, to: bodyCap, half: half)
+        : Self.neck(from: bodyCap, to: bubbleCap, half: half)
+      if let neck { path = path.union(neck) }
+      return path
+    }
+
+    private struct Cap {
+      let x: CGFloat
+      let y: CGFloat
+      let r: CGFloat
+    }
+
+    private static let neckAngle = 0.95
+
+    private static func capsule(_ rect: CGRect) -> Path {
+      guard rect.width > 0.5, rect.height > 0.5 else { return Path() }
+      return Path(roundedRect: rect, cornerRadius: min(rect.width, rect.height) / 2)
+    }
+
+    private static func neck(from left: Cap, to right: Cap, half: CGFloat) -> Path? {
+      let sine = sin(neckAngle), cosine = cos(neckAngle)
+      let startX = left.x + left.r * cosine
+      let endX = right.x - right.r * cosine
+      guard endX - startX >= 0.5 else { return nil }
+      let midX = (startX + endX) / 2
+      let midY = (left.y + right.y) / 2
+      var path = Path()
+      path.move(to: CGPoint(x: startX, y: left.y - left.r * sine))
+      path.addQuadCurve(to: CGPoint(x: endX, y: right.y - right.r * sine), control: CGPoint(x: midX, y: midY - half))
+      path.addLine(to: CGPoint(x: endX, y: right.y + right.r * sine))
+      path.addQuadCurve(to: CGPoint(x: startX, y: left.y + left.r * sine), control: CGPoint(x: midX, y: midY + half))
+      path.closeSubpath()
+      return path
+    }
+  }
+
+  // MARK: - Controls
 
   /// A pulsing red dot inside a hairline ring that fills once per minute.
   private struct RecordingDot: View {
@@ -373,102 +1123,115 @@
     }
   }
 
+  // MARK: - Placement
+
   /// Places the strip on the left or right edge, vertically wherever it was left (remembered per
-  /// app), inside the safe area and above the keyboard. Dragging the dot moves it; letting go snaps
-  /// it to the nearer edge.
+  /// app), inside the safe area and above the keyboard. Dragging the dot moves it; a throw lands
+  /// on the nearer edge, stretching along the way.
   ///
-  /// It owns the strip's animation: `mode` comes straight from `Scrawl` with no transaction, so the
-  /// strip shows `shown`, which follows `mode` inside `withAnimation`. The first value is applied a
-  /// run-loop turn after the window first draws, so the strip always animates in rather than being
-  /// there on the window's first frame.
+  /// `mode` comes straight from `Scrawl`; the first value reaches the strip a run-loop turn after
+  /// the window first draws, so it always animates in.
   struct StripPlacement: View {
     let mode: ScrawlStrip.Mode?
     let actions: ScrawlStrip.Actions
+    /// Pins the edge (previews) instead of the remembered one.
+    var sideOverride: StripSide?
 
-    @AppStorage("dev.kitlangton.scrawl.strip.side") private var side = StripSide.trailing
+    @AppStorage("dev.kitlangton.scrawl.strip.side") private var storedSide = StripSide.trailing
     /// 0 is the top of the space the strip can move in, 1 the bottom.
     @AppStorage("dev.kitlangton.scrawl.strip.position") private var position = 0.5
-    @State private var shown: ScrawlStrip.Mode?
+    @State private var liquid = LiquidStrip()
     @State private var latest: ScrawlStrip.Mode?
     @State private var isReady = false
-    @State private var drag: CGSize?
+    @State private var pressOrigin: CGPoint?
+    @State private var isDragging = false
     /// The keyboard's top edge in screen coordinates while it's showing.
     @State private var keyboardTop: CGFloat?
     @Namespace private var glass
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    private var side: StripSide { sideOverride ?? storedSide }
+
     var body: some View {
-      StripGlassContainer {
-        GeometryReader { geometry in
-          let area = StripArea(geometry, keyboardTop: keyboardTop)
-          if let shown {
-            ScrawlStrip(mode: shown, side: side, actions: placed(actions, in: area), glass: glass)
-              .position(area.center(side: side, position: position, drag: drag))
-              .transition(entryExit)
-          }
-        }
+      GeometryReader { geometry in
+        let area = StripArea(geometry, keyboardTop: keyboardTop)
+        let rest = area.center(side: side, position: position)
+        ScrawlStrip(model: liquid, actions: placed(actions, in: area), glass: glass)
+          .onAppear { liquid.rest(at: rest, animated: false) }
+          .onChange(of: rest) { _, rest in liquid.rest(at: rest, animated: true) }
       }
       .ignoresSafeArea(.keyboard)
       .onAppear {
+        liquid.side = side
+        liquid.reduceMotion = reduceMotion
         latest = mode
         DispatchQueue.main.async {
           isReady = true
-          show(latest)
+          liquid.apply(latest)
         }
       }
       .onChange(of: mode) { _, next in
         latest = next
-        if isReady { show(next) }
+        if isReady { liquid.apply(next) }
+        if next?.phase != .recording {
+          pressOrigin = nil
+          isDragging = false
+        }
       }
+      .onChange(of: side) { _, side in liquid.side = side }
+      .onChange(of: reduceMotion) { _, reduce in liquid.reduceMotion = reduce }
       .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
-        let top = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect)?.minY
-        withAnimation(StripMotion.animation(leaving: false, reduceMotion: reduceMotion)) { keyboardTop = top }
+        keyboardTop = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect)?.minY
       }
       .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
-        withAnimation(StripMotion.animation(leaving: false, reduceMotion: reduceMotion)) { keyboardTop = nil }
+        keyboardTop = nil
       }
-    }
-
-    private func show(_ next: ScrawlStrip.Mode?) {
-      guard next != shown else { return }
-      if next?.isExpanded != true { drag = nil }
-      withAnimation(StripMotion.animation(leaving: next == nil, reduceMotion: reduceMotion)) {
-        shown = next
-      }
-    }
-
-    /// In: from a little toward its edge, slightly small, materialising. Out: toward its edge.
-    private var entryExit: AnyTransition {
-      if reduceMotion { return .opacity }
-      let edge: CGFloat = side == .trailing ? 1 : -1
-      let anchor: UnitPoint = side == .trailing ? .trailing : .leading
-      return .asymmetric(
-        insertion: .scale(scale: 0.85, anchor: anchor).combined(with: .offset(x: 16 * edge)).combined(with: .opacity),
-        removal: .scale(scale: 0.85, anchor: anchor).combined(with: .offset(x: 60 * edge)).combined(with: .opacity)
-      )
     }
 
     private func placed(_ actions: ScrawlStrip.Actions, in area: StripArea) -> ScrawlStrip.Actions {
       var actions = actions
-      actions.gripMoved = { translation in
-        if drag == nil {
+      actions.gripMoved = { translation, velocity in
+        let origin = pressOrigin ?? liquid.place
+        if pressOrigin == nil { pressOrigin = origin }
+        if !isDragging {
           guard translation.magnitude > ScrawlStrip.dragThreshold else { return }
+          isDragging = true
           UIImpactFeedbackGenerator(style: .light).impactOccurred()
         }
-        drag = translation
+        liquid.drag(to: area.clamp(origin.offset(by: translation)), velocity: velocity)
       }
-      actions.gripEnded = { translation, predicted in
-        guard drag != nil else { return }
-        let resting = area.center(side: side, position: position, drag: nil)
-        let landingX = resting.x + predicted.width
-        let landingY = resting.y + translation.height + (predicted.height - translation.height) * 0.25
-        withAnimation(.spring(duration: 0.4, bounce: 0.2)) {
-          side = landingX < area.size.width / 2 ? .leading : .trailing
-          position = area.position(forY: landingY)
-          drag = nil
+      actions.gripEnded = { translation, velocity in
+        defer {
+          pressOrigin = nil
+          isDragging = false
         }
+        guard isDragging, let origin = pressOrigin else { return }
+        let dropped = area.clamp(origin.offset(by: translation))
+        // Where the throw would carry it decides the edge and height (as in the prototype).
+        let landingX = dropped.x + velocity.width * 0.3
+        let landingY = dropped.y + velocity.height * 0.3 * 0.25
+        let landedSide = sideOverride ?? (landingX < area.size.width / 2 ? .leading : .trailing)
+        storedSide = landedSide
+        position = area.position(forY: landingY)
+        liquid.side = landedSide
+        liquid.release(velocity: velocity)
+        liquid.rest(at: area.center(side: landedSide, position: position), animated: true)
         UIImpactFeedbackGenerator(style: .soft).impactOccurred()
       }
+      // A gesture the system cancelled never calls `gripEnded`: put the strip back.
+      actions.gripFinished = {
+        DispatchQueue.main.async {
+          guard isDragging else {
+            pressOrigin = nil
+            return
+          }
+          pressOrigin = nil
+          isDragging = false
+          liquid.release(velocity: .zero)
+          liquid.rest(at: area.center(side: side, position: position), animated: true)
+        }
+      }
+      actions.holdChanged = { liquid.setHolding($0) }
       return actions
     }
   }
@@ -491,11 +1254,15 @@
       yRange = minY ... max(minY, size.height - keyboardOverlap - 8 - halfHeight)
     }
 
-    func center(side: StripSide, position: Double, drag: CGSize?) -> CGPoint {
-      let x = side == .leading ? xRange.lowerBound : xRange.upperBound
-      let y = yRange.lowerBound + (yRange.upperBound - yRange.lowerBound) * min(max(position, 0), 1)
-      guard let drag else { return CGPoint(x: x, y: y) }
-      return CGPoint(x: (x + drag.width).clamped(to: xRange), y: (y + drag.height).clamped(to: yRange))
+    func center(side: StripSide, position: Double) -> CGPoint {
+      CGPoint(
+        x: side == .leading ? xRange.lowerBound : xRange.upperBound,
+        y: yRange.lowerBound + (yRange.upperBound - yRange.lowerBound) * min(max(position, 0), 1)
+      )
+    }
+
+    func clamp(_ point: CGPoint) -> CGPoint {
+      CGPoint(x: point.x.clamped(to: xRange), y: point.y.clamped(to: yRange))
     }
 
     func position(forY y: CGFloat) -> Double {
@@ -505,90 +1272,25 @@
     }
   }
 
-  /// The glass shapes that morph into one another.
-  enum StripGlassID: Hashable, Sendable {
-    case strip, elapsed, status
-  }
-
-  /// Tinted Liquid Glass on iOS 26, identified so it morphs within `StripGlassContainer`; before
-  /// that, a dark material capsule with a hairline (animated with ordinary SwiftUI transitions).
-  private struct StripGlass: ViewModifier {
-    let id: StripGlassID
-    let namespace: Namespace.ID
-    let tint: Double
-    let interactive: Bool
-    @Environment(\.displayScale) private var displayScale
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    func body(content: Content) -> some View {
-      if #available(iOS 26, *) {
-        content
-          .glassEffect(.regular.tint(.black.opacity(tint)).interactive(interactive), in: .capsule)
-          .glassEffectID(id, in: namespace)
-          // Bubbles grow out of the strip; the strip itself materialises (and does when replaced
-          // under Reduce Motion, which also fades instead of morphing).
-          .glassEffectTransition(id == .strip || reduceMotion ? .materialize : .matchedGeometry)
-      } else {
-        content
-          .background {
-            Capsule()
-              .fill(.ultraThinMaterial)
-              .overlay(Capsule().fill(.black.opacity(tint)))
-              .environment(\.colorScheme, .dark)
-          }
-          .overlay(Capsule().strokeBorder(.white.opacity(0.22), lineWidth: 1 / displayScale))
-      }
-    }
-  }
-
-  /// `GlassEffectContainer` on iOS 26, so the strip and its bubbles blend and morph as one.
-  private struct StripGlassContainer<Content: View>: View {
-    @ViewBuilder let content: Content
-
-    var body: some View {
-      if #available(iOS 26, *) {
-        GlassEffectContainer(spacing: Metrics.glassSpacing) { content }
-      } else {
-        content
-      }
-    }
-  }
-
-  private extension StripSide {
-    /// The strip's edge that faces the screen's middle, where bubbles appear.
-    var inner: HorizontalAlignment {
-      self == .trailing ? .leading : .trailing
-    }
-  }
-
   private extension View {
-    func stripGlass(_ id: StripGlassID, in namespace: Namespace.ID, tint: Double = 0.45, interactive: Bool = false) -> some View {
-      modifier(StripGlass(id: id, namespace: namespace, tint: tint, interactive: interactive))
-    }
-
-    /// A small capsule beside the strip (time, sent, failed, discarded).
-    func bubble(_ id: StripGlassID, in namespace: Namespace.ID) -> some View {
-      font(.footnote.weight(.semibold))
-        .foregroundStyle(.white)
-        .lineLimit(1)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .stripGlass(id, in: namespace, tint: 0.5)
-        .fixedSize()
-    }
-
-    /// Sits this overlay just outside the strip, on its inner edge.
-    func outside(_ side: StripSide) -> some View {
-      alignmentGuide(side.inner) { dimensions in
-        side == .trailing
-          ? dimensions[.trailing] + Metrics.bubbleGap
-          : dimensions[.leading] - Metrics.bubbleGap
-      }
+    /// A row's fan-out / gather motion from `LiquidStrip`.
+    func rowMotion(_ row: LiquidStrip.Row) -> some View {
+      scaleEffect(row.scale)
+        .offset(y: row.offset)
+        .opacity(row.opacity)
+        .allowsHitTesting(row.opacity > 0.3)
+        .accessibilityHidden(row.opacity < 0.3)
     }
 
     func reportFrame(_ region: OverlayRegion, to report: @escaping @MainActor (OverlayRegion, CGRect) -> Void) -> some View {
       onGeometryChange(for: CGRect.self, of: { $0.frame(in: .global) }, action: { report(region, $0) })
         .onDisappear { report(region, .zero) }
+    }
+  }
+
+  private extension CGPoint {
+    func offset(by translation: CGSize) -> CGPoint {
+      CGPoint(x: x + translation.width, y: y + translation.height)
     }
   }
 
@@ -606,34 +1308,32 @@
     private struct StripPreview: View {
       let mode: ScrawlStrip.Mode
       var side = StripSide.trailing
-      @Namespace private var glass
 
       var body: some View {
-        ZStack(alignment: side == .trailing ? .trailing : .leading) {
+        ZStack {
           LinearGradient(colors: [.indigo, .teal, .orange], startPoint: .top, endPoint: .bottom)
             .ignoresSafeArea()
-          StripGlassContainer {
-            ScrawlStrip(mode: mode, side: side, glass: glass)
-          }
-          .padding(.horizontal, 6)
+          StripPlacement(mode: mode, actions: .init(), sideOverride: side)
         }
       }
     }
 
-    /// Steps through the states on a loop through `StripPlacement`, so the real animations play.
+    /// Plays variant A's flows on a loop through `StripPlacement`, the way the overlay drives it:
+    /// appear, draw on, pour into send, sent bubble, slide off; appear, pour into discard, Undo
+    /// toast, back to sending, failed with a shake, absorbed and gone.
     private struct StripCyclePreview: View {
-      private static let steps: [ScrawlStrip.Mode?] = [
-        nil,
-        .recording(startedAt: .now, isDrawing: false),
-        .recording(startedAt: .now, isDrawing: true),
-        .sending,
-        .sent("Fix the onboarding flow"),
-        nil,
-        .recording(startedAt: .now, isDrawing: false),
-        .discarded,
-        .sending,
-        .failed,
-        nil,
+      private static let steps: [(mode: ScrawlStrip.Mode?, seconds: Double)] = [
+        (nil, 0.8),
+        (.recording(startedAt: .now, isDrawing: false), 1.4),
+        (.recording(startedAt: .now, isDrawing: true), 1.0),
+        (.sending, 1.4),
+        (.sent("Fix the onboarding flow"), 2.2),
+        (nil, 1.2),
+        (.recording(startedAt: .now, isDrawing: false), 1.4),
+        (.discarded, 2.4),
+        (.sending, 1.4),
+        (.failed, 2.6),
+        (nil, 1.2),
       ]
       @State private var step = 0
 
@@ -641,18 +1341,18 @@
         ZStack {
           LinearGradient(colors: [.indigo, .teal, .orange], startPoint: .top, endPoint: .bottom)
             .ignoresSafeArea()
-          StripPlacement(mode: Self.steps[step], actions: .init())
+          StripPlacement(mode: Self.steps[step].mode, actions: .init(), sideOverride: .trailing)
         }
         .task {
           while !Task.isCancelled {
-            try? await Task.sleep(for: .seconds(1.6))
+            try? await Task.sleep(for: .seconds(Self.steps[step].seconds))
             step = (step + 1) % Self.steps.count
           }
         }
       }
     }
 
-    #Preview("Animated cycle") {
+    #Preview("Animated cycle (variant A)") {
       StripCyclePreview()
     }
 
