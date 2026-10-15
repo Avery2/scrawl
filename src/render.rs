@@ -40,8 +40,7 @@ pub fn save_png(frame: &RgbaFrame, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-fn decode_png<R: std::io::BufRead + std::io::Seek>(source: R) -> anyhow::Result<RgbaFrame> {
+pub fn decode_png<R: std::io::BufRead + std::io::Seek>(source: R) -> anyhow::Result<RgbaFrame> {
     let mut decoder = png::Decoder::new(source);
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info()?;

@@ -1,3 +1,4 @@
+mod autocrop;
 mod capture;
 mod handoff;
 mod helper;
@@ -150,6 +151,16 @@ enum Command {
         /// Frames in the sheet.
         #[arg(long, default_value_t = 12)]
         frames: usize,
+    },
+    /// Experiment: export a bundle's activity and windows to `autocrop/` and write a crop
+    /// playground (`autocrop/index.html`) for tuning how Screen captures get cropped.
+    Autocrop {
+        /// Path to `.scrawl` bundle directory or `latest`.
+        #[arg(default_value = "latest")]
+        bundle: PathBuf,
+        /// Open the playground in the default browser.
+        #[arg(long)]
+        open: bool,
     },
     /// Print the window list the Screen-mode window log would store, and what it costs.
     #[command(hide = true)]
@@ -897,6 +908,21 @@ fn main() -> Result<()> {
             );
             if !sheet.said.is_empty() {
                 println!("Said: “{}”", sheet.said);
+            }
+            Ok(())
+        }
+        Command::Autocrop { bundle, open } => {
+            let (dir, loaded) = handoff::load_bundle(&bundle)?;
+            let page = autocrop::export(&dir, &loaded)?;
+            println!("{}", page.display());
+            if loaded.windows.is_empty() {
+                eprintln!(
+                    "No window log in this bundle (record in Screen mode to get one); \
+                     the playground falls back to activity only."
+                );
+            }
+            if open {
+                std::process::Command::new("open").arg(&page).status()?;
             }
             Ok(())
         }

@@ -1,0 +1,913 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scrawl autocrop</title>
+<style>
+  :root {
+    --bg: #0e0e10; --panel: #161618; --panel2: #1c1c1f; --line: #2a2a2e; --text: #e8e8ea;
+    --dim: #8b8b92; --faint: #5a5a61; --accent: #ff453a; --ok: #32d74b; --warn: #ffd60a;
+    --blue: #64d2ff; --violet: #bf5af2;
+    --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif; }
+  button { font: inherit; color: inherit; }
+  kbd { font: 600 10px/1 var(--mono); padding: 2px 4px; border-radius: 4px; background: #2c2c30;
+    color: #c8c8cc; border: 1px solid #3a3a3f; }
+  header { height: 48px; display: flex; align-items: center; gap: 16px; padding: 0 14px;
+    border-bottom: 1px solid var(--line); background: var(--panel); }
+  .brand { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1 1 auto; }
+  .brand b { color: var(--accent); font-weight: 700; }
+  #meta { color: var(--dim); font-weight: 400; margin-left: 8px; font-size: 12px; }
+  .presets { display: flex; gap: 6px; margin-left: auto; flex: 0 0 auto; }
+  .presets button, .actions button { background: var(--panel2); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 10px; cursor: pointer; display: flex; gap: 7px; align-items: center; white-space: nowrap; }
+  .presets button:hover, .actions button:hover { border-color: #444; }
+  .presets button.active { border-color: var(--accent); background: #2a1716; }
+  .presets i { font-style: normal; color: var(--ok); font-size: 11px; }
+  .actions { display: flex; gap: 6px; flex: 0 0 auto; }
+  .layout { display: grid; grid-template-columns: 286px 1fr; height: calc(100% - 48px); }
+  aside { overflow-y: auto; border-right: 1px solid var(--line); background: var(--panel); padding: 6px 12px 24px; }
+  aside h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim);
+    margin: 14px 0 6px; font-weight: 600; }
+  .ctl { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 2px 8px; margin: 5px 0; }
+  .ctl label { color: #cfcfd3; }
+  .ctl .val { font: 11px var(--mono); color: var(--dim); text-align: right; min-width: 52px; }
+  .ctl input[type=range] { grid-column: 1 / -1; width: 100%; accent-color: var(--accent); height: 14px; margin: 0; }
+  .ctl select { grid-column: 2; background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 3px 6px; font: inherit; font-size: 12px; }
+  .ctl .hint { grid-column: 1 / -1; color: var(--faint); font-size: 11px; }
+  .toggle { display: flex; align-items: center; gap: 8px; margin: 5px 0; cursor: pointer; color: #cfcfd3; }
+  .toggle input { accent-color: var(--accent); margin: 0; }
+  .toggle kbd { margin-left: auto; }
+  main { overflow-y: auto; padding: 12px 14px 40px; }
+  .stage { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); gap: 12px; }
+  figure { margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px; min-width: 0; }
+  figure .box { position: relative; display: flex; align-items: center; justify-content: center; height: min(50vh, 520px); }
+  figure canvas { display: block; max-width: 100%; max-height: 100%; }
+  figcaption { color: var(--dim); font-size: 12px; margin-top: 6px; display: flex; gap: 10px; flex-wrap: wrap; }
+  figcaption b { color: var(--text); font-weight: 600; }
+  .mono { font-family: var(--mono); font-size: 11.5px; }
+  .info { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); gap: 12px; margin-top: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+  .card h4 { margin: 0 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); font-weight: 600; }
+  .said { color: #d9d9dd; font-size: 13px; }
+  .said em { color: var(--faint); font-style: normal; }
+  .shares { display: grid; gap: 4px; }
+  .share { display: grid; grid-template-columns: 150px 1fr 44px; gap: 8px; align-items: center; font-size: 12px; }
+  .share .bar { height: 8px; background: #26262a; border-radius: 4px; overflow: hidden; }
+  .share .bar i { display: block; height: 100%; border-radius: 4px; }
+  .share .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .decision { font-weight: 600; margin-bottom: 6px; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 99px; background: #26262a; color: #cfcfd3; font-size: 11px; margin-right: 4px; }
+  .timeline { margin-top: 12px; }
+  .timeline canvas { width: 100%; height: 86px; display: block; cursor: pointer; }
+  .strip { display: flex; gap: 8px; margin-top: 10px; overflow-x: auto; padding-bottom: 4px; }
+  .thumb { flex: 0 0 auto; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 5px; cursor: pointer; }
+  .thumb.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .thumb canvas { display: block; border-radius: 4px; }
+  .thumb div { font-size: 11px; color: var(--dim); margin-top: 4px; display: flex; justify-content: space-between; gap: 6px; }
+  .thumb div b { color: var(--text); }
+  .sheetwrap { margin-top: 14px; }
+  .sheethead { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; color: var(--dim); font-size: 12px; }
+  .sheethead b { color: var(--text); font-size: 13px; }
+  .sheethead label { margin-left: auto; display: flex; gap: 6px; align-items: center; cursor: pointer; }
+  #sheet { display: block; max-width: 100%; border-radius: 8px; }
+  #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%) translateY(20px); opacity: 0;
+    background: #2c2c30; border: 1px solid #3a3a3f; border-radius: 10px; padding: 8px 14px; transition: .18s ease; pointer-events: none; }
+  #toast.show { opacity: 1; transform: translateX(-50%); }
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 12px; padding: 16px 20px; max-width: 560px; }
+  dialog::backdrop { background: rgba(0,0,0,.55); }
+  dialog table td { padding: 3px 10px 3px 0; }
+  dialog pre { background: #0b0b0c; border: 1px solid var(--line); border-radius: 8px; padding: 10px; max-height: 50vh; overflow: auto; font: 11px var(--mono); }
+  .warn { color: var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">Scrawl <b>autocrop</b><span id="meta"></span></div>
+  <div class="presets" id="presets"></div>
+  <div class="actions">
+    <button id="copy" title="Copy the current settings as JSON"><kbd>C</kbd> Copy settings</button>
+    <button id="helpBtn" title="Shortcuts"><kbd>?</kbd></button>
+  </div>
+</header>
+<div class="layout">
+  <aside id="controls"></aside>
+  <main>
+    <section class="stage">
+      <figure><div class="box"><canvas id="full"></canvas></div><figcaption id="fullCap"></figcaption></figure>
+      <figure><div class="box"><canvas id="crop"></canvas></div><figcaption id="cropCap"></figcaption></figure>
+    </section>
+    <section class="info">
+      <div class="card"><h4>Keyframe</h4><div id="kfInfo"></div></div>
+      <div class="card"><h4>Crop decision</h4><div id="decision"></div></div>
+    </section>
+    <section class="timeline card"><canvas id="timeline"></canvas></section>
+    <section class="strip" id="strip"></section>
+    <section class="sheetwrap card">
+      <div class="sheethead"><b>Contact sheet</b><span id="sheetMeta"></span>
+        <label><input type="checkbox" id="sheetOriginal"> Uncropped <kbd>O</kbd></label></div>
+      <canvas id="sheet"></canvas>
+    </section>
+  </main>
+</div>
+<div id="toast"></div>
+<dialog id="help">
+  <h3 style="margin-top:0">Shortcuts</h3>
+  <table>
+    <tr><td><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd></td><td>Presets: Window-snap, Activity box, Whole capture</td></tr>
+    <tr><td><kbd>←</kbd> <kbd>→</kbd> or <kbd>J</kbd> <kbd>K</kbd></td><td>Previous / next keyframe</td></tr>
+    <tr><td><kbd>W</kbd> <kbd>A</kbd> <kbd>H</kbd> <kbd>S</kbd> <kbd>X</kbd> <kbd>D</kbd></td><td>Overlays: windows, activity, cursor heat, snapped window, crop, scene changes</td></tr>
+    <tr><td><kbd>O</kbd></td><td>Contact sheet uncropped / cropped</td></tr>
+    <tr><td><kbd>C</kbd></td><td>Copy settings JSON</td></tr>
+    <tr><td><kbd>R</kbd></td><td>Reset to the recommended preset</td></tr>
+  </table>
+  <p style="color:var(--dim)">The crop is computed here, in JS, from the bundle's activity
+    (ink, clicks, drags, laser, scrolls, cursor dwell, scene changes) and the window log Scrawl
+    keeps in Screen mode. Settings persist in this browser. When you like a setup, copy the
+    settings: they get baked into Scrawl's Rust side.</p>
+  <form method="dialog"><button style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 12px">Close</button></form>
+</dialog>
+<dialog id="copied"><h3 style="margin-top:0">Settings</h3><pre id="copiedText"></pre>
+  <form method="dialog"><button style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 12px">Close</button></form></dialog>
+<script>
+const DATA = /*SCRAWL_AUTOCROP_DATA*/null;
+
+// ---------------------------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------------------------
+const DEFAULTS = {
+  scope: 'smooth', reachMs: 400,
+  snap: true, snapThreshold: 60, maxWindows: 3, minShare: 10, keepInk: true, ignoreOverlays: true, chrome: true,
+  padding: 16, minW: 480, minH: 320, maxZoom: 3, aspect: 'free',
+  wStroke: 1.0, wClick: 0.6, wLaser: 0.4, wScroll: 0.3, wCursor: 0.15, wChange: 0.1, outlier: 25,
+  zoomStep: 2, mergeIoU: 0.7, fallback: 'frontmost',
+  ovWindows: true, ovActivity: true, ovHeat: true, ovSnap: true, ovCrop: true, ovChanges: false,
+};
+const PRESETS = [
+  { name: 'Window-snap', tag: 'recommended', values: {} },
+  { name: 'Activity box', values: { snap: false, padding: 56, scope: 'smooth', aspect: 'auto', minW: 520, minH: 340 } },
+  { name: 'Whole capture', values: { scope: 'whole', padding: 16 } },
+];
+const OVERLAY_KEYS = new Set(['ovWindows', 'ovActivity', 'ovHeat', 'ovSnap', 'ovCrop', 'ovChanges']);
+const CONTROLS = [
+  { section: 'Scope' },
+  { key: 'scope', label: 'Crop per', type: 'select', options: [['whole', 'Whole capture'], ['keyframe', 'Keyframe'], ['smooth', 'Keyframe, smoothed']] },
+  { key: 'reachMs', label: 'Activity reach', type: 'range', min: 0, max: 4000, step: 100, unit: 'ms', hint: 'Widens each keyframe\'s slice of the timeline (slices meet halfway between keyframes).' },
+  { section: 'Window snapping' },
+  { key: 'snap', label: 'Snap to windows', type: 'toggle' },
+  { key: 'snapThreshold', label: 'Snap when windows hold', type: 'range', min: 30, max: 100, step: 5, unit: '%', hint: 'Share of the weighted activity in the top 1–N windows.' },
+  { key: 'maxWindows', label: 'Max windows in a union', type: 'range', min: 1, max: 3, step: 1 },
+  { key: 'minShare', label: 'Min share per window', type: 'range', min: 0, max: 40, step: 1, unit: '%' },
+  { key: 'keepInk', label: 'Always keep ink inside', type: 'toggle' },
+  { key: 'chrome', label: 'Include touched menu bar / Dock', type: 'toggle' },
+  { key: 'ignoreOverlays', label: 'Ignore full-screen agent overlays', type: 'toggle' },
+  { section: 'Size' },
+  { key: 'padding', label: 'Padding', type: 'range', min: 0, max: 200, step: 4, unit: 'pt' },
+  { key: 'minW', label: 'Min width', type: 'range', min: 120, max: 1600, step: 20, unit: 'pt' },
+  { key: 'minH', label: 'Min height', type: 'range', min: 80, max: 1000, step: 20, unit: 'pt' },
+  { key: 'maxZoom', label: 'Max zoom', type: 'range', min: 1, max: 6, step: 0.25, unit: '×', hint: 'The crop covers at least 1/zoom of the screen along its longer side.' },
+  { key: 'aspect', label: 'Aspect', type: 'select', options: [['free', 'Free'], ['auto', 'Nearest common'], ['screen', 'Screen'], ['16:9', '16:9'], ['16:10', '16:10'], ['3:2', '3:2'], ['4:3', '4:3'], ['1:1', '1:1']] },
+  { section: 'Activity weights' },
+  { key: 'wStroke', label: 'Ink stroke', type: 'range', min: 0, max: 3, step: 0.05 },
+  { key: 'wClick', label: 'Click / drag', type: 'range', min: 0, max: 3, step: 0.05 },
+  { key: 'wLaser', label: 'Laser', type: 'range', min: 0, max: 3, step: 0.05 },
+  { key: 'wScroll', label: 'Scroll', type: 'range', min: 0, max: 3, step: 0.05 },
+  { key: 'wCursor', label: 'Cursor dwell (per s)', type: 'range', min: 0, max: 2, step: 0.05 },
+  { key: 'wChange', label: 'Scene change region', type: 'range', min: 0, max: 2, step: 0.05 },
+  { key: 'outlier', label: 'Cursor outlier beyond', type: 'range', min: 5, max: 100, step: 1, unit: '%', hint: 'Of the screen diagonal, from the nearest ink/click (or the cursor\'s median when there is none).' },
+  { section: 'Smoothing & fallback' },
+  { key: 'zoomStep', label: 'Max zoom change', type: 'range', min: 1, max: 6, step: 0.25, unit: '×', hint: 'Between neighbouring keyframes, by area; the smaller crop grows to fit. 6× is off.' },
+  { key: 'mergeIoU', label: 'Merge crops overlapping ≥', type: 'range', min: 0.3, max: 1, step: 0.05, hint: 'Neighbouring crops this similar (IoU) become one.' },
+  { key: 'fallback', label: 'Talk-only keyframes', type: 'select', options: [['frontmost', 'Frontmost window'], ['previous', 'Previous crop'], ['screen', 'Whole screen']] },
+  { section: 'Overlays' },
+  { key: 'ovWindows', label: 'Windows', type: 'toggle', kbd: 'W' },
+  { key: 'ovActivity', label: 'Activity', type: 'toggle', kbd: 'A' },
+  { key: 'ovHeat', label: 'Cursor heat', type: 'toggle', kbd: 'H' },
+  { key: 'ovSnap', label: 'Snapped window', type: 'toggle', kbd: 'S' },
+  { key: 'ovCrop', label: 'Crop', type: 'toggle', kbd: 'X' },
+  { key: 'ovChanges', label: 'Scene changes', type: 'toggle', kbd: 'D' },
+];
+const STORE = 'scrawl-autocrop-settings-v1';
+let settings = { ...DEFAULTS, ...loadStored() };
+function loadStored() { try { return JSON.parse(localStorage.getItem(STORE)) || {}; } catch { return {}; } }
+function save() { try { localStorage.setItem(STORE, JSON.stringify(settings)); } catch {} }
+
+// ---------------------------------------------------------------------------------------------
+// Data
+// ---------------------------------------------------------------------------------------------
+const SCREEN = DATA.screen;
+const SW = SCREEN.width, SH = SCREEN.height, DIAG = Math.hypot(SW, SH);
+const KF = DATA.keyframes.slice().sort((a, b) => a.t - b.t);
+const DUR = Math.max(DATA.durationMs, KF.length ? KF[KF.length - 1].t + 1 : 1);
+const SNAPS = DATA.windows.slice().sort((a, b) => a.t - b.t);
+let sel = 0;
+
+const clockOf = ms => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const hue = s => { let h = 0; for (const c of s || '') h = (h * 31 + c.charCodeAt(0)) >>> 0; return h % 360; };
+const appColor = (app, a = 1) => `hsla(${hue(app)}, 85%, 62%, ${a})`;
+
+function subsample(pts, max) {
+  if (pts.length <= max) return pts;
+  const out = [];
+  for (let i = 0; i < max; i++) out.push(pts[Math.round(i * (pts.length - 1) / (max - 1))]);
+  return out;
+}
+
+/** Every piece of activity as {kind, t0, t1, pts: [[x, y, t]], dwell?, kf?}. */
+function buildItems() {
+  const items = [];
+  DATA.strokes.forEach((s, i) => items.push({ kind: s.laser ? 'laser' : 'stroke', t0: s.t0, t1: s.t1, id: i,
+    pts: subsample(s.pts, 48), all: s.pts }));
+  DATA.clicks.forEach(c => items.push({ kind: 'click', t0: c.t, t1: c.t, pts: [[c.x, c.y, c.t]], label: c.label }));
+  DATA.drags.forEach(d => {
+    const mid = (d.path || []).map(p => [p[0], p[1], (d.t + d.t1) / 2]);
+    items.push({ kind: 'drag', t0: d.t, t1: d.t1, pts: subsample([[d.x0, d.y0, d.t], ...mid, [d.x1, d.y1, d.t1]], 16) });
+  });
+  DATA.scrolls.forEach(s => items.push({ kind: 'scroll', t0: s.t, t1: s.t, pts: [[s.x, s.y, s.t]] }));
+  DATA.points.forEach(p => items.push({ kind: 'laser', t0: p.t, t1: p.t, pts: [[p.x, p.y, p.t]] }));
+  const cur = DATA.cursor;
+  cur.forEach((c, i) => {
+    const next = i + 1 < cur.length ? cur[i + 1][0] : DUR;
+    items.push({ kind: 'cursor', t0: c[0], t1: next, pts: [[c[1], c[2], c[0]]], dwell: Math.min(next - c[0], 4000) / 1000 });
+  });
+  KF.forEach((kf, k) => (kf.changes || []).forEach(b => {
+    const area = Math.sqrt((b[2] - b[0]) * (b[3] - b[1]));
+    items.push({ kind: 'change', t0: kf.t, t1: kf.t, kf: k, box: b, area,
+      pts: [[b[0], b[1], kf.t], [b[2], b[1], kf.t], [b[0], b[3], kf.t], [b[2], b[3], kf.t], [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2, kf.t]] });
+  }));
+  return items;
+}
+const ITEMS = buildItems();
+
+function itemWeight(it, s) {
+  switch (it.kind) {
+    case 'stroke': return s.wStroke;
+    case 'click': case 'drag': return s.wClick;
+    case 'laser': return s.wLaser;
+    case 'scroll': return s.wScroll;
+    case 'cursor': return s.wCursor * it.dwell;
+    case 'change': return s.wChange * clamp(it.area * 3, 0.2, 1);
+  }
+  return 0;
+}
+
+function segment(k, s) {
+  if (s.scope === 'whole' || k < 0) return [0, DUR];
+  const t = KF[k].t;
+  const a = k === 0 ? 0 : (KF[k - 1].t + t) / 2;
+  const b = k === KF.length - 1 ? DUR : (t + KF[k + 1].t) / 2;
+  return [a - s.reachMs, b + s.reachMs];
+}
+
+function windowsAt(t, s) {
+  if (!SNAPS.length) return [];
+  let snap = SNAPS[0];
+  for (const x of SNAPS) { if (x.t <= t) snap = x; else break; }
+  return snap.windows.filter(w => {
+    if (!s.ignoreOverlays) return true;
+    const area = (Math.min(w.box[2], 1) - Math.max(w.box[0], 0)) * (Math.min(w.box[3], 1) - Math.max(w.box[1], 0));
+    return !(w.regular === false && w.layer === 0 && area > 0.85);
+  });
+}
+const isChrome = w => (w.layer === 24 && w.app === 'Window Server') || (w.layer === 20 && w.app === 'Dock');
+// Only deliberate input pulls the menu bar or Dock into a crop, not cursor dwell or screen changes.
+const DELIBERATE = new Set(['stroke', 'click', 'drag', 'laser', 'scroll']);
+const hit = (wins, x, y) => wins.find(w => x >= w.box[0] && x <= w.box[2] && y >= w.box[1] && y <= w.box[3]);
+const winLabel = w => isChrome(w) ? (w.layer === 24 ? 'Menu bar' : 'Dock') : w.app;
+
+// ---------------------------------------------------------------------------------------------
+// Rect helpers (normalized [x0, y0, x1, y1])
+// ---------------------------------------------------------------------------------------------
+const union = (a, b) => !a ? b : !b ? a : [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])];
+const clip01 = r => [clamp(r[0], 0, 1), clamp(r[1], 0, 1), clamp(r[2], 0, 1), clamp(r[3], 0, 1)];
+const area = r => Math.max(0, r[2] - r[0]) * Math.max(0, r[3] - r[1]);
+function iou(a, b) {
+  const i = area([Math.max(a[0], b[0]), Math.max(a[1], b[1]), Math.min(a[2], b[2]), Math.min(a[3], b[3])]);
+  return i / (area(a) + area(b) - i || 1);
+}
+const lerpRect = (a, b, t) => a.map((v, i) => v + (b[i] - v) * t);
+function bboxOf(pts) {
+  if (!pts.length) return null;
+  let r = [1, 1, 0, 0];
+  for (const p of pts) r = [Math.min(r[0], p.x), Math.min(r[1], p.y), Math.max(r[2], p.x), Math.max(r[3], p.y)];
+  return r;
+}
+function pad(r, s) { const px = s.padding / SW, py = s.padding / SH; return [r[0] - px, r[1] - py, r[2] + px, r[3] + py]; }
+
+const RATIOS = { '16:9': 16 / 9, '16:10': 1.6, '3:2': 1.5, '4:3': 4 / 3, '1:1': 1 };
+/** Min size, max zoom and aspect (only ever growing the rect), then fit inside the screen. */
+function shape(r, s) {
+  let cx = (r[0] + r[2]) / 2, cy = (r[1] + r[3]) / 2;
+  let w = Math.max(r[2] - r[0], 1e-4) * SW, h = Math.max(r[3] - r[1], 1e-4) * SH; // points
+  w = Math.max(w, Math.min(s.minW, SW)); h = Math.max(h, Math.min(s.minH, SH));
+  const need = 1 / s.maxZoom;
+  const cover = Math.max(w / SW, h / SH);
+  if (cover < need) { w *= need / cover; h *= need / cover; }
+  let ratio = null;
+  if (s.aspect === 'screen') ratio = SW / SH;
+  else if (s.aspect === 'auto') {
+    const cur = w / h; let best = null;
+    for (const v of [16 / 9, 1.6, 1.5, 4 / 3, 1, 3 / 4, 2 / 3, 9 / 16]) if (!best || Math.abs(Math.log(v / cur)) < Math.abs(Math.log(best / cur))) best = v;
+    ratio = best;
+  } else if (RATIOS[s.aspect]) ratio = RATIOS[s.aspect];
+  if (ratio) { if (w / h < ratio) w = h * ratio; else h = w / ratio; }
+  w = Math.min(w, SW) / SW; h = Math.min(h, SH) / SH;
+  cx = clamp(cx, w / 2, 1 - w / 2); cy = clamp(cy, h / 2, 1 - h / 2);
+  return [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2];
+}
+
+// ---------------------------------------------------------------------------------------------
+// The crop algorithm
+// ---------------------------------------------------------------------------------------------
+function frontmostRect(t, s) {
+  const wins = windowsAt(t, s).filter(w => !isChrome(w));
+  const w = wins.find(w => w.frontmost) || wins.find(w => w.regular !== false);
+  return w ? { rect: clip01(w.box), win: w } : null;
+}
+
+/** Crop for keyframe k (or the whole capture when k < 0), before smoothing. */
+function cropFor(k, s) {
+  const [a, b] = segment(k, s);
+  const t = k >= 0 ? KF[k].t : DUR / 2;
+  const items = ITEMS.filter(it => it.t1 >= a && it.t0 <= b && (it.kind !== 'change' || k < 0 || it.kf === k));
+  const pts = [];
+  for (const it of items) {
+    const w = itemWeight(it, s);
+    if (w <= 0) continue;
+    for (const p of it.pts) pts.push({ x: p[0], y: p[1], t: p[2], w: w / it.pts.length, kind: it.kind, item: it });
+  }
+  // Cursor outliers: far from everything deliberate (or from the cursor's own median).
+  const anchors = subsample(pts.filter(p => p.kind !== 'cursor'), 300);
+  const lim = s.outlier / 100;
+  const dist = (p, q) => Math.hypot((p.x - q.x) * SW, (p.y - q.y) * SH) / DIAG;
+  let center = null;
+  if (!anchors.length) {
+    const cur = pts.filter(p => p.kind === 'cursor');
+    if (cur.length) center = { x: wmedian(cur, 'x'), y: wmedian(cur, 'y') };
+  }
+  for (const p of pts) {
+    if (p.kind !== 'cursor') continue;
+    const d = anchors.length ? Math.min(...anchors.map(q => dist(p, q))) : center ? dist(p, center) : 0;
+    p.outlier = d > lim;
+  }
+  const used = pts.filter(p => !p.outlier);
+  const atKf = windowsAt(t, s);
+  const shares = new Map();
+  const chromeHits = new Map();
+  let total = 0, desktop = 0;
+  for (const p of used) {
+    const win = hit(windowsAt(p.t, s), p.x, p.y);
+    p.win = win;
+    if (win && isChrome(win)) {
+      if (!s.chrome || !DELIBERATE.has(p.kind)) { p.dropped = true; continue; }
+      (chromeHits.get(win.id) || chromeHits.set(win.id, { win, pts: [] }).get(win.id)).pts.push(p);
+      total += p.w;
+      continue;
+    }
+    total += p.w;
+    if (!win) { desktop += p.w; continue; }
+    const e = shares.get(win.id) || { win: atKf.find(w => w.id === win.id) || win, w: 0 };
+    e.w += p.w; shares.set(win.id, e);
+  }
+  const ranked = [...shares.values()].sort((x, y) => y.w - x.w).map(e => ({ ...e, share: total ? e.w / total : 0 }));
+  const res = { k, segment: [a, b], pts, ranked, desktop: total ? desktop / total : 0, snapped: [], chrome: [] };
+  if (total <= 0) {
+    res.empty = true;
+    return res;
+  }
+  const kept = used.filter(p => !p.dropped && !(p.win && isChrome(p.win)));
+  let rect = null;
+  if (s.snap && ranked.length) {
+    let cum = 0;
+    for (let n = 1; n <= Math.min(s.maxWindows, ranked.length); n++) {
+      if (n > 1 && ranked[n - 1].share * 100 < s.minShare) break;
+      cum += ranked[n - 1].share;
+      if (cum * 100 >= s.snapThreshold) {
+        res.snapped = ranked.slice(0, n).map(e => e.win);
+        rect = res.snapped.reduce((r, w) => union(r, clip01(w.box)), null);
+        res.reason = n === 1 ? `Snapped to ${winLabel(ranked[0].win)} (${Math.round(cum * 100)}% of the activity)`
+          : `Union of ${n} windows (${Math.round(cum * 100)}% of the activity)`;
+        break;
+      }
+    }
+  }
+  if (!rect) {
+    rect = bboxOf(kept);
+    res.reason = s.snap && ranked.length
+      ? `Activity box: no ${s.maxWindows > 1 ? `1–${s.maxWindows} windows` : 'window'} held ${s.snapThreshold}%`
+      : 'Activity box';
+  }
+  if (s.keepInk) {
+    const ink = bboxOf(used.filter(p => p.kind === 'stroke' && !p.dropped));
+    if (ink && rect && (ink[0] < rect[0] || ink[1] < rect[1] || ink[2] > rect[2] || ink[3] > rect[3])) {
+      rect = union(rect, ink); res.reason += ' + ink outside it';
+    }
+  }
+  for (const { win, pts: cps } of chromeHits.values()) {
+    const bb = bboxOf(cps), r = clip01(win.box);
+    const horizontal = (r[2] - r[0]) * SW >= (r[3] - r[1]) * SH;
+    const extra = 40;
+    const cr = horizontal ? [bb[0] - extra / SW, r[1], bb[2] + extra / SW, r[3]] : [r[0], bb[1] - extra / SH, r[2], bb[3] + extra / SH];
+    rect = union(rect, cr);
+    res.chrome.push(win);
+    res.reason += ` + ${winLabel(win).toLowerCase()}`;
+  }
+  res.core = rect;
+  return res;
+}
+
+function wmedian(pts, key) {
+  const sorted = pts.slice().sort((a, b) => a[key] - b[key]);
+  const half = sorted.reduce((s, p) => s + p.w, 0) / 2;
+  let acc = 0;
+  for (const p of sorted) { acc += p.w; if (acc >= half) return p[key]; }
+  return sorted.length ? sorted[sorted.length - 1][key] : 0.5;
+}
+
+function fallbackFor(res, t, s, prev) {
+  if (s.fallback === 'previous' && prev) { res.reason = 'Talk only: kept the previous crop'; return prev; }
+  if (s.fallback !== 'screen') {
+    const f = frontmostRect(t, s);
+    if (f) { res.reason = `Talk only: frontmost window (${winLabel(f.win)})`; res.snapped = [f.win]; return f.rect; }
+  }
+  res.reason = 'Talk only: whole screen';
+  return [0, 0, 1, 1];
+}
+
+/** Final crops for every keyframe plus per-keyframe diagnostics. */
+function computeAll(s) {
+  if (s.scope === 'whole') {
+    const res = cropFor(-1, s);
+    const rect = res.empty ? shape(fallbackFor(res, DUR / 2, s, null), s) : shape(pad(res.core, s), s);
+    return KF.map((_, k) => ({ ...res, k, rect, raw: rect }));
+  }
+  const out = KF.map((kf, k) => cropFor(k, s));
+  // Keyframes with activity first, then talk-only ones (which may borrow a neighbour's crop).
+  out.forEach(r => { if (!r.empty) r.rect = r.raw = shape(pad(r.core, s), s); });
+  out.forEach((r, k) => {
+    if (!r.empty) return;
+    let prev = null;
+    for (let j = k - 1; j >= 0 && !prev; j--) prev = out[j].rect;
+    for (let j = k + 1; j < out.length && !prev && s.fallback === 'previous'; j++) if (!out[j].empty) prev = out[j].rect;
+    r.rect = r.raw = shape(fallbackFor(r, KF[k].t, s, prev), s);
+  });
+  if (s.scope === 'smooth') {
+    // Neighbours that overlap this much become one crop (their union).
+    let start = 0;
+    for (let k = 1; k <= out.length; k++) {
+      const group = out.slice(start, k);
+      const u = group.reduce((r, g) => union(r, g.rect), null);
+      if (k < out.length && iou(u, out[k].rect) >= s.mergeIoU) continue;
+      if (group.length > 1) {
+        const merged = shape(u, s);
+        group.forEach(g => { g.rect = merged; g.merged = group.length; });
+      }
+      start = k;
+    }
+    // Then limit how much the zoom jumps between neighbours: the smaller crop grows (around its
+    // own centre) until the area ratio is at most zoomStep.
+    if (s.zoomStep < 6) for (let pass = 0; pass < 2; pass++) {
+      for (let k = 1; k < out.length; k++) {
+        const [a, b] = [out[k - 1], out[k]];
+        const [small, big] = area(a.rect) < area(b.rect) ? [a, b] : [b, a];
+        const ratio = area(big.rect) / Math.max(area(small.rect), 1e-6);
+        if (ratio <= s.zoomStep + 1e-6) continue;
+        const f = Math.sqrt(ratio / s.zoomStep), r = small.rect;
+        const cx = (r[0] + r[2]) / 2, cy = (r[1] + r[3]) / 2, hw = (r[2] - r[0]) * f / 2, hh = (r[3] - r[1]) * f / 2;
+        small.rect = shape([cx - hw, cy - hh, cx + hw, cy + hh], s);
+        small.grown = true;
+      }
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Images
+// ---------------------------------------------------------------------------------------------
+const IMGS = KF.map(kf => {
+  const img = new Image();
+  img.onload = () => schedule();
+  img.onerror = () => { if (!img.dataset.retried && kf.path) { img.dataset.retried = 1; img.src = 'file://' + kf.path; } };
+  img.src = kf.file;
+  return img;
+});
+const ready = img => img.complete && img.naturalWidth > 0;
+function frameSize(k) {
+  const img = IMGS[k];
+  if (ready(img)) return [img.naturalWidth, img.naturalHeight];
+  if (KF[k].size) return [KF[k].size.width, KF[k].size.height];
+  if (SCREEN.frame) return [SCREEN.frame.width, SCREEN.frame.height];
+  return [1280, Math.round(1280 * SH / SW)];
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------------------------
+let RESULTS = [];
+let pending = false;
+function schedule() { if (!pending) { pending = true; requestAnimationFrame(() => { pending = false; render(); }); } }
+
+function sizeCanvas(canvas, w, h) {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+  canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return ctx;
+}
+function fitIn(box, aspect) {
+  const bw = box.clientWidth, bh = box.clientHeight;
+  return bw / bh > aspect ? [bh * aspect, bh] : [bw, bw / aspect];
+}
+function drawImageOrPlaceholder(ctx, k, sx, sy, sw, sh, dx, dy, dw, dh) {
+  const img = IMGS[k];
+  if (ready(img)) ctx.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);
+  else { ctx.fillStyle = '#222'; ctx.fillRect(dx, dy, dw, dh); ctx.fillStyle = '#666'; ctx.font = '12px sans-serif'; ctx.fillText('frame not found', dx + 10, dy + 20); }
+}
+function roundRect(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+function label(ctx, text, x, y, color, opts = {}) {
+  ctx.font = `${opts.bold ? 600 : 500} ${opts.size || 11}px -apple-system, sans-serif`;
+  const w = ctx.measureText(text).width + 10, h = (opts.size || 11) + 7;
+  ctx.fillStyle = opts.bg || 'rgba(14,14,16,.82)';
+  roundRect(ctx, x, y, w, h, 5); ctx.fill();
+  if (color) { ctx.fillStyle = color; ctx.fillRect(x, y + 3, 2.5, h - 6); }
+  ctx.fillStyle = opts.fg || '#fff'; ctx.textBaseline = 'middle';
+  ctx.fillText(text, x + 6, y + h / 2 + 0.5);
+  return w;
+}
+
+function renderFull() {
+  const canvas = document.getElementById('full');
+  const [fw, fh] = frameSize(sel);
+  const [W, H] = fitIn(canvas.parentElement, fw / fh);
+  const ctx = sizeCanvas(canvas, W, H);
+  drawImageOrPlaceholder(ctx, sel, 0, 0, fw, fh, 0, 0, W, H);
+  const res = RESULTS[sel], s = settings, kf = KF[sel];
+  const X = x => x * W, Y = y => y * H;
+  const wins = windowsAt(kf.t, s);
+  if (s.ovHeat) {
+    const heat = document.createElement('canvas'); heat.width = W; heat.height = H;
+    const hc = heat.getContext('2d');
+    for (const p of res.pts) {
+      if (p.kind !== 'cursor' || p.outlier) continue;
+      const r = 18 + Math.min(p.item.dwell, 3) * 14;
+      const g = hc.createRadialGradient(X(p.x), Y(p.y), 0, X(p.x), Y(p.y), r);
+      const a = clamp(0.08 + p.item.dwell * 0.25, 0.08, 0.6);
+      g.addColorStop(0, `rgba(255,159,10,${a})`); g.addColorStop(1, 'rgba(255,159,10,0)');
+      hc.fillStyle = g; hc.fillRect(X(p.x) - r, Y(p.y) - r, r * 2, r * 2);
+    }
+    ctx.save(); ctx.globalCompositeOperation = 'screen'; ctx.drawImage(heat, 0, 0, W, H); ctx.restore();
+  }
+  if (s.ovWindows) {
+    const shareOf = new Map(res.ranked.map(e => [e.win.id, e.share]));
+    // Back to front so front windows' labels win.
+    for (const w of wins.slice().reverse()) {
+      const r = clip01(w.box);
+      ctx.strokeStyle = appColor(w.app, isChrome(w) ? 0.5 : 0.85); ctx.lineWidth = w.frontmost ? 2 : 1;
+      ctx.setLineDash(isChrome(w) ? [4, 3] : []);
+      ctx.strokeRect(X(r[0]) + 0.5, Y(r[1]) + 0.5, X(r[2]) - X(r[0]) - 1, Y(r[3]) - Y(r[1]) - 1);
+      ctx.setLineDash([]);
+    }
+    for (const w of wins) {
+      const r = clip01(w.box);
+      const share = shareOf.get(w.id);
+      const text = `${winLabel(w)}${w.title && !isChrome(w) ? ' — ' + w.title.slice(0, 32) : ''}${w.frontmost ? ' ★' : ''}${share ? `  ${Math.round(share * 100)}%` : ''}`;
+      label(ctx, text, X(r[0]) + 4, clamp(Y(r[1]) + 4, 2, H - 20), appColor(w.app));
+    }
+  }
+  if (s.ovSnap) {
+    for (const w of res.snapped) {
+      const r = clip01(w.box);
+      ctx.fillStyle = 'rgba(50,215,75,.10)'; ctx.fillRect(X(r[0]), Y(r[1]), X(r[2]) - X(r[0]), Y(r[3]) - Y(r[1]));
+      ctx.strokeStyle = 'rgba(50,215,75,.95)'; ctx.lineWidth = 2.5; ctx.strokeRect(X(r[0]) + 1, Y(r[1]) + 1, X(r[2]) - X(r[0]) - 2, Y(r[3]) - Y(r[1]) - 2);
+    }
+  }
+  if (s.ovChanges) {
+    ctx.strokeStyle = 'rgba(191,90,242,.9)'; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
+    for (const b of kf.changes || []) ctx.strokeRect(X(b[0]), Y(b[1]), X(b[2]) - X(b[0]), Y(b[3]) - Y(b[1]));
+    ctx.setLineDash([]);
+  }
+  if (s.ovActivity) {
+    const seen = new Set();
+    for (const p of res.pts) {
+      const it = p.item;
+      if (seen.has(it)) continue; seen.add(it);
+      const faded = p.dropped;
+      if (it.kind === 'stroke' || (it.kind === 'laser' && it.all)) {
+        ctx.strokeStyle = it.kind === 'stroke' ? 'rgba(100,210,255,.95)' : 'rgba(255,55,200,.9)'; ctx.lineWidth = 2; ctx.lineJoin = 'round';
+        ctx.beginPath(); (it.all || it.pts).forEach((q, i) => i ? ctx.lineTo(X(q[0]), Y(q[1])) : ctx.moveTo(X(q[0]), Y(q[1]))); ctx.stroke();
+      } else if (it.kind === 'click') {
+        ctx.strokeStyle = faded ? '#777' : 'rgba(255,214,10,.95)'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(X(it.pts[0][0]), Y(it.pts[0][1]), 9, 0, 7); ctx.stroke();
+        ctx.beginPath(); ctx.arc(X(it.pts[0][0]), Y(it.pts[0][1]), 2.5, 0, 7); ctx.fillStyle = ctx.strokeStyle; ctx.fill();
+      } else if (it.kind === 'drag') {
+        ctx.strokeStyle = 'rgba(255,214,10,.95)'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+        ctx.beginPath(); it.pts.forEach((q, i) => i ? ctx.lineTo(X(q[0]), Y(q[1])) : ctx.moveTo(X(q[0]), Y(q[1]))); ctx.stroke(); ctx.setLineDash([]);
+      } else if (it.kind === 'scroll') {
+        ctx.fillStyle = 'rgba(100,210,255,.9)'; ctx.font = '600 14px sans-serif'; ctx.fillText('⇕', X(it.pts[0][0]) - 4, Y(it.pts[0][1]));
+      } else if (it.kind === 'laser') {
+        ctx.fillStyle = 'rgba(255,55,200,.95)'; ctx.beginPath(); ctx.arc(X(it.pts[0][0]), Y(it.pts[0][1]), 4, 0, 7); ctx.fill();
+      }
+    }
+    // Outlier cursor samples: grey crosses.
+    ctx.strokeStyle = 'rgba(160,160,170,.7)'; ctx.lineWidth = 1.2;
+    for (const p of res.pts) if (p.outlier) { const x = X(p.x), y = Y(p.y); ctx.beginPath(); ctx.moveTo(x - 3, y - 3); ctx.lineTo(x + 3, y + 3); ctx.moveTo(x + 3, y - 3); ctx.lineTo(x - 3, y + 3); ctx.stroke(); }
+  }
+  if (s.ovCrop) {
+    const r = res.rect;
+    ctx.save(); ctx.fillStyle = 'rgba(0,0,0,.5)';
+    ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.rect(X(r[0]), Y(r[1]), X(r[2]) - X(r[0]), Y(r[3]) - Y(r[1])); ctx.fill('evenodd'); ctx.restore();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.setLineDash([7, 5]);
+    ctx.strokeRect(X(r[0]) + 0.75, Y(r[1]) + 0.75, X(r[2]) - X(r[0]) - 1.5, Y(r[3]) - Y(r[1]) - 1.5); ctx.setLineDash([]);
+    if (res.core && !res.empty) {
+      const c = res.core; ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 1;
+      ctx.strokeRect(X(c[0]), Y(c[1]), X(c[2]) - X(c[0]), Y(c[3]) - Y(c[1]));
+    }
+  }
+  const cap = document.getElementById('fullCap');
+  cap.innerHTML = `<span><b>#${kf.index}</b> · ${clockOf(kf.t)} · full frame ${fw}×${fh} px</span>`
+    + `<span class="mono">${(fw / SW).toFixed(2)} px/pt · screen ${Math.round(SW)}×${Math.round(SH)} pt</span>`
+    + (DATA.hasWindowLog ? `<span>${wins.length} windows at this moment</span>` : `<span class="warn">no window log in this bundle: activity only</span>`);
+}
+
+function cropPixels(k, r) {
+  const [fw, fh] = frameSize(k);
+  return [r[0] * fw, r[1] * fh, (r[2] - r[0]) * fw, (r[3] - r[1]) * fh];
+}
+
+function renderCrop() {
+  const canvas = document.getElementById('crop');
+  const res = RESULTS[sel], kf = KF[sel];
+  const [sx, sy, sw, sh] = cropPixels(sel, res.rect);
+  const [W, H] = fitIn(canvas.parentElement, sw / sh);
+  const ctx = sizeCanvas(canvas, W, H);
+  ctx.imageSmoothingQuality = 'high';
+  drawImageOrPlaceholder(ctx, sel, sx, sy, sw, sh, 0, 0, W, H);
+  drawBadge(ctx, `#${kf.index} · ${clockOf(kf.t)}`, W, 1);
+  const r = res.rect;
+  const ptW = (r[2] - r[0]) * SW, ptH = (r[3] - r[1]) * SH;
+  const cell = sheetCell();
+  const up = Math.min(cell / sw, 960 / sh);
+  document.getElementById('cropCap').innerHTML =
+    `<span><b>${Math.round(ptW)}×${Math.round(ptH)} pt</b> (${Math.round(area(r) * 100)}% of the screen)</span>`
+    + `<span class="mono">source ${Math.round(sw)}×${Math.round(sh)} px</span>`
+    + `<span class="mono ${up > 1.15 ? 'warn' : ''}">sheet cell ${cell}px → ${up > 1 ? '×' + up.toFixed(2) + ' upscale' : 'downscale'}</span>`;
+}
+
+function drawBadge(ctx, text, W, k) {
+  ctx.font = `700 ${12 * k}px -apple-system, sans-serif`;
+  const tw = ctx.measureText(text).width, h = 22 * k, w = tw + 16 * k, m = 6 * k;
+  const x = W - w - m, y = m;
+  ctx.fillStyle = 'rgba(255,255,255,.17)'; roundRect(ctx, x, y, w, h, h / 2); ctx.fill();
+  ctx.fillStyle = 'rgba(18,18,20,.86)'; roundRect(ctx, x + k, y + k, w - 2 * k, h - 2 * k, h / 2 - k); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.textBaseline = 'middle'; ctx.fillText(text, x + 8 * k, y + h / 2 + 0.5);
+}
+
+function renderInfo() {
+  const kf = KF[sel], res = RESULTS[sel];
+  const j = kf.justifiedBy || {};
+  const why = { mark: 'ink mark', click: 'click', laser: 'laser', scene_change: 'scene change', speech: 'spoken cue', initial: 'first frame', flag: 'flag' }[j.kind] || kf.reason;
+  const words = DATA.words.filter(w => w.t0 >= res.segment[0] && w.t0 < res.segment[1]).map(w => w.text).join(' ');
+  document.getElementById('kfInfo').innerHTML =
+    `<div style="margin-bottom:6px"><span class="pill">#${kf.index} · ${clockOf(kf.t)}</span><span class="pill">cut for: ${why}</span>`
+    + (kf.event ? `<span class="pill">${esc(kf.event)}</span>` : '') + `<span class="pill">slice ${clockOf(Math.max(0, res.segment[0]))}–${clockOf(Math.min(DUR, res.segment[1]))}</span></div>`
+    + `<div class="said">${kf.said ? '“' + esc(kf.said) + '”' : words ? '<em>(words in slice)</em> ' + esc(words) : '<em>No narration.</em>'}</div>`;
+  const counts = {};
+  for (const p of res.pts) if (!p.outlier) counts[p.item.kind] = (counts[p.item.kind] || new Set()).add(p.item);
+  const chips = Object.entries(counts).map(([k, v]) => `<span class="pill">${v.size} ${k}${v.size > 1 && k !== 'cursor' ? 's' : ''}</span>`).join('');
+  const outl = res.pts.filter(p => p.outlier).length;
+  const rows = res.ranked.slice(0, 5).map(e => `<div class="share"><span class="n" title="${esc(e.win.title || '')}">${esc(winLabel(e.win))}${e.win.title ? ' <span style="color:var(--faint)">' + esc(e.win.title) + '</span>' : ''}</span><span class="bar"><i style="width:${(e.share * 100).toFixed(1)}%;background:${appColor(e.win.app)}"></i></span><span class="mono">${Math.round(e.share * 100)}%</span></div>`).join('')
+    + (res.desktop > 0.005 ? `<div class="share"><span class="n" style="color:var(--dim)">Desktop / no window</span><span class="bar"><i style="width:${(res.desktop * 100).toFixed(1)}%;background:#666"></i></span><span class="mono">${Math.round(res.desktop * 100)}%</span></div>` : '');
+  document.getElementById('decision').innerHTML =
+    `<div class="decision">${esc(res.reason || '')}${res.merged ? ` <span class="pill">merged ×${res.merged}</span>` : ''}${res.grown ? ' <span class="pill">grown to limit the zoom change</span>' : ''}</div>`
+    + `<div style="margin-bottom:6px">${chips || '<span class="pill">no activity</span>'}${outl ? `<span class="pill">${outl} cursor outliers</span>` : ''}</div>`
+    + `<div class="shares">${rows}</div>`;
+}
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function renderTimeline() {
+  const canvas = document.getElementById('timeline');
+  const W = canvas.clientWidth, H = 86;
+  const ctx = sizeCanvas(canvas, W, H);
+  const L = 64, R = 8, T = (t) => L + (W - L - R) * clamp(t / DUR, 0, 1);
+  const rows = [['keyframes', 4, 18], ['words', 24, 10], ['ink · laser', 36, 10], ['clicks', 48, 10], ['cursor', 60, 10], ['windows', 72, 10]];
+  ctx.font = '10px -apple-system, sans-serif'; ctx.textBaseline = 'middle';
+  for (const [name, y, h] of rows) { ctx.fillStyle = '#5a5a61'; ctx.fillText(name, 4, y + h / 2); ctx.fillStyle = '#1d1d20'; ctx.fillRect(L, y, W - L - R, h); }
+  RESULTS.forEach((r, k) => {
+    const [a, b] = segment(k, { ...settings, reachMs: 0 });
+    ctx.fillStyle = k === sel ? 'rgba(255,69,58,.28)' : (k % 2 ? '#26262a' : '#222225');
+    ctx.fillRect(T(a), 4, T(b) - T(a), 18);
+  });
+  if (settings.reachMs > 0 && settings.scope !== 'whole') {
+    const [a, b] = RESULTS[sel].segment; ctx.strokeStyle = 'rgba(255,69,58,.6)'; ctx.setLineDash([3, 3]);
+    ctx.strokeRect(T(a), 3.5, T(b) - T(a), 19); ctx.setLineDash([]);
+  }
+  KF.forEach((kf, k) => { ctx.fillStyle = k === sel ? '#fff' : '#bbb'; ctx.fillRect(T(kf.t) - 0.5, 4, 1.5, 18); ctx.font = '600 10px -apple-system, sans-serif'; ctx.fillText(kf.index, T(kf.t) + 3, 13); });
+  ctx.fillStyle = 'rgba(200,200,210,.55)';
+  for (const w of DATA.words) ctx.fillRect(T(w.t0), 26, Math.max(1, T(w.t1) - T(w.t0) - 1), 6);
+  for (const s of DATA.strokes) { ctx.fillStyle = s.laser ? 'rgba(255,55,200,.9)' : 'rgba(255,69,58,.95)'; ctx.fillRect(T(s.t0), 37, Math.max(2, T(s.t1) - T(s.t0)), 8); }
+  for (const p of DATA.points) { ctx.fillStyle = 'rgba(255,55,200,.9)'; ctx.fillRect(T(p.t) - 1, 37, 2, 8); }
+  ctx.fillStyle = 'rgba(255,214,10,.95)';
+  for (const c of DATA.clicks) ctx.fillRect(T(c.t) - 1, 49, 2, 8);
+  for (const d of DATA.drags) ctx.fillRect(T(d.t), 50, Math.max(2, T(d.t1) - T(d.t)), 6);
+  ctx.fillStyle = 'rgba(100,210,255,.8)';
+  for (const s of DATA.scrolls) ctx.fillRect(T(s.t) - 0.5, 50, 1, 6);
+  ctx.fillStyle = 'rgba(255,159,10,.5)';
+  for (const c of DATA.cursor) ctx.fillRect(T(c[0]), 61, 1, 8);
+  let lastFront = null;
+  for (const snap of SNAPS) {
+    ctx.fillStyle = 'rgba(50,215,75,.8)'; ctx.fillRect(T(snap.t) - 0.5, 73, 1, 8);
+    const f = snap.windows.find(w => w.frontmost);
+    if (f && f.app !== lastFront) { ctx.fillStyle = appColor(f.app); ctx.font = '9px -apple-system, sans-serif'; ctx.fillText(f.app, T(snap.t) + 3, 77); lastFront = f.app; }
+  }
+  canvas.onclick = e => {
+    const t = (e.offsetX - L) / (W - L - R) * DUR;
+    let best = 0; KF.forEach((kf, k) => { if (Math.abs(kf.t - t) < Math.abs(KF[best].t - t)) best = k; });
+    select(best);
+  };
+}
+
+function renderStrip() {
+  const strip = document.getElementById('strip');
+  if (strip.children.length !== KF.length) {
+    strip.innerHTML = '';
+    KF.forEach((kf, k) => {
+      const d = document.createElement('div'); d.className = 'thumb';
+      d.innerHTML = `<canvas></canvas><div><b>#${kf.index} · ${clockOf(kf.t)}</b><span>${kf.reason.replace('_', ' ')}</span></div>`;
+      d.onclick = () => select(k); strip.appendChild(d);
+    });
+  }
+  KF.forEach((kf, k) => {
+    const d = strip.children[k]; d.classList.toggle('sel', k === sel);
+    const [fw, fh] = frameSize(k);
+    const H = 84, W = Math.round(H * fw / fh);
+    const ctx = sizeCanvas(d.querySelector('canvas'), W, H);
+    drawImageOrPlaceholder(ctx, k, 0, 0, fw, fh, 0, 0, W, H);
+    const r = RESULTS[k].rect;
+    ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.rect(r[0] * W, r[1] * H, (r[2] - r[0]) * W, (r[3] - r[1]) * H); ctx.fill('evenodd');
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.strokeRect(r[0] * W + 0.5, r[1] * H + 0.5, (r[2] - r[0]) * W - 1, (r[3] - r[1]) * H - 1);
+  });
+}
+
+// Scrawl's contact sheet layout (render_contact_sheet): 16 px padding, 14 px gaps, 640 px cells
+// two to a row (440 px, three to a row, when every frame is portrait), cards at most 960 px tall.
+function sheetCell() { return sheetRects().every(r => r[3] > r[2]) ? 440 : 640; }
+function sheetRects() {
+  const original = document.getElementById('sheetOriginal').checked;
+  return KF.map((_, k) => cropPixels(k, original ? [0, 0, 1, 1] : RESULTS[k].rect));
+}
+function renderSheet() {
+  const PAD = 16, GAP = 14;
+  const rects = sheetRects();
+  if (!rects.length) return;
+  const portrait = rects.every(r => r[3] > r[2]);
+  const cell = portrait ? 440 : 640;
+  const cols = rects.length === 1 ? 1 : portrait ? Math.min(rects.length, 3) : 2;
+  const sizes = rects.map(r => { const s = Math.min(cell / r[2], 960 / r[3]); return [r[2] * s, r[3] * s, s]; });
+  const rowH = [];
+  for (let i = 0; i < sizes.length; i += cols) rowH.push(Math.max(...sizes.slice(i, i + cols).map(s => s[1])));
+  const W = PAD * 2 + cell * cols + GAP * (cols - 1);
+  const H = Math.ceil(PAD * 2 + rowH.reduce((a, b) => a + b, 0) + GAP * (rowH.length - 1));
+  const canvas = document.getElementById('sheet');
+  const shown = Math.min(W, canvas.parentElement.clientWidth);
+  canvas.width = W; canvas.height = H; canvas.style.width = shown + 'px'; canvas.style.height = (H * shown / W) + 'px';
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingQuality = 'high';
+  ctx.fillStyle = '#141414'; ctx.fillRect(0, 0, W, H);
+  let y = PAD, ups = [];
+  rowH.forEach((rh, row) => {
+    for (let c = 0; c < cols; c++) {
+      const i = row * cols + c; if (i >= rects.length) break;
+      const [cw, ch, scale] = sizes[i]; ups.push(scale);
+      const x = PAD + c * (cell + GAP) + (cell - cw) / 2, cy = y + (rh - ch) / 2;
+      ctx.fillStyle = '#2e2e30'; roundRect(ctx, x, cy, cw, ch, 10); ctx.fill();
+      ctx.save(); roundRect(ctx, x + 1, cy + 1, cw - 2, ch - 2, 9); ctx.clip();
+      const [sx, sy, sw, sh] = rects[i];
+      drawImageOrPlaceholder(ctx, i, sx, sy, sw, sh, x + 1, cy + 1, cw - 2, ch - 2);
+      ctx.restore();
+      ctx.save(); ctx.translate(x, cy); drawBadge(ctx, `#${KF[i].index} · ${clockOf(KF[i].t)}`, cw, 1); ctx.restore();
+    }
+    y += rh + GAP;
+  });
+  const maxUp = Math.max(...ups);
+  document.getElementById('sheetMeta').innerHTML = `${W}×${H} px · ${cols} per row · `
+    + `<span class="${maxUp > 1.15 ? 'warn' : ''}">largest upscale ×${maxUp.toFixed(2)}</span>`
+    + (maxUp > 1.15 && DATA.mode === 'display' ? ' (Screen captures are sampled 1280 px wide, so tight crops get soft)' : '');
+}
+
+function render() {
+  if (!KF.length) { document.querySelector('main').innerHTML = '<p style="padding:20px">This bundle has no keyframes.</p>'; return; }
+  RESULTS = computeAll(settings);
+  renderFull(); renderCrop(); renderInfo(); renderTimeline(); renderStrip(); renderSheet();
+  syncControls();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Controls
+// ---------------------------------------------------------------------------------------------
+const inputs = {};
+function fmt(c, v) {
+  if (c.type !== 'range') return '';
+  const n = c.step < 1 ? Number(v).toFixed(c.step < 0.1 ? 2 : 1) : String(v);
+  return n + (c.unit ? (c.unit === '×' ? '×' : ' ' + c.unit) : '');
+}
+function buildControls() {
+  const host = document.getElementById('controls');
+  for (const c of CONTROLS) {
+    if (c.section) { const h = document.createElement('h3'); h.textContent = c.section; host.appendChild(h); continue; }
+    if (c.type === 'toggle') {
+      const l = document.createElement('label'); l.className = 'toggle';
+      l.innerHTML = `<input type="checkbox"><span>${c.label}</span>${c.kbd ? `<kbd>${c.kbd}</kbd>` : ''}`;
+      const inp = l.querySelector('input'); inp.onchange = () => set(c.key, inp.checked);
+      inputs[c.key] = { c, inp }; host.appendChild(l); continue;
+    }
+    const d = document.createElement('div'); d.className = 'ctl';
+    if (c.type === 'select') {
+      d.innerHTML = `<label>${c.label}</label><select>${c.options.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')}</select>`;
+      const inp = d.querySelector('select'); inp.onchange = () => set(c.key, inp.value);
+      inputs[c.key] = { c, inp };
+    } else {
+      d.innerHTML = `<label>${c.label}</label><span class="val"></span><input type="range" min="${c.min}" max="${c.max}" step="${c.step}">`;
+      const inp = d.querySelector('input'); inp.oninput = () => set(c.key, Number(inp.value));
+      inputs[c.key] = { c, inp, val: d.querySelector('.val') };
+    }
+    if (c.hint) d.insertAdjacentHTML('beforeend', `<span class="hint">${c.hint}</span>`);
+    host.appendChild(d);
+  }
+  const ph = document.getElementById('presets');
+  PRESETS.forEach((p, i) => {
+    const b = document.createElement('button');
+    b.innerHTML = `<kbd>${i + 1}</kbd> ${p.name}${p.tag ? ` <i>${p.tag}</i>` : ''}`;
+    b.onclick = () => applyPreset(i); ph.appendChild(b);
+  });
+}
+function syncControls() {
+  for (const [k, { c, inp, val }] of Object.entries(inputs)) {
+    if (c.type === 'toggle') inp.checked = !!settings[k];
+    else if (String(inp.value) !== String(settings[k])) inp.value = settings[k];
+    if (val) val.textContent = fmt(c, settings[k]);
+  }
+  const active = PRESETS.findIndex(p => algoKeys().every(k => ({ ...DEFAULTS, ...p.values })[k] === settings[k]));
+  [...document.getElementById('presets').children].forEach((b, i) => b.classList.toggle('active', i === active));
+}
+const algoKeys = () => Object.keys(DEFAULTS).filter(k => !OVERLAY_KEYS.has(k));
+function set(key, value) { settings[key] = value; save(); schedule(); }
+function applyPreset(i) {
+  const keep = Object.fromEntries([...OVERLAY_KEYS].map(k => [k, settings[k]]));
+  settings = { ...DEFAULTS, ...PRESETS[i].values, ...keep }; save(); schedule();
+  toast(`Preset ${i + 1}: ${PRESETS[i].name}`);
+}
+function select(k) { sel = clamp(k, 0, KF.length - 1); schedule(); }
+function toast(text) {
+  const t = document.getElementById('toast'); t.textContent = text; t.classList.add('show');
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => t.classList.remove('show'), 1400);
+}
+async function copySettings() {
+  const out = { algorithm: 'scrawl-autocrop/1', bundle: DATA.id, ...Object.fromEntries(algoKeys().map(k => [k, settings[k]])) };
+  const text = JSON.stringify(out, null, 2);
+  try { await navigator.clipboard.writeText(text); toast('Settings copied'); }
+  catch {
+    const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select();
+    const ok = document.execCommand('copy'); ta.remove();
+    if (ok) toast('Settings copied');
+    else { document.getElementById('copiedText').textContent = text; document.getElementById('copied').showModal(); }
+  }
+}
+
+document.addEventListener('keydown', e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.target.tagName === 'SELECT' || (e.target.tagName === 'INPUT' && e.target.type !== 'checkbox' && e.target.type !== 'range')) return;
+  const key = e.key.toLowerCase();
+  const toggles = { w: 'ovWindows', a: 'ovActivity', h: 'ovHeat', s: 'ovSnap', x: 'ovCrop', d: 'ovChanges' };
+  if (['1', '2', '3'].includes(key)) applyPreset(Number(key) - 1);
+  else if (key === 'arrowright' || key === 'k') { select(sel + 1); e.preventDefault(); }
+  else if (key === 'arrowleft' || key === 'j') { select(sel - 1); e.preventDefault(); }
+  else if (key === 'home') select(0);
+  else if (key === 'end') select(KF.length - 1);
+  else if (toggles[key]) set(toggles[key], !settings[toggles[key]]);
+  else if (key === 'o') { const c = document.getElementById('sheetOriginal'); c.checked = !c.checked; schedule(); }
+  else if (key === 'c') copySettings();
+  else if (key === 'r') applyPreset(0);
+  else if (key === '?') document.getElementById('help').showModal();
+  else return;
+  if (e.target.tagName === 'INPUT') e.target.blur();
+});
+document.getElementById('copy').onclick = copySettings;
+document.getElementById('helpBtn').onclick = () => document.getElementById('help').showModal();
+document.getElementById('sheetOriginal').onchange = schedule;
+window.addEventListener('resize', schedule);
+
+document.getElementById('meta').textContent =
+  `${DATA.id} · ${DATA.mode}${DATA.source ? ' · ' + DATA.source : ''} · ${clockOf(DUR)} · ${KF.length} keyframes · ${SNAPS.length} window snapshots · ${DATA.cursor.length} cursor samples`;
+buildControls();
+render();
+</script>
+</body>
+</html>

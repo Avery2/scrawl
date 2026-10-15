@@ -37,6 +37,9 @@ cargo run -- import ~/Downloads/20261013T164000.mp4 --timeline ~/Downloads/20261
 
 # Rebuild an existing bundle with the current transcriber and keyframe rules
 cargo run -- reprocess latest --out /tmp/again.scrawl
+
+# Experiment: open the crop playground for a Screen-mode capture
+cargo run -- autocrop latest --open
 ```
 
 ## Capture Controls
@@ -55,6 +58,37 @@ While picking a target, the island shows the modes **Area**, **Window**, **Scree
 - Area: drag a region. Window: click a window. Screen and iPhone: `⏎`, `S`, `⌥⇧S`, **Record**, or
   clicking the selected mode again starts recording (`⏎`/`⌥⇧S` record the full screen from Area and
   Window too)
+
+## Autocrop (experiment)
+
+Instead of picking an area up front, record the whole screen (**Screen** in the picker, or `3`) and
+let Scrawl work out where you were gesturing. While a Screen capture records, Scrawl also logs:
+
+- **`windows`** in `scrawl.json`: the on-screen windows, front to back (id, app, bundle ID, title,
+  bounds in capture points, layer, frontmost), including the menu bar and the Dock's strip. A
+  snapshot is taken at the start, when a click, ink stroke or shortcut starts, when the frontmost
+  app changes, at most every 500 ms while the cursor moves and every 2 s otherwise, and stored only
+  when the list changed. Each snapshot costs about 0.5 ms. Titles stay in `scrawl.json`; they never
+  go into `summary.md` or the clipboard.
+- **`cursor`**: the cursor at up to 15 Hz while it moves, as `[t, x, y]` (normalized), so dwell
+  counts.
+
+`scrawl autocrop <bundle|latest> [--open]` writes `autocrop/data.json` (keyframes and what cut
+them, ink, clicks, drags, scrolls, laser, cursor, changed regions between keyframes, window
+snapshots, words) and `autocrop/index.html`, a self-contained playground that runs from disk. It
+shows each keyframe with the windows, activity, cursor heat, the window the activity snapped to and
+the crop; the cropped frame; and the cropped contact sheet, all recomputed live from sliders, with
+three presets (`1`–`3`) and **Copy settings**. Bundles without a window log fall back to activity
+only.
+
+The crop algorithm lives only in the playground's JS for now. Once the settings are picked, it gets
+ported to Rust (`src/autocrop.rs`) and applied when a Screen capture finishes. To try the
+playground without recording, build the synthetic fixture (Playwright from `site/node_modules`):
+
+```sh
+bun scripts/autocrop-fixture.mjs /tmp/fixture.scrawl
+cargo run -- autocrop /tmp/fixture.scrawl --open
+```
 
 ## iPhone
 
