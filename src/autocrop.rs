@@ -831,7 +831,8 @@ impl Ctx<'_> {
                 }
                 c += dir;
             }
-            Some(Some(last))
+            // Ending right at the window's edge is a border, not the end of a line.
+            Some(((limit - last) * dir >= 2 * gap).then_some(last))
         };
         let mut right = c1;
         let mut left = c0;
@@ -2042,10 +2043,11 @@ mod tests {
         assert!((1300.0..1330.0).contains(&right), "right edge {right}");
         assert_eq!(r[0], crop[0], "nothing crosses the left edge");
         assert_eq!((r[1], r[3]), (crop[1], crop[3]));
-        // Never past the window; lines running into its edge are left alone like the rule.
+        // Never past the window; lines that run to (or nearly to) its edge are left alone,
+        // like the rule.
         let narrow = [310.0 / 1728.0, 0.0, 1270.0 / 1728.0, 1.0];
         let right = ctx.finish_lines(crop, &content, narrow)[2] * 1728.0;
-        assert!((1250.0..=1270.0).contains(&right), "{right}");
+        assert!((1245.0..=1270.0).contains(&right), "{right}");
     }
 
     #[test]
