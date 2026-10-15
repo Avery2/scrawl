@@ -4041,3 +4041,36 @@ kbd {
     filter: none !important;
   }
 }
+
+/* Reduced motion keeps the fades (they carry the information) and drops travel, scale and blur. */
+@media (prefers-reduced-motion: reduce) {
+  .enter,
+  .enter-pop,
+  .td-line,
+  .sheet-card.develop,
+  .md-line-reveal,
+  .audio-word-chip,
+  .island-content,
+  .bundle-preview-inner {
+    animation: fade-in 0.2s ease both !important;
+  }
+
+  .island-leaving {
+    animation: none !important;
+  }
+
+  .island,
+  .tp-paste-line {
+    transition: opacity 0.2s ease !important;
+  }
+
+  .island.gone {
+    transform: translate3d(-50%, 0, 0);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
