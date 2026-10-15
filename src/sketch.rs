@@ -1335,6 +1335,7 @@ mod tests {
             }],
             contact_sheet: "contact.png".into(),
             video: None,
+            video_offset_ms: 0,
             audio: None,
             source: None,
             device: None,

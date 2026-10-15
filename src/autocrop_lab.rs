@@ -51,6 +51,36 @@ pub fn downscale(frame: &RgbaFrame, max_w: u32) -> RgbaFrame {
     RgbaFrame::new(frame.t_ms, w, h, rgba)
 }
 
+/// Area-averaged copy at exactly `w`×`h` (what ScreenCaptureKit hands the sampler).
+pub fn resize(frame: &RgbaFrame, w: u32, h: u32) -> RgbaFrame {
+    let (sw, sh) = (frame.width as usize, frame.height as usize);
+    let (w, h) = (w.max(1) as usize, h.max(1) as usize);
+    let mut rgba = vec![0_u8; w * h * 4];
+    for y in 0..h {
+        let (y0, y1) = (y * sh / h, ((y + 1) * sh / h).max(y * sh / h + 1));
+        for x in 0..w {
+            let (x0, x1) = (x * sw / w, ((x + 1) * sw / w).max(x * sw / w + 1));
+            let mut acc = [0_u32; 4];
+            for row in y0..y1 {
+                for px in frame.rgba[(row * sw + x0) * 4..(row * sw + x1) * 4]
+                    .as_chunks::<4>()
+                    .0
+                {
+                    for (a, v) in acc.iter_mut().zip(px) {
+                        *a += u32::from(*v);
+                    }
+                }
+            }
+            let n = ((y1 - y0) * (x1 - x0)) as u32;
+            let i = (y * w + x) * 4;
+            for c in 0..4 {
+                rgba[i + c] = (acc[c] / n) as u8;
+            }
+        }
+    }
+    RgbaFrame::new(frame.t_ms, w as u32, h as u32, rgba)
+}
+
 /// The crop algorithm's input for a bundle: change regions from `scrawl.json` when the bundle
 /// was cropped, else from its keyframe images.
 pub fn input_for_bundle(dir: &Path, bundle: &ScrawlBundle) -> Input {
@@ -413,6 +443,243 @@ pub fn build_fixture(
         std::fs::copy(truth, out.join("truth.json"))?;
     }
     Ok(out.to_path_buf())
+}
+
+/// What `simulate_capture` measured.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimReport {
+    pub seconds: u64,
+    pub legacy: bool,
+    pub candidates: usize,
+    pub candidate_bytes: usize,
+    pub first_candidate_ms: u64,
+    pub sample_interval_ms: u64,
+    pub keyframes: usize,
+    /// Keyframes at the movie's full width.
+    pub full_size_keyframes: usize,
+    pub finish_ms: u64,
+}
+
+/// A Screen capture of `seconds`, driven headless: the scenario's screen states and input loop to
+/// fill the time, the sampler's candidate buffer fills on a virtual clock (no waiting), and the
+/// bundle is finished as at the end of a real capture, with keyframes decoded from `movie` (a
+/// recording of the same states, `mkmovie`). `legacy` replays the old sampler instead: full-size
+/// candidates, the newest 300 kept, keyframes straight from them.
+pub fn simulate_capture(
+    scenario_path: &Path,
+    seconds: u64,
+    movie: Option<&Path>,
+    legacy: bool,
+    out: &Path,
+) -> Result<SimReport> {
+    use crate::capture::{
+        CANDIDATE_BUDGET_BYTES, CANDIDATE_EDGE, CandidateBuffer, FRAME_SAMPLE_INTERVAL,
+    };
+    let scenario: Scenario = serde_json::from_slice(&std::fs::read(scenario_path)?)?;
+    let base = scenario_path.parent().unwrap_or(Path::new("."));
+    let states: Vec<(u64, RgbaFrame)> = scenario
+        .frames
+        .iter()
+        .map(|f| {
+            let full = decode(&base.join(&f.file))?;
+            let frame = if legacy {
+                full
+            } else {
+                let (w, h) = crate::capture::capture_size(&scenario.target, CANDIDATE_EDGE);
+                resize(&full, w, h)
+            };
+            Ok((f.t, frame))
+        })
+        .collect::<Result<_>>()?;
+    let period = scenario.duration_ms.max(1);
+    let total = seconds * 1_000;
+    let laps = total.div_ceil(period);
+    let shift = |t: u64, lap: u64| t + lap * period;
+    let mut strokes = Vec::new();
+    let mut events = Vec::new();
+    let mut words = Vec::new();
+    let mut windows = Vec::new();
+    let mut cursor = Vec::new();
+    for lap in 0..laps {
+        for s in &scenario.strokes {
+            let mut s = s.clone();
+            (s.t0, s.t1) = (shift(s.t0, lap), shift(s.t1, lap));
+            strokes.push(s);
+        }
+        for e in &scenario.events {
+            let mut json = serde_json::to_value(e)?;
+            for key in ["t", "t1"] {
+                if let Some(t) = json.get(key).and_then(Value::as_u64) {
+                    json[key] = json!(shift(t, lap));
+                }
+            }
+            events.push(serde_json::from_value::<InteractionEvent>(json)?);
+        }
+        for w in &scenario.words {
+            words.push(WordTiming {
+                t0: shift(w.t0, lap),
+                t1: shift(w.t1, lap),
+                text: w.text.clone(),
+            });
+        }
+        for snap in &scenario.windows {
+            let mut snap = snap.clone();
+            snap.t = shift(snap.t, lap);
+            windows.push(snap);
+        }
+        for c in &scenario.cursor {
+            cursor.push(CursorSample(shift(c.0, lap), c.1, c.2));
+        }
+    }
+    strokes.retain(|s| s.t1 < total);
+    events.retain(|e| {
+        serde_json::to_value(e)
+            .ok()
+            .and_then(|v| v["t"].as_u64())
+            .is_some_and(|t| t < total)
+    });
+    // When the input monitors raise the sampler's urgent flag: clicks and stroke starts.
+    let mut urgent: Vec<u64> = events
+        .iter()
+        .filter_map(|e| match e {
+            InteractionEvent::Click { t, .. } | InteractionEvent::Drag { t, .. } => Some(*t),
+            _ => None,
+        })
+        .chain(strokes.iter().map(|s| s.t0))
+        .collect();
+    urgent.sort_unstable();
+    let state_at = |t: u64| {
+        let local = t % period;
+        let i = states.iter().rposition(|(st, _)| *st <= local).unwrap_or(0);
+        let mut f = states[i].1.clone();
+        f.t_ms = t;
+        f
+    };
+    let mut next_urgent = urgent.iter().peekable();
+    let (frames, interval_ms) = if legacy {
+        let mut kept = std::collections::VecDeque::with_capacity(300);
+        let mut t = 0;
+        while t <= total {
+            while let Some(&&u) = next_urgent.peek() {
+                if u > t {
+                    break;
+                }
+                next_urgent.next();
+                if kept.len() >= 300 {
+                    kept.pop_front();
+                }
+                kept.push_back(state_at(u));
+            }
+            if kept.len() >= 300 {
+                kept.pop_front();
+            }
+            kept.push_back(state_at(t));
+            t += FRAME_SAMPLE_INTERVAL.as_millis() as u64;
+        }
+        (Vec::from(kept), FRAME_SAMPLE_INTERVAL.as_millis() as u64)
+    } else {
+        let mut buffer = CandidateBuffer::new(CANDIDATE_BUDGET_BYTES);
+        let mut t = 0;
+        while t <= total {
+            while let Some(&&u) = next_urgent.peek() {
+                if u > t {
+                    break;
+                }
+                next_urgent.next();
+                buffer.push(state_at(u), true);
+            }
+            buffer.push(state_at(t), false);
+            t += buffer.interval().as_millis() as u64;
+        }
+        let interval = buffer.interval().as_millis() as u64;
+        (buffer.into_frames(), interval)
+    };
+    let report_candidates = frames.len();
+    let candidate_bytes = frames.iter().map(|f| f.rgba.len()).sum();
+    let first_candidate_ms = frames.first().map_or(0, |f| f.t_ms);
+    drop(states);
+
+    if out.exists() {
+        std::fs::remove_dir_all(out)?;
+    }
+    std::fs::create_dir_all(out)?;
+    let video = match movie {
+        Some(m) => {
+            let dest = out.join("recording.mp4");
+            std::fs::copy(m, &dest)?;
+            Some(dest)
+        }
+        None => None,
+    };
+    let text = words
+        .iter()
+        .map(|w| w.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let transcript = TranscriptData {
+        source: "fixture".into(),
+        model: None,
+        text,
+        segments: Vec::new(),
+        words,
+        estimated: false,
+    };
+    let started = std::time::Instant::now();
+    let (_, bundle, _) = crate::build_bundle_from_parts(
+        out,
+        scenario.target,
+        total,
+        frames,
+        strokes,
+        events,
+        transcript,
+        video.clone(),
+        None,
+        crate::SourceExtras {
+            activity: ActivityLog {
+                windows,
+                cursor,
+                ..Default::default()
+            },
+            full_frames: video
+                .filter(|_| !legacy)
+                .map(|v| crate::movie_keyframes(v, 0)),
+            ..Default::default()
+        },
+    )?;
+    let finish_ms = started.elapsed().as_millis() as u64;
+    let full_dir = bundle
+        .autocrop
+        .as_ref()
+        .map_or("frames", |a| a.full_frames.as_str());
+    let full_size_keyframes = bundle
+        .keyframes
+        .iter()
+        .filter(|kf| {
+            let name = Path::new(&kf.file).file_name().unwrap_or_default();
+            std::fs::File::open(out.join(full_dir).join(name))
+                .ok()
+                .and_then(|f| {
+                    png::Decoder::new(BufReader::new(f))
+                        .read_info()
+                        .ok()
+                        .map(|r| r.info().width)
+                })
+                .is_some_and(|w| w >= 2560)
+        })
+        .count();
+    Ok(SimReport {
+        seconds,
+        legacy,
+        candidates: report_candidates,
+        candidate_bytes,
+        first_candidate_ms,
+        sample_interval_ms: interval_ms,
+        keyframes: bundle.keyframes.len(),
+        full_size_keyframes,
+        finish_ms,
+    })
 }
 
 // ---------------------------------------------------------------------------------------------

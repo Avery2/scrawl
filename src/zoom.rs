@@ -213,7 +213,7 @@ pub fn zoom(
         // screens doesn't sit in memory.
         let mut out = Vec::with_capacity(times.len());
         for (chunk, rects) in times.chunks(6).zip(crops.chunks(6)) {
-            let decoded = crate::helper::frames(&video, crate::helper::FrameTimes::At(chunk), 0)?;
+            let decoded = crate::movie_frames_at(&video, chunk, bundle.video_offset_ms, 0)?;
             for (frame, rect) in decoded.into_iter().zip(rects) {
                 let frame = match rect {
                     Some(r) => crate::autocrop::crop_frame(&frame, *r),
@@ -224,7 +224,7 @@ pub fn zoom(
         }
         out
     } else {
-        crate::helper::frames(&video, crate::helper::FrameTimes::At(&times), 900)?
+        crate::movie_frames_at(&video, &times, bundle.video_offset_ms, 900)?
     };
     ensure!(!frames.is_empty(), "No frames could be decoded");
     let mut cells = Vec::with_capacity(frames.len());

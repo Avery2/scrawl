@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -19,8 +18,96 @@ use crate::model::{
     CaptureMode, InteractionEvent, RgbaFrame, SCALE, Stroke, TargetFrame, TargetInfo,
 };
 
-const MAX_RETAINED_FRAMES: usize = 300;
-const FRAME_SAMPLE_INTERVAL: Duration = Duration::from_millis(220);
+pub const FRAME_SAMPLE_INTERVAL: Duration = Duration::from_millis(220);
+/// Candidate frames only feed scene diffs and keyframe selection; the keyframes themselves are
+/// decoded from `recording.mp4` at full size afterwards.
+pub const CANDIDATE_EDGE: f64 = 480.0;
+/// Without a recording to decode from, the candidates are the keyframes, so keep them sharper.
+const CANDIDATE_EDGE_NO_VIDEO: f64 = 1280.0;
+/// The candidates' memory ceiling, however long the capture runs.
+pub const CANDIDATE_BUDGET_BYTES: usize = 384 << 20;
+
+/// The candidate frames of a capture, bounded in memory. When full it drops every other frame
+/// (keeping the first and the ones taken for a click, stroke or shortcut) and samples half as
+/// often from then on, so a long capture keeps its whole timeline, evenly, at a coarser step.
+pub struct CandidateBuffer {
+    frames: Vec<(RgbaFrame, bool)>,
+    cap: usize,
+    budget: usize,
+    interval: Duration,
+}
+
+impl CandidateBuffer {
+    pub fn new(budget_bytes: usize) -> Self {
+        Self {
+            frames: Vec::new(),
+            cap: 0,
+            budget: budget_bytes,
+            interval: FRAME_SAMPLE_INTERVAL,
+        }
+    }
+
+    /// How often to sample now.
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub fn push(&mut self, frame: RgbaFrame, urgent: bool) {
+        if self.cap == 0 {
+            self.cap = (self.budget / frame.rgba.len().max(1)).clamp(60, 1_200);
+        }
+        self.frames.push((frame, urgent));
+        if self.frames.len() >= self.cap {
+            self.thin();
+        }
+    }
+
+    fn thin(&mut self) {
+        let mut regular = 0_usize;
+        let mut kept: Vec<(RgbaFrame, bool)> = std::mem::take(&mut self.frames)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, (_, urgent))| {
+                let keep = *i == 0 || *urgent || regular.is_multiple_of(2);
+                if !urgent {
+                    regular += 1;
+                }
+                keep
+            })
+            .map(|(_, f)| f)
+            .collect();
+        // Mostly urgent frames (a storm of clicks): thin those too.
+        if kept.len() > self.cap * 3 / 4 {
+            kept = kept
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| i.is_multiple_of(2))
+                .map(|(_, f)| f)
+                .collect();
+        }
+        self.frames = kept;
+        self.interval *= 2;
+    }
+
+    pub fn into_frames(self) -> Vec<RgbaFrame> {
+        self.frames.into_iter().map(|(f, _)| f).collect()
+    }
+}
+
+/// What a finished screen capture leaves behind.
+pub struct ScreenRecording {
+    /// Small candidate frames for keyframe selection (see `CANDIDATE_EDGE`).
+    pub frames: Vec<RgbaFrame>,
+    pub video: Option<PathBuf>,
+    pub duration_ms: u64,
+    /// The capture time (on the frames' clock) of the video's start.
+    pub video_offset_ms: u64,
+}
 
 type CfTypeRef = *const c_void;
 type EventRef = *mut c_void;
@@ -892,7 +979,7 @@ mod tests {
     #[test]
     fn screen_stop_joins_worker_before_collecting_its_final_media() {
         let stopping = Arc::new(AtomicBool::new(false));
-        let frames = Arc::new(Mutex::new(VecDeque::new()));
+        let frames = Arc::new(Mutex::new(CandidateBuffer::new(1 << 20)));
         let worker_stopping = Arc::clone(&stopping);
         let worker_frames = Arc::clone(&frames);
         let path = std::env::temp_dir().join(crate::make_bundle_id());
@@ -906,7 +993,7 @@ mod tests {
             worker_frames
                 .lock()
                 .unwrap()
-                .push_back(RgbaFrame::new(42, 1, 1, vec![1, 2, 3, 255]));
+                .push(RgbaFrame::new(42, 1, 1, vec![1, 2, 3, 255]), false);
             std::fs::write(&worker_path, b"finalized media").unwrap();
             Some(worker_path)
         });
@@ -915,14 +1002,81 @@ mod tests {
             stopping,
             urgent_snapshot: Arc::new(AtomicBool::new(false)),
             frames,
+            video_offset_ms: Arc::new(AtomicU64::new(120)),
             sampler_thread: Some(worker),
         };
-        let (frames, video, _) = session.stop();
+        let recording = session.stop();
+        let frames = recording.frames;
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].t_ms, 42);
         assert_eq!(frames[0].rgba, vec![1, 2, 3, 255]);
-        assert_eq!(video.as_ref(), Some(&path));
+        assert_eq!(recording.video.as_ref(), Some(&path));
+        assert_eq!(recording.video_offset_ms, 120);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn candidate_buffer_stays_bounded_and_keeps_the_whole_timeline() {
+        // A 1 MB budget of 4 KB frames: a 256-frame cap.
+        let mut buffer = CandidateBuffer::new(1 << 20);
+        let frame = |t| RgbaFrame::new(t, 32, 32, vec![0; 32 * 32 * 4]);
+        let mut t = 0;
+        let mut peak = 0;
+        // Three hours at the sampler's pace, with a click frame every 10 s.
+        while t < 3 * 3_600_000 {
+            buffer.push(frame(t), t % 10_000 == 0);
+            peak = peak.max(buffer.len());
+            t += buffer.interval().as_millis() as u64;
+        }
+        assert!(peak <= 256, "peak {peak}");
+        assert!(buffer.interval() >= FRAME_SAMPLE_INTERVAL * 64);
+        let frames = buffer.into_frames();
+        assert_eq!(frames[0].t_ms, 0, "the start is kept");
+        assert!(frames.windows(2).all(|w| w[0].t_ms < w[1].t_ms));
+        // Spread over the whole capture, not bunched at the end.
+        let first_half = frames.iter().filter(|f| f.t_ms < 3 * 1_800_000).count();
+        assert!(
+            first_half * 3 > frames.len(),
+            "{first_half} of {}",
+            frames.len()
+        );
+    }
+
+    #[test]
+    fn candidate_buffer_keeps_urgent_frames_when_thinning() {
+        let mut buffer = CandidateBuffer::new(40 * 4096);
+        let frame = |t| RgbaFrame::new(t, 32, 32, vec![0; 32 * 32 * 4]);
+        for t in 0..60 {
+            buffer.push(frame(t * 220), t == 33);
+        }
+        assert!(buffer.len() < 60);
+        assert_eq!(buffer.interval(), FRAME_SAMPLE_INTERVAL * 2);
+        assert!(buffer.into_frames().iter().any(|f| f.t_ms == 33 * 220));
+    }
+
+    #[test]
+    fn candidates_are_small_and_recordings_keep_full_size() {
+        let target = |mode, width, height| TargetInfo {
+            mode,
+            app: None,
+            bundle_id: None,
+            window_title: None,
+            window_id: None,
+            display_id: 1,
+            frame: TargetFrame {
+                x: 0.0,
+                y: 0.0,
+                width,
+                height,
+                scale: 2.0,
+            },
+        };
+        let display = target(CaptureMode::Display, 1728.0, 1117.0);
+        assert_eq!(capture_size(&display, CANDIDATE_EDGE), (480, 310));
+        assert_eq!(capture_size(&display, 2560.0), (2560, 1654));
+        let region = target(CaptureMode::Region, 480.0, 320.0);
+        assert_eq!(capture_size(&region, CANDIDATE_EDGE), (480, 320));
+        assert_eq!(capture_size(&region, 1280.0), (960, 640));
     }
 
     #[test]
@@ -1089,7 +1243,8 @@ pub struct ScreenCaptureSession {
     started_at: Instant,
     stopping: Arc<AtomicBool>,
     urgent_snapshot: Arc<AtomicBool>,
-    frames: Arc<Mutex<VecDeque<RgbaFrame>>>,
+    frames: Arc<Mutex<CandidateBuffer>>,
+    video_offset_ms: Arc<AtomicU64>,
     sampler_thread: Option<JoinHandle<Option<PathBuf>>>,
 }
 
@@ -1102,11 +1257,13 @@ impl ScreenCaptureSession {
         let started_at = Instant::now();
         let stopping = Arc::new(AtomicBool::new(false));
         let urgent_snapshot = Arc::new(AtomicBool::new(true));
-        let frames = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RETAINED_FRAMES)));
+        let frames = Arc::new(Mutex::new(CandidateBuffer::new(CANDIDATE_BUDGET_BYTES)));
+        let video_offset_ms = Arc::new(AtomicU64::new(0));
 
         let thread_stopping = Arc::clone(&stopping);
         let thread_urgent = Arc::clone(&urgent_snapshot);
         let thread_frames = Arc::clone(&frames);
+        let thread_offset = Arc::clone(&video_offset_ms);
         let sampler_target = target;
         let sampler_thread = thread::Builder::new()
             .name("scrawl-frame-sampler".into())
@@ -1117,9 +1274,21 @@ impl ScreenCaptureSession {
                     .clone();
                 // Keep SCK initialization, capture and teardown on the owning worker.
                 // stop() joins even if it arrives while setup is still in progress.
-                let (stream, recording_output, video_path, mut filter_and_config) =
-                    setup_sck_capture(&sampler_target, video_output_path, &initial_excluded);
+                let (stream, recording_output, video_path, filter) = setup_sck_capture(
+                    &sampler_target,
+                    video_output_path,
+                    &initial_excluded,
+                    started_at,
+                    &thread_offset,
+                );
                 crate::ui::start_metric("sck_ready_ms", started_at);
+                let shot_edge = if video_path.is_some() {
+                    CANDIDATE_EDGE
+                } else {
+                    CANDIDATE_EDGE_NO_VIDEO
+                };
+                let shot_config = sck_config(&sampler_target, shot_edge);
+                let mut filter_and_config = filter.map(|f| (f, shot_config));
                 let mut last_sample = Instant::now()
                     .checked_sub(FRAME_SAMPLE_INTERVAL)
                     .unwrap_or_else(Instant::now);
@@ -1132,14 +1301,26 @@ impl ScreenCaptureSession {
                         .clone();
                     if cur_excluded.len() != last_excluded_len {
                         last_excluded_len = cur_excluded.len();
-                        if let Some((new_filter, new_cfg)) =
+                        if let Some((new_filter, _)) =
                             build_sck_filter_and_config(&sampler_target, &cur_excluded)
                         {
-                            filter_and_config = Some((new_filter, new_cfg));
+                            // The recording must hide the same windows as the candidates, or
+                            // keyframes decoded from it could show Scrawl's own overlays.
+                            if let Some(ref stream) = stream
+                                && let Err(error) = stream.update_content_filter(&new_filter)
+                            {
+                                scrawl_log(format!("Recording filter update failed: {error:?}"));
+                            }
+                            filter_and_config =
+                                Some((new_filter, sck_config(&sampler_target, shot_edge)));
                         }
                     }
                     let urgent = thread_urgent.swap(false, Ordering::AcqRel);
-                    if urgent || last_sample.elapsed() >= FRAME_SAMPLE_INTERVAL {
+                    let interval = thread_frames
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .interval();
+                    if urgent || last_sample.elapsed() >= interval {
                         last_sample = Instant::now();
                         let t_ms = started_at.elapsed().as_millis() as u64;
                         if urgent {
@@ -1152,13 +1333,10 @@ impl ScreenCaptureSession {
                         } else {
                             crate::render::render_synthetic_demo_frame(1280, 800, t_ms, phase)
                         };
-                        let mut guard = thread_frames
+                        thread_frames
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if guard.len() >= MAX_RETAINED_FRAMES {
-                            guard.pop_front();
-                        }
-                        guard.push_back(frame);
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(frame, urgent);
                     }
                     thread::sleep(Duration::from_millis(30));
                 }
@@ -1177,6 +1355,7 @@ impl ScreenCaptureSession {
             stopping,
             urgent_snapshot,
             frames,
+            video_offset_ms,
             sampler_thread,
         }
     }
@@ -1189,7 +1368,7 @@ impl ScreenCaptureSession {
         self.started_at.elapsed().as_millis() as u64
     }
 
-    pub fn stop(mut self) -> (Vec<RgbaFrame>, Option<PathBuf>, u64) {
+    pub fn stop(mut self) -> ScreenRecording {
         let duration_ms = self.elapsed_ms();
         self.stopping.store(true, Ordering::Release);
         let video_path = self
@@ -1197,18 +1376,25 @@ impl ScreenCaptureSession {
             .take()
             .and_then(|handle| handle.join().ok())
             .flatten();
-        let mut collected: Vec<RgbaFrame> = self
-            .frames
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .drain(..)
-            .collect();
+        let buffer = std::mem::replace(
+            &mut *self
+                .frames
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            CandidateBuffer::new(0),
+        );
+        let mut collected = buffer.into_frames();
         if collected.is_empty() {
             collected.push(crate::render::render_synthetic_demo_frame(1280, 800, 0, 0));
         }
         let valid_video =
             video_path.filter(|path| path.exists() && path.metadata().is_ok_and(|m| m.len() > 0));
-        (collected, valid_video, duration_ms.max(100))
+        ScreenRecording {
+            frames: collected,
+            video: valid_video,
+            duration_ms: duration_ms.max(100),
+            video_offset_ms: self.video_offset_ms.load(Ordering::Acquire),
+        }
     }
 }
 
@@ -1279,17 +1465,32 @@ fn build_sck_filter_and_config(
         None
     }?;
 
-    let max_dim = target.frame.width.max(target.frame.height).max(1.0);
     // Full-screen captures get auto-cropped to a window or region afterwards (`scrawl autocrop`),
     // so they need enough pixels for a crop to a quarter of the screen to stay sharp.
-    let long_edge = if target.mode == CaptureMode::Display { 2560.0 } else { 1280.0 };
-    let scale = (long_edge / max_dim).min(2.0);
-    let capture_width = ((target.frame.width * scale).round() as u32).max(48) & !1;
-    let capture_height = ((target.frame.height * scale).round() as u32).max(48) & !1;
+    let long_edge = if target.mode == CaptureMode::Display {
+        2560.0
+    } else {
+        1280.0
+    };
+    Some((filter, sck_config(target, long_edge)))
+}
 
+/// The capture size for `target` with its long edge at most `long_edge` px (and at most 2× its
+/// size in points).
+pub fn capture_size(target: &TargetInfo, long_edge: f64) -> (u32, u32) {
+    let max_dim = target.frame.width.max(target.frame.height).max(1.0);
+    let scale = (long_edge / max_dim).min(2.0);
+    (
+        ((target.frame.width * scale).round() as u32).max(48) & !1,
+        ((target.frame.height * scale).round() as u32).max(48) & !1,
+    )
+}
+
+fn sck_config(target: &TargetInfo, long_edge: f64) -> SCStreamConfiguration {
+    let (width, height) = capture_size(target, long_edge);
     let mut config = SCStreamConfiguration::new()
-        .with_width(capture_width)
-        .with_height(capture_height)
+        .with_width(width)
+        .with_height(height)
         .with_shows_cursor(true);
     if target.mode == CaptureMode::Region {
         config.set_source_rect(CGRect::new(
@@ -1299,18 +1500,22 @@ fn build_sck_filter_and_config(
             target.frame.height.max(32.0),
         ));
     }
-    Some((filter, config))
+    config
 }
 
+/// Starts the recording stream; returns it with the filter for candidate screenshots. Stores
+/// when the recording started (ms since `started_at`) into `video_offset_ms`.
 fn setup_sck_capture(
     target: &TargetInfo,
     video_output_path: Option<PathBuf>,
     excluded_window_ids: &[u32],
+    started_at: Instant,
+    video_offset_ms: &AtomicU64,
 ) -> (
     Option<SCStream>,
     Option<SCRecordingOutput>,
     Option<PathBuf>,
-    Option<(SCContentFilter, SCStreamConfiguration)>,
+    Option<SCContentFilter>,
 ) {
     let Some((filter, config)) = build_sck_filter_and_config(target, excluded_window_ids) else {
         return (None, None, None, None);
@@ -1325,18 +1530,24 @@ fn setup_sck_capture(
             && let Some(rec_output) = SCRecordingOutput::new(&rec_cfg)
             && let Ok(stream) = SCStream::new(&filter, &config)
             && stream.add_recording_output(&rec_output).is_ok()
-            && stream.start_capture().is_ok()
         {
-            return (
-                Some(stream),
-                Some(rec_output),
-                Some(video_path),
-                Some((filter, config)),
-            );
+            // The movie's clock starts while `start_capture` runs; its midpoint is the closest
+            // estimate this side of the recording delegate.
+            let before = started_at.elapsed();
+            if stream.start_capture().is_ok() {
+                let after = started_at.elapsed();
+                video_offset_ms.store(((before + after) / 2).as_millis() as u64, Ordering::Release);
+                return (
+                    Some(stream),
+                    Some(rec_output),
+                    Some(video_path),
+                    Some(filter),
+                );
+            }
         }
     }
 
-    (None, None, None, Some((filter, config)))
+    (None, None, None, Some(filter))
 }
 
 fn capture_sck_frame(

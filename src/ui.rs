@@ -1925,24 +1925,22 @@ impl ScrawlCoordinator {
                             return (finalized, duration_ms);
                         }
                     };
-                    let ((frames, video_path, duration_ms), recorded_audio) =
-                        std::thread::scope(|s| {
-                            let screen_handle = s.spawn(|| screen_session.stop());
-                            let audio = audio_recorder.and_then(|r| r.stop().ok());
-                            (screen_handle.join().unwrap(), audio)
-                        });
+                    let (recording, recorded_audio) = std::thread::scope(|s| {
+                        let screen_handle = s.spawn(|| screen_session.stop());
+                        let audio = audio_recorder.and_then(|r| r.stop().ok());
+                        (screen_handle.join().unwrap(), audio)
+                    });
+                    let duration_ms = recording.duration_ms;
                     let activity = window_log
                         .map(crate::windows::WindowLogger::stop)
                         .unwrap_or_default();
                     let finalized = crate::finalize_capture_bundle(
                         &bundle_dir,
                         target,
-                        duration_ms,
-                        frames,
+                        recording,
                         strokes,
                         events,
                         recorded_audio,
-                        video_path,
                         None,
                         activity,
                     );
@@ -3759,20 +3757,21 @@ pub fn run_start_benchmark() {
                     let CaptureSource::Screen { session, audio, .. } = rec.source else {
                         unreachable!("The benchmark records the screen")
                     };
-                    let ((frames, video, duration), audio) = std::thread::scope(|scope| {
+                    let (recording, audio) = std::thread::scope(|scope| {
                         let screen = scope.spawn(|| session.stop());
                         let audio = audio.expect("Microphone failed to start").stop().expect("Microphone failed to stop");
                         (screen.join().unwrap(), audio)
                     });
                     if !quick_stop {
-                        assert!(video.is_some(), "MP4 missing");
+                        assert!(recording.video.is_some(), "MP4 missing");
                         assert!(audio.sample_count > 0, "Microphone returned no samples");
-                        assert!(frames.iter().any(|f| f.width == 960 && f.height == 640), "No real SCK frames (synthetic fallback only)");
+                        // Candidates are small (480 px long edge); the MP4 keeps full size.
+                        assert!(recording.frames.iter().any(|f| f.width == 480 && f.height == 320), "No real SCK frames (synthetic fallback only)");
                     }
                     let wav = hound::WavReader::new(std::io::Cursor::new(&audio.wav_bytes)).unwrap();
                     assert_eq!(wav.duration() as usize, audio.sample_count);
                     std::fs::write(rec.bundle_dir.join("audio.wav"), &audio.wav_bytes).unwrap();
-                    println!("START_RUN {}", serde_json::json!({"run": run, "frames": frames.len(), "first_frame_ms": frames[0].t_ms, "audio_samples": audio.sample_count, "duration_ms": duration}));
+                    println!("START_RUN {}", serde_json::json!({"run": run, "frames": recording.frames.len(), "first_frame_ms": recording.frames[0].t_ms, "audio_samples": audio.sample_count, "duration_ms": recording.duration_ms, "video_offset_ms": recording.video_offset_ms}));
                     coord.set_island_phase(IslandPhase::Hidden);
                     close_capture_windows(cx);
                 }).unwrap();
@@ -4297,7 +4296,10 @@ mod tests {
         for mode in SelectionMode::ALL {
             assert_eq!(SelectionMode::from_key(mode.key()), Some(mode));
         }
-        assert_eq!(SelectionMode::from_key("iphone\n"), Some(SelectionMode::Iphone));
+        assert_eq!(
+            SelectionMode::from_key("iphone\n"),
+            Some(SelectionMode::Iphone)
+        );
         assert_eq!(SelectionMode::from_key("fullscreen"), None);
     }
 

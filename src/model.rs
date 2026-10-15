@@ -64,6 +64,9 @@ pub struct ScrawlBundle {
     pub contact_sheet: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video: Option<String>,
+    /// When the video starts on the bundle's clock (ms): video time = bundle time − this.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub video_offset_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<String>,
     /// Where the pictures came from when it isn't this Mac's screen (`"iphone"`).
@@ -91,6 +94,10 @@ pub struct ScrawlBundle {
     /// the full frames are kept beside them).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autocrop: Option<AutocropInfo>,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

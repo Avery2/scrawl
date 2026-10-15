@@ -181,6 +181,22 @@ enum Command {
         #[arg(long)]
         settings: Option<PathBuf>,
     },
+    /// Drive a Screen capture of a scenario headless for SECONDS: the sampler's candidate buffer
+    /// on a virtual clock, then the finish (keyframes decoded from MOVIE), timed; prints JSON.
+    #[command(name = "capture-sim", hide = true)]
+    CaptureSim {
+        scenario: PathBuf,
+        #[arg(long)]
+        seconds: u64,
+        /// A recording of the scenario's states (`recording.mp4` for the bundle).
+        #[arg(long)]
+        movie: Option<PathBuf>,
+        /// Replay the old sampler: full-size candidates, the newest 300 kept.
+        #[arg(long)]
+        legacy: bool,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Score auto-crop against simulated captures with ground truth (`truth.json`).
     #[command(name = "autocrop-eval", hide = true)]
     AutocropEval {
@@ -321,6 +337,8 @@ pub struct SourceExtras {
     pub activity: windows::ActivityLog,
     /// Time-only markers (ms); each becomes a `Flag` mark with keyframe priority.
     pub flags: Vec<u64>,
+    /// When the video starts on the bundle's clock (ms).
+    pub video_offset_ms: u64,
     /// Screen-capture auto-crop: `None` follows the config, `Some(None)` is off.
     pub autocrop: Option<Option<autocrop::Settings>>,
     /// Decodes the chosen keyframes again at full quality, for sources that select on small
@@ -331,20 +349,52 @@ pub struct SourceExtras {
 /// Decodes frames at these times at full quality.
 pub type FullFrames = Box<dyn Fn(&[u64]) -> Result<Vec<RgbaFrame>>>;
 
+/// Keyframes at native size from a Mac screen recording, whose clock starts `offset_ms` into the
+/// capture. Each frame comes back stamped with the capture time it was asked for.
+pub fn movie_keyframes(movie: PathBuf, offset_ms: u64) -> FullFrames {
+    Box::new(move |times: &[u64]| movie_frames_at(&movie, times, offset_ms, 0))
+}
+
+/// Frames of a movie whose clock starts `offset_ms` into the bundle's, at bundle times.
+pub fn movie_frames_at(
+    movie: &Path,
+    times: &[u64],
+    offset_ms: u64,
+    max_edge: u32,
+) -> Result<Vec<RgbaFrame>> {
+    let at: Vec<u64> = times.iter().map(|t| t.saturating_sub(offset_ms)).collect();
+    let mut frames = helper::frames(movie, helper::FrameTimes::At(&at), max_edge)?;
+    // The helper stamps each frame with the time it was asked for, clamped to the movie (the
+    // last keyframe can fall just past its end); map it back to the bundle time.
+    for frame in &mut frames {
+        if let Some(i) = (0..at.len()).min_by_key(|&i| at[i].abs_diff(frame.t_ms)) {
+            frame.t_ms = times[i];
+        }
+    }
+    Ok(frames)
+}
+
 /// Core pipeline that turns raw frames, strokes, events, and audio/transcript into a complete `.scrawl` bundle on disk.
 #[allow(clippy::too_many_arguments)]
+///
+/// The recording's candidate frames are small; the keyframes are decoded again from its video at
+/// full size, falling back to the candidates if that fails.
 pub fn finalize_capture_bundle(
     bundle_dir: &Path,
     target: TargetInfo,
-    duration_ms: u64,
-    frames: Vec<RgbaFrame>,
+    recording: capture::ScreenRecording,
     strokes: Vec<Stroke>,
     events: Vec<InteractionEvent>,
     recorded_audio: Option<RecordedAudio>,
-    video_path: Option<PathBuf>,
     note: Option<String>,
     activity: windows::ActivityLog,
 ) -> Result<(PathBuf, ScrawlBundle, String)> {
+    let capture::ScreenRecording {
+        frames,
+        video: video_path,
+        duration_ms,
+        video_offset_ms,
+    } = recording;
     if let Some(ref audio) = recorded_audio {
         let wav_path = bundle_dir.join("audio.wav");
         let _ = std::fs::create_dir_all(bundle_dir);
@@ -364,10 +414,12 @@ pub fn finalize_capture_bundle(
         strokes,
         events,
         transcript,
-        video_path,
+        video_path.clone(),
         note,
         SourceExtras {
             activity,
+            video_offset_ms,
+            full_frames: video_path.map(|movie| movie_keyframes(movie, video_offset_ms)),
             ..SourceExtras::default()
         },
     )
@@ -413,6 +465,13 @@ pub fn build_bundle_from_parts(
         &transcript,
         MAX_KEYFRAMES,
     );
+    // Only the first candidate is needed from here on (auto-crop's baseline); free the rest
+    // before the full-size keyframes arrive.
+    let baseline = {
+        let mut frames = frames;
+        frames.truncate(1);
+        frames.pop()
+    };
     let selected = match &extras.full_frames {
         Some(decode) if !selected.is_empty() => {
             let times: Vec<u64> = selected.iter().map(|(k, _)| k.t).collect();
@@ -444,7 +503,7 @@ pub fn build_bundle_from_parts(
     };
     let (annotated_frames, cropped) = autocrop::annotate_and_crop(
         selected,
-        frames.first(),
+        baseline.as_ref(),
         crop_settings.as_ref(),
         &target,
         duration_ms,
@@ -488,6 +547,7 @@ pub fn build_bundle_from_parts(
         keyframes,
         contact_sheet: "contact-sheet.png".into(),
         video: video_rel,
+        video_offset_ms: extras.video_offset_ms,
         audio: audio_rel,
         source: extras.source,
         device: extras.device,
@@ -792,7 +852,7 @@ fn main() -> Result<()> {
                 )
             });
             std::thread::sleep(Duration::from_secs(duration.max(1)));
-            let (frames, video_out, elapsed_ms) = session.stop();
+            let recording = session.stop();
             let activity = window_log
                 .map(windows::WindowLogger::stop)
                 .unwrap_or_default();
@@ -800,12 +860,10 @@ fn main() -> Result<()> {
             let (_dir, _bundle, summary) = finalize_capture_bundle(
                 &bundle_dir,
                 target,
-                elapsed_ms,
-                frames,
+                recording,
                 Vec::new(),
                 Vec::new(),
                 recorded_audio,
-                video_out,
                 note,
                 activity,
             )?;
@@ -889,15 +947,13 @@ fn main() -> Result<()> {
                     recorded.as_ref().map(|_| wav.as_path()),
                     recorded.as_ref(),
                 );
-                let frames = helper::frames(&copied, helper::FrameTimes::Every(220), 1280)?;
-                // Screen captures are cropped, so their keyframes come from the movie at full size.
-                let full_frames: Option<FullFrames> = (old.target.mode == CaptureMode::Display)
-                    .then(|| {
-                        let movie = copied.clone();
-                        Box::new(move |times: &[u64]| {
-                            helper::frames(&movie, helper::FrameTimes::At(times), 0)
-                        }) as FullFrames
-                    });
+                // Small candidates, then the keyframes from the movie at full size, as at capture.
+                let offset = old.video_offset_ms;
+                let mut frames = helper::frames(&copied, helper::FrameTimes::Every(220), 640)?;
+                for frame in &mut frames {
+                    frame.t_ms += offset;
+                }
+                let full_frames = Some(movie_keyframes(copied.clone(), offset));
                 build_bundle_from_parts(
                     &out,
                     old.target,
@@ -915,6 +971,7 @@ fn main() -> Result<()> {
                             ..Default::default()
                         },
                         full_frames,
+                        video_offset_ms: offset,
                         ..SourceExtras::default()
                     },
                 )?
@@ -1016,6 +1073,18 @@ fn main() -> Result<()> {
                 .transpose()?;
             let dir = autocrop_lab::build_fixture(&scenario, &out, settings)?;
             println!("{}", dir.display());
+            Ok(())
+        }
+        Command::CaptureSim {
+            scenario,
+            seconds,
+            movie,
+            legacy,
+            out,
+        } => {
+            let report =
+                autocrop_lab::simulate_capture(&scenario, seconds, movie.as_deref(), legacy, &out)?;
+            println!("{}", serde_json::to_string(&report)?);
             Ok(())
         }
         Command::AutocropEval {

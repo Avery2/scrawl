@@ -680,9 +680,10 @@ pub fn extract_frames_range(
     ensure!(from_ms <= to_ms, "Frame range ends before it starts");
     ensure!(fps > 0 && fps <= 240, "FPS must be between 1 and 240");
     let directory = resolve_bundle_dir(bundle_dir)?;
-    let video = load_bundle(&directory)
-        .ok()
-        .and_then(|(_, bundle)| bundle.video)
+    let loaded = load_bundle(&directory).ok().map(|(_, bundle)| bundle);
+    let offset_ms = loaded.as_ref().map_or(0, |b| b.video_offset_ms);
+    let video = loaded
+        .and_then(|bundle| bundle.video)
         .map_or_else(|| directory.join("recording.mp4"), |v| directory.join(v));
     if video.is_file() && from_ms < to_ms {
         let output_dir = directory
@@ -738,8 +739,7 @@ pub fn extract_frames_range(
         let step_ms = (1_000 / u64::from(fps)).max(1);
         let times: Vec<u64> = (from_ms..=to_ms).step_by(step_ms as usize).collect();
         if !times.is_empty()
-            && let Ok(decoded) =
-                crate::helper::frames(&video, crate::helper::FrameTimes::At(&times), 0)
+            && let Ok(decoded) = crate::movie_frames_at(&video, &times, offset_ms, 0)
             && !decoded.is_empty()
         {
             fs::create_dir_all(&output_dir)?;

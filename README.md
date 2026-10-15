@@ -91,7 +91,7 @@ most of the screen isn't worth it, and the keyframe stays whole.
 The bundle then has:
 
 - `frames/frame-XX.png` and `contact-sheet.png`: cropped from the full-resolution frames (Screen
-  captures sample at 2560 px wide), with the ink and badges redrawn at the crop's scale;
+  keyframes are decoded from the 2560 px wide recording), with the ink and badges redrawn at the crop's scale;
 - `frames-full/frame-XX.png` and `contact-sheet-full.png`: the uncropped versions;
 - one line in `summary.md`, e.g. `Cropped to: Ghostty + Safari (full frames in frames-full/)`;
 - `autocrop` in `scrawl.json`: each keyframe's crop in points, its kind and reason, and the

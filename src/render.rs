@@ -1332,6 +1332,7 @@ mod tests {
             keyframes: vec![],
             contact_sheet: "contact-sheet.png".into(),
             video: None,
+            video_offset_ms: 0,
             audio: None,
             source: None,
             device: None,
