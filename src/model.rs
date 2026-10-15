@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::windows::{CursorSample, WindowSnapshot};
+
 /// Coordinates in `Stroke::pts` are scaled to `0..=10_000` (1/10000 of target width/height).
 pub const SCALE: i32 = 10_000;
 
@@ -78,6 +80,13 @@ pub struct ScrawlBundle {
     /// Which screen the app said it was on, and when (ScrawlKit `Scrawl.screen`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub screens: Vec<ScreenSpan>,
+    /// Screen mode: the on-screen windows over time, front to back, stored only when they
+    /// change. Titles stay here and never go into the summary or the clipboard.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<WindowSnapshot>,
+    /// Screen mode: the cursor at up to 15 Hz while it moves, as `[t, x, y]` (normalized).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cursor: Vec<CursorSample>,
 }
 
 impl ScrawlBundle {

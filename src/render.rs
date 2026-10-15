@@ -1339,6 +1339,8 @@ mod tests {
             context: Default::default(),
             context_changes: Vec::new(),
             screens: Vec::new(),
+            windows: Vec::new(),
+            cursor: Vec::new(),
         }
     }
 

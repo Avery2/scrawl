@@ -13,6 +13,7 @@ mod sketch;
 mod sparkle;
 mod transcribe;
 mod ui;
+mod windows;
 mod zoom;
 
 use std::path::{Path, PathBuf};
@@ -150,6 +151,13 @@ enum Command {
         #[arg(long, default_value_t = 12)]
         frames: usize,
     },
+    /// Print the window list the Screen-mode window log would store, and what it costs.
+    #[command(hide = true)]
+    Windows {
+        /// Repeat the snapshot this many times and report the average time.
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
+    },
     /// Copy a `.scrawl` bundle to the clipboard or send it to an OpenCode V2 session.
     Send {
         /// Path to `.scrawl` bundle directory or `latest`.
@@ -261,6 +269,8 @@ pub struct SourceExtras {
     pub context: std::collections::BTreeMap<String, String>,
     pub context_changes: Vec<model::ContextChange>,
     pub screens: Vec<model::ScreenSpan>,
+    /// Screen mode's window and cursor log.
+    pub activity: windows::ActivityLog,
     /// Time-only markers (ms); each becomes a `Flag` mark with keyframe priority.
     pub flags: Vec<u64>,
     /// Decodes the chosen keyframes again at full quality, for sources that select on small
@@ -281,6 +291,7 @@ pub fn finalize_capture_bundle(
     recorded_audio: Option<RecordedAudio>,
     video_path: Option<PathBuf>,
     note: Option<String>,
+    activity: windows::ActivityLog,
 ) -> Result<(PathBuf, ScrawlBundle, String)> {
     if let Some(ref audio) = recorded_audio {
         let wav_path = bundle_dir.join("audio.wav");
@@ -303,7 +314,10 @@ pub fn finalize_capture_bundle(
         transcript,
         video_path,
         note,
-        SourceExtras::default(),
+        SourceExtras {
+            activity,
+            ..SourceExtras::default()
+        },
     )
 }
 
@@ -416,6 +430,8 @@ pub fn build_bundle_from_parts(
         context: extras.context,
         context_changes: extras.context_changes,
         screens: extras.screens,
+        windows: extras.activity.windows,
+        cursor: extras.activity.cursor,
     };
 
     let contact_sheet = render_contact_sheet(&bundle, &annotated_frames);
@@ -699,8 +715,16 @@ fn main() -> Result<()> {
                 Some(video_path),
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             );
+            let window_log = (target.mode == CaptureMode::Display).then(|| {
+                windows::WindowLogger::start(
+                    target.frame,
+                    std::time::Instant::now(),
+                    std::sync::Arc::default(),
+                )
+            });
             std::thread::sleep(Duration::from_secs(duration.max(1)));
             let (frames, video_out, elapsed_ms) = session.stop();
+            let activity = window_log.map(windows::WindowLogger::stop).unwrap_or_default();
             let recorded_audio = audio.and_then(|a| a.stop().ok());
             let (_dir, _bundle, summary) = finalize_capture_bundle(
                 &bundle_dir,
@@ -712,6 +736,7 @@ fn main() -> Result<()> {
                 recorded_audio,
                 video_out,
                 note,
+                activity,
             )?;
             print!("{summary}");
             Ok(())
@@ -804,7 +829,14 @@ fn main() -> Result<()> {
                     transcript,
                     Some(copied),
                     old.note,
-                    SourceExtras::default(),
+                    SourceExtras {
+                        activity: windows::ActivityLog {
+                            windows: old.windows,
+                            cursor: old.cursor,
+                            ..Default::default()
+                        },
+                        ..SourceExtras::default()
+                    },
                 )?
                 .2
             };
@@ -866,6 +898,26 @@ fn main() -> Result<()> {
             if !sheet.said.is_empty() {
                 println!("Said: “{}”", sheet.said);
             }
+            Ok(())
+        }
+        Command::Windows { repeat } => {
+            let target = discover_target(None);
+            let dock = windows::dock_rect(target.frame);
+            let mut cache = std::collections::HashMap::new();
+            let started = std::time::Instant::now();
+            let mut windows = Vec::new();
+            for _ in 0..repeat.max(1) {
+                windows = windows::snapshot(target.frame, dock, &mut cache);
+            }
+            let each = started.elapsed().as_secs_f64() * 1_000.0 / f64::from(repeat.max(1));
+            println!("{}", serde_json::to_string_pretty(&windows)?);
+            eprintln!(
+                "{} windows on display {} ({}×{} pt), {each:.2} ms per snapshot",
+                windows.len(),
+                target.display_id,
+                target.frame.width,
+                target.frame.height
+            );
             Ok(())
         }
         Command::Send {

@@ -1335,6 +1335,8 @@ mod tests {
             context: Default::default(),
             context_changes: Vec::new(),
             screens: Vec::new(),
+            windows: Vec::new(),
+            cursor: Vec::new(),
         };
         let tl = timeline(&bundle).join("\n");
         assert!(tl.find("0:03 “").unwrap() < tl.find("0:04 · pressed").unwrap());

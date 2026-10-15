@@ -900,6 +900,8 @@ enum CaptureSource {
     Screen {
         session: ScreenCaptureSession,
         audio: Option<AudioRecorder>,
+        /// Screen mode only: which windows were where, for `scrawl autocrop`.
+        windows: Option<crate::windows::WindowLogger>,
     },
     /// The helper's mirror window records the phone's native video and the narration.
     Phone(PhoneSession),
@@ -1696,12 +1698,25 @@ impl ScrawlCoordinator {
             Arc::clone(&self.telemetry.excluded_window_ids),
         );
         start_metric("sck_start_ms", stage);
+        let window_log = (target.mode == CaptureMode::Display).then(|| {
+            let started_at = *self
+                .telemetry
+                .started_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::windows::WindowLogger::start(
+                target.frame,
+                started_at,
+                Arc::clone(&self.telemetry.window_log_request),
+            )
+        });
         self.active_recording = Some(ActiveRecording {
             target,
             bundle_dir,
             source: CaptureSource::Screen {
                 session: screen_session,
                 audio: audio_recorder,
+                windows: window_log,
             },
             _metal_overlay: metal_overlay,
         });
@@ -1853,7 +1868,7 @@ impl ScrawlCoordinator {
         };
         let _ = self.telemetry.finish_session();
         match rec.source {
-            CaptureSource::Screen { session, audio } => {
+            CaptureSource::Screen { session, audio, .. } => {
                 let _ = session.stop();
                 if let Some(audio) = audio {
                     let _ = audio.stop();
@@ -1886,8 +1901,12 @@ impl ScrawlCoordinator {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let (screen_session, audio_recorder) = match source {
-                        CaptureSource::Screen { session, audio } => (session, audio),
+                    let (screen_session, audio_recorder, window_log) = match source {
+                        CaptureSource::Screen {
+                            session,
+                            audio,
+                            windows,
+                        } => (session, audio, windows),
                         CaptureSource::Phone(session) => {
                             let finalized = session.stop().and_then(|recording| {
                                 crate::phone::finalize_live_capture(
@@ -1912,6 +1931,9 @@ impl ScrawlCoordinator {
                             let audio = audio_recorder.and_then(|r| r.stop().ok());
                             (screen_handle.join().unwrap(), audio)
                         });
+                    let activity = window_log
+                        .map(crate::windows::WindowLogger::stop)
+                        .unwrap_or_default();
                     let finalized = crate::finalize_capture_bundle(
                         &bundle_dir,
                         target,
@@ -1922,6 +1944,7 @@ impl ScrawlCoordinator {
                         recorded_audio,
                         video_path,
                         None,
+                        activity,
                     );
                     (finalized, duration_ms)
                 })
@@ -3733,7 +3756,7 @@ pub fn run_start_benchmark() {
                     let rec = coord.active_recording.take().expect("Recording did not start");
                     assert!(rec._metal_overlay.is_some(), "Metal overlay failed");
                     coord.telemetry.finish_session();
-                    let CaptureSource::Screen { session, audio } = rec.source else {
+                    let CaptureSource::Screen { session, audio, .. } = rec.source else {
                         unreachable!("The benchmark records the screen")
                     };
                     let ((frames, video, duration), audio) = std::thread::scope(|scope| {

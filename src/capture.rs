@@ -1047,6 +1047,20 @@ pub fn ensure_external_app_active() {
     }
 }
 
+/// The frontmost app's pid, or the last external one while Scrawl itself is in front.
+pub fn frontmost_external_pid() -> Option<i32> {
+    use objc2_app_kit::NSWorkspace;
+    let our_pid = std::process::id() as i32;
+    let pid = NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .map_or(0, |a| a.processIdentifier());
+    if pid > 0 && pid != our_pid {
+        return Some(pid);
+    }
+    let fallback = LAST_EXTERNAL_APP_PID.load(Ordering::Acquire);
+    (fallback > 0 && fallback != our_pid).then_some(fallback)
+}
+
 fn frontmost_app_info() -> Option<(i32, String, Option<String>)> {
     use objc2_app_kit::{NSRunningApplication, NSWorkspace};
     let our_pid = std::process::id() as i32;
@@ -1357,6 +1371,9 @@ pub struct SharedCaptureTelemetry {
     pub active_laser: Mutex<Option<Stroke>>,
     pub live_ink: Mutex<Option<Stroke>>,
     pub excluded_window_ids: Arc<Mutex<Vec<u32>>>,
+    /// Raised when a click, ink stroke or shortcut starts, so the Screen-mode window log takes
+    /// a snapshot right away.
+    pub window_log_request: Arc<AtomicBool>,
     pub ui_sender: flume::Sender<LiveOverlayEvent>,
     tap_port: AtomicU64,
     last_shortcut_ms: AtomicU64,
@@ -1387,6 +1404,7 @@ impl SharedCaptureTelemetry {
             active_laser: Mutex::new(None),
             live_ink: Mutex::new(None),
             excluded_window_ids: Arc::new(Mutex::new(Vec::new())),
+            window_log_request: Arc::new(AtomicBool::new(false)),
             ui_sender,
             tap_port: AtomicU64::new(0),
             last_shortcut_ms: AtomicU64::new(0),
@@ -1530,6 +1548,7 @@ impl SharedCaptureTelemetry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         self.shift_held.store(false, Ordering::Release);
+        self.window_log_request.store(false, Ordering::Release);
         self.active.store(true, Ordering::Release);
     }
 
@@ -1732,6 +1751,7 @@ unsafe extern "C" fn tap_callback(
             if pure_shift || !telemetry.contains_screen_point(loc.x, loc.y) {
                 return event;
             }
+            telemetry.window_log_request.store(true, Ordering::Release);
             let start_frame = *telemetry
                 .target_frame
                 .lock()
@@ -1845,6 +1865,7 @@ unsafe extern "C" fn tap_callback(
                         chord.push('⌘');
                     }
                     chord.push_str(key_name);
+                    telemetry.window_log_request.store(true, Ordering::Release);
                     telemetry
                         .events
                         .lock()
@@ -2057,6 +2078,9 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
                 .live_ink
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.is_none() {
+                telemetry.window_log_request.store(true, Ordering::Release);
+            }
             let stroke = guard.get_or_insert_with(|| Stroke {
                 t0: t_ms,
                 t1: t_ms,

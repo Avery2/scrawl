@@ -482,6 +482,7 @@ pub fn build_movie_bundle(
         full_frames: Some(Box::new(move |times: &[u64]| -> Result<Vec<RgbaFrame>> {
             helper::frames(&movie, FrameTimes::At(times), PHONE_FRAME_EDGE)
         })),
+        ..Default::default()
     };
     crate::build_bundle_from_parts(
         bundle_dir,
