@@ -2,7 +2,9 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_DIR="${HOME}/Applications/Scrawl.app"
+# SCRAWL_APP_DIR builds the signed bundle somewhere else (staging for remote installs, see
+# install-app-remote.sh); SCRAWL_NO_LAUNCH=1 skips the ~/bin link and the restart.
+APP_DIR="${SCRAWL_APP_DIR:-${HOME}/Applications/Scrawl.app}"
 CONTENTS_DIR="${APP_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
 RESOURCES_DIR="${CONTENTS_DIR}/Resources"
@@ -99,6 +101,10 @@ if [[ -d "${FRAMEWORKS_DIR}/Sparkle.framework/Versions/B" ]]; then
 fi
 codesign --force --sign "${IDENTITY}" --identifier "dev.kitlangton.scrawl.helper" "${MACOS_DIR}/scrawl-helper"
 codesign --force --sign "${IDENTITY}" --identifier "dev.kitlangton.scrawl" "${APP_DIR}"
+
+if [[ "${SCRAWL_NO_LAUNCH:-0}" == "1" ]]; then
+  exit 0
+fi
 
 ln -sf "${MACOS_DIR}/scrawl" "${HOME}/bin/scrawl"
 
