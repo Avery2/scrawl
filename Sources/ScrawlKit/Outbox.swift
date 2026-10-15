@@ -346,6 +346,9 @@ final class Outbox: NSObject, @unchecked Sendable {
     request.httpMethod = "POST"
     request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
     request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    // Apple reserves `Authorization` for the URL loading system, so a background session may drop
+    // or replace it; the server also accepts the token here.
+    request.setValue(token, forHTTPHeaderField: "X-Scrawl-Token")
     request.setValue(String(entry.payloadBytes), forHTTPHeaderField: "Content-Length")
     let task = session.uploadTask(with: request, fromFile: payloadURL(entry.id))
     task.taskDescription = entry.id

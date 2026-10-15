@@ -144,6 +144,7 @@ struct OutboxTests {
     #expect(received.request.url == target.appending(path: "ingest"))
     #expect(received.request.httpMethod == "POST")
     #expect(received.request.value(forHTTPHeaderField: "Authorization") == "Bearer pbcap_test")
+    #expect(received.request.value(forHTTPHeaderField: "X-Scrawl-Token") == "pbcap_test")
     #expect(received.request.value(forHTTPHeaderField: "Content-Type") == "application/octet-stream")
     #expect(received.request.value(forHTTPHeaderField: "Content-Length") == String(expectedPayload.count))
     // The payload was on disk while it was being sent.
