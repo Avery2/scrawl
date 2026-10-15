@@ -168,12 +168,26 @@ fn said_between(bundle: &ScrawlBundle, from: u64, to: u64) -> String {
         .join(" ")
 }
 
+/// The auto-crop of the keyframe nearest `t` (keyframe crops meet halfway between keyframes).
+fn crop_at(bundle: &ScrawlBundle, t: u64) -> Option<crate::autocrop::Rect> {
+    let info = bundle.autocrop.as_ref()?;
+    let (k, _) = bundle
+        .keyframes
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, kf)| kf.t.abs_diff(t))?;
+    let crop = info.crops.get(k)?;
+    (crop.kind != crate::autocrop::CropKind::Full).then(|| crop.rect(&bundle.target.frame))
+}
+
+/// `cropped`: in an auto-cropped bundle, crop each cell like the nearest keyframe.
 pub fn zoom(
     dir: &Path,
     bundle: &ScrawlBundle,
     at: &str,
     span_ms: u64,
     count: usize,
+    cropped: bool,
 ) -> Result<ZoomSheet> {
     let video = bundle
         .video
@@ -190,13 +204,38 @@ pub fn zoom(
     );
     let (from_ms, to_ms) = window(at_ms, span_ms, bundle.duration_ms);
     let times = sample_times(from_ms, to_ms, count);
-    let mut frames = crate::helper::frames(&video, crate::helper::FrameTimes::At(&times), 900)?;
+    let crops: Vec<Option<crate::autocrop::Rect>> = times
+        .iter()
+        .map(|&t| crop_at(bundle, t).filter(|_| cropped))
+        .collect();
+    let mut frames = if crops.iter().any(Option::is_some) {
+        // Decoded at full size a few at a time and cropped straight away, so a sheet of 2560 px
+        // screens doesn't sit in memory.
+        let mut out = Vec::with_capacity(times.len());
+        for (chunk, rects) in times.chunks(6).zip(crops.chunks(6)) {
+            let decoded = crate::helper::frames(&video, crate::helper::FrameTimes::At(chunk), 0)?;
+            for (frame, rect) in decoded.into_iter().zip(rects) {
+                let frame = match rect {
+                    Some(r) => crate::autocrop::crop_frame(&frame, *r),
+                    None => frame,
+                };
+                out.push(crate::autocrop_lab::downscale(&frame, 1280));
+            }
+        }
+        out
+    } else {
+        crate::helper::frames(&video, crate::helper::FrameTimes::At(&times), 900)?
+    };
     ensure!(!frames.is_empty(), "No frames could be decoded");
-    let marks = &bundle.marks;
     let mut cells = Vec::with_capacity(frames.len());
     for (i, frame) in frames.iter_mut().enumerate() {
         let t = frame.t_ms;
         let events = events_at(&bundle.events, t);
+        let rect = crops
+            .get(i)
+            .copied()
+            .flatten()
+            .unwrap_or(crate::autocrop::FULL);
         // Labels are sized for the sheet's cell, not the decoded frame.
         let cell_width = if frame.height > frame.width {
             300.0
@@ -214,12 +253,14 @@ pub fn zoom(
             mark_id: None,
             cursor: None,
         };
+        let view =
+            crate::autocrop::crop_view(rect, &keyframe, &bundle.strokes, &bundle.marks, &events);
         crate::render::annotate_keyframe_in_place(
             frame,
-            &keyframe,
-            &bundle.strokes,
-            marks,
-            &events,
+            &view.keyframe,
+            &view.strokes,
+            &view.marks,
+            &view.events,
         );
         crate::render::draw_time_label(frame, &clock(t), label_scale);
         cells.push((i + 1, t));

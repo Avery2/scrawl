@@ -61,6 +61,7 @@
   .share .bar { height: 8px; background: #26262a; border-radius: 4px; overflow: hidden; }
   .share .bar i { display: block; height: 100%; border-radius: 4px; }
   .share .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .stale #crop { opacity: .55; }
   .decision { font-weight: 600; margin-bottom: 6px; }
   .pill { display: inline-block; padding: 1px 7px; border-radius: 99px; background: #26262a; color: #cfcfd3; font-size: 11px; margin-right: 4px; }
   .timeline { margin-top: 12px; }
@@ -119,7 +120,7 @@
 <dialog id="help">
   <h3 style="margin-top:0">Shortcuts</h3>
   <table>
-    <tr><td><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd></td><td>Presets: Window-snap, Activity box, Whole capture</td></tr>
+    <tr><td><kbd>1</kbd>–<kbd>4</kbd></td><td>Presets: Recommended, Windows only, Activity box, Whole capture (<kbd>4</kbd>)</td></tr>
     <tr><td><kbd>←</kbd> <kbd>→</kbd> or <kbd>J</kbd> <kbd>K</kbd></td><td>Previous / next keyframe</td></tr>
     <tr><td><kbd>W</kbd> <kbd>A</kbd> <kbd>H</kbd> <kbd>S</kbd> <kbd>X</kbd> <kbd>D</kbd></td><td>Overlays: windows, activity, cursor heat, snapped window, crop, scene changes</td></tr>
     <tr><td><kbd>O</kbd></td><td>Contact sheet uncropped / cropped</td></tr>
@@ -137,53 +138,61 @@
 <script>
 const DATA = /*SCRAWL_AUTOCROP_DATA*/null;
 
+// The crop itself is Scrawl's (src/autocrop.rs): this page only draws it. With `scrawl autocrop
+// --serve` every settings change is sent to POST /crop; without it only the presets, computed
+// when the page was written, are available.
+
 // ---------------------------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------------------------
-const DEFAULTS = {
-  scope: 'smooth', reachMs: 400,
-  snap: true, snapThreshold: 60, maxWindows: 3, minShare: 10, keepInk: true, ignoreOverlays: true, chrome: true,
-  padding: 16, minW: 480, minH: 320, maxZoom: 3, aspect: 'free',
-  wStroke: 1.0, wClick: 0.6, wLaser: 0.4, wScroll: 0.3, wCursor: 0.15, wChange: 0.1, outlier: 25,
-  zoomStep: 2, mergeIoU: 0.7, fallback: 'frontmost',
-  ovWindows: true, ovActivity: true, ovHeat: true, ovSnap: true, ovCrop: true, ovChanges: false,
-};
-const PRESETS = [
-  { name: 'Window-snap', tag: 'recommended', values: {} },
-  { name: 'Activity box', values: { snap: false, padding: 56, scope: 'smooth', aspect: 'auto', minW: 520, minH: 340 } },
-  { name: 'Whole capture', values: { scope: 'whole', padding: 16 } },
-];
-const OVERLAY_KEYS = new Set(['ovWindows', 'ovActivity', 'ovHeat', 'ovSnap', 'ovCrop', 'ovChanges']);
+const DEFAULTS = { ...DATA.defaults };
+const OVERLAYS = { ovWindows: true, ovActivity: true, ovHeat: true, ovSnap: true, ovCrop: true, ovChanges: false };
+const PRESETS = DATA.presets.map((p, i) => ({ name: p.name, tag: i === 0 ? 'default' : '', values: p.settings, crops: p.crops }));
+const OVERLAY_KEYS = new Set(Object.keys(OVERLAYS));
+const pct = { unit: '%', scale: 100 };
 const CONTROLS = [
   { section: 'Scope' },
-  { key: 'scope', label: 'Crop per', type: 'select', options: [['whole', 'Whole capture'], ['keyframe', 'Keyframe'], ['smooth', 'Keyframe, smoothed']] },
+  { key: 'scope', label: 'Crop per', type: 'select', options: [['whole', 'Whole capture'], ['keyframe', 'Keyframe'], ['grouped', 'Keyframe, grouped']] },
   { key: 'reachMs', label: 'Activity reach', type: 'range', min: 0, max: 4000, step: 100, unit: 'ms', hint: 'Widens each keyframe\'s slice of the timeline (slices meet halfway between keyframes).' },
-  { section: 'Window snapping' },
+  { section: 'Windows' },
   { key: 'snap', label: 'Snap to windows', type: 'toggle' },
-  { key: 'snapThreshold', label: 'Snap when windows hold', type: 'range', min: 30, max: 100, step: 5, unit: '%', hint: 'Share of the weighted activity in the top 1–N windows.' },
+  { key: 'snapThreshold', label: 'Snap when windows hold', type: 'range', min: 0.3, max: 1, step: 0.05, ...pct, hint: 'Share of the weighted activity in the top 1–N windows.' },
   { key: 'maxWindows', label: 'Max windows in a union', type: 'range', min: 1, max: 3, step: 1 },
-  { key: 'minShare', label: 'Min share per window', type: 'range', min: 0, max: 40, step: 1, unit: '%' },
-  { key: 'keepInk', label: 'Always keep ink inside', type: 'toggle' },
+  { key: 'minShare', label: 'Min share per window', type: 'range', min: 0, max: 0.4, step: 0.01, ...pct },
+  { key: 'bigWindow', label: 'Focus inside windows over', type: 'range', min: 0.2, max: 1, step: 0.05, ...pct, hint: 'Of the screen: a window this big isn\'t a useful crop, so crop around the activity in it.' },
+  { key: 'context', label: 'Focus context', type: 'range', min: 0, max: 0.5, step: 0.01, ...pct, hint: 'Margin around the activity, as a share of the window\'s size.' },
+  { key: 'hitSlop', label: 'Window hit slop', type: 'range', min: 0, max: 80, step: 4, unit: 'pt' },
+  { key: 'keepInput', label: 'Always keep ink and clicks inside', type: 'toggle' },
   { key: 'chrome', label: 'Include touched menu bar / Dock', type: 'toggle' },
   { key: 'ignoreOverlays', label: 'Ignore full-screen agent overlays', type: 'toggle' },
   { section: 'Size' },
-  { key: 'padding', label: 'Padding', type: 'range', min: 0, max: 200, step: 4, unit: 'pt' },
+  { key: 'padding', label: 'Padding', type: 'range', min: 0, max: 120, step: 4, unit: 'pt' },
   { key: 'minW', label: 'Min width', type: 'range', min: 120, max: 1600, step: 20, unit: 'pt' },
   { key: 'minH', label: 'Min height', type: 'range', min: 80, max: 1000, step: 20, unit: 'pt' },
   { key: 'maxZoom', label: 'Max zoom', type: 'range', min: 1, max: 6, step: 0.25, unit: '×', hint: 'The crop covers at least 1/zoom of the screen along its longer side.' },
   { key: 'aspect', label: 'Aspect', type: 'select', options: [['free', 'Free'], ['auto', 'Nearest common'], ['screen', 'Screen'], ['16:9', '16:9'], ['16:10', '16:10'], ['3:2', '3:2'], ['4:3', '4:3'], ['1:1', '1:1']] },
-  { section: 'Activity weights' },
+  { key: 'fullAbove', label: 'Keep the full frame above', type: 'range', min: 0.5, max: 1.01, step: 0.01, ...pct },
+  { section: 'Edges' },
+  { key: 'snapOut', label: 'Move edges out to white space', type: 'range', min: 0, max: 300, step: 10, unit: 'pt' },
+  { key: 'snapOutFrac', label: '…or this share of the crop', type: 'range', min: 0, max: 1.5, step: 0.05, ...pct },
+  { key: 'snapIn', label: 'Move edges in', type: 'range', min: 0, max: 200, step: 10, unit: 'pt' },
+  { key: 'trim', label: 'Trim blank margins to', type: 'range', min: 0, max: 100, step: 4, unit: 'pt' },
+  { key: 'contentReach', label: 'Reach for content across blank', type: 'range', min: 0, max: 600, step: 20, unit: 'pt' },
+  { section: 'Activity' },
   { key: 'wStroke', label: 'Ink stroke', type: 'range', min: 0, max: 3, step: 0.05 },
   { key: 'wClick', label: 'Click / drag', type: 'range', min: 0, max: 3, step: 0.05 },
   { key: 'wLaser', label: 'Laser', type: 'range', min: 0, max: 3, step: 0.05 },
   { key: 'wScroll', label: 'Scroll', type: 'range', min: 0, max: 3, step: 0.05 },
   { key: 'wCursor', label: 'Cursor dwell (per s)', type: 'range', min: 0, max: 2, step: 0.05 },
   { key: 'wChange', label: 'Scene change region', type: 'range', min: 0, max: 2, step: 0.05 },
-  { key: 'outlier', label: 'Cursor outlier beyond', type: 'range', min: 5, max: 100, step: 1, unit: '%', hint: 'Of the screen diagonal, from the nearest ink/click (or the cursor\'s median when there is none).' },
-  { section: 'Smoothing & fallback' },
+  { key: 'passiveCap', label: 'Cursor + changes at most', type: 'range', min: 0, max: 3, step: 0.05, unit: '× input' },
+  { key: 'minDwell', label: 'Cursor counts where it rests', type: 'range', min: 0, max: 2, step: 0.05, unit: 's' },
+  { key: 'causeReach', label: 'Changes a click caused, within', type: 'range', min: 0, max: 160, step: 10, unit: 'pt' },
+  { key: 'outlier', label: 'Cursor outlier beyond', type: 'range', min: 0.03, max: 1, step: 0.01, ...pct, hint: 'Of the screen diagonal, from the nearest ink/click (or the cursor\'s median when there is none).' },
+  { section: 'Grouping & fallback' },
+  { key: 'mergeIou', label: 'Merge crops overlapping ≥', type: 'range', min: 0.3, max: 1.01, step: 0.05, hint: 'Neighbouring crops this similar (IoU) become one.' },
   { key: 'zoomStep', label: 'Max zoom change', type: 'range', min: 1, max: 6, step: 0.25, unit: '×', hint: 'Between neighbouring keyframes, by area; the smaller crop grows to fit. 6× is off.' },
-  { key: 'mergeIoU', label: 'Merge crops overlapping ≥', type: 'range', min: 0.3, max: 1, step: 0.05, hint: 'Neighbouring crops this similar (IoU) become one.' },
-  { key: 'fallback', label: 'Talk-only keyframes', type: 'select', options: [['frontmost', 'Frontmost window'], ['previous', 'Previous crop'], ['screen', 'Whole screen']] },
+  { key: 'fallback', label: 'Talk-only keyframes', type: 'select', options: [['previous', 'Previous crop'], ['frontmost', 'Frontmost window'], ['screen', 'Whole screen']] },
   { section: 'Overlays' },
   { key: 'ovWindows', label: 'Windows', type: 'toggle', kbd: 'W' },
   { key: 'ovActivity', label: 'Activity', type: 'toggle', kbd: 'A' },
@@ -192,309 +201,47 @@ const CONTROLS = [
   { key: 'ovCrop', label: 'Crop', type: 'toggle', kbd: 'X' },
   { key: 'ovChanges', label: 'Scene changes', type: 'toggle', kbd: 'D' },
 ];
-const STORE = 'scrawl-autocrop-settings-v1';
-let settings = { ...DEFAULTS, ...loadStored() };
+const STORE = 'scrawl-autocrop-settings-v2';
+let settings = { ...DEFAULTS, ...OVERLAYS, ...loadStored() };
 function loadStored() { try { return JSON.parse(localStorage.getItem(STORE)) || {}; } catch { return {}; } }
 function save() { try { localStorage.setItem(STORE, JSON.stringify(settings)); } catch {} }
 
 // ---------------------------------------------------------------------------------------------
 // Data
 // ---------------------------------------------------------------------------------------------
-const SCREEN = DATA.screen;
-const SW = SCREEN.width, SH = SCREEN.height, DIAG = Math.hypot(SW, SH);
-const KF = DATA.keyframes.slice().sort((a, b) => a.t - b.t);
+const INPUT = DATA.input;
+const SCREEN = { ...DATA.screen, frame: DATA.frame };
+const SW = SCREEN.width, SH = SCREEN.height;
+const KF = DATA.keyframes;
 const DUR = Math.max(DATA.durationMs, KF.length ? KF[KF.length - 1].t + 1 : 1);
-const SNAPS = DATA.windows.slice().sort((a, b) => a.t - b.t);
+const SNAPS = INPUT.snapshots.map(([t, windows]) => ({ t, windows }));
+const ITEMS = INPUT.items;
+const byKind = (k) => ITEMS.filter((it) => it.kind === k);
 let sel = 0;
 
 const clockOf = ms => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const hue = s => { let h = 0; for (const c of s || '') h = (h * 31 + c.charCodeAt(0)) >>> 0; return h % 360; };
 const appColor = (app, a = 1) => `hsla(${hue(app)}, 85%, 62%, ${a})`;
-
-function subsample(pts, max) {
-  if (pts.length <= max) return pts;
-  const out = [];
-  for (let i = 0; i < max; i++) out.push(pts[Math.round(i * (pts.length - 1) / (max - 1))]);
-  return out;
-}
-
-/** Every piece of activity as {kind, t0, t1, pts: [[x, y, t]], dwell?, kf?}. */
-function buildItems() {
-  const items = [];
-  DATA.strokes.forEach((s, i) => items.push({ kind: s.laser ? 'laser' : 'stroke', t0: s.t0, t1: s.t1, id: i,
-    pts: subsample(s.pts, 48), all: s.pts }));
-  DATA.clicks.forEach(c => items.push({ kind: 'click', t0: c.t, t1: c.t, pts: [[c.x, c.y, c.t]], label: c.label }));
-  DATA.drags.forEach(d => {
-    const mid = (d.path || []).map(p => [p[0], p[1], (d.t + d.t1) / 2]);
-    items.push({ kind: 'drag', t0: d.t, t1: d.t1, pts: subsample([[d.x0, d.y0, d.t], ...mid, [d.x1, d.y1, d.t1]], 16) });
-  });
-  DATA.scrolls.forEach(s => items.push({ kind: 'scroll', t0: s.t, t1: s.t, pts: [[s.x, s.y, s.t]] }));
-  DATA.points.forEach(p => items.push({ kind: 'laser', t0: p.t, t1: p.t, pts: [[p.x, p.y, p.t]] }));
-  const cur = DATA.cursor;
-  cur.forEach((c, i) => {
-    const next = i + 1 < cur.length ? cur[i + 1][0] : DUR;
-    items.push({ kind: 'cursor', t0: c[0], t1: next, pts: [[c[1], c[2], c[0]]], dwell: Math.min(next - c[0], 4000) / 1000 });
-  });
-  KF.forEach((kf, k) => (kf.changes || []).forEach(b => {
-    const area = Math.sqrt((b[2] - b[0]) * (b[3] - b[1]));
-    items.push({ kind: 'change', t0: kf.t, t1: kf.t, kf: k, box: b, area,
-      pts: [[b[0], b[1], kf.t], [b[2], b[1], kf.t], [b[0], b[3], kf.t], [b[2], b[3], kf.t], [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2, kf.t]] });
-  }));
-  return items;
-}
-const ITEMS = buildItems();
-
-function itemWeight(it, s) {
-  switch (it.kind) {
-    case 'stroke': return s.wStroke;
-    case 'click': case 'drag': return s.wClick;
-    case 'laser': return s.wLaser;
-    case 'scroll': return s.wScroll;
-    case 'cursor': return s.wCursor * it.dwell;
-    case 'change': return s.wChange * clamp(it.area * 3, 0.2, 1);
-  }
-  return 0;
-}
-
-function segment(k, s) {
-  if (s.scope === 'whole' || k < 0) return [0, DUR];
-  const t = KF[k].t;
-  const a = k === 0 ? 0 : (KF[k - 1].t + t) / 2;
-  const b = k === KF.length - 1 ? DUR : (t + KF[k + 1].t) / 2;
-  return [a - s.reachMs, b + s.reachMs];
-}
-
-function windowsAt(t, s) {
-  if (!SNAPS.length) return [];
-  let snap = SNAPS[0];
-  for (const x of SNAPS) { if (x.t <= t) snap = x; else break; }
-  return snap.windows.filter(w => {
-    if (!s.ignoreOverlays) return true;
-    const area = (Math.min(w.box[2], 1) - Math.max(w.box[0], 0)) * (Math.min(w.box[3], 1) - Math.max(w.box[1], 0));
-    return !(w.regular === false && w.layer === 0 && area > 0.85);
-  });
-}
-const isChrome = w => (w.layer === 24 && w.app === 'Window Server') || (w.layer === 20 && w.app === 'Dock');
-// Only deliberate input pulls the menu bar or Dock into a crop, not cursor dwell or screen changes.
-const DELIBERATE = new Set(['stroke', 'click', 'drag', 'laser', 'scroll']);
-const hit = (wins, x, y) => wins.find(w => x >= w.box[0] && x <= w.box[2] && y >= w.box[1] && y <= w.box[3]);
-const winLabel = w => isChrome(w) ? (w.layer === 24 ? 'Menu bar' : 'Dock') : w.app;
-
-// ---------------------------------------------------------------------------------------------
-// Rect helpers (normalized [x0, y0, x1, y1])
-// ---------------------------------------------------------------------------------------------
-const union = (a, b) => !a ? b : !b ? a : [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])];
-const clip01 = r => [clamp(r[0], 0, 1), clamp(r[1], 0, 1), clamp(r[2], 0, 1), clamp(r[3], 0, 1)];
+const clip01 = r => [Math.max(0, r[0]), Math.max(0, r[1]), Math.min(1, r[2]), Math.min(1, r[3])];
 const area = r => Math.max(0, r[2] - r[0]) * Math.max(0, r[3] - r[1]);
-function iou(a, b) {
-  const i = area([Math.max(a[0], b[0]), Math.max(a[1], b[1]), Math.min(a[2], b[2]), Math.min(a[3], b[3])]);
-  return i / (area(a) + area(b) - i || 1);
+const isChrome = w => (w.layer === 24 && w.app === 'Window Server') || (w.layer === 20 && w.app === 'Dock');
+const winLabel = w => isChrome(w) ? (w.layer === 24 ? 'Menu bar' : 'Dock') : w.app;
+function windowsAt(t) {
+  let snap = SNAPS[0];
+  for (const s of SNAPS) if (s.t <= t) snap = s;
+  if (!snap) return [];
+  return snap.windows.filter(w => !(settings.ignoreOverlays && !w.regular && w.layer === 0 && area(clip01(w.rect)) > 0.85));
 }
-const lerpRect = (a, b, t) => a.map((v, i) => v + (b[i] - v) * t);
-function bboxOf(pts) {
-  if (!pts.length) return null;
-  let r = [1, 1, 0, 0];
-  for (const p of pts) r = [Math.min(r[0], p.x), Math.min(r[1], p.y), Math.max(r[2], p.x), Math.max(r[3], p.y)];
-  return r;
-}
-function pad(r, s) { const px = s.padding / SW, py = s.padding / SH; return [r[0] - px, r[1] - py, r[2] + px, r[3] + py]; }
-
-const RATIOS = { '16:9': 16 / 9, '16:10': 1.6, '3:2': 1.5, '4:3': 4 / 3, '1:1': 1 };
-/** Min size, max zoom and aspect (only ever growing the rect), then fit inside the screen. */
-function shape(r, s) {
-  let cx = (r[0] + r[2]) / 2, cy = (r[1] + r[3]) / 2;
-  let w = Math.max(r[2] - r[0], 1e-4) * SW, h = Math.max(r[3] - r[1], 1e-4) * SH; // points
-  w = Math.max(w, Math.min(s.minW, SW)); h = Math.max(h, Math.min(s.minH, SH));
-  const need = 1 / s.maxZoom;
-  const cover = Math.max(w / SW, h / SH);
-  if (cover < need) { w *= need / cover; h *= need / cover; }
-  let ratio = null;
-  if (s.aspect === 'screen') ratio = SW / SH;
-  else if (s.aspect === 'auto') {
-    const cur = w / h; let best = null;
-    for (const v of [16 / 9, 1.6, 1.5, 4 / 3, 1, 3 / 4, 2 / 3, 9 / 16]) if (!best || Math.abs(Math.log(v / cur)) < Math.abs(Math.log(best / cur))) best = v;
-    ratio = best;
-  } else if (RATIOS[s.aspect]) ratio = RATIOS[s.aspect];
-  if (ratio) { if (w / h < ratio) w = h * ratio; else h = w / ratio; }
-  w = Math.min(w, SW) / SW; h = Math.min(h, SH) / SH;
-  cx = clamp(cx, w / 2, 1 - w / 2); cy = clamp(cy, h / 2, 1 - h / 2);
-  return [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2];
+/** The keyframe's slice of the timeline without reach (they meet halfway). */
+function segment(k) {
+  const t = KF[k].t;
+  return [k ? (KF[k - 1].t + t) / 2 : 0, k + 1 < KF.length ? (t + KF[k + 1].t) / 2 : DUR];
 }
 
-// ---------------------------------------------------------------------------------------------
-// The crop algorithm
-// ---------------------------------------------------------------------------------------------
-function frontmostRect(t, s) {
-  const wins = windowsAt(t, s).filter(w => !isChrome(w));
-  const w = wins.find(w => w.frontmost) || wins.find(w => w.regular !== false);
-  return w ? { rect: clip01(w.box), win: w } : null;
-}
-
-/** Crop for keyframe k (or the whole capture when k < 0), before smoothing. */
-function cropFor(k, s) {
-  const [a, b] = segment(k, s);
-  const t = k >= 0 ? KF[k].t : DUR / 2;
-  const items = ITEMS.filter(it => it.t1 >= a && it.t0 <= b && (it.kind !== 'change' || k < 0 || it.kf === k));
-  const pts = [];
-  for (const it of items) {
-    const w = itemWeight(it, s);
-    if (w <= 0) continue;
-    for (const p of it.pts) pts.push({ x: p[0], y: p[1], t: p[2], w: w / it.pts.length, kind: it.kind, item: it });
-  }
-  // Cursor outliers: far from everything deliberate (or from the cursor's own median).
-  const anchors = subsample(pts.filter(p => p.kind !== 'cursor'), 300);
-  const lim = s.outlier / 100;
-  const dist = (p, q) => Math.hypot((p.x - q.x) * SW, (p.y - q.y) * SH) / DIAG;
-  let center = null;
-  if (!anchors.length) {
-    const cur = pts.filter(p => p.kind === 'cursor');
-    if (cur.length) center = { x: wmedian(cur, 'x'), y: wmedian(cur, 'y') };
-  }
-  for (const p of pts) {
-    if (p.kind !== 'cursor') continue;
-    const d = anchors.length ? Math.min(...anchors.map(q => dist(p, q))) : center ? dist(p, center) : 0;
-    p.outlier = d > lim;
-  }
-  const used = pts.filter(p => !p.outlier);
-  const atKf = windowsAt(t, s);
-  const shares = new Map();
-  const chromeHits = new Map();
-  let total = 0, desktop = 0;
-  for (const p of used) {
-    const win = hit(windowsAt(p.t, s), p.x, p.y);
-    p.win = win;
-    if (win && isChrome(win)) {
-      if (!s.chrome || !DELIBERATE.has(p.kind)) { p.dropped = true; continue; }
-      (chromeHits.get(win.id) || chromeHits.set(win.id, { win, pts: [] }).get(win.id)).pts.push(p);
-      total += p.w;
-      continue;
-    }
-    total += p.w;
-    if (!win) { desktop += p.w; continue; }
-    const e = shares.get(win.id) || { win: atKf.find(w => w.id === win.id) || win, w: 0 };
-    e.w += p.w; shares.set(win.id, e);
-  }
-  const ranked = [...shares.values()].sort((x, y) => y.w - x.w).map(e => ({ ...e, share: total ? e.w / total : 0 }));
-  const res = { k, segment: [a, b], pts, ranked, desktop: total ? desktop / total : 0, snapped: [], chrome: [] };
-  if (total <= 0) {
-    res.empty = true;
-    return res;
-  }
-  const kept = used.filter(p => !p.dropped && !(p.win && isChrome(p.win)));
-  let rect = null;
-  if (s.snap && ranked.length) {
-    let cum = 0;
-    for (let n = 1; n <= Math.min(s.maxWindows, ranked.length); n++) {
-      if (n > 1 && ranked[n - 1].share * 100 < s.minShare) break;
-      cum += ranked[n - 1].share;
-      if (cum * 100 >= s.snapThreshold) {
-        res.snapped = ranked.slice(0, n).map(e => e.win);
-        rect = res.snapped.reduce((r, w) => union(r, clip01(w.box)), null);
-        res.reason = n === 1 ? `Snapped to ${winLabel(ranked[0].win)} (${Math.round(cum * 100)}% of the activity)`
-          : `Union of ${n} windows (${Math.round(cum * 100)}% of the activity)`;
-        break;
-      }
-    }
-  }
-  if (!rect) {
-    rect = bboxOf(kept);
-    res.reason = s.snap && ranked.length
-      ? `Activity box: no ${s.maxWindows > 1 ? `1–${s.maxWindows} windows` : 'window'} held ${s.snapThreshold}%`
-      : 'Activity box';
-  }
-  if (s.keepInk) {
-    const ink = bboxOf(used.filter(p => p.kind === 'stroke' && !p.dropped));
-    if (ink && rect && (ink[0] < rect[0] || ink[1] < rect[1] || ink[2] > rect[2] || ink[3] > rect[3])) {
-      rect = union(rect, ink); res.reason += ' + ink outside it';
-    }
-  }
-  for (const { win, pts: cps } of chromeHits.values()) {
-    const bb = bboxOf(cps), r = clip01(win.box);
-    const horizontal = (r[2] - r[0]) * SW >= (r[3] - r[1]) * SH;
-    const extra = 40;
-    const cr = horizontal ? [bb[0] - extra / SW, r[1], bb[2] + extra / SW, r[3]] : [r[0], bb[1] - extra / SH, r[2], bb[3] + extra / SH];
-    rect = union(rect, cr);
-    res.chrome.push(win);
-    res.reason += ` + ${winLabel(win).toLowerCase()}`;
-  }
-  res.core = rect;
-  return res;
-}
-
-function wmedian(pts, key) {
-  const sorted = pts.slice().sort((a, b) => a[key] - b[key]);
-  const half = sorted.reduce((s, p) => s + p.w, 0) / 2;
-  let acc = 0;
-  for (const p of sorted) { acc += p.w; if (acc >= half) return p[key]; }
-  return sorted.length ? sorted[sorted.length - 1][key] : 0.5;
-}
-
-function fallbackFor(res, t, s, prev) {
-  if (s.fallback === 'previous' && prev) { res.reason = 'Talk only: kept the previous crop'; return prev; }
-  if (s.fallback !== 'screen') {
-    const f = frontmostRect(t, s);
-    if (f) { res.reason = `Talk only: frontmost window (${winLabel(f.win)})`; res.snapped = [f.win]; return f.rect; }
-  }
-  res.reason = 'Talk only: whole screen';
-  return [0, 0, 1, 1];
-}
-
-/** Final crops for every keyframe plus per-keyframe diagnostics. */
-function computeAll(s) {
-  if (s.scope === 'whole') {
-    const res = cropFor(-1, s);
-    const rect = res.empty ? shape(fallbackFor(res, DUR / 2, s, null), s) : shape(pad(res.core, s), s);
-    return KF.map((_, k) => ({ ...res, k, rect, raw: rect }));
-  }
-  const out = KF.map((kf, k) => cropFor(k, s));
-  // Keyframes with activity first, then talk-only ones (which may borrow a neighbour's crop).
-  out.forEach(r => { if (!r.empty) r.rect = r.raw = shape(pad(r.core, s), s); });
-  out.forEach((r, k) => {
-    if (!r.empty) return;
-    let prev = null;
-    for (let j = k - 1; j >= 0 && !prev; j--) prev = out[j].rect;
-    for (let j = k + 1; j < out.length && !prev && s.fallback === 'previous'; j++) if (!out[j].empty) prev = out[j].rect;
-    r.rect = r.raw = shape(fallbackFor(r, KF[k].t, s, prev), s);
-  });
-  if (s.scope === 'smooth') {
-    // Neighbours that overlap this much become one crop (their union).
-    let start = 0;
-    for (let k = 1; k <= out.length; k++) {
-      const group = out.slice(start, k);
-      const u = group.reduce((r, g) => union(r, g.rect), null);
-      if (k < out.length && iou(u, out[k].rect) >= s.mergeIoU) continue;
-      if (group.length > 1) {
-        const merged = shape(u, s);
-        group.forEach(g => { g.rect = merged; g.merged = group.length; });
-      }
-      start = k;
-    }
-    // Then limit how much the zoom jumps between neighbours: the smaller crop grows (around its
-    // own centre) until the area ratio is at most zoomStep.
-    if (s.zoomStep < 6) for (let pass = 0; pass < 2; pass++) {
-      for (let k = 1; k < out.length; k++) {
-        const [a, b] = [out[k - 1], out[k]];
-        const [small, big] = area(a.rect) < area(b.rect) ? [a, b] : [b, a];
-        const ratio = area(big.rect) / Math.max(area(small.rect), 1e-6);
-        if (ratio <= s.zoomStep + 1e-6) continue;
-        const f = Math.sqrt(ratio / s.zoomStep), r = small.rect;
-        const cx = (r[0] + r[2]) / 2, cy = (r[1] + r[3]) / 2, hw = (r[2] - r[0]) * f / 2, hh = (r[3] - r[1]) * f / 2;
-        small.rect = shape([cx - hw, cy - hh, cx + hw, cy + hh], s);
-        small.grown = true;
-      }
-    }
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------------------------------------
-// Images
-// ---------------------------------------------------------------------------------------------
 const IMGS = KF.map(kf => {
   const img = new Image();
   img.onload = () => schedule();
-  img.onerror = () => { if (!img.dataset.retried && kf.path) { img.dataset.retried = 1; img.src = 'file://' + kf.path; } };
   img.src = kf.file;
   return img;
 });
@@ -502,15 +249,29 @@ const ready = img => img.complete && img.naturalWidth > 0;
 function frameSize(k) {
   const img = IMGS[k];
   if (ready(img)) return [img.naturalWidth, img.naturalHeight];
-  if (KF[k].size) return [KF[k].size.width, KF[k].size.height];
   if (SCREEN.frame) return [SCREEN.frame.width, SCREEN.frame.height];
   return [1280, Math.round(1280 * SH / SW)];
 }
 
 // ---------------------------------------------------------------------------------------------
-// Rendering
+// Results: from the presets, or from Scrawl when served
 // ---------------------------------------------------------------------------------------------
-let RESULTS = [];
+const algoKeys = () => Object.keys(DEFAULTS);
+const algo = (s) => Object.fromEntries(algoKeys().map(k => [k, s[k]]));
+const same = (a, b) => algoKeys().every(k => JSON.stringify(a[k]) === JSON.stringify(b[k]));
+let RESULTS = PRESETS[0].crops;
+let stale = false, inflight = null, queued = false;
+async function compute() {
+  const preset = PRESETS.find(p => same({ ...DEFAULTS, ...p.values }, settings));
+  if (preset) { RESULTS = preset.crops; stale = false; return; }
+  if (!DATA.served) { stale = true; return; }
+  if (inflight) { queued = true; return; }
+  inflight = fetch('/crop', { method: 'POST', body: JSON.stringify(algo(settings)) })
+    .then(r => r.ok ? r.json() : r.text().then(t => Promise.reject(new Error(t))))
+    .then(crops => { RESULTS = crops; stale = false; })
+    .catch(e => { stale = true; toast(`Crop failed: ${e.message}`); })
+    .finally(() => { inflight = null; if (queued) { queued = false; compute().then(draw); } else draw(); });
+}
 let pending = false;
 function schedule() { if (!pending) { pending = true; requestAnimationFrame(() => { pending = false; render(); }); } }
 
@@ -551,58 +312,61 @@ function renderFull() {
   drawImageOrPlaceholder(ctx, sel, 0, 0, fw, fh, 0, 0, W, H);
   const res = RESULTS[sel], s = settings, kf = KF[sel];
   const X = x => x * W, Y = y => y * H;
-  const wins = windowsAt(kf.t, s);
+  const wins = windowsAt(kf.t);
+  const used = res.used.map(i => ITEMS[i]);
   if (s.ovHeat) {
     const heat = document.createElement('canvas'); heat.width = W; heat.height = H;
     const hc = heat.getContext('2d');
-    for (const p of res.pts) {
-      if (p.kind !== 'cursor' || p.outlier) continue;
-      const r = 18 + Math.min(p.item.dwell, 3) * 14;
-      const g = hc.createRadialGradient(X(p.x), Y(p.y), 0, X(p.x), Y(p.y), r);
-      const a = clamp(0.08 + p.item.dwell * 0.25, 0.08, 0.6);
+    for (const it of used) {
+      if (it.kind !== 'cursor') continue;
+      const [x, y] = it.pts[0];
+      const r = 18 + Math.min(it.dwell, 3) * 14;
+      const g = hc.createRadialGradient(X(x), Y(y), 0, X(x), Y(y), r);
+      const a = clamp(0.08 + it.dwell * 0.25, 0.08, 0.6);
       g.addColorStop(0, `rgba(255,159,10,${a})`); g.addColorStop(1, 'rgba(255,159,10,0)');
-      hc.fillStyle = g; hc.fillRect(X(p.x) - r, Y(p.y) - r, r * 2, r * 2);
+      hc.fillStyle = g; hc.fillRect(X(x) - r, Y(y) - r, r * 2, r * 2);
     }
     ctx.save(); ctx.globalCompositeOperation = 'screen'; ctx.drawImage(heat, 0, 0, W, H); ctx.restore();
   }
   if (s.ovWindows) {
-    const shareOf = new Map(res.ranked.map(e => [e.win.id, e.share]));
+    const shareOf = new Map(res.shares.map(e => [e.id, e.share]));
     // Back to front so front windows' labels win.
     for (const w of wins.slice().reverse()) {
-      const r = clip01(w.box);
+      const r = clip01(w.rect);
       ctx.strokeStyle = appColor(w.app, isChrome(w) ? 0.5 : 0.85); ctx.lineWidth = w.frontmost ? 2 : 1;
       ctx.setLineDash(isChrome(w) ? [4, 3] : []);
       ctx.strokeRect(X(r[0]) + 0.5, Y(r[1]) + 0.5, X(r[2]) - X(r[0]) - 1, Y(r[3]) - Y(r[1]) - 1);
       ctx.setLineDash([]);
     }
     for (const w of wins) {
-      const r = clip01(w.box);
+      const r = clip01(w.rect);
       const share = shareOf.get(w.id);
-      const text = `${winLabel(w)}${w.title && !isChrome(w) ? ' — ' + w.title.slice(0, 32) : ''}${w.frontmost ? ' ★' : ''}${share ? `  ${Math.round(share * 100)}%` : ''}`;
+      const text = `${winLabel(w)}${w.frontmost ? ' ★' : ''}${share ? `  ${Math.round(share * 100)}%` : ''}`;
       label(ctx, text, X(r[0]) + 4, clamp(Y(r[1]) + 4, 2, H - 20), appColor(w.app));
     }
   }
   if (s.ovSnap) {
-    for (const w of res.snapped) {
-      const r = clip01(w.box);
+    for (const w of wins.filter(w => res.snapped.includes(w.id))) {
+      const r = clip01(w.rect);
       ctx.fillStyle = 'rgba(50,215,75,.10)'; ctx.fillRect(X(r[0]), Y(r[1]), X(r[2]) - X(r[0]), Y(r[3]) - Y(r[1]));
       ctx.strokeStyle = 'rgba(50,215,75,.95)'; ctx.lineWidth = 2.5; ctx.strokeRect(X(r[0]) + 1, Y(r[1]) + 1, X(r[2]) - X(r[0]) - 2, Y(r[3]) - Y(r[1]) - 2);
     }
   }
   if (s.ovChanges) {
     ctx.strokeStyle = 'rgba(191,90,242,.9)'; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
-    for (const b of kf.changes || []) ctx.strokeRect(X(b[0]), Y(b[1]), X(b[2]) - X(b[0]), Y(b[3]) - Y(b[1]));
+    for (const it of ITEMS) {
+      if (it.kind !== 'change' || it.keyframe !== sel) continue;
+      const b = [it.pts[0][0], it.pts[0][1], it.pts[3][0], it.pts[3][1]];
+      ctx.strokeRect(X(b[0]), Y(b[1]), X(b[2]) - X(b[0]), Y(b[3]) - Y(b[1]));
+    }
     ctx.setLineDash([]);
   }
   if (s.ovActivity) {
-    const seen = new Set();
-    for (const p of res.pts) {
-      const it = p.item;
-      if (seen.has(it)) continue; seen.add(it);
-      const faded = p.dropped;
-      if (it.kind === 'stroke' || (it.kind === 'laser' && it.all)) {
+    for (const it of used) {
+      const faded = false;
+      if (it.kind === 'stroke' || (it.kind === 'laser' && it.pts.length > 1)) {
         ctx.strokeStyle = it.kind === 'stroke' ? 'rgba(100,210,255,.95)' : 'rgba(255,55,200,.9)'; ctx.lineWidth = 2; ctx.lineJoin = 'round';
-        ctx.beginPath(); (it.all || it.pts).forEach((q, i) => i ? ctx.lineTo(X(q[0]), Y(q[1])) : ctx.moveTo(X(q[0]), Y(q[1]))); ctx.stroke();
+        ctx.beginPath(); it.pts.forEach((q, i) => i ? ctx.lineTo(X(q[0]), Y(q[1])) : ctx.moveTo(X(q[0]), Y(q[1]))); ctx.stroke();
       } else if (it.kind === 'click') {
         ctx.strokeStyle = faded ? '#777' : 'rgba(255,214,10,.95)'; ctx.lineWidth = 2;
         ctx.beginPath(); ctx.arc(X(it.pts[0][0]), Y(it.pts[0][1]), 9, 0, 7); ctx.stroke();
@@ -618,7 +382,7 @@ function renderFull() {
     }
     // Outlier cursor samples: grey crosses.
     ctx.strokeStyle = 'rgba(160,160,170,.7)'; ctx.lineWidth = 1.2;
-    for (const p of res.pts) if (p.outlier) { const x = X(p.x), y = Y(p.y); ctx.beginPath(); ctx.moveTo(x - 3, y - 3); ctx.lineTo(x + 3, y + 3); ctx.moveTo(x + 3, y - 3); ctx.lineTo(x - 3, y + 3); ctx.stroke(); }
+    for (const [px, py] of res.outliers) { const x = X(px), y = Y(py); ctx.beginPath(); ctx.moveTo(x - 3, y - 3); ctx.lineTo(x + 3, y + 3); ctx.moveTo(x + 3, y - 3); ctx.lineTo(x - 3, y + 3); ctx.stroke(); }
   }
   if (s.ovCrop) {
     const r = res.rect;
@@ -626,15 +390,15 @@ function renderFull() {
     ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.rect(X(r[0]), Y(r[1]), X(r[2]) - X(r[0]), Y(r[3]) - Y(r[1])); ctx.fill('evenodd'); ctx.restore();
     ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.setLineDash([7, 5]);
     ctx.strokeRect(X(r[0]) + 0.75, Y(r[1]) + 0.75, X(r[2]) - X(r[0]) - 1.5, Y(r[3]) - Y(r[1]) - 1.5); ctx.setLineDash([]);
-    if (res.core && !res.empty) {
-      const c = res.core; ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 1;
+    if (res.need) {
+      const c = res.need; ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 1;
       ctx.strokeRect(X(c[0]), Y(c[1]), X(c[2]) - X(c[0]), Y(c[3]) - Y(c[1]));
     }
   }
   const cap = document.getElementById('fullCap');
   cap.innerHTML = `<span><b>#${kf.index}</b> · ${clockOf(kf.t)} · full frame ${fw}×${fh} px</span>`
     + `<span class="mono">${(fw / SW).toFixed(2)} px/pt · screen ${Math.round(SW)}×${Math.round(SH)} pt</span>`
-    + (DATA.hasWindowLog ? `<span>${wins.length} windows at this moment</span>` : `<span class="warn">no window log in this bundle: activity only</span>`);
+    + (SNAPS.length ? `<span>${wins.length} windows at this moment</span>` : `<span class="warn">no window log in this bundle: activity only</span>`);
 }
 
 function cropPixels(k, r) {
@@ -672,23 +436,23 @@ function drawBadge(ctx, text, W, k) {
 
 function renderInfo() {
   const kf = KF[sel], res = RESULTS[sel];
-  const j = kf.justifiedBy || {};
-  const why = { mark: 'ink mark', click: 'click', laser: 'laser', scene_change: 'scene change', speech: 'spoken cue', initial: 'first frame', flag: 'flag' }[j.kind] || kf.reason;
-  const words = DATA.words.filter(w => w.t0 >= res.segment[0] && w.t0 < res.segment[1]).map(w => w.text).join(' ');
+  const why = { mark: 'ink mark', click: 'click', laser: 'laser', scene_change: 'scene change', speech: 'spoken cue', initial: 'first frame', flag: 'flag' }[kf.reason] || kf.reason;
+  const [a, b] = res.slice;
+  const words = DATA.words.filter(w => w.t0 >= a && w.t0 < b).map(w => w.text).join(' ');
   document.getElementById('kfInfo').innerHTML =
     `<div style="margin-bottom:6px"><span class="pill">#${kf.index} · ${clockOf(kf.t)}</span><span class="pill">cut for: ${why}</span>`
-    + (kf.event ? `<span class="pill">${esc(kf.event)}</span>` : '') + `<span class="pill">slice ${clockOf(Math.max(0, res.segment[0]))}–${clockOf(Math.min(DUR, res.segment[1]))}</span></div>`
+    + (kf.event ? `<span class="pill">${esc(kf.event)}</span>` : '') + `<span class="pill">slice ${clockOf(Math.max(0, a))}–${clockOf(Math.min(DUR, b))}</span></div>`
     + `<div class="said">${kf.said ? '“' + esc(kf.said) + '”' : words ? '<em>(words in slice)</em> ' + esc(words) : '<em>No narration.</em>'}</div>`;
   const counts = {};
-  for (const p of res.pts) if (!p.outlier) counts[p.item.kind] = (counts[p.item.kind] || new Set()).add(p.item);
-  const chips = Object.entries(counts).map(([k, v]) => `<span class="pill">${v.size} ${k}${v.size > 1 && k !== 'cursor' ? 's' : ''}</span>`).join('');
-  const outl = res.pts.filter(p => p.outlier).length;
-  const rows = res.ranked.slice(0, 5).map(e => `<div class="share"><span class="n" title="${esc(e.win.title || '')}">${esc(winLabel(e.win))}${e.win.title ? ' <span style="color:var(--faint)">' + esc(e.win.title) + '</span>' : ''}</span><span class="bar"><i style="width:${(e.share * 100).toFixed(1)}%;background:${appColor(e.win.app)}"></i></span><span class="mono">${Math.round(e.share * 100)}%</span></div>`).join('')
-    + (res.desktop > 0.005 ? `<div class="share"><span class="n" style="color:var(--dim)">Desktop / no window</span><span class="bar"><i style="width:${(res.desktop * 100).toFixed(1)}%;background:#666"></i></span><span class="mono">${Math.round(res.desktop * 100)}%</span></div>` : '');
+  for (const i of res.used) { const k = ITEMS[i].kind; counts[k] = (counts[k] || 0) + 1; }
+  const chips = Object.entries(counts).map(([k, n]) => `<span class="pill">${n} ${k}${n > 1 && k !== 'cursor' ? 's' : ''}</span>`).join('');
+  const outl = res.outliers.length;
+  const rows = res.shares.slice(0, 5).map(e => `<div class="share"><span class="n">${esc(e.app)}</span><span class="bar"><i style="width:${(e.share * 100).toFixed(1)}%;background:${appColor(e.app)}"></i></span><span class="mono">${Math.round(e.share * 100)}%</span></div>`).join('');
   document.getElementById('decision').innerHTML =
-    `<div class="decision">${esc(res.reason || '')}${res.merged ? ` <span class="pill">merged ×${res.merged}</span>` : ''}${res.grown ? ' <span class="pill">grown to limit the zoom change</span>' : ''}</div>`
+    `<div class="decision"><span class="pill">${esc(res.kind)}</span> ${esc(res.reason || '')}${res.merged ? ` <span class="pill">merged ×${res.merged}</span>` : ''}${res.grown ? ' <span class="pill">grown to limit the zoom change</span>' : ''}</div>`
     + `<div style="margin-bottom:6px">${chips || '<span class="pill">no activity</span>'}${outl ? `<span class="pill">${outl} cursor outliers</span>` : ''}</div>`
-    + `<div class="shares">${rows}</div>`;
+    + `<div class="shares">${rows}</div>`
+    + (stale ? `<div class="warn" style="margin-top:8px">These settings aren't a preset. Run <code>scrawl autocrop --serve</code> to tune live; showing the last crop.</div>` : '');
 }
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
@@ -701,26 +465,25 @@ function renderTimeline() {
   ctx.font = '10px -apple-system, sans-serif'; ctx.textBaseline = 'middle';
   for (const [name, y, h] of rows) { ctx.fillStyle = '#5a5a61'; ctx.fillText(name, 4, y + h / 2); ctx.fillStyle = '#1d1d20'; ctx.fillRect(L, y, W - L - R, h); }
   RESULTS.forEach((r, k) => {
-    const [a, b] = segment(k, { ...settings, reachMs: 0 });
+    const [a, b] = segment(k);
     ctx.fillStyle = k === sel ? 'rgba(255,69,58,.28)' : (k % 2 ? '#26262a' : '#222225');
     ctx.fillRect(T(a), 4, T(b) - T(a), 18);
   });
   if (settings.reachMs > 0 && settings.scope !== 'whole') {
-    const [a, b] = RESULTS[sel].segment; ctx.strokeStyle = 'rgba(255,69,58,.6)'; ctx.setLineDash([3, 3]);
+    const [a, b] = RESULTS[sel].slice; ctx.strokeStyle = 'rgba(255,69,58,.6)'; ctx.setLineDash([3, 3]);
     ctx.strokeRect(T(a), 3.5, T(b) - T(a), 19); ctx.setLineDash([]);
   }
   KF.forEach((kf, k) => { ctx.fillStyle = k === sel ? '#fff' : '#bbb'; ctx.fillRect(T(kf.t) - 0.5, 4, 1.5, 18); ctx.font = '600 10px -apple-system, sans-serif'; ctx.fillText(kf.index, T(kf.t) + 3, 13); });
   ctx.fillStyle = 'rgba(200,200,210,.55)';
   for (const w of DATA.words) ctx.fillRect(T(w.t0), 26, Math.max(1, T(w.t1) - T(w.t0) - 1), 6);
-  for (const s of DATA.strokes) { ctx.fillStyle = s.laser ? 'rgba(255,55,200,.9)' : 'rgba(255,69,58,.95)'; ctx.fillRect(T(s.t0), 37, Math.max(2, T(s.t1) - T(s.t0)), 8); }
-  for (const p of DATA.points) { ctx.fillStyle = 'rgba(255,55,200,.9)'; ctx.fillRect(T(p.t) - 1, 37, 2, 8); }
+  for (const s of [...byKind('stroke'), ...byKind('laser')]) { ctx.fillStyle = s.kind === 'laser' ? 'rgba(255,55,200,.9)' : 'rgba(255,69,58,.95)'; ctx.fillRect(T(s.t0), 37, Math.max(2, T(s.t1) - T(s.t0)), 8); }
   ctx.fillStyle = 'rgba(255,214,10,.95)';
-  for (const c of DATA.clicks) ctx.fillRect(T(c.t) - 1, 49, 2, 8);
-  for (const d of DATA.drags) ctx.fillRect(T(d.t), 50, Math.max(2, T(d.t1) - T(d.t)), 6);
+  for (const c of byKind('click')) ctx.fillRect(T(c.t0) - 1, 49, 2, 8);
+  for (const d of byKind('drag')) ctx.fillRect(T(d.t0), 50, Math.max(2, T(d.t1) - T(d.t0)), 6);
   ctx.fillStyle = 'rgba(100,210,255,.8)';
-  for (const s of DATA.scrolls) ctx.fillRect(T(s.t) - 0.5, 50, 1, 6);
+  for (const s of byKind('scroll')) ctx.fillRect(T(s.t0) - 0.5, 50, 1, 6);
   ctx.fillStyle = 'rgba(255,159,10,.5)';
-  for (const c of DATA.cursor) ctx.fillRect(T(c[0]), 61, 1, 8);
+  for (const c of byKind('cursor')) ctx.fillRect(T(c.t0), 61, 1, 8);
   let lastFront = null;
   for (const snap of SNAPS) {
     ctx.fillStyle = 'rgba(50,215,75,.8)'; ctx.fillRect(T(snap.t) - 0.5, 73, 1, 8);
@@ -799,14 +562,18 @@ function renderSheet() {
   const maxUp = Math.max(...ups);
   document.getElementById('sheetMeta').innerHTML = `${W}×${H} px · ${cols} per row · `
     + `<span class="${maxUp > 1.15 ? 'warn' : ''}">largest upscale ×${maxUp.toFixed(2)}</span>`
-    + (maxUp > 1.15 && DATA.mode === 'display' ? ' (Screen captures are sampled 1280 px wide, so tight crops get soft)' : '');
+    + (maxUp > 1.15 ? ' (tight crops of small frames get soft)' : '');
 }
 
-function render() {
-  if (!KF.length) { document.querySelector('main').innerHTML = '<p style="padding:20px">This bundle has no keyframes.</p>'; return; }
-  RESULTS = computeAll(settings);
+function draw() {
+  if (!RESULTS.length) return;
   renderFull(); renderCrop(); renderInfo(); renderTimeline(); renderStrip(); renderSheet();
   syncControls();
+  document.body.classList.toggle('stale', stale);
+}
+function render() {
+  if (!KF.length) { document.querySelector('main').innerHTML = '<p style="padding:20px">This bundle has no keyframes.</p>'; return; }
+  compute().then(draw);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -815,6 +582,7 @@ function render() {
 const inputs = {};
 function fmt(c, v) {
   if (c.type !== 'range') return '';
+  if (c.scale) return Math.round(v * c.scale) + '%';
   const n = c.step < 1 ? Number(v).toFixed(c.step < 0.1 ? 2 : 1) : String(v);
   return n + (c.unit ? (c.unit === '×' ? '×' : ' ' + c.unit) : '');
 }
@@ -854,10 +622,9 @@ function syncControls() {
     else if (String(inp.value) !== String(settings[k])) inp.value = settings[k];
     if (val) val.textContent = fmt(c, settings[k]);
   }
-  const active = PRESETS.findIndex(p => algoKeys().every(k => ({ ...DEFAULTS, ...p.values })[k] === settings[k]));
+  const active = PRESETS.findIndex(p => same({ ...DEFAULTS, ...p.values }, settings));
   [...document.getElementById('presets').children].forEach((b, i) => b.classList.toggle('active', i === active));
 }
-const algoKeys = () => Object.keys(DEFAULTS).filter(k => !OVERLAY_KEYS.has(k));
 function set(key, value) { settings[key] = value; save(); schedule(); }
 function applyPreset(i) {
   const keep = Object.fromEntries([...OVERLAY_KEYS].map(k => [k, settings[k]]));
@@ -870,8 +637,8 @@ function toast(text) {
   clearTimeout(toast.timer); toast.timer = setTimeout(() => t.classList.remove('show'), 1400);
 }
 async function copySettings() {
-  const out = { algorithm: 'scrawl-autocrop/1', bundle: DATA.id, ...Object.fromEntries(algoKeys().map(k => [k, settings[k]])) };
-  const text = JSON.stringify(out, null, 2);
+  // Pasteable into ~/.config/scrawl/config.json as "autocrop": {...}.
+  const text = JSON.stringify(Object.fromEntries(algoKeys().filter(k => JSON.stringify(settings[k]) !== JSON.stringify(DEFAULTS[k])).map(k => [k, settings[k]])), null, 2);
   try { await navigator.clipboard.writeText(text); toast('Settings copied'); }
   catch {
     const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select();
@@ -886,7 +653,7 @@ document.addEventListener('keydown', e => {
   if (e.target.tagName === 'SELECT' || (e.target.tagName === 'INPUT' && e.target.type !== 'checkbox' && e.target.type !== 'range')) return;
   const key = e.key.toLowerCase();
   const toggles = { w: 'ovWindows', a: 'ovActivity', h: 'ovHeat', s: 'ovSnap', x: 'ovCrop', d: 'ovChanges' };
-  if (['1', '2', '3'].includes(key)) applyPreset(Number(key) - 1);
+  if (/^[1-9]$/.test(key) && Number(key) <= PRESETS.length) applyPreset(Number(key) - 1);
   else if (key === 'arrowright' || key === 'k') { select(sel + 1); e.preventDefault(); }
   else if (key === 'arrowleft' || key === 'j') { select(sel - 1); e.preventDefault(); }
   else if (key === 'home') select(0);
@@ -905,7 +672,7 @@ document.getElementById('sheetOriginal').onchange = schedule;
 window.addEventListener('resize', schedule);
 
 document.getElementById('meta').textContent =
-  `${DATA.id} · ${DATA.mode}${DATA.source ? ' · ' + DATA.source : ''} · ${clockOf(DUR)} · ${KF.length} keyframes · ${SNAPS.length} window snapshots · ${DATA.cursor.length} cursor samples`;
+  `${DATA.id} · ${DATA.mode}${DATA.source ? ' · ' + DATA.source : ''} · ${clockOf(DUR)} · ${KF.length} keyframes · ${SNAPS.length} window snapshots · ${byKind('cursor').length} cursor samples · ${DATA.served ? 'live' : 'presets only (serve to tune)'}`;
 buildControls();
 render();
 </script>

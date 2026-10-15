@@ -273,6 +273,9 @@ pub struct Config {
     pub ingest_token: Option<String>,
     #[serde(default, alias = "tetherApps")]
     pub usb_apps: Vec<String>,
+    /// `false` turns Screen-capture auto-crop off; an object overrides its settings.
+    #[serde(default)]
+    pub autocrop: Option<serde_json::Value>,
 }
 
 pub fn default_config_path() -> PathBuf {

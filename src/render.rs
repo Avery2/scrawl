@@ -1340,6 +1340,7 @@ mod tests {
             screens: Vec::new(),
             windows: Vec::new(),
             cursor: Vec::new(),
+            autocrop: None,
         }
     }
 

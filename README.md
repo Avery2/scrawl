@@ -38,8 +38,8 @@ cargo run -- import ~/Downloads/20261013T164000.mp4 --timeline ~/Downloads/20261
 # Rebuild an existing bundle with the current transcriber and keyframe rules
 cargo run -- reprocess latest --out /tmp/again.scrawl
 
-# Experiment: open the crop playground for a Screen-mode capture
-cargo run -- autocrop latest --open
+# Tune auto-crop on a Screen capture, live
+cargo run -- autocrop latest --serve --open
 ```
 
 ## Capture Controls
@@ -59,10 +59,11 @@ While picking a target, the island shows the modes **Area**, **Window**, **Scree
   clicking the selected mode again starts recording (`⏎`/`⌥⇧S` record the full screen from Area and
   Window too)
 
-## Autocrop (experiment)
+## Auto-crop (Screen captures)
 
-Instead of picking an area up front, record the whole screen (**Screen** in the picker, or `3`) and
-let Scrawl work out where you were gesturing. While a Screen capture records, Scrawl also logs:
+Instead of picking an area up front, record the whole screen (**Screen** in the picker, or `3`).
+Scrawl works out where you were gesturing and crops each keyframe to it. While a Screen capture
+records, Scrawl logs:
 
 - **`windows`** in `scrawl.json`: the on-screen windows, front to back (id, app, bundle ID, title,
   bounds in capture points, layer, frontmost), including the menu bar and the Dock's strip. A
@@ -73,22 +74,65 @@ let Scrawl work out where you were gesturing. While a Screen capture records, Sc
 - **`cursor`**: the cursor at up to 15 Hz while it moves, as `[t, x, y]` (normalized), so dwell
   counts.
 
-`scrawl autocrop <bundle|latest> [--open]` writes `autocrop/data.json` (keyframes and what cut
-them, ink, clicks, drags, scrolls, laser, cursor, changed regions between keyframes, window
-snapshots, words) and `autocrop/index.html`, a self-contained playground that runs from disk. It
-shows each keyframe with the windows, activity, cursor heat, the window the activity snapped to and
-the crop; the cropped frame; and the cropped contact sheet, all recomputed live from sliders, with
-three presets (`1`–`3`) and **Copy settings**. Bundles without a window log fall back to activity
-only.
+When the capture finishes, each keyframe gets the slice of the timeline halfway to its neighbours,
+and `src/autocrop.rs` weighs what happened in it: ink, clicks, drags and scrolls first, then where
+the cursor rested and what changed on screen (a cursor wandering far from the ink is ignored). The
+crop is then:
 
-The crop algorithm lives only in the playground's JS for now. Once the settings are picked, it gets
-ported to Rust (`src/autocrop.rs`) and applied when a Screen capture finishes. To try the
-playground without recording, build the synthetic fixture (Playwright from `site/node_modules`):
+- **the window** holding the activity (two at most, for an arrow from one to the other), including
+  a menu it opened and the touched part of the menu bar;
+- or, when that window is most of the screen (maximized, full screen), **the activity inside it**
+  with some context, its edges moved into nearby white space so they don't cut through text;
+- or the previous crop, for a keyframe with only talk.
+
+Neighbouring crops that mostly overlap become one, so the sheet doesn't jitter. A crop covering
+most of the screen isn't worth it, and the keyframe stays whole.
+
+The bundle then has:
+
+- `frames/frame-XX.png` and `contact-sheet.png`: cropped from the full-resolution frames (Screen
+  captures sample at 2560 px wide), with the ink and badges redrawn at the crop's scale;
+- `frames-full/frame-XX.png` and `contact-sheet-full.png`: the uncropped versions;
+- one line in `summary.md`, e.g. `Cropped to: Ghostty + Safari (full frames in frames-full/)`;
+- `autocrop` in `scrawl.json`: each keyframe's crop in points, its kind and reason, and the
+  changed regions that fed it.
+
+`scrawl zoom` crops its cells like the nearest keyframe (`--full` for the whole screen).
+`scrawl reprocess <bundle> --out <dir>` re-runs it on an existing Screen capture from its video.
+To turn it off, or change a setting, use `~/.config/scrawl/config.json`:
+
+```json
+{ "autocrop": false }
+{ "autocrop": { "padding": 24, "minW": 480 } }
+```
+
+### Tuning
+
+`scrawl autocrop <bundle|latest> --serve --open` opens a playground that runs the same Rust crop as
+you move its sliders: each keyframe with its windows, activity, cursor heat, outliers and crop, the
+cropped frame, and the cropped contact sheet. **Copy settings** gives the JSON for the config.
+Without `--serve` it writes `autocrop/index.html` with the presets only.
+
+The settings were tuned on simulated captures with hand-labelled ideal crops: one maximized
+terminal, two windows side by side, an arrow from one window to another, a tiny badge in a huge
+window, a menu-bar menu, talk-only keyframes, a dragged window, overlapping windows, thirty seconds
+hopping between three windows, a stray cursor, a full-screen app, and a scrolling page.
+`scripts/autocrop-corpus.mjs` renders them with Playwright (from `site/node_modules`), `scrawl
+fixture` builds each into a real bundle through the capture pipeline, `scrawl autocrop-eval` scores
+the crops (coverage of the ink and clicks, overlap with the ideal, context, legibility in the sheet,
+stability; `--sweep` searches the settings), and `scripts/autocrop-gallery.mjs` renders a gallery to
+judge them by eye:
 
 ```sh
-bun scripts/autocrop-fixture.mjs /tmp/fixture.scrawl
-cargo run -- autocrop /tmp/fixture.scrawl --open
+bun scripts/autocrop-corpus.mjs /tmp/corpus
+for s in /tmp/corpus/*/scenario.json; do
+  scrawl fixture "$s" --out "/tmp/bundles/$(basename "$(dirname "$s")").scrawl"
+done
+scrawl autocrop-eval /tmp/bundles --json /tmp/scores.json   # add --sweep to search
+bun scripts/autocrop-gallery.mjs /tmp/gallery /tmp/bundles --scores /tmp/scores.json
 ```
+
+`autocrop-eval --export src/autocrop-corpus.json` refreshes the corpus the unit tests score.
 
 ## iPhone
 

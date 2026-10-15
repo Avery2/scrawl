@@ -87,6 +87,54 @@ pub struct ScrawlBundle {
     /// Screen mode: the cursor at up to 15 Hz while it moves, as `[t, x, y]` (normalized).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cursor: Vec<CursorSample>,
+    /// Screen mode: how the keyframes were cropped (`frames/` and the contact sheet are cropped;
+    /// the full frames are kept beside them).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autocrop: Option<AutocropInfo>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutocropInfo {
+    /// What the keyframes were cropped to, for the summary (app names, never window titles).
+    pub label: String,
+    /// The uncropped keyframes, with the same file names as `frames/`.
+    pub full_frames: String,
+    pub full_contact_sheet: String,
+    /// One per keyframe, in keyframe order.
+    pub crops: Vec<KeyframeCrop>,
+    /// The regions each keyframe changed since the previous one (normalized `[x0, y0, x1, y1]`),
+    /// kept because they are one of the crop's inputs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<Vec<[f32; 4]>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyframeCrop {
+    pub index: usize,
+    /// In capture points.
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub kind: crate::autocrop::CropKind,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apps: Vec<String>,
+}
+
+impl KeyframeCrop {
+    /// The crop normalized to the capture.
+    pub fn rect(&self, frame: &TargetFrame) -> [f32; 4] {
+        let (w, h) = (frame.width.max(1.0), frame.height.max(1.0));
+        [
+            (self.x / w) as f32,
+            (self.y / h) as f32,
+            ((self.x + self.width) / w) as f32,
+            ((self.y + self.height) / h) as f32,
+        ]
+    }
 }
 
 impl ScrawlBundle {

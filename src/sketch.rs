@@ -487,6 +487,12 @@ pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> 
     {
         out.push_str(&format!("Note: {}\n", note.trim()));
     }
+    if let Some(crop) = &bundle.autocrop {
+        out.push_str(&format!(
+            "Cropped to: {} (full frames in {}/)\n",
+            crop.label, crop.full_frames
+        ));
+    }
     // App events and context changes nest under the keyframe on screen when they happened.
     let mut app_events: Vec<(u64, String)> = bundle
         .events
@@ -1337,6 +1343,7 @@ mod tests {
             screens: Vec::new(),
             windows: Vec::new(),
             cursor: Vec::new(),
+            autocrop: None,
         };
         let tl = timeline(&bundle).join("\n");
         assert!(tl.find("0:03 “").unwrap() < tl.find("0:04 · pressed").unwrap());

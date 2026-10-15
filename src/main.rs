@@ -1,4 +1,5 @@
 mod autocrop;
+mod autocrop_lab;
 mod capture;
 mod handoff;
 mod helper;
@@ -31,9 +32,7 @@ use crate::model::{
     Shape, Stroke, TargetFrame, TargetInfo, TranscriptData, TranscriptSegment, WordTiming,
     parse_clock_ms,
 };
-use crate::render::{
-    annotate_keyframe_in_place, render_contact_sheet, render_synthetic_demo_frame,
-};
+use crate::render::{render_contact_sheet, render_synthetic_demo_frame};
 use crate::sketch::{marks_of, summary_markdown};
 
 #[derive(Parser)]
@@ -151,9 +150,13 @@ enum Command {
         /// Frames in the sheet.
         #[arg(long, default_value_t = 12)]
         frames: usize,
+        /// Show the whole screen even when the bundle's keyframes are auto-cropped.
+        #[arg(long)]
+        full: bool,
     },
-    /// Experiment: export a bundle's activity and windows to `autocrop/` and write a crop
-    /// playground (`autocrop/index.html`) for tuning how Screen captures get cropped.
+    /// Open the auto-crop playground for a Screen capture: each keyframe with its windows,
+    /// activity and crop, and the cropped contact sheet. `--serve` reruns the crop live as
+    /// settings change; without it the page shows the presets.
     Autocrop {
         /// Path to `.scrawl` bundle directory or `latest`.
         #[arg(default_value = "latest")]
@@ -161,6 +164,40 @@ enum Command {
         /// Open the playground in the default browser.
         #[arg(long)]
         open: bool,
+        /// Serve the playground on localhost so the sliders rerun the crop.
+        #[arg(long)]
+        serve: bool,
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+    },
+    /// Build a bundle from a simulated Screen capture (`scripts/autocrop-corpus.mjs`).
+    #[command(hide = true)]
+    Fixture {
+        /// The scenario's `scenario.json`.
+        scenario: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// Auto-crop settings JSON (defaults otherwise).
+        #[arg(long)]
+        settings: Option<PathBuf>,
+    },
+    /// Score auto-crop against simulated captures with ground truth (`truth.json`).
+    #[command(name = "autocrop-eval", hide = true)]
+    AutocropEval {
+        /// Bundles, or directories of bundles.
+        bundles: Vec<PathBuf>,
+        /// Settings JSON to score (defaults otherwise).
+        #[arg(long)]
+        settings: Option<PathBuf>,
+        /// Search for better settings, starting from these.
+        #[arg(long)]
+        sweep: bool,
+        /// Write per-keyframe scores as JSON here.
+        #[arg(long)]
+        json: Option<PathBuf>,
+        /// Write the corpus (inputs and ground truth, no images) here, for unit tests.
+        #[arg(long)]
+        export: Option<PathBuf>,
     },
     /// Print the window list the Screen-mode window log would store, and what it costs.
     #[command(hide = true)]
@@ -284,11 +321,15 @@ pub struct SourceExtras {
     pub activity: windows::ActivityLog,
     /// Time-only markers (ms); each becomes a `Flag` mark with keyframe priority.
     pub flags: Vec<u64>,
+    /// Screen-capture auto-crop: `None` follows the config, `Some(None)` is off.
+    pub autocrop: Option<Option<autocrop::Settings>>,
     /// Decodes the chosen keyframes again at full quality, for sources that select on small
     /// candidate frames (phone movies).
-    #[allow(clippy::type_complexity)]
-    pub full_frames: Option<Box<dyn Fn(&[u64]) -> Result<Vec<RgbaFrame>>>>,
+    pub full_frames: Option<FullFrames>,
 }
+
+/// Decodes frames at these times at full quality.
+pub type FullFrames = Box<dyn Fn(&[u64]) -> Result<Vec<RgbaFrame>>>;
 
 /// Core pipeline that turns raw frames, strokes, events, and audio/transcript into a complete `.scrawl` bundle on disk.
 #[allow(clippy::too_many_arguments)]
@@ -396,13 +437,25 @@ pub fn build_bundle_from_parts(
     };
     let selected_at = std::time::Instant::now();
 
-    let mut annotated_frames = Vec::with_capacity(selected.len());
-    let mut keyframes = Vec::with_capacity(selected.len());
-    for (kf, mut raw_frame) in selected {
-        annotate_keyframe_in_place(&mut raw_frame, &kf, &strokes, &marks, &events);
-        keyframes.push(kf.clone());
-        annotated_frames.push((kf, raw_frame));
-    }
+    let crop_settings = match extras.autocrop {
+        Some(settings) => settings,
+        None if target.mode == CaptureMode::Display => autocrop::Settings::configured(),
+        None => None,
+    };
+    let (annotated_frames, cropped) = autocrop::annotate_and_crop(
+        selected,
+        frames.first(),
+        crop_settings.as_ref(),
+        &target,
+        duration_ms,
+        &strokes,
+        &marks,
+        &events,
+        &extras.activity.windows,
+        &extras.activity.cursor,
+    );
+    let keyframes: Vec<model::Keyframe> =
+        annotated_frames.iter().map(|(kf, _)| kf.clone()).collect();
     let annotated_at = std::time::Instant::now();
 
     let id = bundle_dir
@@ -443,8 +496,13 @@ pub fn build_bundle_from_parts(
         screens: extras.screens,
         windows: extras.activity.windows,
         cursor: extras.activity.cursor,
+        autocrop: cropped.as_ref().map(|(info, _)| info.clone()),
     };
 
+    if let Some((info, full)) = &cropped {
+        let sheet = render_contact_sheet(&bundle, full);
+        autocrop::write_full_frames(bundle_dir, info, full, &sheet)?;
+    }
     let contact_sheet = render_contact_sheet(&bundle, &annotated_frames);
     let rendered_at = std::time::Instant::now();
     let summary = summary_markdown(&bundle, bundle_dir);
@@ -735,7 +793,9 @@ fn main() -> Result<()> {
             });
             std::thread::sleep(Duration::from_secs(duration.max(1)));
             let (frames, video_out, elapsed_ms) = session.stop();
-            let activity = window_log.map(windows::WindowLogger::stop).unwrap_or_default();
+            let activity = window_log
+                .map(windows::WindowLogger::stop)
+                .unwrap_or_default();
             let recorded_audio = audio.and_then(|a| a.stop().ok());
             let (_dir, _bundle, summary) = finalize_capture_bundle(
                 &bundle_dir,
@@ -830,6 +890,14 @@ fn main() -> Result<()> {
                     recorded.as_ref(),
                 );
                 let frames = helper::frames(&copied, helper::FrameTimes::Every(220), 1280)?;
+                // Screen captures are cropped, so their keyframes come from the movie at full size.
+                let full_frames: Option<FullFrames> = (old.target.mode == CaptureMode::Display)
+                    .then(|| {
+                        let movie = copied.clone();
+                        Box::new(move |times: &[u64]| {
+                            helper::frames(&movie, helper::FrameTimes::At(times), 0)
+                        }) as FullFrames
+                    });
                 build_bundle_from_parts(
                     &out,
                     old.target,
@@ -846,6 +914,7 @@ fn main() -> Result<()> {
                             cursor: old.cursor,
                             ..Default::default()
                         },
+                        full_frames,
                         ..SourceExtras::default()
                     },
                 )?
@@ -889,10 +958,11 @@ fn main() -> Result<()> {
             at,
             span,
             frames,
+            full,
         } => {
             let (dir, loaded) = handoff::load_bundle(&bundle)?;
             ensure!(span.is_finite() && span > 0.0, "--span must be positive");
-            let sheet = zoom::zoom(&dir, &loaded, &at, (span * 1_000.0) as u64, frames)?;
+            let sheet = zoom::zoom(&dir, &loaded, &at, (span * 1_000.0) as u64, frames, !full)?;
             println!("{}", sheet.path.display());
             println!(
                 "{} → {}, {} frames: {}",
@@ -911,18 +981,89 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Autocrop { bundle, open } => {
+        Command::Autocrop {
+            bundle,
+            open,
+            serve,
+            port,
+        } => {
             let (dir, loaded) = handoff::load_bundle(&bundle)?;
-            let page = autocrop::export(&dir, &loaded)?;
-            println!("{}", page.display());
             if loaded.windows.is_empty() {
                 eprintln!(
                     "No window log in this bundle (record in Screen mode to get one); \
                      the playground falls back to activity only."
                 );
             }
+            if serve {
+                return autocrop_lab::serve(&dir, &loaded, port, open);
+            }
+            let page = autocrop_lab::export(&dir, &loaded)?;
+            println!("{}", page.display());
             if open {
                 std::process::Command::new("open").arg(&page).status()?;
+            }
+            Ok(())
+        }
+        Command::Fixture {
+            scenario,
+            out,
+            settings,
+        } => {
+            let settings = settings
+                .map(|p| -> Result<autocrop::Settings> {
+                    Ok(serde_json::from_slice(&std::fs::read(p)?)?)
+                })
+                .transpose()?;
+            let dir = autocrop_lab::build_fixture(&scenario, &out, settings)?;
+            println!("{}", dir.display());
+            Ok(())
+        }
+        Command::AutocropEval {
+            bundles,
+            settings,
+            sweep,
+            json,
+            export,
+        } => {
+            let settings: autocrop::Settings = match settings {
+                Some(p) => serde_json::from_slice(&std::fs::read(p)?)?,
+                None => autocrop::Settings::default(),
+            };
+            let mut dirs = Vec::new();
+            for path in bundles {
+                if path.join("scrawl.json").is_file() {
+                    dirs.push(path);
+                } else {
+                    let mut found: Vec<PathBuf> = std::fs::read_dir(&path)?
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.join("truth.json").is_file())
+                        .collect();
+                    found.sort();
+                    dirs.extend(found);
+                }
+            }
+            let cases = dirs
+                .iter()
+                .map(|d| autocrop_lab::load_case(d))
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(path) = export {
+                std::fs::write(path, autocrop_lab::export_cases(&cases)?)?;
+            }
+            autocrop_lab::print_scores("uncropped", &autocrop_lab::score_uncropped(&cases));
+            let scores = autocrop_lab::score_all(&cases, &settings);
+            autocrop_lab::print_scores("settings", &scores);
+            let scores = if sweep {
+                let (best, _) = autocrop_lab::sweep(&cases, &settings);
+                let scores = autocrop_lab::score_all(&cases, &best);
+                autocrop_lab::print_scores("swept", &scores);
+                println!("{}", serde_json::to_string_pretty(&best)?);
+                scores
+            } else {
+                scores
+            };
+            if let Some(path) = json {
+                std::fs::write(path, serde_json::to_vec_pretty(&scores)?)?;
             }
             Ok(())
         }
