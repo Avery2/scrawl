@@ -1620,6 +1620,11 @@ impl ScrawlCoordinator {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(ov.window_number());
+                self.telemetry
+                    .passthrough_window_ids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(ov.window_number());
             }
             self.picker_metal_overlay = overlay;
         }
@@ -1681,6 +1686,11 @@ impl ScrawlCoordinator {
             if let Some(ref o) = ov {
                 self.telemetry
                     .excluded_window_ids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(o.window_number());
+                self.telemetry
+                    .passthrough_window_ids
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(o.window_number());

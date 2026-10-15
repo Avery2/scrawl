@@ -122,6 +122,8 @@ const EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = u32::MAX - 1;
 const EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = u32::MAX;
 
 const KEYBOARD_EVENT_KEYCODE: u32 = 9;
+/// `kCGEventTargetUnixProcessID`: the process an annotated session event is going to.
+const EVENT_TARGET_UNIX_PROCESS_ID: u32 = 40;
 const SCROLL_WHEEL_DELTA_AXIS_1: u32 = 11;
 const SCROLL_WHEEL_DELTA_AXIS_2: u32 = 12;
 
@@ -240,6 +242,9 @@ unsafe extern "C" {
         user_info: *mut c_void,
     ) -> *mut c_void;
     fn CGEventTapEnable(tap: *mut c_void, enable: bool);
+    fn CGEventTapIsEnabled(tap: *mut c_void) -> bool;
+    fn CGEventSourceButtonState(state_id: u32, button: u32) -> bool;
+    fn CGPreflightListenEventAccess() -> bool;
     fn CGEventCreate(source: *const c_void) -> EventRef;
     fn CGEventCreateMouseEvent(
         source: *const c_void,
@@ -1015,6 +1020,109 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// Kit's Screen capture on the Pro: the event tap was off (no Input Monitoring), so his
+    /// clicks on OpenCode's composer never reached the bundle. Polled button state stands in.
+    #[test]
+    fn clicks_are_recorded_from_polled_buttons_while_the_event_tap_is_off() {
+        let (sender, _receiver) = flume::unbounded();
+        let telemetry = SharedCaptureTelemetry::new(sender);
+        telemetry.reset_for_session(TargetFrame {
+            x: 0.0,
+            y: 0.0,
+            width: 1728.0,
+            height: 1117.0,
+            scale: 2.0,
+        });
+        assert!(!telemetry.tap_live.load(Ordering::Acquire));
+        let mut prev = [false; 2];
+        let not_scrawl = |_: f64, _: f64| false;
+        let composer = (778.0, 1050.0);
+        // A Shift-drag is ink, not a click.
+        poll_clicks(
+            &telemetry,
+            &mut prev,
+            [true, false],
+            composer,
+            true,
+            not_scrawl,
+        );
+        poll_clicks(
+            &telemetry,
+            &mut prev,
+            [false, false],
+            composer,
+            true,
+            not_scrawl,
+        );
+        // A click on the composer.
+        poll_clicks(
+            &telemetry,
+            &mut prev,
+            [true, false],
+            composer,
+            false,
+            not_scrawl,
+        );
+        poll_clicks(
+            &telemetry,
+            &mut prev,
+            [true, false],
+            composer,
+            false,
+            not_scrawl,
+        );
+        poll_clicks(
+            &telemetry,
+            &mut prev,
+            [false, false],
+            composer,
+            false,
+            not_scrawl,
+        );
+        // Then the stop button, which is Scrawl's own.
+        let stop = (860.0, 20.0);
+        poll_clicks(&telemetry, &mut prev, [true, false], stop, false, |_, _| {
+            true
+        });
+        poll_clicks(
+            &telemetry,
+            &mut prev,
+            [false, false],
+            stop,
+            false,
+            |_, _| true,
+        );
+        // While the tap is live it reports clicks itself.
+        telemetry.tap_live.store(true, Ordering::Release);
+        poll_clicks(
+            &telemetry,
+            &mut prev,
+            [true, false],
+            composer,
+            false,
+            not_scrawl,
+        );
+        poll_clicks(
+            &telemetry,
+            &mut prev,
+            [false, false],
+            composer,
+            false,
+            not_scrawl,
+        );
+
+        let (events, _) = telemetry.finish_session();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let InteractionEvent::Click { x, y, button, .. } = &events[0] else {
+            panic!("{events:?}");
+        };
+        assert!(
+            (x - 0.45).abs() < 0.01 && (y - 0.94).abs() < 0.01,
+            "{x}, {y}"
+        );
+        assert_eq!(button.as_deref(), Some("left"));
+    }
+
     #[test]
     fn candidate_buffer_stays_bounded_and_keeps_the_whole_timeline() {
         // A 1 MB budget of 4 KB frames: a 256-frame cap.
@@ -1589,7 +1697,13 @@ pub struct SharedCaptureTelemetry {
     /// a snapshot right away.
     pub window_log_request: Arc<AtomicBool>,
     pub ui_sender: flume::Sender<LiveOverlayEvent>,
+    /// Scrawl's windows that let clicks through (the ink overlay), skipped when deciding whether
+    /// a click landed on Scrawl itself.
+    pub passthrough_window_ids: Mutex<Vec<u32>>,
     tap_port: AtomicU64,
+    /// Whether the event tap is delivering. It can't be enabled without Input Monitoring, and
+    /// macOS turns it off under Secure Input; the HID poller records clicks while it is off.
+    tap_live: AtomicBool,
     last_shortcut_ms: AtomicU64,
     drag_start: Mutex<Option<(u64, f32, f32, Option<String>, TargetFrame)>>,
 }
@@ -1620,7 +1734,9 @@ impl SharedCaptureTelemetry {
             excluded_window_ids: Arc::new(Mutex::new(Vec::new())),
             window_log_request: Arc::new(AtomicBool::new(false)),
             ui_sender,
+            passthrough_window_ids: Mutex::new(Vec::new()),
             tap_port: AtomicU64::new(0),
+            tap_live: AtomicBool::new(false),
             last_shortcut_ms: AtomicU64::new(0),
             drag_start: Mutex::new(None),
         })
@@ -1764,6 +1880,12 @@ impl SharedCaptureTelemetry {
         self.shift_held.store(false, Ordering::Release);
         self.window_log_request.store(false, Ordering::Release);
         self.active.store(true, Ordering::Release);
+        let tap = if self.check_tap() {
+            "event tap"
+        } else {
+            "polled mouse buttons (event tap off)"
+        };
+        scrawl_log(format!("session clicks from {tap}"));
     }
 
     pub fn elapsed_ms(&self) -> u64 {
@@ -1786,6 +1908,112 @@ impl SharedCaptureTelemetry {
             && screen_x <= frame.x + frame.width
             && screen_y >= frame.y
             && screen_y <= frame.y + frame.height
+    }
+
+    /// A mouse button went down at a global point.
+    fn pointer_down(&self, t_ms: u64, screen_x: f64, screen_y: f64) {
+        if !self.contains_screen_point(screen_x, screen_y) {
+            return;
+        }
+        let (nx, ny, _, _) = self.normalize_point(screen_x, screen_y);
+        self.window_log_request.store(true, Ordering::Release);
+        let start_frame = *self
+            .target_frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *self
+            .drag_start
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((t_ms, nx, ny, None, start_frame));
+    }
+
+    /// A mouse button came up: records the click or drag that `pointer_down` began.
+    fn pointer_up(&self, t_ms: u64, screen_x: f64, screen_y: f64, right: bool) {
+        let Some((t0, x0, y0, start_label, start_frame)) = self
+            .drag_start
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        else {
+            return;
+        };
+        let end_frame = *self
+            .target_frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !same_target_frame(start_frame, end_frame) {
+            return;
+        }
+        let (nx, ny, fw, fh) = self.normalize_point(screen_x, screen_y);
+        let dist_px = ((nx - x0) * fw as f32).hypot((ny - y0) * fh as f32);
+        let _ = self.ui_sender.try_send(LiveOverlayEvent::RequestSnapshot);
+        let event = if dist_px < 12.0 {
+            InteractionEvent::Click {
+                t: t0,
+                x: x0,
+                y: y0,
+                button: Some(if right { "right" } else { "left" }.into()),
+                label: start_label,
+                role: None,
+            }
+        } else {
+            InteractionEvent::Drag {
+                t: t0,
+                t1: t_ms,
+                x0,
+                y0,
+                x1: nx,
+                y1: ny,
+                label: start_label,
+                button: None,
+                path: Vec::new(),
+            }
+        };
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+    }
+
+    /// Whether the topmost window at a global point is Scrawl's own (ignoring the click-through
+    /// ink overlay).
+    fn on_scrawl_window(&self, x: f64, y: f64) -> bool {
+        let passthrough = self
+            .passthrough_window_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let windows = objc2::rc::autoreleasepool(|_| crate::windows::raw_windows());
+        crate::windows::owned_window_at(&windows, x, y, std::process::id() as i32, &passthrough)
+    }
+
+    /// Re-enables the event tap if macOS turned it off, and notes whether it is delivering.
+    fn check_tap(&self) -> bool {
+        let tap = self.tap_port.load(Ordering::Acquire) as *mut c_void;
+        let live = !tap.is_null()
+            && unsafe {
+                CGEventTapIsEnabled(tap) || {
+                    CGEventTapEnable(tap, true);
+                    CGEventTapIsEnabled(tap)
+                }
+            };
+        if self.tap_live.swap(live, Ordering::AcqRel) != live {
+            scrawl_log(if live {
+                "event tap live".to_string()
+            } else {
+                format!(
+                    "event tap off (Input Monitoring {}, or Secure Input is on); clicks come from \
+                     polling the mouse buttons",
+                    if unsafe { CGPreflightListenEventAccess() } {
+                        "granted"
+                    } else {
+                        "not granted"
+                    }
+                )
+            });
+        }
+        live
     }
 
     pub fn normalize_point(&self, screen_x: f64, screen_y: f64) -> (f32, f32, u32, u32) {
@@ -1889,7 +2117,14 @@ pub fn start_global_input_tap(telemetry: Arc<SharedCaptureTelemetry>) {
                 .cast::<c_void>();
             // tap = 2 (kCGAnnotatedSessionEventTap), options = 1 (kCGEventTapOptionListenOnly)
             let tap = unsafe { CGEventTapCreate(2, 0, 1, mask, tap_callback, user_info) };
-            scrawl_log(format!("CGEventTapCreate -> tap={tap:p}"));
+            scrawl_log(format!(
+                "CGEventTapCreate -> tap={tap:p} (Input Monitoring {})",
+                if unsafe { CGPreflightListenEventAccess() } {
+                    "granted"
+                } else {
+                    "not granted"
+                }
+            ));
             if tap.is_null() {
                 let _ = unsafe { Arc::from_raw(user_info.cast::<SharedCaptureTelemetry>()) };
                 return;
@@ -1909,6 +2144,29 @@ pub fn start_global_input_tap(telemetry: Arc<SharedCaptureTelemetry>) {
             unsafe { CFRelease(tap) };
             let _ = unsafe { Arc::from_raw(user_info.cast::<SharedCaptureTelemetry>()) };
         });
+}
+
+/// Clicks from the mouse buttons' polled state, while the event tap is off: a press starts a
+/// click like the tap's mouse-down (unless it lands on Scrawl's own window), a release ends it.
+fn poll_clicks(
+    telemetry: &SharedCaptureTelemetry,
+    prev: &mut [bool; 2],
+    now: [bool; 2],
+    (x, y): (f64, f64),
+    pure_shift: bool,
+    on_scrawl: impl Fn(f64, f64) -> bool,
+) {
+    let was = std::mem::replace(prev, now);
+    if telemetry.tap_live.load(Ordering::Acquire) || pure_shift {
+        return;
+    }
+    for (button, (&down, &before)) in now.iter().zip(&was).enumerate() {
+        if down && !before && !on_scrawl(x, y) {
+            telemetry.pointer_down(telemetry.elapsed_ms(), x, y);
+        } else if !down && before {
+            telemetry.pointer_up(telemetry.elapsed_ms(), x, y, button == 1);
+        }
+    }
 }
 
 fn same_target_frame(a: TargetFrame, b: TargetFrame) -> bool {
@@ -1958,85 +2216,27 @@ unsafe extern "C" fn tap_callback(
 
     let t_ms = telemetry.elapsed_ms();
     let loc = unsafe { CGEventGetLocation(event) };
-    let (nx, ny, fw, fh) = telemetry.normalize_point(loc.x, loc.y);
+    let (nx, ny, _, _) = telemetry.normalize_point(loc.x, loc.y);
 
+    // Scrawl's own controls (the stop button, the HUD) aren't part of what is being shown.
+    let on_scrawl = || {
+        let target = unsafe { CGEventGetIntegerValueField(event, EVENT_TARGET_UNIX_PROCESS_ID) };
+        target == i64::from(std::process::id())
+    };
     match event_type {
         EVENT_LEFT_MOUSE_DOWN | EVENT_RIGHT_MOUSE_DOWN => {
-            if pure_shift || !telemetry.contains_screen_point(loc.x, loc.y) {
+            if pure_shift || on_scrawl() {
                 return event;
             }
-            telemetry.window_log_request.store(true, Ordering::Release);
-            let start_frame = *telemetry
-                .target_frame
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *telemetry
-                .drag_start
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some((t_ms, nx, ny, None, start_frame));
+            telemetry.pointer_down(t_ms, loc.x, loc.y);
         }
         EVENT_LEFT_MOUSE_UP | EVENT_RIGHT_MOUSE_UP => {
             if pure_shift {
                 return event;
             }
-            let Some((t0, x0, y0, start_label, start_frame)) = telemetry
-                .drag_start
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            else {
-                return event;
-            };
-            let end_frame = *telemetry
-                .target_frame
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !same_target_frame(start_frame, end_frame) {
-                return event;
-            }
-            let dist_px = ((nx - x0) * fw as f32).hypot((ny - y0) * fh as f32);
-            if dist_px < 12.0 {
-                let _ = telemetry
-                    .ui_sender
-                    .try_send(LiveOverlayEvent::RequestSnapshot);
-                telemetry
-                    .events
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(InteractionEvent::Click {
-                        t: t0,
-                        x: x0,
-                        y: y0,
-                        button: Some(if event_type == EVENT_RIGHT_MOUSE_UP {
-                            "right".into()
-                        } else {
-                            "left".into()
-                        }),
-                        label: start_label,
-                        role: None,
-                    });
-            } else {
-                let _ = telemetry
-                    .ui_sender
-                    .try_send(LiveOverlayEvent::RequestSnapshot);
-                telemetry
-                    .events
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(InteractionEvent::Drag {
-                        t: t0,
-                        t1: t_ms,
-                        x0,
-                        y0,
-                        x1: nx,
-                        y1: ny,
-                        label: start_label,
-                        button: None,
-                        path: Vec::new(),
-                    });
-            }
+            telemetry.pointer_up(t_ms, loc.x, loc.y, event_type == EVENT_RIGHT_MOUSE_UP);
         }
+        EVENT_SCROLL_WHEEL if on_scrawl() => {}
         EVENT_SCROLL_WHEEL => {
             let dy =
                 unsafe { CGEventGetIntegerValueField(event, SCROLL_WHEEL_DELTA_AXIS_1) } as f32;
@@ -2190,8 +2390,14 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
     let mut prev_undo = false;
     let mut await_shift_release = false;
     let mut prev_mod_mask = (0_u8, false, false);
+    let mut prev_buttons = [false; 2];
+    let mut last_tap_check = Instant::now();
     loop {
         thread::sleep(Duration::from_millis(8));
+        if last_tap_check.elapsed() >= Duration::from_millis(500) {
+            telemetry.check_tap();
+            last_tap_check = Instant::now();
+        }
 
         // Combine COMBINED_SESSION_STATE (0, includes Karabiner virtual HID) and HID_SYSTEM_STATE (1).
         let flags = unsafe { CGEventSourceFlagsState(0) | CGEventSourceFlagsState(1) };
@@ -2253,9 +2459,16 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
         }
         prev_paste = paste_now;
 
+        let buttons = unsafe {
+            [
+                CGEventSourceButtonState(1, 0) || CGEventSourceButtonState(0, 0),
+                CGEventSourceButtonState(1, 1) || CGEventSourceButtonState(0, 1),
+            ]
+        };
         if !telemetry.active.load(Ordering::Acquire) {
             prev_shift_ink = false;
             prev_undo = false;
+            prev_buttons = buttons;
             continue;
         }
 
@@ -2277,6 +2490,15 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
             .pointer_screen
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = [loc.x as f32, loc.y as f32];
+
+        poll_clicks(
+            &telemetry,
+            &mut prev_buttons,
+            buttons,
+            (loc.x, loc.y),
+            shift && !cmd && !ctrl && !alt,
+            |x, y| telemetry.on_scrawl_window(x, y),
+        );
 
         let inside_target = telemetry.contains_screen_point(loc.x, loc.y);
         let pure_shift = shift && !cmd && !ctrl && !alt && !await_shift_release;

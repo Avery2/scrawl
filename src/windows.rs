@@ -195,6 +195,24 @@ pub fn filter_windows(
     out
 }
 
+/// Whether the topmost window under a global point (in `raw`, front to back) belongs to `own_pid`,
+/// looking through `passthrough` windows, which let clicks fall to whatever is below them.
+pub fn owned_window_at(
+    raw: &[RawWindow],
+    x: f64,
+    y: f64,
+    own_pid: i32,
+    passthrough: &[u32],
+) -> bool {
+    raw.iter()
+        .filter(|w| {
+            let [wx, wy, ww, wh] = w.bounds;
+            w.alpha > 0.01 && x >= wx && x <= wx + ww && y >= wy && y <= wy + wh
+        })
+        .find(|w| !(w.pid == own_pid && passthrough.contains(&w.id)))
+        .is_some_and(|w| w.pid == own_pid)
+}
+
 /// Reads the on-screen window list (front to back) from the window server.
 #[cfg(target_os = "macos")]
 pub fn raw_windows() -> Vec<RawWindow> {
@@ -464,6 +482,41 @@ mod tests {
             layer: 0,
             frontmost: id == 1,
         }
+    }
+
+    #[test]
+    fn clicks_on_scrawl_windows_are_found_through_the_ink_overlay() {
+        let window = |id, pid, bounds| RawWindow {
+            id,
+            pid,
+            owner: String::new(),
+            title: String::new(),
+            bounds,
+            layer: 0,
+            alpha: 1.0,
+        };
+        let own = 7;
+        let raw = [
+            window(1, own, [0.0, 0.0, 1728.0, 1117.0]), // the ink overlay, click-through
+            window(2, own, [700.0, 6.0, 320.0, 44.0]),  // the recording control
+            window(3, 99, [100.0, 30.0, 1200.0, 900.0]), // an app
+        ];
+        assert!(
+            owned_window_at(&raw, 800.0, 20.0, own, &[1]),
+            "the stop button"
+        );
+        assert!(
+            !owned_window_at(&raw, 400.0, 500.0, own, &[1]),
+            "the app under the overlay"
+        );
+        assert!(
+            !owned_window_at(&raw, 1500.0, 1000.0, own, &[1]),
+            "the desktop"
+        );
+        assert!(
+            owned_window_at(&raw, 400.0, 500.0, own, &[]),
+            "an overlay that takes clicks"
+        );
     }
 
     #[test]
