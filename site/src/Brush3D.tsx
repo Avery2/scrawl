@@ -45,8 +45,9 @@ const DROPS = 12
 const TIP: [number, number] = [336, 771]
 const DEG = Math.PI / 180
 
-// Hover the brush for the ⚙ knobs chip, or press 1–5 for a finish. Dev only: the production
-// build of knobs is always disabled and returns these locked defaults.
+// Hover the brush for the ⚙ knobs chip, or press 1–5 for a finish. Dev server only: the deployed
+// site uses knobs' production build, which is always disabled and renders these locked defaults
+// (Kit's chosen look).
 export const brushControls = defineControls(
   "brush",
   {
@@ -65,7 +66,7 @@ export const brushControls = defineControls(
     tilt: knob(0, { min: -35, max: 35, step: 1, unit: "deg", label: "Tilt angle", group: "Pose" }),
   },
   {
-    enabled: true,
+    enabled: import.meta.env.DEV,
     // The default preset is the brushed handle, so 1–5 over the brush steps through all five finishes.
     presets: {
       chrome: { handle: "chrome", handleRough: 0.05, grain: 0, chamfer: 0.3 },
