@@ -9,6 +9,55 @@ import { Terminal } from "./terminal"
 
 type UserStroke = { points: [number, number, number][]; done: boolean }
 
+const supportsSvgBackdrop =
+  typeof window !== "undefined" &&
+  typeof CSS !== "undefined" &&
+  CSS.supports("backdrop-filter", "url(#scrawl-liquid-glass)") &&
+  /Chrome|Chromium|CriOS|Edg/i.test(navigator.userAgent) &&
+  !("GestureEvent" in window)
+
+function createLensDataUrl(): string | null {
+  if (!supportsSvgBackdrop || typeof document === "undefined") return null
+  const w = 180
+  const h = 52
+  const canvas = document.createElement("canvas")
+  canvas.width = w
+  canvas.height = h
+  const ctx = canvas.getContext("2d")
+  if (!ctx) return null
+  const img = ctx.createImageData(w, h)
+  const d = img.data
+  const r = h / 2
+  const bevel = 15
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const cx = Math.max(r, Math.min(w - r, x))
+      const cy = r
+      const dx = x - cx
+      const dy = y - cy
+      const dist = Math.hypot(dx, dy)
+      const edgeDist = r - dist
+      let nx = 0
+      let ny = 0
+      if (edgeDist > 0 && edgeDist < bevel && dist > 1e-4) {
+        const t = 1 - edgeDist / bevel
+        const mag = t * t
+        nx = (dx / dist) * mag
+        ny = (dy / dist) * mag
+      }
+      const idx = (y * w + x) * 4
+      d[idx] = Math.round(128 - nx * 124)
+      d[idx + 1] = Math.round(128 - ny * 124)
+      d[idx + 2] = 128
+      d[idx + 3] = 255
+    }
+  }
+  ctx.putImageData(img, 0, 0)
+  return canvas.toDataURL()
+}
+
+const LENS_DATA_URL = createLensDataUrl()
+
 function initialScale() {
   if (typeof window === "undefined") return 1
   const pad = window.innerWidth <= 760 ? 20 : 40
@@ -194,6 +243,27 @@ export function Demo() {
   }, [mode, broken])
 
   useEffect(() => {
+    const down = (e: PointerEvent) => {
+      const btn = (e.target as Element | null)?.closest?.(".liquid-glass")
+      if (btn) btn.classList.add("pressed")
+    }
+    const clear = () => {
+      for (const el of document.querySelectorAll(".liquid-glass.pressed")) {
+        el.classList.remove("pressed")
+      }
+    }
+    window.addEventListener("pointerdown", down, true)
+    window.addEventListener("pointerup", clear, true)
+    window.addEventListener("pointercancel", clear, true)
+    window.addEventListener("blur", clear)
+    return () => {
+      window.removeEventListener("pointerdown", down, true)
+      window.removeEventListener("pointerup", clear, true)
+      window.removeEventListener("pointercancel", clear, true)
+      window.removeEventListener("blur", clear)
+    }
+  }, [])
+  useEffect(() => {
     const key = (e: KeyboardEvent) => setShiftDown(e.shiftKey)
     const blur = () => setShiftDown(false)
     window.addEventListener("keydown", key)
@@ -309,14 +379,41 @@ export function Demo() {
     last.current = { t, at, speed }
   }, [t, playing, sound, cues, cursor, mode])
 
-  const ended = started && !playing && t >= T.end
+  const ended = started && !playing && t >= T.end - 50
   const other: Mode = mode === "mac" ? "iphone" : "mac"
 
   const overTerminal =
     !!cursor && cursor.at[0] > AGENT.x && cursor.at[0] < AGENT.x + AGENT.w && cursor.at[1] > AGENT.y + 28 && cursor.at[1] < AGENT.y + AGENT.h
 
   return (
-    <div className="demo">
+    <div className={`demo${LENS_DATA_URL ? " svg-glass" : ""}`}>
+      {LENS_DATA_URL && (
+        <svg className="liquid-glass-defs" aria-hidden>
+          <defs>
+            <filter
+              id="scrawl-liquid-glass"
+              x="0%"
+              y="0%"
+              width="100%"
+              height="100%"
+              filterUnits="objectBoundingBox"
+              primitiveUnits="objectBoundingBox"
+              colorInterpolationFilters="sRGB"
+            >
+              <feGaussianBlur in="SourceGraphic" stdDeviation="0.06 0.2" edgeMode="duplicate" result="preblur" />
+              <feImage href={LENS_DATA_URL} x="0" y="0" width="1" height="1" preserveAspectRatio="none" result="lens" />
+              <feDisplacementMap in="preblur" in2="lens" scale="0.075" xChannelSelector="R" yChannelSelector="G" result="refracted" />
+              <feGaussianBlur in="refracted" stdDeviation="0.015 0.05" edgeMode="duplicate" result="blurred" />
+              <feColorMatrix in="blurred" type="saturate" values="2.05" result="saturated" />
+              <feComponentTransfer in="saturated">
+                <feFuncR type="linear" slope="1.22" intercept="0.02" />
+                <feFuncG type="linear" slope="1.22" intercept="0.02" />
+                <feFuncB type="linear" slope="1.24" intercept="0.025" />
+              </feComponentTransfer>
+            </filter>
+          </defs>
+        </svg>
+      )}
       <ModeSwitch mode={mode} onMode={switchMode} />
       <div
         ref={wrapRef}
@@ -355,7 +452,7 @@ export function Demo() {
         </div>
         {!started && (
           <button
-            className="stage-play"
+            className="stage-play liquid-glass"
             onPointerDown={(e) => {
               e.stopPropagation()
               sfx.unlock()
@@ -370,7 +467,7 @@ export function Demo() {
         )}
         {started && playing && !sound && (
           <button
-            className="stage-sound-hint"
+            className="stage-sound-hint liquid-glass"
             onPointerDown={(e) => {
               e.stopPropagation()
               sfx.unlock()
@@ -392,11 +489,11 @@ export function Demo() {
         )}
         {ended && (
           <div className="stage-end" onPointerDown={(e) => e.stopPropagation()}>
-            <button className="stage-btn" onClick={replay}>
+            <button className="stage-btn liquid-glass" onClick={replay}>
               <ReplayIcon />
               Replay
             </button>
-            <button className="stage-btn primary" onClick={() => switchMode(other)}>
+            <button className="stage-btn primary liquid-glass liquid-glass-primary" onClick={() => switchMode(other)}>
               {other === "iphone" ? <PhoneIcon /> : <MacIcon />}
               {other === "iphone" ? "Watch iPhone Mirror" : "Watch Mac Window"}
               <span aria-hidden>→</span>

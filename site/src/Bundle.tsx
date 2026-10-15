@@ -240,7 +240,7 @@ function VideoView({ script, width, height }: { script: Script; width: number; h
   return (
     <div className="video">
       <Frame script={script} n={2} width={width} height={height - 44}>
-        <span className="video-play" aria-hidden>
+        <span className="video-play liquid-glass" aria-hidden>
           <svg viewBox="0 0 16 16">
             <path d="M4.5 2.8v10.4a.6.6 0 00.9.5l8.3-5.2a.6.6 0 000-1L5.4 2.3a.6.6 0 00-.9.5z" />
           </svg>

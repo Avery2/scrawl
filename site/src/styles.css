@@ -735,10 +735,7 @@ kbd {
   width: 58px;
   height: 58px;
   border-radius: 50%;
-  transform: translate(-50%, -50%);
-  background: rgba(30, 30, 32, 0.62);
-  backdrop-filter: blur(14px) saturate(1.6);
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.16);
+  transform: translate3d(-50%, -50%, 0);
 }
 
 .video-play svg {
@@ -746,6 +743,7 @@ kbd {
   height: 22px;
   margin-left: 3px;
   fill: #fff;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.35));
 }
 
 .video-bar {
@@ -2888,6 +2886,112 @@ kbd {
   color: var(--fg);
 }
 
+/* ---------- Liquid Glass (ScrawlKit strip & iOS 26 style) ---------- */
+
+.liquid-glass-defs {
+  position: fixed;
+  left: -9999px;
+  top: -9999px;
+  width: 1px;
+  height: 1px;
+  pointer-events: none;
+}
+
+.liquid-glass {
+  --lg-bg: linear-gradient(175deg, rgba(255, 255, 255, 0.17) 0%, rgba(255, 255, 255, 0.06) 50%, rgba(255, 255, 255, 0.12) 100%);
+  --lg-bg-hover: linear-gradient(175deg, rgba(255, 255, 255, 0.24) 0%, rgba(255, 255, 255, 0.09) 50%, rgba(255, 255, 255, 0.16) 100%);
+  --lg-bg-active: linear-gradient(185deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0.05) 48%, rgba(255, 255, 255, 0.18) 100%);
+  --lg-sheen: linear-gradient(160deg, rgba(255, 255, 255, 0.3) 0%, rgba(255, 255, 255, 0.08) 28%, transparent 56%, rgba(255, 255, 255, 0.12) 100%);
+  --lg-sheen-hover: linear-gradient(158deg, rgba(255, 255, 255, 0.38) 0%, rgba(255, 255, 255, 0.11) 30%, transparent 56%, rgba(255, 255, 255, 0.16) 100%);
+  --lg-sheen-active: linear-gradient(340deg, rgba(255, 255, 255, 0.32) 0%, rgba(255, 255, 255, 0.09) 32%, transparent 60%, rgba(255, 255, 255, 0.18) 100%);
+  --lg-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.72),
+    inset 0 -0.5px 0 rgba(255, 255, 255, 0.3),
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.26),
+    inset 0 10px 18px -10px rgba(255, 255, 255, 0.28),
+    inset 0 -10px 18px -12px rgba(255, 255, 255, 0.26),
+    0 12px 30px -8px rgba(0, 0, 0, 0.58),
+    0 2px 6px rgba(0, 0, 0, 0.28);
+  --lg-shadow-hover:
+    inset 0 1px 0 rgba(255, 255, 255, 0.85),
+    inset 0 -0.5px 0 rgba(255, 255, 255, 0.36),
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.32),
+    inset 0 12px 20px -10px rgba(255, 255, 255, 0.34),
+    inset 0 -10px 18px -11px rgba(255, 255, 255, 0.32),
+    0 16px 36px -8px rgba(0, 0, 0, 0.64),
+    0 4px 10px rgba(0, 0, 0, 0.32);
+  --lg-shadow-active:
+    inset 0 0.5px 0 rgba(255, 255, 255, 0.48),
+    inset 0 2px 8px rgba(0, 0, 0, 0.18),
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.24),
+    inset 0 -10px 18px -10px rgba(255, 255, 255, 0.36),
+    0 6px 18px -6px rgba(0, 0, 0, 0.54),
+    0 1px 4px rgba(0, 0, 0, 0.28);
+  background: var(--lg-bg);
+  -webkit-backdrop-filter: blur(15px) saturate(205%) brightness(1.22);
+  backdrop-filter: blur(15px) saturate(205%) brightness(1.22);
+  box-shadow: var(--lg-shadow);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.48);
+}
+
+.svg-glass .liquid-glass {
+  backdrop-filter: url(#scrawl-liquid-glass);
+}
+
+.liquid-glass::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(162deg, rgba(255, 255, 255, 0.78) 0%, rgba(255, 255, 255, 0.16) 42%, rgba(255, 255, 255, 0.08) 68%, rgba(255, 255, 255, 0.44) 100%);
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+.liquid-glass::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--lg-sheen);
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .liquid-glass:hover::after {
+    background: var(--lg-sheen-hover);
+  }
+}
+
+.liquid-glass:active,
+.liquid-glass.pressed {
+  background: var(--lg-bg-active);
+  box-shadow: var(--lg-shadow-active);
+}
+
+.liquid-glass:active::after,
+.liquid-glass.pressed::after {
+  background: var(--lg-sheen-active);
+}
+
+.liquid-glass-primary {
+  --lg-bg: rgba(245, 245, 252, 0.78);
+  --lg-bg-hover: rgba(252, 252, 255, 0.88);
+  --lg-bg-active: rgba(235, 235, 244, 0.82);
+  --lg-sheen: linear-gradient(160deg, rgba(255, 255, 255, 0.65) 0%, rgba(255, 255, 255, 0.15) 36%, transparent 60%, rgba(255, 255, 255, 0.35) 100%);
+  color: #09090b;
+  text-shadow: 0 0.5px 0 rgba(255, 255, 255, 0.55);
+}
+
 .stage-play {
   position: absolute;
   left: 50%;
@@ -2905,32 +3009,30 @@ kbd {
   white-space: nowrap;
   color: #fff;
   transform: translate3d(-50%, -50%, 0);
-  background: rgba(24, 24, 28, 0.76);
-  backdrop-filter: blur(24px) saturate(1.6);
-  -webkit-backdrop-filter: blur(24px) saturate(1.6);
-  box-shadow:
-    inset 0 0 0 0.5px rgba(255, 255, 255, 0.22),
-    0 20px 50px rgba(0, 0, 0, 0.5);
   transition:
-    transform 0.16s ease-out,
-    background 0.18s ease;
+    transform 0.32s cubic-bezier(0.22, 1.35, 0.36, 1),
+    box-shadow 0.22s ease,
+    background 0.22s ease;
 }
 
 @media (hover: hover) and (pointer: fine) {
   .stage-play:hover {
-    transform: translate3d(-50%, -50%, 0) scale(1.04);
-    background: rgba(34, 34, 40, 0.84);
+    transform: translate3d(-50%, -50%, 0) scale(1.035);
+    background: var(--lg-bg-hover);
+    box-shadow: var(--lg-shadow-hover);
   }
 }
 
-.stage-play:active {
-  transform: translate3d(-50%, -50%, 0) scale(0.97);
+.stage-play:active,
+.stage-play.pressed {
+  transform: translate3d(-50%, -50%, 0) scale(0.96);
 }
 
 .stage-play svg {
   width: 16px;
   height: 16px;
   fill: currentColor;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.32));
 }
 
 .sound-btn {
@@ -3033,35 +3135,37 @@ kbd {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  height: 34px;
-  padding: 0 13px 0 10px;
+  height: 38px;
+  padding: 0 14px 0 11px;
   border-radius: 999px;
-  font-size: 12.5px;
-  font-weight: 550;
-  color: rgba(255, 255, 255, 0.92);
-  background: rgba(22, 22, 26, 0.78);
-  backdrop-filter: blur(18px) saturate(1.5);
-  -webkit-backdrop-filter: blur(18px) saturate(1.5);
-  box-shadow:
-    inset 0 0 0 0.5px rgba(255, 255, 255, 0.2),
-    0 8px 24px rgba(0, 0, 0, 0.45);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  color: rgba(255, 255, 255, 0.95);
   animation: enter 0.22s cubic-bezier(0.22, 1, 0.36, 1) both;
   transition:
-    transform 0.15s ease-out,
-    background 0.15s ease;
+    transform 0.3s cubic-bezier(0.22, 1.35, 0.36, 1),
+    box-shadow 0.2s ease,
+    background 0.2s ease;
 }
 
-.stage-sound-hint:hover {
-  background: rgba(32, 32, 38, 0.88);
+@media (hover: hover) and (pointer: fine) {
+  .stage-sound-hint:hover {
+    transform: scale(1.03);
+    background: var(--lg-bg-hover);
+    box-shadow: var(--lg-shadow-hover);
+  }
 }
 
-.stage-sound-hint:active {
-  transform: scale(0.97);
+.stage-sound-hint:active,
+.stage-sound-hint.pressed {
+  transform: scale(0.96);
 }
 
 .stage-sound-hint svg {
   width: 15px;
   height: 15px;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.32));
 }
 
 .draw-btn {
@@ -3101,10 +3205,13 @@ kbd {
   align-self: center;
   padding: 4px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(18, 18, 24, 0.42);
+  -webkit-backdrop-filter: blur(14px) saturate(190%) brightness(1.06);
+  backdrop-filter: blur(14px) saturate(190%) brightness(1.06);
   box-shadow:
-    inset 0 0 0 1px rgba(255, 255, 255, 0.08),
-    0 10px 30px rgba(0, 0, 0, 0.35);
+    inset 0 0.5px 0 rgba(255, 255, 255, 0.28),
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.14),
+    0 10px 28px -8px rgba(0, 0, 0, 0.5);
 }
 
 .mode-thumb {
@@ -3114,15 +3221,19 @@ kbd {
   left: 4px;
   width: calc(50% - 4px);
   border-radius: 999px;
-  background: linear-gradient(rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.13));
+  background:
+    linear-gradient(168deg, rgba(255, 255, 255, 0.24) 0%, rgba(255, 255, 255, 0.08) 46%, rgba(255, 255, 255, 0.14) 100%);
   box-shadow:
-    inset 0 0.5px 0 rgba(255, 255, 255, 0.35),
-    0 4px 14px rgba(0, 0, 0, 0.35);
-  transition: transform 0.38s cubic-bezier(0.3, 1.3, 0.5, 1);
+    inset 0 0.5px 0 rgba(255, 255, 255, 0.62),
+    inset 0 -0.5px 0 rgba(255, 255, 255, 0.2),
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.2),
+    inset 0 -8px 14px -10px rgba(255, 255, 255, 0.22),
+    0 4px 14px rgba(0, 0, 0, 0.38);
+  transition: transform 0.38s cubic-bezier(0.22, 1.25, 0.36, 1);
 }
 
 .mode-thumb.iphone {
-  transform: translateX(100%);
+  transform: translate3d(100%, 0, 0);
 }
 
 .mode-switch button {
@@ -3138,7 +3249,13 @@ kbd {
   font-weight: 550;
   color: var(--muted);
   white-space: nowrap;
-  transition: color 0.2s;
+  transition:
+    color 0.2s ease,
+    transform 0.24s cubic-bezier(0.22, 1.35, 0.36, 1);
+}
+
+.mode-switch button:active {
+  transform: scale(0.96);
 }
 
 .mode-switch button:hover,
@@ -3159,7 +3276,7 @@ kbd {
   align-items: center;
   justify-content: center;
   gap: 12px;
-  background: rgba(6, 6, 10, 0.45);
+  background: rgba(6, 6, 10, 0.36);
   animation: stage-end-in 0.35s ease both;
 }
 
@@ -3173,7 +3290,8 @@ kbd {
 }
 
 .stage-btn {
-  display: flex;
+  position: relative;
+  display: inline-flex;
   align-items: center;
   gap: 9px;
   height: 52px;
@@ -3182,34 +3300,32 @@ kbd {
   font-size: 16px;
   font-weight: 600;
   letter-spacing: -0.01em;
+  white-space: nowrap;
   color: #fff;
-  background: rgba(24, 24, 28, 0.72);
-  backdrop-filter: blur(24px) saturate(1.6);
-  -webkit-backdrop-filter: blur(24px) saturate(1.6);
-  box-shadow:
-    inset 0 0 0 0.5px rgba(255, 255, 255, 0.2),
-    0 20px 50px rgba(0, 0, 0, 0.5);
   transition:
-    transform 0.2s ease,
-    background 0.2s ease;
+    transform 0.32s cubic-bezier(0.22, 1.35, 0.36, 1),
+    box-shadow 0.22s ease,
+    background 0.22s ease;
 }
 
 @media (hover: hover) and (pointer: fine) {
   .stage-btn:hover {
-    transform: scale(1.04);
+    transform: scale(1.035);
+    background: var(--lg-bg-hover);
+    box-shadow: var(--lg-shadow-hover);
   }
   .stage-btn.primary:hover {
-    background: #fff;
+    background: var(--lg-bg-hover);
   }
 }
 
-.stage-btn:active {
-  transform: scale(0.97);
+.stage-btn:active,
+.stage-btn.pressed {
+  transform: scale(0.96);
 }
 
 .stage-btn.primary {
-  color: #000;
-  background: #f5f5f7;
+  color: #09090b;
 }
 
 .stage-btn svg {
@@ -3235,10 +3351,10 @@ kbd {
     border-radius: 12px;
   }
   .stage-play {
-    height: 42px;
-    padding: 0 18px 0 15px;
+    height: 44px;
+    padding: 0 20px 0 16px;
     gap: 8px;
-    font-size: 14px;
+    font-size: 14.5px;
   }
   .stage-play svg {
     width: 14px;
@@ -3247,15 +3363,15 @@ kbd {
   .stage-sound-hint {
     left: 10px;
     bottom: 10px;
-    height: 32px;
-    padding: 0 11px 0 9px;
-    font-size: 12px;
+    height: 36px;
+    padding: 0 13px 0 10px;
+    font-size: 12.5px;
   }
   .stage-btn {
-    height: 38px;
-    padding: 0 15px 0 13px;
+    height: 44px;
+    padding: 0 16px 0 14px;
     gap: 7px;
-    font-size: 13px;
+    font-size: 13.5px;
     white-space: nowrap;
   }
   .stage-end {
@@ -3736,6 +3852,9 @@ kbd {
   .ts-content,
   .sound-wave,
   .stage-sound-hint,
+  .stage-play,
+  .stage-btn,
+  .liquid-glass::after,
   .rec-dot,
   .rec-halo,
   .orbit i {
