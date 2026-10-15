@@ -82,7 +82,8 @@ crop is then:
 - **the window** holding the activity (two at most, for an arrow from one to the other), including
   a menu it opened and the touched part of the menu bar;
 - or, when that window is most of the screen (maximized, full screen), **the activity inside it**
-  with some context, its edges moved into nearby white space so they don't cut through text;
+  with some context, its edges moved into nearby white space and past the ends of any lines of
+  text they cross (up to the window's edge), so they don't cut words in half;
 - or the previous crop, for a keyframe with only talk.
 
 Neighbouring crops that mostly overlap become one, so the sheet doesn't jitter. A crop covering

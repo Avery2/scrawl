@@ -562,6 +562,9 @@ pub struct Crop {
     pub core: Option<Rect>,
     /// The activity itself: deliberate input, where the cursor rested, what a click changed.
     pub need: Option<Rect>,
+    /// The window a Focus crop sits in: its edges may grow up to here to finish lines of text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub within: Option<Rect>,
     pub slice: [u64; 2],
     pub shares: Vec<Share>,
     /// Snapped window ids.
@@ -776,6 +779,78 @@ impl Ctx<'_> {
         } else {
             None
         }
+    }
+
+    /// Widens `r` so its left and right edges don't cut through lines of text: each line that
+    /// crosses an edge is followed to its end (a 12 pt gap), and the edge moves past the
+    /// furthest end, at most as far as `snap` reaches and never out of `within`. Runs longer
+    /// than that are rules, borders or wrapped-off text, not lines to finish.
+    fn finish_lines(&self, r: Rect, content: &Content, within: Rect) -> Rect {
+        let cell = Content::CELL_PT;
+        let (cols, rows) = (content.cols as i64, content.rows as i64);
+        let reach = (self
+            .s
+            .snap_out
+            .max(self.s.snap_out_frac * (r[2] - r[0]) * self.sw)
+            / cell)
+            .round() as i64;
+        let gap = (12.0 / cell).round() as i64;
+        if reach <= 0 {
+            return r;
+        }
+        let busy = |c: i64, row: i64| {
+            (0..cols).contains(&c)
+                && content.count(c as usize, row as usize, c as usize + 1, row as usize + 1) > 0
+        };
+        let mut c0 = (r[0] * content.cols as f32).floor() as i64;
+        let mut c1 = (r[2] * content.cols as f32).ceil() as i64;
+        let r0 = ((r[1] * content.rows as f32).floor() as i64).max(0);
+        let r1 = ((r[3] * content.rows as f32).ceil() as i64).min(rows);
+        let w0 = ((within[0].max(0.0) * content.cols as f32).floor() as i64).max(0);
+        let w1 = ((within[2].min(1.0) * content.cols as f32).ceil() as i64).min(cols);
+        // Where the line on `row` that crosses boundary `edge` ends going `dir`, if it does
+        // within `limit`. `None` when nothing crosses there.
+        let line_end = |row: i64, edge: i64, dir: i64, limit: i64| -> Option<Option<i64>> {
+            // Cells just inside and just outside the boundary.
+            let outside = if dir > 0 { edge } else { edge - 1 };
+            let inside = outside - dir;
+            let near = |from: i64, step: i64| (0..gap).any(|k| busy(from + step * k, row));
+            if !near(inside, -dir) || !near(outside, dir) {
+                return None;
+            }
+            let (mut c, mut last, mut blank) = (outside, inside, 0);
+            while blank < gap {
+                if (c - limit) * dir > 0 || !(0..cols).contains(&c) {
+                    return Some(None);
+                }
+                if busy(c, row) {
+                    last = c;
+                    blank = 0;
+                } else {
+                    blank += 1;
+                }
+                c += dir;
+            }
+            Some(Some(last))
+        };
+        let mut right = c1;
+        let mut left = c0;
+        for row in r0..r1 {
+            if let Some(Some(end)) = line_end(row, c1, 1, (c1 + reach).min(w1) - 1) {
+                right = right.max(end + 1 + gap);
+            }
+            if let Some(Some(start)) = line_end(row, c0, -1, (c0 - reach).max(w0)) {
+                left = left.min(start - gap);
+            }
+        }
+        c1 = right.min(w1);
+        c0 = left.max(w0);
+        clip01([
+            c0 as f32 / content.cols as f32,
+            r[1],
+            c1 as f32 / content.cols as f32,
+            r[3],
+        ])
     }
 
     /// Moves each edge of `r` to the nearest stretch of empty screen (a column gap of 12 pt, or
@@ -1228,6 +1303,7 @@ impl Ctx<'_> {
             apps: crop_apps,
             core: Some(core),
             need: activity,
+            within: (kind == CropKind::Focus).then_some(within),
             slice,
             shares: share_list,
             snapped: snapped.iter().map(|w| w.id).collect(),
@@ -1247,6 +1323,7 @@ impl Ctx<'_> {
             apps,
             core: None,
             need: None,
+            within: None,
             slice,
             shares: Vec::new(),
             snapped: Vec::new(),
@@ -1389,6 +1466,7 @@ pub fn compute(input: &Input, settings: &Settings) -> Vec<Crop> {
             if let Some(grown) = ctx.reach_content(snapped, content, keep) {
                 snapped = ctx.snap(grown, content, keep);
             }
+            let snapped = ctx.finish_lines(snapped, content, c.within.unwrap_or(FULL));
             c.rect = if area(snapped) >= settings.full_above {
                 FULL
             } else {
@@ -1912,6 +1990,62 @@ mod tests {
         let r = ctx.snap([0.28, 0.25, 0.6, 0.55], &content, [0.4, 0.3, 0.5, 0.4]);
         assert!(r[2] >= 0.70 && r[2] < 0.76, "right edge {r:?}");
         assert!(r[0] <= 0.30 && r[0] > 0.26, "left edge {r:?}");
+    }
+
+    /// Kit's capture: a tall Focus crop whose right edge ran through a ragged paragraph,
+    /// cutting "…instead of 5 GB, a" mid-line, because each column there is only a few
+    /// percent text.
+    #[test]
+    fn crop_edges_finish_the_lines_they_cross() {
+        let mut frame = RgbaFrame::new(0, 1728, 1117, vec![30; 1728 * 1117 * 4]);
+        let mut fill = |x0: usize, x1: usize, y0: usize, h: usize| {
+            for y in y0..y0 + h {
+                for x in x0..x1 {
+                    // Letters with a 4 px space between words.
+                    if x % 48 < 44 {
+                        let i = (y * 1728 + x) * 4;
+                        frame.rgba[i..i + 3].copy_from_slice(&[220, 220, 220]);
+                    }
+                }
+            }
+        };
+        // Paragraph lines from x 646 to between 1180 and 1300, every 26 pt.
+        for (i, end) in [1300, 1250, 1290, 1180, 1300, 1270, 1240, 1300]
+            .iter()
+            .enumerate()
+        {
+            fill(646, *end, 120 + i * 26, 12);
+        }
+        // A rule across the whole window.
+        fill(310, 1700, 400, 2);
+        let content = Content::from_frame(&frame, [1728.0, 1117.0]);
+        let input = Input {
+            screen: [1728.0, 1117.0],
+            ..Default::default()
+        };
+        let s = Settings::default();
+        let ctx = Ctx {
+            input: &input,
+            s: &s,
+            sw: 1728.0,
+            sh: 1117.0,
+        };
+        let crop = [
+            621.0 / 1728.0,
+            27.0 / 1117.0,
+            1248.0 / 1728.0,
+            832.0 / 1117.0,
+        ];
+        let window = [310.0 / 1728.0, 38.0 / 1117.0, 1990.0 / 1728.0, 1.0];
+        let r = ctx.finish_lines(crop, &content, window);
+        let right = r[2] * 1728.0;
+        assert!((1300.0..1330.0).contains(&right), "right edge {right}");
+        assert_eq!(r[0], crop[0], "nothing crosses the left edge");
+        assert_eq!((r[1], r[3]), (crop[1], crop[3]));
+        // Never past the window; lines running into its edge are left alone like the rule.
+        let narrow = [310.0 / 1728.0, 0.0, 1270.0 / 1728.0, 1.0];
+        let right = ctx.finish_lines(crop, &content, narrow)[2] * 1728.0;
+        assert!((1250.0..=1270.0).contains(&right), "{right}");
     }
 
     #[test]

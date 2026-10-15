@@ -983,6 +983,7 @@ pub fn score_uncropped(cases: &[Case]) -> Vec<CaseScore> {
                     apps: Vec::new(),
                     core: None,
                     need: None,
+                    within: None,
                     slice: [0, 0],
                     shares: Vec::new(),
                     snapped: Vec::new(),
