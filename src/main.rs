@@ -4,6 +4,7 @@ mod capture;
 mod handoff;
 mod helper;
 mod hex;
+mod hold;
 mod icons;
 mod inbox;
 mod keyframes;

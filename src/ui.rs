@@ -23,8 +23,8 @@ use screencapturekit::prelude::*;
 use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
 
 use crate::capture::{
-    LiveOverlayEvent, ScreenCaptureSession, SharedCaptureTelemetry, ShortcutChord,
-    current_mouse_screen, discover_target, install_global_hotkeys, list_selectable_windows,
+    LiveOverlayEvent, ScreenCaptureSession, SharedCaptureTelemetry, current_mouse_screen,
+    discover_target, install_global_hotkeys, list_selectable_windows,
     record_external_frontmost_app, region_target, scrawl_log, selectable_window_at,
     set_escape_hotkey_enabled, shortcut_from_key_and_mods, start_global_input_tap,
     update_global_shortcut,
@@ -188,16 +188,22 @@ fn selecting_row_width(label_widths: &[f32], record_width: Option<f32>) -> f32 {
 }
 
 /// Intrinsic outer width of the capsule for a phase, mirroring the layout in `HudPillWindow`.
-fn island_content_width(window: &Window, phase: IslandPhase, clock: &str, iphone: bool) -> f32 {
+/// `hold`: the held switcher, which always lists iPhone and records on release (no Record chip).
+fn island_content_width(
+    window: &Window,
+    phase: IslandPhase,
+    clock: &str,
+    iphone: bool,
+    hold: bool,
+) -> f32 {
     let divider = 1.0 + 2.0 * DIVIDER_MX;
     let inner = match phase {
         IslandPhase::Selecting { mode } => {
-            let labels: Vec<f32> = SelectionMode::available(iphone)
+            let labels: Vec<f32> = SelectionMode::available(iphone || hold)
                 .iter()
                 .map(|m| measure_text(window, m.label(), HUD_TEXT, FontWeight::MEDIUM))
                 .collect();
-            let record = mode
-                .shows_record()
+            let record = (mode.shows_record() && !hold)
                 .then(|| chip_width(window, "Record", FontWeight::SEMIBOLD));
             selecting_row_width(&labels, record)
         }
@@ -458,11 +464,7 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
 
     let shortcut = crate::capture::ShortcutConfig::load().label;
     add(&format!("Record Screen  {shortcut}"), sel!(toggleCapture:));
-    let choose = crate::capture::picker_label(&shortcut).map_or_else(
-        || "Choose What to Record…".to_owned(),
-        |l| format!("Choose What to Record…  {l}"),
-    );
-    add(&choose, sel!(chooseTarget:));
+    add("Choose What to Record…", sel!(chooseTarget:));
     add("Record iPhone", sel!(recordIphone:));
     add("Open Latest Bundle", sel!(openLatest:));
     add("Generate Demo Bundle", sel!(runDemo:));
@@ -908,58 +910,6 @@ pub enum IslandPhase {
     Dismissing,
 }
 
-/// Where capture stands, as far as the capture shortcuts care.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum CaptureState {
-    /// Nothing open (or a finished capture's island). `mirror`: the iPhone mirror is showing.
-    Idle {
-        mirror: bool,
-    },
-    Selecting(SelectionMode),
-    Recording {
-        elapsed_ms: u64,
-    },
-    Processing,
-}
-
-/// What a capture shortcut does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ShortcutAction {
-    /// Record the display under the cursor, auto-cropped, without the picker.
-    RecordScreen,
-    /// From the picker: record what it is on (the phone, else the full screen it shows).
-    RecordSelected,
-    RecordIphone,
-    OpenPicker,
-    ClosePicker,
-    Finish,
-    Ignore,
-}
-
-/// A second press this soon after a recording starts is a double press, not "finish".
-const DOUBLE_PRESS_MS: u64 = 400;
-
-/// ⌥⇧S records the screen at once (the phone if its mirror is up) and finishes a recording;
-/// ⌥⇧⌘S opens or closes the picker. In the picker ⌥⇧S records what it is on.
-fn route_shortcut(chord: ShortcutChord, state: CaptureState) -> ShortcutAction {
-    match (state, chord) {
-        (CaptureState::Recording { elapsed_ms }, _) if elapsed_ms < DOUBLE_PRESS_MS => {
-            ShortcutAction::Ignore
-        }
-        (CaptureState::Recording { .. }, _) => ShortcutAction::Finish,
-        (CaptureState::Processing, _) => ShortcutAction::Ignore,
-        (CaptureState::Selecting(_), ShortcutChord::Record) => ShortcutAction::RecordSelected,
-        (CaptureState::Selecting(_), ShortcutChord::Picker) => ShortcutAction::ClosePicker,
-        (CaptureState::Idle { mirror: true }, ShortcutChord::Record) => {
-            ShortcutAction::RecordIphone
-        }
-        (CaptureState::Idle { mirror: false }, ShortcutChord::Record) => {
-            ShortcutAction::RecordScreen
-        }
-        (CaptureState::Idle { .. }, ShortcutChord::Picker) => ShortcutAction::OpenPicker,
-    }
-}
-
 enum CaptureSource {
     Screen {
         session: ScreenCaptureSession,
@@ -1033,6 +983,13 @@ pub struct ScrawlCoordinator {
     /// The picker opened on Area because the last recording was the iPhone and no phone had been
     /// seen yet: switch to the phone when discovery finds one, unless Kit picked a mode himself.
     open_iphone_when_found: bool,
+    /// ⌥⇧S held as a ⌘Tab-style switcher (`crate::hold`).
+    switcher: crate::hold::Switcher,
+    /// The modifiers held when the shortcut went down; releasing any of them commits.
+    hold_mods: u64,
+    /// The open picker is the held switcher, not the menu bar's picker.
+    hold_picker: bool,
+    clock: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1083,6 +1040,10 @@ impl ScrawlCoordinator {
             inbox: crate::inbox::Inbox::load_default(),
             last_mode: SelectionMode::load_last_used(),
             open_iphone_when_found: false,
+            switcher: crate::hold::Switcher::default(),
+            hold_mods: 0,
+            hold_picker: false,
+            clock: Instant::now(),
         }
     }
 
@@ -1166,7 +1127,7 @@ impl ScrawlCoordinator {
                     && matches!(
                         coord.island_phase,
                         IslandPhase::Selecting {
-                            mode: SelectionMode::Area
+                            mode: SelectionMode::Area | SelectionMode::Iphone
                         }
                     )
                 {
@@ -1189,34 +1150,146 @@ impl ScrawlCoordinator {
         matches!(self.island_phase, IslandPhase::Selecting { .. })
     }
 
-    fn capture_state(&self) -> CaptureState {
+    fn activity(&self) -> crate::hold::Activity {
+        use crate::hold::Activity;
         if let Some(rec) = &self.active_recording {
-            CaptureState::Recording {
+            Activity::Recording {
                 elapsed_ms: rec.started.elapsed().as_millis() as u64,
             }
         } else if self.is_processing() {
-            CaptureState::Processing
-        } else if let IslandPhase::Selecting { mode } = self.island_phase {
-            CaptureState::Selecting(mode)
+            Activity::Processing
+        } else if self.is_selecting() && !self.switcher.is_switching() {
+            Activity::Picker
         } else {
-            CaptureState::Idle {
-                mirror: self.iphone_preview.is_some(),
-            }
+            Activity::Free
         }
     }
 
-    /// ⌥⇧S, ⌥⇧⌘S and the menu items that stand for them.
-    pub fn handle_shortcut(&mut self, chord: ShortcutChord, cx: &mut Context<Self>) {
-        let action = route_shortcut(chord, self.capture_state());
-        scrawl_log(format!("shortcut {chord:?} -> {action:?}"));
+    fn clock_ms(&self) -> u64 {
+        self.clock.elapsed().as_millis() as u64
+    }
+
+    /// The capture shortcut went down (from Carbon, the event tap or the HID poller).
+    pub fn press_shortcut(&mut self, cx: &mut Context<Self>) {
+        let activity = self.activity();
+        if !self.switcher.is_held() && activity == crate::hold::Activity::Free {
+            self.hold_mods = crate::capture::modifier_flags();
+        }
+        if let Some(mode) = self.selection_mode() {
+            self.switcher.follow(mode);
+        }
+        let action = self.switcher.press(self.clock_ms(), activity);
+        self.apply_switcher(action, cx);
+    }
+
+    /// Polled from the UI loop while the shortcut is held: watches for ⌥⇧ coming up and Esc,
+    /// whichever app or window has focus.
+    pub fn tick_switcher(&mut self, cx: &mut Context<Self>) {
+        if !self.switcher.is_held() {
+            return;
+        }
+        if self.switcher.is_switching() && !self.is_selecting() {
+            // Closed some other way (✕, a click on a chip).
+            self.switcher.reset();
+            return;
+        }
+        let action = if crate::capture::escape_down() {
+            self.switcher.escape()
+        } else {
+            let mods = crate::capture::modifier_flags();
+            let held = self.hold_mods != 0 && mods & self.hold_mods == self.hold_mods;
+            self.switcher.tick(self.clock_ms(), held)
+        };
+        self.apply_switcher(action, cx);
+    }
+
+    fn apply_switcher(&mut self, action: crate::hold::Action, cx: &mut Context<Self>) {
+        use crate::hold::Action;
+        if action != Action::None {
+            scrawl_log(format!("switcher -> {action:?}"));
+        }
         match action {
-            ShortcutAction::RecordScreen => self.record_screen_now(cx),
-            ShortcutAction::RecordSelected => self.record_selected_mode(cx),
-            ShortcutAction::RecordIphone => self.start_recording_iphone(cx),
-            ShortcutAction::OpenPicker => self.begin_target_selection(cx),
-            ShortcutAction::ClosePicker => self.dismiss_island(cx),
-            ShortcutAction::Finish => self.finish_recording(cx),
-            ShortcutAction::Ignore => {}
+            Action::None => {}
+            Action::RecordScreen => self.record_screen_now(cx),
+            Action::Open(mode) => {
+                self.open_picker(Some(SelectionMode::Screen), cx);
+                if mode != SelectionMode::Screen {
+                    self.show_switcher_mode(mode, cx);
+                }
+            }
+            Action::Show(mode) => self.show_switcher_mode(mode, cx),
+            Action::Commit(mode) => self.commit_switcher(mode, cx),
+            Action::Cancel => {
+                if self.is_selecting() {
+                    self.cancel_recording(cx);
+                }
+            }
+            Action::RecordSelected => self.record_selected_mode(cx),
+            Action::Finish => self.finish_recording(cx),
+        }
+    }
+
+    /// The menu's Record Screen item, the review window's Record button and `app --record`.
+    pub fn record_or_finish(&mut self, cx: &mut Context<Self>) {
+        if self.is_recording() {
+            self.finish_recording(cx);
+        } else if self.is_selecting() {
+            self.record_selected_mode(cx);
+        } else if !self.is_processing() {
+            self.record_screen_now(cx);
+        }
+    }
+
+    fn show_switcher_mode(&mut self, mode: SelectionMode, cx: &mut Context<Self>) {
+        if mode == SelectionMode::Iphone && self.iphone.is_some() {
+            self.preview_iphone(cx);
+        } else {
+            self.set_selection_mode(mode, cx);
+            // No phone yet: the badge says so, and the mirror opens if discovery finds one.
+            self.open_iphone_when_found = mode == SelectionMode::Iphone;
+        }
+    }
+
+    /// ⌥⇧ released: record what the switcher shows. An iPhone that isn't there or a drag too
+    /// small for an area records nothing.
+    fn commit_switcher(&mut self, mode: SelectionMode, cx: &mut Context<Self>) {
+        match self.selection_mode().unwrap_or(mode) {
+            SelectionMode::Screen => self.start_recording_full_screen(cx),
+            SelectionMode::Window => {
+                if self.hovered_window.is_none() {
+                    if self.windows_loading {
+                        self.selectable_windows = list_selectable_windows();
+                        self.windows_loading = false;
+                    }
+                    self.hovered_window = current_mouse_screen()
+                        .and_then(|[x, y]| {
+                            selectable_window_at(
+                                &self.selectable_windows,
+                                f64::from(x),
+                                f64::from(y),
+                            )
+                        })
+                        .cloned();
+                }
+                match self.hovered_window.clone() {
+                    Some(target) => self.start_recording_with_target(target, cx),
+                    None => self.start_recording_full_screen(cx),
+                }
+            }
+            SelectionMode::Iphone => {
+                if self.iphone.is_some() || self.iphone_preview.is_some() {
+                    self.start_recording_iphone(cx);
+                } else {
+                    self.cancel_recording(cx);
+                }
+            }
+            SelectionMode::Area => match self.selection_drag.and_then(|(a, b)| area_rect(a, b)) {
+                Some([x, y, w, h]) => {
+                    let target = region_target(x, y, w, h, &self.selectable_windows);
+                    self.start_recording_with_target(target, cx);
+                }
+                None => self.cancel_recording(cx),
+            },
         }
     }
 
@@ -1407,6 +1480,29 @@ impl ScrawlCoordinator {
             return false;
         };
         let mods = keystroke.modifiers;
+        // Esc cancels even with ⌥⇧ still held from the switcher.
+        if keystroke.key == "escape" {
+            self.switcher.reset();
+            self.cancel_recording(cx);
+            return true;
+        }
+        // The shortcut itself, if it reaches a picker window instead of Carbon.
+        if let Some(cfg) = shortcut_from_key_and_mods(
+            &keystroke.key,
+            mods.platform,
+            mods.control,
+            mods.alt,
+            mods.shift,
+        ) && self.telemetry.matches_shortcut(
+            cfg.key_code as u16,
+            mods.platform,
+            mods.control,
+            mods.alt,
+            mods.shift,
+        ) {
+            self.telemetry.emit_capture_shortcut();
+            return true;
+        }
         if mods.platform || mods.control || mods.alt {
             return false;
         }
@@ -1616,11 +1712,18 @@ impl ScrawlCoordinator {
         cx.notify();
     }
 
+    /// The menu bar's picker, opening on the mode the last recording used.
     pub fn begin_target_selection(&mut self, cx: &mut Context<Self>) {
+        self.open_picker(None, cx);
+    }
+
+    /// Opens the picker; `hold` is the held switcher's opening mode (`crate::hold`).
+    fn open_picker(&mut self, hold: Option<SelectionMode>, cx: &mut Context<Self>) {
         if self.is_recording() || self.is_processing() {
             return;
         }
-        scrawl_log("begin_target_selection invoked");
+        scrawl_log(format!("open_picker invoked (hold: {hold:?})"));
+        self.hold_picker = hold.is_some();
         let started = Instant::now();
         self.recording_shortcut_key = false;
         self.selectable_windows.clear();
@@ -1697,13 +1800,13 @@ impl ScrawlCoordinator {
         }
         // Open on the mode the last recording used. The phone needs a live preview, started once
         // the picker is up; Window starts on Area's crosshair until the window list arrives.
-        let opening = match self.last_mode {
+        let opening = match hold.unwrap_or(self.last_mode) {
             SelectionMode::Iphone => SelectionMode::Area,
             mode => mode,
         };
         self.set_island_phase(IslandPhase::Selecting { mode: opening });
         self.open_iphone_when_found = false;
-        if self.last_mode == SelectionMode::Iphone {
+        if hold.is_none() && self.last_mode == SelectionMode::Iphone {
             if self.iphone.is_some() {
                 self.preview_iphone(cx);
             } else {
@@ -1765,7 +1868,9 @@ impl ScrawlCoordinator {
             quick && target.mode == CaptureMode::Display,
             std::sync::atomic::Ordering::Release,
         );
-        if let IslandPhase::Selecting { mode } = self.island_phase {
+        if let IslandPhase::Selecting { mode } = self.island_phase
+            && !self.hold_picker
+        {
             self.remember_mode(mode);
         }
         self.recording_shortcut_key = false;
@@ -2135,7 +2240,8 @@ impl Render for HudPillWindow {
 
         let clock = format_clock(elapsed_ms);
         let has_iphone = coord.iphone.is_some();
-        let target_width = island_content_width(window, target_phase, &clock, has_iphone);
+        let hold = coord.hold_picker;
+        let target_width = island_content_width(window, target_phase, &clock, has_iphone, hold);
         let snap_initial_width =
             phase_age < 0.025 && matches!(phase, IslandPhase::Selecting { .. }) && opacity < 0.35;
         self.coordinator.update(cx, |coord, _| {
@@ -2216,13 +2322,19 @@ impl Render for HudPillWindow {
 
         let capsule_content = match content_phase {
             IslandPhase::Selecting { mode } => row
-                .children(SelectionMode::available(has_iphone).iter().map(|&segment| {
-                    let c_segment = self.coordinator.clone();
-                    mode_segment(segment, segment == mode).on_click(move |_, _, cx| {
-                        c_segment.update(cx, |coord, cx| coord.click_selection_mode(segment, cx));
-                    })
-                }))
-                .when(mode.shows_record(), |row| {
+                .children(
+                    SelectionMode::available(has_iphone || hold)
+                        .iter()
+                        .map(|&segment| {
+                            let c_segment = self.coordinator.clone();
+                            mode_segment(segment, segment == mode).on_click(move |_, _, cx| {
+                                c_segment.update(cx, |coord, cx| {
+                                    coord.click_selection_mode(segment, cx)
+                                });
+                            })
+                        }),
+                )
+                .when(mode.shows_record() && !hold, |row| {
                     row.child(
                         primary_chip("sel-record", "Record").on_click(move |_, _, cx| {
                             c_record.update(cx, |coord, cx| coord.record_selected_mode(cx));
@@ -2655,6 +2767,10 @@ impl Render for TargetPickerWindow {
             .and_then(PhoneSession::device)
             .or_else(|| coord.iphone.clone())
             .map_or_else(|| "iPhone".to_string(), |d| d.name);
+        let hold = coord.hold_picker;
+        let shortcut = coord.shortcut_label();
+        let (hold_mods, hold_key) = crate::capture::shortcut_parts(&shortcut);
+        let no_phone = hold && iphone_rect.is_none() && coord.iphone.is_none();
 
         // Selection rect in window-local coordinates, clipped to the screen, plus its badge.
         let highlight: Option<([f32; 4], String)> = match mode {
@@ -2686,14 +2802,29 @@ impl Render for TargetPickerWindow {
                 ]);
                 ([rx - origin[0], ry - origin[1], rw, rh], title)
             }),
+            SelectionMode::Screen if hold => Some((
+                [0.0, 0.0, screen[0], screen[1]],
+                format!(
+                    "Full screen · {hold_key} to switch · drag for an area · release {hold_mods} to record"
+                ),
+            )),
             SelectionMode::Screen => Some((
                 [0.0, 0.0, screen[0], screen[1]],
                 "Full screen · Click to record".to_string(),
             )),
+            SelectionMode::Iphone if no_phone => Some((
+                [0.0, 0.0, screen[0], screen[1]],
+                "No iPhone connected".to_string(),
+            )),
             SelectionMode::Iphone => iphone_rect.map(|[rx, ry, rw, rh]| {
+                let action = if hold {
+                    format!("release {hold_mods} to record")
+                } else {
+                    "Click to record".to_string()
+                };
                 (
                     [rx - origin[0], ry - origin[1], rw, rh],
-                    format!("{iphone_name} · Click to record"),
+                    format!("{iphone_name} · {action}"),
                 )
             }),
         }
@@ -2710,6 +2841,7 @@ impl Render for TargetPickerWindow {
                 measure_text(window, &measured_label, BADGE_TEXT, FontWeight::MEDIUM).min(max_text);
             let size = [text_w + 2.0 * BADGE_PX + 2.0, BADGE_H];
             let anchor = match mode {
+                SelectionMode::Iphone if no_phone => BadgeAnchor::Center,
                 SelectionMode::Area | SelectionMode::Iphone => BadgeAnchor::BelowTrailing,
                 SelectionMode::Window | SelectionMode::Screen => BadgeAnchor::Center,
             };
@@ -2788,6 +2920,15 @@ impl Render for TargetPickerWindow {
                         IslandPhase::Selecting { mode } => mode,
                         _ => return,
                     };
+                    // The held switcher: a drag selects an area; releasing ⌥⇧ records.
+                    if coord.hold_picker {
+                        coord.selection_drag = Some(([sx, sy], [sx, sy]));
+                        if cur_mode == SelectionMode::Area {
+                            coord.sync_picker_overlay();
+                            cx.notify();
+                        }
+                        return;
+                    }
                     match cur_mode {
                         SelectionMode::Area => {
                             coord.selection_drag = Some(([sx, sy], [sx, sy]));
@@ -2834,12 +2975,29 @@ impl Render for TargetPickerWindow {
         .on_mouse_move(move |event: &MouseMoveEvent, _window, cx| {
             let [sx, sy] = current_mouse_screen()
                 .unwrap_or([f32::from(event.position.x), f32::from(event.position.y)]);
+            let dragging = event.pressed_button == Some(MouseButton::Left);
             c_move.update(cx, |coord, cx| {
                 coord.selection_pointer = Some([sx, sy]);
                 let cur_mode = match coord.island_phase {
                     IslandPhase::Selecting { mode } => mode,
                     _ => return,
                 };
+                if coord.hold_picker
+                    && dragging
+                    && let Some((start, _)) = coord.selection_drag
+                {
+                    let moved = (sx - start[0]).hypot(sy - start[1]) >= 6.0;
+                    if cur_mode != SelectionMode::Area && moved {
+                        let action = coord.switcher.drag();
+                        coord.apply_switcher(action, cx);
+                    }
+                    if coord.selection_mode() == Some(SelectionMode::Area) {
+                        coord.selection_drag = Some((start, [sx, sy]));
+                        coord.sync_picker_overlay();
+                        cx.notify();
+                    }
+                    return;
+                }
                 match cur_mode {
                     SelectionMode::Area => {
                         if let Some((start, _)) = coord.selection_drag {
@@ -2881,6 +3039,19 @@ impl Render for TargetPickerWindow {
                 let [sx, sy] = current_mouse_screen()
                     .unwrap_or([f32::from(event.position.x), f32::from(event.position.y)]);
                 c_up.update(cx, |coord, cx| {
+                    // The held switcher keeps the area until ⌥⇧ is released.
+                    if coord.hold_picker {
+                        if coord.selection_mode() == Some(SelectionMode::Area)
+                            && let Some((start, _)) = coord.selection_drag
+                        {
+                            coord.selection_drag = Some((start, [sx, sy]));
+                        } else {
+                            coord.selection_drag = None;
+                        }
+                        coord.sync_picker_overlay();
+                        cx.notify();
+                        return;
+                    }
                     if let Some((start, _)) = coord.selection_drag.take() {
                         let x = f64::from(start[0].min(sx));
                         let y = f64::from(start[1].min(sy));
@@ -2912,6 +3083,13 @@ enum BadgeAnchor {
     BelowTrailing,
     /// Centered over the target (Window hover).
     Center,
+}
+
+/// A dragged area in global points, if it's big enough to record (as in the Area picker).
+fn area_rect(a: [f32; 2], b: [f32; 2]) -> Option<[f64; 4]> {
+    let w = f64::from((a[0] - b[0]).abs());
+    let h = f64::from((a[1] - b[1]).abs());
+    (w >= 36.0 && h >= 36.0).then(|| [f64::from(a[0].min(b[0])), f64::from(a[1].min(b[1])), w, h])
 }
 
 fn clip_rect([x, y, w, h]: [f32; 4], [sw, sh]: [f32; 2]) -> [f32; 4] {
@@ -3026,9 +3204,7 @@ impl Render for BundleReviewWindow {
                         .child(
                             hint_button("empty-record", "Record", Some(shortcut_label), true)
                                 .on_click(move |_, _, cx| {
-                                    c_start.update(cx, |coord, cx| {
-                                        coord.handle_shortcut(ShortcutChord::Record, cx);
-                                    });
+                                    c_start.update(cx, |coord, cx| coord.record_or_finish(cx));
                                 }),
                         )
                         .child(
@@ -3103,14 +3279,14 @@ impl Render for BundleReviewWindow {
                         mods.control,
                         mods.alt,
                         mods.shift,
-                    ) && let Some(chord) = coord.telemetry.matches_shortcut(
+                    ) && coord.telemetry.matches_shortcut(
                         cfg.key_code as u16,
                         mods.platform,
                         mods.control,
                         mods.alt,
                         mods.shift,
                     ) {
-                        coord.telemetry.emit_capture_shortcut(chord);
+                        coord.telemetry.emit_capture_shortcut();
                         return true;
                     }
                     false
@@ -3935,9 +4111,7 @@ pub fn run_app(
         }
         if start_recording_immediately {
             let coord_clone = coordinator.clone();
-            coord_clone.update(cx, |coord, cx| {
-                coord.handle_shortcut(ShortcutChord::Record, cx);
-            });
+            coord_clone.update(cx, |coord, cx| coord.record_or_finish(cx));
         }
         if start_iphone_immediately {
             coordinator.update(cx, |coord, cx| coord.start_recording_iphone(cx));
@@ -3993,9 +4167,7 @@ pub fn run_app(
                         while let Ok(action) = rx.try_recv() {
                             match action {
                                 MenuAction::ToggleCapture => {
-                                    loop_coord.update(cx, |coord, cx| {
-                                        coord.handle_shortcut(ShortcutChord::Record, cx);
-                                    });
+                                    loop_coord.update(cx, |coord, cx| coord.record_or_finish(cx));
                                 }
                                 MenuAction::ChooseTarget => {
                                     loop_coord.update(cx, |coord, cx| {
@@ -4071,9 +4243,7 @@ pub fn run_app(
                     let mut should_open_pill = false;
                     while let Ok(ev) = ui_receiver.try_recv() {
                         loop_coord.update(cx, |coord, cx| match ev {
-                            LiveOverlayEvent::CaptureShortcut(chord) => {
-                                coord.handle_shortcut(chord, cx);
-                            }
+                            LiveOverlayEvent::CaptureShortcut => coord.press_shortcut(cx),
                             LiveOverlayEvent::PasteLatestShortcut => {
                                 if !coord.is_recording() && !coord.is_selecting() {
                                     coord.paste_latest(cx);
@@ -4115,6 +4285,9 @@ pub fn run_app(
                         ensure_hud_pill_open(&loop_coord, cx);
                     }
 
+                    if loop_coord.read(cx).switcher.is_held() {
+                        loop_coord.update(cx, |coord, cx| coord.tick_switcher(cx));
+                    }
                     if loop_coord.read(cx).is_island_visible() {
                         record_external_frontmost_app();
                         loop_coord.update(cx, |coord, cx| coord.step_island(dt, cx));
@@ -4273,65 +4446,12 @@ mod tests {
     }
 
     #[test]
-    fn the_shortcut_records_at_once_and_the_picker_moves_to_cmd() {
-        use ShortcutAction::*;
-        use ShortcutChord::{Picker, Record};
-        let idle = CaptureState::Idle { mirror: false };
-        // Idle: ⌥⇧S records the screen, ⌥⇧⌘S opens the picker.
-        assert_eq!(route_shortcut(Record, idle), RecordScreen);
-        assert_eq!(route_shortcut(Picker, idle), OpenPicker);
-        // The iPhone mirror is up: ⌥⇧S records the phone.
-        let mirror = CaptureState::Idle { mirror: true };
-        assert_eq!(route_shortcut(Record, mirror), RecordIphone);
-        assert_eq!(route_shortcut(Picker, mirror), OpenPicker);
-        // In the picker: ⌥⇧S records what it is on, ⌥⇧⌘S closes it.
-        for mode in [
-            SelectionMode::Area,
-            SelectionMode::Window,
-            SelectionMode::Screen,
-            SelectionMode::Iphone,
-        ] {
-            assert_eq!(
-                route_shortcut(Record, CaptureState::Selecting(mode)),
-                RecordSelected
-            );
-            assert_eq!(
-                route_shortcut(Picker, CaptureState::Selecting(mode)),
-                ClosePicker
-            );
-        }
-        // Recording: either chord finishes.
-        let recording = CaptureState::Recording { elapsed_ms: 5_000 };
-        assert_eq!(route_shortcut(Record, recording), Finish);
-        assert_eq!(route_shortcut(Picker, recording), Finish);
-        // Still writing the last bundle: nothing.
-        assert_eq!(route_shortcut(Record, CaptureState::Processing), Ignore);
-        assert_eq!(route_shortcut(Picker, CaptureState::Processing), Ignore);
-    }
-
-    #[test]
-    fn a_double_press_does_not_finish_the_capture_it_just_started() {
-        let at = |elapsed_ms| CaptureState::Recording { elapsed_ms };
+    fn a_held_drag_needs_room_for_an_area() {
         assert_eq!(
-            route_shortcut(ShortcutChord::Record, at(0)),
-            ShortcutAction::Ignore
+            area_rect([100.0, 80.0], [40.0, 20.0]),
+            Some([40.0, 20.0, 60.0, 60.0])
         );
-        assert_eq!(
-            route_shortcut(ShortcutChord::Record, at(250)),
-            ShortcutAction::Ignore
-        );
-        assert_eq!(
-            route_shortcut(ShortcutChord::Record, at(399)),
-            ShortcutAction::Ignore
-        );
-        assert_eq!(
-            route_shortcut(ShortcutChord::Picker, at(150)),
-            ShortcutAction::Ignore
-        );
-        assert_eq!(
-            route_shortcut(ShortcutChord::Record, at(400)),
-            ShortcutAction::Finish
-        );
+        assert_eq!(area_rect([0.0, 0.0], [30.0, 200.0]), None);
     }
 
     #[test]
