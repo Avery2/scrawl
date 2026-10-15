@@ -1,4 +1,5 @@
 import { type ComponentType, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
+import { flushSync } from "react-dom"
 import { MacWindow, PhoneMirror } from "./apps"
 import type { StageGpuOverlay as StageGpuOverlayType } from "./gpu-fx"
 import { INK_SHADOW, InkPath, inkPath } from "./ink"
@@ -59,6 +60,25 @@ function createLensDataUrl(): string | null {
 
 const LENS_DATA_URL = createLensDataUrl()
 
+declare global {
+  interface Window {
+    __scrawlDemo?: {
+      ready: () => boolean
+      t: () => number
+      seek: (ms: number) => void
+      mode: (m: Mode) => void
+      play: () => void
+    }
+  }
+}
+
+// `?timescale=0.25` plays the timeline in slow motion (narration off) to judge motion by eye.
+const TIMESCALE = (() => {
+  if (typeof window === "undefined") return 1
+  const v = Number(new URLSearchParams(window.location.search).get("timescale"))
+  return v > 0 && v <= 4 ? v : 1
+})()
+
 function initialScale() {
   if (typeof window === "undefined") return 1
   const pad = window.innerWidth <= 760 ? 20 : 40
@@ -88,6 +108,7 @@ function usePlayback(duration: number, stepClock: (prevT: number, dt: number) =>
     const tick = (now: number) => {
       const dt = document.hidden ? 0 : Math.min(200, Math.max(0, now - last))
       last = now
+      if (TIMESCALE !== 1) for (const a of document.getAnimations()) a.playbackRate = TIMESCALE
       const next = Math.min(duration, stepRef.current(tRef.current, dt))
       tRef.current = next
       setT(next)
@@ -148,7 +169,8 @@ export function Demo() {
 
   const stepClock = useCallback(
     (prevT: number, dt: number) => {
-      const candidate = prevT + dt
+      const candidate = prevT + dt * TIMESCALE
+      if (TIMESCALE !== 1) return candidate
       const master = sfx.syncNarration(mode, candidate, true, sound)
       return master !== null ? master : candidate
     },
@@ -163,6 +185,7 @@ export function Demo() {
   )
 
   const { t, tRef, playing, seek, play, pause } = usePlayback(T.end, stepClock, onSync)
+  const scriptRef = useRef<ReturnType<typeof buildScript> | null>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
   const badgeRef = useRef<HTMLSpanElement>(null)
@@ -293,6 +316,30 @@ export function Demo() {
   }, [])
 
   const script = useMemo(() => (anchors ? buildScript(mode, anchors) : null), [anchors, mode])
+  scriptRef.current = script
+
+  // Test hook for motion captures: seek the timeline to any ms and render it synchronously, so a
+  // capture can step at a fixed 60 fps of demo time regardless of the browser's frame rate.
+  useEffect(() => {
+    window.__scrawlDemo = {
+      ready: () => !!scriptRef.current,
+      t: () => tRef.current,
+      seek: (ms: number) => {
+        flushSync(() => {
+          setStarted(true)
+          pause()
+          seek(ms)
+        })
+      },
+      mode: (next: Mode) => flushSync(() => setMode(next)),
+      play: () => {
+        setStarted(true)
+        setSound(false)
+        sfx.setEnabled(false)
+        play()
+      },
+    }
+  }, [pause, play, seek, tRef])
 
   const switchMode = (next: Mode) => {
     if (next === mode) return
