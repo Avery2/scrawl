@@ -382,26 +382,73 @@ export function Keys({ t, mode }: { t: number; mode: Mode }) {
 }
 
 // The spoken words follow the pen: each clause's pill sits beside the mark it describes.
+// Both clauses occupy the same CSS grid cell so the pill size stays constant and never reflows.
 export function Caption({ t, script }: { t: number; script: Script }) {
   const { words: all, clause2 } = script.narration
   const first = all[0][1]
   if (t < first - 300 || t > T.finish + 400) return null
   const swap = all[clause2][1] - 60
-  const second = t >= swap
-  const words = second ? all.slice(clause2) : all.slice(0, clause2)
-  // Dip opacity cleanly to 0 across `swap` so the text/box-height change between clauses never snaps visibly.
-  const clauseFade = second ? easeOut(progress(t, swap, swap + 180)) : 1 - easeOut(progress(t, swap - 160, swap))
-  const opacity = Math.min(progress(t, first - 300, first), 1 - progress(t, T.finish, T.finish + 400), clauseFade)
+  const c1Words = all.slice(0, clause2)
+  const c2Words = all.slice(clause2)
+
+  const envIn = easeOut(progress(t, first - 280, first - 20))
+  const envOut = 1 - progress(t, T.finish, T.finish + 380)
+  const opacity = Math.min(envIn, envOut)
   if (opacity <= 0.005) return null
-  const pos = second ? script.speech[1] : script.speech[0]
-  const liftY = second ? (1 - easeOut(progress(t, swap, swap + 220))) * 6 : -easeOut(progress(t, swap - 160, swap)) * 4
-  const now = words.findIndex(([, at, end]) => t >= at && t < end + 120)
-  const talking = now >= 0
+
+  const glideProg = progress(t, swap - 220, swap + 260)
+  const glide = glideProg < 0.5 ? 4 * glideProg * glideProg * glideProg : 1 - Math.pow(-2 * glideProg + 2, 3) / 2
+  const [a, b] = script.speech
+  const x = a[0] + (b[0] - a[0]) * glide
+  const y = a[1] + (b[1] - a[1]) * glide + (1 - envIn) * 5
+
+  const c1Out = easeOut(progress(t, swap - 170, swap + 50))
+  const c2In = easeOut(progress(t, swap - 40, swap + 200))
+  const talking = all.some(([, at, end]) => t >= at - 20 && t < end + 140)
+
+  const renderWord = ([w, at, end]: [string, number, number], i: number) => {
+    const dt = t - (at - 35)
+    const text = w.replace("—", "\u2060—\u2060")
+    if (dt <= 0) {
+      return (
+        <span key={i} className="w-slot">
+          <span className="w pending">{text}</span>{" "}
+        </span>
+      )
+    }
+    const appear = easeOut(Math.min(1, dt / 230))
+    const active = t >= at - 20 && t < end + 160
+    const spokenSpan = Math.max(120, end - at + 180)
+    const glow = active ? Math.sin(Math.min(1, Math.max(0, (t - (at - 20)) / spokenSpan)) * Math.PI) : 0
+    const lead = dt < 260 ? Math.sin((dt / 260) * Math.PI) : 0
+    const lum = Math.max(glow, lead)
+    const rise = (1 - appear) * 4.5
+    const blur = appear < 0.98 ? (1 - appear) * 3.5 : 0
+    return (
+      <span key={i} className="w-slot">
+        <span
+          className={active ? "w now" : "w said"}
+          style={{
+            opacity: appear,
+            transform: rise > 0.05 ? `translate3d(0, ${rise.toFixed(2)}px, 0)` : undefined,
+            filter: blur > 0.08 ? `blur(${blur.toFixed(2)}px)` : undefined,
+            textShadow:
+              lum > 0.04
+                ? `0 0 ${(10 * lum).toFixed(1)}px rgba(255, 255, 255, ${(0.65 * lum).toFixed(2)}), 0 0 ${(18 * lum).toFixed(1)}px rgba(255, 110, 90, ${(0.32 * lum).toFixed(2)})`
+                : undefined,
+          }}
+        >
+          {text}
+        </span>{" "}
+      </span>
+    )
+  }
+
   return (
     <div
       className="caption"
       style={{
-        transform: `translate3d(${pos[0].toFixed(2)}px, ${(pos[1] + liftY).toFixed(2)}px, 0) translate(-100%, -50%)`,
+        transform: `translate3d(${x.toFixed(2)}px, ${y.toFixed(2)}px, 0) translate(-100%, -50%)`,
         opacity,
       }}
     >
@@ -411,13 +458,30 @@ export function Caption({ t, script }: { t: number; script: Script }) {
           return <i key={i} style={{ transform: `scaleY(${amp})` }} />
         })}
       </span>
-      <p>
-        {words.map(([w, at], i) => (
-          <span key={i} className={at > t ? "w pending" : i === now ? "w now" : "w said"}>
-            {w.replace("—", "\u2060—\u2060")}{" "}
-          </span>
-        ))}
-      </p>
+      <div className="caption-clauses">
+        <p
+          className="caption-clause"
+          style={{
+            opacity: 1 - c1Out,
+            transform: c1Out > 0.005 ? `translate3d(0, ${(-6 * c1Out).toFixed(2)}px, 0)` : undefined,
+            filter: c1Out > 0.02 && c1Out < 0.99 ? `blur(${(3 * c1Out).toFixed(2)}px)` : undefined,
+          }}
+          aria-hidden={c1Out >= 0.99}
+        >
+          {c1Words.map(renderWord)}
+        </p>
+        <p
+          className="caption-clause"
+          style={{
+            opacity: c2In,
+            transform: c2In < 0.995 ? `translate3d(0, ${(6 * (1 - c2In)).toFixed(2)}px, 0)` : undefined,
+            filter: c2In > 0.01 && c2In < 0.98 ? `blur(${(3 * (1 - c2In)).toFixed(2)}px)` : undefined,
+          }}
+          aria-hidden={c2In <= 0.01}
+        >
+          {c2Words.map(renderWord)}
+        </p>
+      </div>
     </div>
   )
 }
@@ -472,11 +536,13 @@ export const ContactSheet = memo(function ContactSheet({
   script,
   width,
   height,
+  develop,
 }: {
   mode: Mode
   script: Script
   width: number
   height?: number
+  develop?: boolean
 }) {
   const area = captureArea(mode)
   const portrait = area.h > area.w
@@ -489,9 +555,12 @@ export const ContactSheet = memo(function ContactSheet({
   const k = Math.min(width / w0, (height ?? Infinity) / h0)
   return (
     <div className="sheet" style={{ width: w0 * k, height: h0 * k, padding: 16 * k, gap: 14 * k, borderRadius: Math.max(2, 6 * k) }}>
-      {script.frames.map((f) => (
+      {script.frames.map((f, idx) => (
         <div key={f.n} className="sheet-frame" style={{ width: cell * k, height: fh0 * k }}>
-          <div className="sheet-card" style={{ width: fw0 * k, height: fh0 * k, borderRadius: 10 * k }}>
+          <div
+            className={`sheet-card${develop ? " develop" : ""}`}
+            style={{ width: fw0 * k, height: fh0 * k, borderRadius: 10 * k, animationDelay: develop ? `${idx * 85}ms` : undefined }}
+          >
             <KeyframeScene mode={mode} script={script} frame={f} scale={(fw0 * k) / area.w} />
             <FrameBadge n={f.n} k={k} />
           </div>

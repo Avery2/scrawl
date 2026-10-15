@@ -90,10 +90,11 @@ function SummaryView() {
   return (
     <div className="md">
       {summaryText("mac").map((line, i) => {
+        const delayStyle = { animationDelay: `${i * 65}ms` }
         const head = line.match(/^\[scrawl (\S+) · (.+) · (.+)\]$/)
         if (head)
           return (
-            <div key={i} className="md-head">
+            <div key={i} className="md-head md-line-reveal" style={delayStyle}>
               <span className="md-dim">[</span>
               <span className="md-key">scrawl</span> <span className="md-num">{head[1]}</span>
               <span className="md-dim"> · </span>
@@ -106,14 +107,18 @@ function SummaryView() {
         const item = line.match(/^- #(\d+) \((\S+)\) (.*)$/)
         if (item)
           return (
-            <div key={i} className="md-item">
+            <div key={i} className="md-item md-line-reveal" style={delayStyle}>
               <span className="md-dim">-</span>
               <span>
                 <span className="md-pin">#{item[1]}</span> <span className="md-num">({item[2]})</span> <span className="md-quote">{item[3]}</span>
               </span>
             </div>
           )
-        return <div key={i}>{line}</div>
+        return (
+          <div key={i} className="md-line-reveal" style={delayStyle}>
+            {line}
+          </div>
+        )
       })}
     </div>
   )
@@ -294,7 +299,7 @@ function AudioView({ script }: { script: Script }) {
       </div>
       <p className="audio-words">
         {words.map((w, i) => (
-          <span key={i}>
+          <span key={i} className="audio-word-chip" style={{ animationDelay: `${i * 18}ms` }}>
             <em>{(w.t0 / 1000).toFixed(1)}</em>
             {w.text}
           </span>
@@ -326,7 +331,7 @@ export function BundleExplorer() {
 
   let preview: ReactNode = null
   if (script && width > 0) {
-    if (selected === "sheet") preview = <ContactSheet mode="mac" script={script} width={width} height={height - 20} />
+    if (selected === "sheet") preview = <ContactSheet mode="mac" script={script} width={width} height={height - 20} develop />
     else if (selected === "summary") preview = <SummaryView />
     else if (selected === "json" && json) preview = <JsonView value={json} />
     else if (selected === "frame1") preview = <Frame script={script} n={1} width={width} height={height} />

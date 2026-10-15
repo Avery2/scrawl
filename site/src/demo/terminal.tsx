@@ -71,10 +71,32 @@ const Braille = memo(function Braille({ frame }: { frame: number }) {
   return <span className="tbraille">{BRAILLE[frame % BRAILLE.length]}</span>
 })
 
+// Realistic token-burst stream for the agent's final summary (starts at t = 20180, finishes before T.done = 21400).
+const STREAM_START = T.fix[0] + 180
+const STREAM_TOKENS: { text: string; code?: boolean; dt: number }[] = [
+  { text: "The ", dt: 0 },
+  { text: "Live", code: true, dt: 55 },
+  { text: " badge", dt: 110 },
+  { text: " now sits", dt: 175 },
+  { text: " in the", dt: 225 },
+  { text: " title row's", dt: 295 },
+  { text: " flex flow,", dt: 365 },
+  { text: " rows", dt: 455 },
+  { text: " are back", dt: 510 },
+  { text: " to ", dt: 555 },
+  { text: "py-2.5", code: true, dt: 615 },
+  { text: ",", dt: 660 },
+  { text: " and the", dt: 730 },
+  { text: " action row", dt: 795 },
+  { text: " lost its", dt: 865 },
+  { text: " stray ", dt: 920 },
+  { text: "14px", dt: 980 },
+  { text: " top padding.", dt: 1050 },
+]
+
 function Prompt({
   mode,
-  image,
-  text,
+  pasteStage,
   submitted,
   done,
   focused,
@@ -82,24 +104,33 @@ function Prompt({
   spinFrame,
 }: {
   mode: Mode
-  image: boolean
-  text: boolean
+  pasteStage: number
   submitted: boolean
   done: boolean
   focused: boolean
   running: boolean
   spinFrame: number
 }) {
+  const lines = pasteStage >= 2 ? summaryText(mode, true) : null
   return (
     <div className="tp">
       <div className="tp-box">
         <span className="tp-bar" />
         <div className="tp-inner">
           <div className="tp-text">
-            {image ? (
+            {pasteStage >= 1 ? (
               <>
-                <span className="tx-paste">[Image 1]</span>{" "}
-                {text && summaryText(mode, true).join("\n")}
+                <span className="tx-paste enter-pop">[Image 1]</span>{" "}
+                {lines &&
+                  lines.map((line, idx) => {
+                    const show = pasteStage >= idx + 2
+                    return (
+                      <span key={idx} className={`tp-paste-line${show ? " on" : ""}`}>
+                        {idx > 0 ? "\n" : ""}
+                        {line}
+                      </span>
+                    )
+                  })}
                 <Cursor focused={focused} />
               </>
             ) : (
@@ -180,11 +211,15 @@ const DIFF: [number, " " | "-" | "+", Tok[]][] = (
   ] as const
 ).map(([n, sign, code]) => [n, sign, tsx(code)])
 
-const Diff = memo(function Diff() {
+const Diff = memo(function Diff({ applied }: { applied: boolean }) {
   return (
-    <div className="tdiff">
+    <div className={`tdiff${applied ? " applied" : ""}`}>
       {DIFF.map(([n, sign, tokens], i) => (
-        <div key={i} className={`td-line${sign === "+" ? " add" : sign === "-" ? " del" : ""}`}>
+        <div
+          key={i}
+          className={`td-line${sign === "+" ? " add" : sign === "-" ? " del" : ""}`}
+          style={{ animationDelay: `${i * 34}ms` }}
+        >
           <span className="td-num">{n}</span>
           <span className="td-sign">{sign === " " ? " " : sign}</span>
           <span className="td-code">
@@ -204,14 +239,65 @@ const Diff = memo(function Diff() {
   )
 })
 
+function StreamedResponse({ streamElapsed, done }: { streamElapsed: number; done: boolean }) {
+  // Find the index of the first pending token so the zero-width streaming caret sits right at the leading edge.
+  let firstPending = STREAM_TOKENS.length
+  for (let i = 0; i < STREAM_TOKENS.length; i++) {
+    if (streamElapsed < STREAM_TOKENS[i].dt) {
+      firstPending = i
+      break
+    }
+  }
+  const showCaret = !done && streamElapsed >= 0
+
+  return (
+    <div className="ta-text enter">
+      {STREAM_TOKENS.map((tok, i) => {
+        const age = streamElapsed - tok.dt
+        const visible = done || age >= 0
+        const freshCls =
+          !done && visible
+            ? age < 70
+              ? " fresh-3"
+              : age < 145
+                ? " fresh-2"
+                : age < 230
+                  ? " fresh-1"
+                  : ""
+            : ""
+        const inner = tok.code ? <span className="tx-code">{tok.text}</span> : tok.text
+        return (
+          <span key={i} className="tok-slot">
+            {showCaret && i === firstPending && (
+              <span className="tstream-cur-wrap" aria-hidden>
+                <i className="tstream-cur" />
+              </span>
+            )}
+            <span className={`tok${visible ? "" : " pending"}${freshCls}`}>{inner}</span>
+          </span>
+        )
+      })}
+      {showCaret && firstPending === STREAM_TOKENS.length && (
+        <span className="tstream-cur-wrap" aria-hidden>
+          <i className="tstream-cur" />
+        </span>
+      )}
+    </div>
+  )
+}
+
 function Session({
   step,
+  diffApplied,
+  streamElapsed,
   brailleFrame,
   mode,
   script,
   children,
 }: {
   step: number
+  diffApplied: boolean
+  streamElapsed: number
   brailleFrame: number
   mode: Mode
   script: Script
@@ -221,6 +307,8 @@ function Session({
   const viewRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
   const [offset, setOffset] = useState(0)
+  const hasStream = streamElapsed >= 0
+  const done = step >= 4
 
   // Sticky-bottom scrollbox: content starts at the top and scrolls once it overflows.
   useLayoutEffect(() => {
@@ -228,17 +316,17 @@ function Session({
     const content = contentRef.current
     if (!view || !content) return
     setOffset(Math.min(0, view.clientHeight - content.scrollHeight))
-  }, [step])
+  }, [step, hasStream, done])
 
   return (
     <div className="tui-session">
       <div ref={viewRef} className="ts-view">
         <div ref={contentRef} className="ts-content" style={{ transform: `translate3d(0, ${offset}px, 0)` }}>
-          <div className="tu-msg">
+          <div className="tu-msg enter">
             <span className="tu-bar" />
             <div className="tu-inner">
               <div className="tu-images">
-                <ContactSheet mode={mode} script={script} width={300} height={8 * 15} />
+                <ContactSheet mode={mode} script={script} width={300} height={8 * 15} develop />
               </div>
               <div className="tu-text">
                 <div className="tu-body">{`[Image 1] ${summary.join("\n")}`}</div>
@@ -265,24 +353,19 @@ function Session({
                       Preparing edit…
                     </>
                   ) : (
-                    <>← Edit src/components/HeaderCard.tsx</>
+                    <span className="tt-edit-done">← Edit src/components/HeaderCard.tsx</span>
                   )}
                 </div>
-                {step >= 3 && <Diff />}
+                {step >= 3 && <Diff applied={diffApplied} />}
               </div>
             </div>
           )}
-          {step >= 4 && (
-            <>
-              <div className="ta-text enter">
-                The <span className="tx-code">Live</span> badge now sits in the title row's flex flow, rows are back to{" "}
-                <span className="tx-code">py-2.5</span>, and the action row lost its stray 14px top padding.
-              </div>
-              <div className="ta-foot enter">
-                <span className="tx-build">Build</span>
-                <span className="tx-mute"> · Claude Opus 4.6 · 4.1s</span>
-              </div>
-            </>
+          {(hasStream || done) && <StreamedResponse streamElapsed={streamElapsed} done={done} />}
+          {done && (
+            <div className="ta-foot enter">
+              <span className="tx-build">Build</span>
+              <span className="tx-mute"> · Claude Opus 4.6 · 4.1s</span>
+            </div>
           )}
         </div>
       </div>
@@ -312,20 +395,22 @@ function Home({ children }: { children: ReactNode }) {
 
 const TerminalInner = memo(function TerminalInner({
   active,
-  image,
-  text,
+  pasteStage,
   submitted,
   step,
+  diffApplied,
+  streamElapsed,
   spinFrame,
   brailleFrame,
   mode,
   script,
 }: {
   active: boolean
-  image: boolean
-  text: boolean
+  pasteStage: number
   submitted: boolean
   step: number
+  diffApplied: boolean
+  streamElapsed: number
   spinFrame: number
   brailleFrame: number
   mode: Mode
@@ -337,8 +422,7 @@ const TerminalInner = memo(function TerminalInner({
   const prompt = (
     <Prompt
       mode={mode}
-      image={image}
-      text={text}
+      pasteStage={pasteStage}
       submitted={submitted}
       done={done}
       focused={active && !running}
@@ -354,7 +438,14 @@ const TerminalInner = memo(function TerminalInner({
       </div>
       <div className="tui">
         {submitted ? (
-          <Session step={step} brailleFrame={brailleFrame} mode={mode} script={script}>
+          <Session
+            step={step}
+            diffApplied={diffApplied}
+            streamElapsed={streamElapsed}
+            brailleFrame={brailleFrame}
+            mode={mode}
+            script={script}
+          >
             {prompt}
           </Session>
         ) : (
@@ -369,18 +460,29 @@ export function Terminal({ t, mode, script }: { t: number; mode: Mode; script: S
   const active = terminalActive(t)
   const submitted = t >= T.submit
   const step = t >= T.done ? 4 : t >= T.diff ? 3 : t >= T.edit ? 2 : t >= T.read ? 1 : 0
+  const diffApplied = t >= T.fix[0]
+  const streamElapsed = t >= T.done ? 1200 : t >= STREAM_START ? Math.floor((t - STREAM_START) / 30) * 30 : -1
   const running = submitted && step < 4
-  const image = t >= T.paste && t < T.submit
-  const text = t >= T.paste + 160 && t < T.submit
+  const pasteStage =
+    t >= T.submit || t < T.paste
+      ? 0
+      : t < T.paste + 90
+        ? 1
+        : t < T.paste + 160
+          ? 2
+          : t < T.paste + 230
+            ? 3
+            : 4
   const spinFrame = running ? Math.floor(t / 40) % 54 : 0
   const brailleFrame = step === 2 ? Math.floor(t / 80) % BRAILLE.length : 0
   return (
     <TerminalInner
       active={active}
-      image={image}
-      text={text}
+      pasteStage={pasteStage}
       submitted={submitted}
       step={step}
+      diffApplied={diffApplied}
+      streamElapsed={streamElapsed}
       spinFrame={spinFrame}
       brailleFrame={brailleFrame}
       mode={mode}
