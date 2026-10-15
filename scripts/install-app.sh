@@ -71,7 +71,7 @@ cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
   <key>NSSpeechRecognitionUsageDescription</key>
   <string>Scrawl transcribes your narration on this Mac.</string>
   <key>SUEnableAutomaticChecks</key>
-  <true/>
+  <false/>
   <key>SUAutomaticallyUpdate</key>
   <false/>
   <key>SUAllowsAutomaticUpdates</key>
