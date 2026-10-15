@@ -21,7 +21,8 @@ const pct = (xs: number[], p: number) => {
 const all: number[] = []
 const longTasks: number[] = []
 for (let r = 0; r < runs; r++) {
-  const browser = await (browserName === "webkit" ? webkit : chromium).launch()
+  const exe = process.env.PW_WEBKIT && browserName === "webkit" ? { executablePath: process.env.PW_WEBKIT } : {}
+  const browser = await (browserName === "webkit" ? webkit : chromium).launch(exe)
   const ctx = await browser.newContext({ viewport, deviceScaleFactor: size === "iphone" ? 3 : 2, isMobile: size === "iphone", hasTouch: size === "iphone" })
   const page = await ctx.newPage()
   await page.goto(`${url}${url.includes("?") ? "&" : "?"}${query}`, { waitUntil: "networkidle" })
