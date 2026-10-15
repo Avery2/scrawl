@@ -553,7 +553,7 @@
         if failure == .unauthorized { pairingRevoked = true }
         guard shownEntry == id || (isActive && !isRecording && !isStarting && uploadStatus == .idle && !isDiscardPending) else { return }
         shownEntry = nil
-        Task { await presentFailure(failure == .unauthorized ? .linkExpired : .tooLarge, entry: id) }
+        Task { await presentFailure(ScrawlStrip.Failure(failure), entry: id) }
       }
     }
 
@@ -1093,7 +1093,7 @@
       // The outbox holds the only copy from here on.
       Self.delete(finished)
       if let failure = entry.failure {
-        await presentFailure(failure == .unauthorized ? .linkExpired : .tooLarge, entry: entry.id)
+        await presentFailure(ScrawlStrip.Failure(failure), entry: entry.id)
         return
       }
       shownEntry = entry.id

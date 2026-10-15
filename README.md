@@ -179,8 +179,9 @@ any configured URL is `https`, recordings go through a durable outbox instead of
   (`dev.kitlangton.scrawl.outbox.<bundle ID>`), so they survive the app being suspended or killed
   and never load the movie into memory. The session is recreated whenever the app is configured, and
   it picks up uploads still in flight from an earlier launch.
-- **Retries.** A 401 or 403 (the link was revoked) and a 413 (too large) are permanent: the entry
-  stays on disk, marked failed. Anything else (offline, timeouts, 5xx, other statuses) is retried
+- **Retries.** A 401 or 403 (the link was revoked), a 413 (too large) and any other 4xx except 408
+  and 429 (the server rejected these exact bytes) are permanent: the entry stays on disk, marked
+  failed, with Share. Anything else (offline, timeouts, 408, 429, 5xx) is retried
   with backoff (15 s, doubling up to 30 min), and immediately when the network comes back, the app
   comes to the foreground, or it launches. An entry never uploads twice at once. The server dedupes
   on person and `recordedAt`, so resending after a lost reply is safe. Opening a new setup link

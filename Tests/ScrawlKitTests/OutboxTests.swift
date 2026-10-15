@@ -153,7 +153,7 @@ struct OutboxTests {
     #expect(await eventually { filesOnDisk.isEmpty })
   }
 
-  @Test(arguments: [500, 502, 503, 429, 400, 404])
+  @Test(arguments: [500, 502, 503, 429, 408])
   func transientStatusesAreRetriedWithBackoffAndTheFileIsKept(status: Int) async throws {
     StubServer.reset([.init(status: status)])
     let outbox = makeOutbox()
@@ -300,6 +300,10 @@ struct OutboxTests {
     #expect(Outbox.classify(status: 413) == .permanent(.tooLarge))
     #expect(Outbox.classify(status: 500) == .retry)
     #expect(Outbox.classify(status: 429) == .retry)
+    #expect(Outbox.classify(status: 408) == .retry)
+    #expect(Outbox.classify(status: 400) == .permanent(.rejected))
+    #expect(Outbox.classify(status: 404) == .permanent(.rejected))
+    #expect(Outbox.classify(status: 411) == .permanent(.rejected))
     #expect(Outbox.classify(status: nil) == .retry)
     #expect(Outbox.backoff(afterAttempts: 1) == 15)
     #expect(Outbox.backoff(afterAttempts: 2) == 30)

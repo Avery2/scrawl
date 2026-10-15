@@ -57,13 +57,22 @@
 
     /// Why a recording didn't send; every failure keeps Share.
     enum Failure: Equatable {
-      case unreachable, linkExpired, tooLarge, notSaved
+      case unreachable, linkExpired, tooLarge, rejected, notSaved
+
+      init(_ failure: Outbox.Failure) {
+        switch failure {
+        case .unauthorized: self = .linkExpired
+        case .tooLarge: self = .tooLarge
+        case .rejected: self = .rejected
+        }
+      }
 
       var notice: Notice {
         switch self {
         case .unreachable: Notice("Mac didn't answer")
         case .linkExpired: Notice("Scrawl link expired", detail: "Ask Kit for a new one")
         case .tooLarge: Notice("Too large to send")
+        case .rejected: Notice("Couldn't send", detail: "The server rejected it")
         case .notSaved: Notice("Couldn't save to send")
         }
       }

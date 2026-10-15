@@ -8,9 +8,10 @@ import Foundation
 /// deleted after a 2xx. Uploads are file uploads on a background `URLSession`, so they continue
 /// while the app is suspended or killed and never hold the movie in memory.
 ///
-/// - 401 and 403 (the link was revoked) and 413 (too large) are permanent: the entry stays on disk,
-///   marked failed, until the link is renewed or it's shared some other way.
-/// - Everything else (no network, timeouts, 5xx, other statuses) is retried with backoff, and
+/// - 401 and 403 (the link was revoked), 413 (too large) and every other 4xx except 408 and 429
+///   (the server rejected these exact bytes, so resending can't help) are permanent: the entry stays
+///   on disk, marked failed, until the link is renewed or it's shared some other way.
+/// - Everything else (no network, timeouts, 408, 429, 5xx) is retried with backoff, and
 ///   whenever `kick(force: true)` is called (network back, app foregrounded, launch).
 /// - An entry is never uploading twice at once: in-flight tasks are tracked by entry ID, including
 ///   tasks a background session carried over from a previous launch.
@@ -26,6 +27,8 @@ final class Outbox: NSObject, @unchecked Sendable {
     case unauthorized
     /// 413, or the payload is over the size limit before sending.
     case tooLarge
+    /// Any other 4xx except 408/429 (malformed frame or timeline, missing Content-Length, …).
+    case rejected
   }
 
   struct Entry: Codable, Sendable, Equatable {
@@ -60,6 +63,8 @@ final class Outbox: NSObject, @unchecked Sendable {
     case 200 ..< 300: return .success
     case 401, 403: return .permanent(.unauthorized)
     case 413: return .permanent(.tooLarge)
+    case 408, 429: return .retry
+    case 400 ..< 500: return .permanent(.rejected)
     default: return .retry
     }
   }
