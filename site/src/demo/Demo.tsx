@@ -1,12 +1,13 @@
-import { type ComponentType, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
+import { type ComponentType, type CSSProperties, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
 import { flushSync } from "react-dom"
 import { MacWindow, PhoneMirror } from "./apps"
 import type { StageGpuOverlay as StageGpuOverlayType } from "./gpu-fx"
 import { INK_SHADOW, InkPath, inkPath } from "./ink"
 import { measureAnchors, sameAnchors } from "./measure"
+import { motion, motionControls } from "./motion"
 import { AGENT, type Anchors, BEATS, buildScript, cursorAt, type Mode, STAGE, T } from "./script"
 import * as sfx from "./sfx"
-import { Caption, Cursor, fixAmount, Island, Ink, Keys, MenuBar, phoneLive, Ripples, Selection, terminalActive } from "./stage-parts"
+import { Caption, Cursor, fixState, Island, Ink, Keys, MenuBar, phoneLive, Ripples, Selection, terminalActive } from "./stage-parts"
 import { Terminal } from "./terminal"
 
 type UserStroke = { points: [number, number, number][]; done: boolean }
@@ -198,8 +199,10 @@ export function Demo() {
   const [drawMode, setDrawMode] = useState(false)
   const [GpuOverlay, setGpuOverlay] = useState<ComponentType<Parameters<typeof StageGpuOverlayType>[0]> | null>(null)
 
-  // Lazy-load the WebGPU/WebGL2 stage effects overlay after first paint so initial load/LCP stays untouched.
+  // Lazy-load the wet-ink sheen after first paint so initial load stays untouched. Phones draw the
+  // stage too small for it to show, so they never load it.
   useEffect(() => {
+    if (window.innerWidth < 700) return
     let cancelled = false
     const raf = requestAnimationFrame(() => {
       import("./gpu-fx").then((mod) => {
@@ -264,16 +267,33 @@ export function Demo() {
     return () => ro.disconnect()
   }, [])
 
-  const { fix, rowFix, settle } = fixAmount(t)
-  const broken = fix === 0
-  const fixRef = useRef(fix)
-  fixRef.current = fix
+  const look = useSyncExternalStore(motionControls.subscribe, motion, motion)
+  // CSS-driven reveals (blocks entering the terminal, diff lines, contact-sheet cards) read these.
+  const lookVars = {
+    "--m-enter-ms": `${look.enterMs}ms`,
+    "--m-enter-rise": `${look.enterRise}px`,
+    "--m-scroll-ms": `${look.scrollMs}ms`,
+  } as CSSProperties
+
+  // Dev server only: hover the stage for the ⚙ knobs chip with every motion value and the looks.
+  useEffect(() => {
+    const host = wrapRef.current
+    if (!host || !motionControls.enabled) return
+    return motionControls.attach(host)
+  }, [])
+
+  const fixNow = fixState(t)
+  // One object per distinct fix state, so the memoized app windows skip frames where nothing moved.
+  const fix = useMemo(() => fixNow, [fixNow.badge, fixNow.rows, fixNow.actions, fixNow.badgeSheen, fixNow.actionsSheen]) // eslint-disable-line react-hooks/exhaustive-deps
+  const broken = t < T.fix[0]
+  const fixRef = useRef(broken)
+  fixRef.current = broken
 
   // Strokes target the broken layout, so only measure while nothing has been fixed yet.
   useLayoutEffect(() => {
     if (!broken) return
     const measure = () => {
-      if (fixRef.current !== 0 || !stageRef.current || !badgeRef.current || !actionsRef.current || !titleRef.current) return
+      if (!fixRef.current || !stageRef.current || !badgeRef.current || !actionsRef.current || !titleRef.current) return
       const next = measureAnchors(stageRef.current, badgeRef.current, actionsRef.current, titleRef.current)
       setAnchors((prev) => (prev && sameAnchors(prev, next) ? prev : next))
     }
@@ -449,7 +469,7 @@ export function Demo() {
     !!cursor && cursor.at[0] > AGENT.x && cursor.at[0] < AGENT.x + AGENT.w && cursor.at[1] > AGENT.y + 28 && cursor.at[1] < AGENT.y + AGENT.h
 
   return (
-    <div className={`demo${LENS_DATA_URL ? " svg-glass" : ""}`}>
+    <div className={`demo${LENS_DATA_URL ? " svg-glass" : ""}`} style={lookVars}>
       {LENS_DATA_URL && (
         <svg className="liquid-glass-defs" aria-hidden>
           <defs>
@@ -493,9 +513,9 @@ export function Demo() {
         <div ref={stageRef} className="stage wallpaper" style={{ width: STAGE.w, height: STAGE.h, transform: `scale(${scale})` }}>
           <MenuBar t={t} />
           {mode === "mac" ? (
-            <MacWindow fix={fix} rowFix={rowFix} settle={settle} refs={refs} inactive={terminalActive(t)} />
+            <MacWindow fix={fix} sheen={look.sheen} refs={refs} inactive={terminalActive(t)} />
           ) : (
-            <PhoneMirror fix={fix} rowFix={rowFix} settle={settle} refs={refs} live={live} />
+            <PhoneMirror fix={fix} sheen={look.sheen} refs={refs} live={live} />
           )}
           {script && <Terminal t={t} mode={mode} script={script} />}
           {script && <Selection t={t} script={script} cursor={cursor} />}
@@ -511,18 +531,9 @@ export function Demo() {
               ))}
             </svg>
           )}
+          {GpuOverlay && <GpuOverlay t={t} script={script} intensity={look.inkSheen} stageRef={stageRef} />}
           {cursor && <Cursor c={cursor} crosshair={mode === "mac" && t >= T.select && t < T.record} ibeam={overTerminal && t >= T.promptClick - 400 && t < T.paste + 120} />}
         </div>
-        {GpuOverlay && (
-          <GpuOverlay
-            t={t}
-            mode={mode}
-            script={script}
-            userStrokes={user}
-            stageRef={stageRef}
-            wrapRef={wrapRef}
-          />
-        )}
         {!started && (
           <button
             className="stage-play liquid-glass"

@@ -4,7 +4,6 @@ import {
   AREA,
   clock,
   easeOut,
-  easeOutBack,
   type Mode,
   PHONE,
   PILL,
@@ -21,7 +20,8 @@ import {
   MAC_WINDOW,
 } from "./script"
 import { INK_SHADOW, InkPath, PinMark } from "./ink"
-import { MacWindow, PhoneMirror } from "./apps"
+import { BROKEN, type Fix, MacWindow, PhoneMirror } from "./apps"
+import { easeOutCubic, motion, smoother, springAt } from "./motion"
 
 const pressedAt = (t: number, at: number) => t >= at - 60 && t < at + 160
 
@@ -111,16 +111,7 @@ function Chip({
 
 const Divider = () => <span className="island-divider" />
 
-const IslandInner = memo(function IslandInner({
-  state,
-  phoneOn,
-  phonePressed,
-  recordPressed,
-  finishPressed,
-  undoDim,
-  recText,
-  gone,
-}: {
+type IslandProps = {
   state: Pill
   phoneOn: boolean
   phonePressed: boolean
@@ -128,100 +119,129 @@ const IslandInner = memo(function IslandInner({
   finishPressed: boolean
   undoDim: boolean
   recText: string
-  gone: boolean
-}) {
-  const items = state === "notch" ? PILL.items.select : state === "select" && phoneOn ? PILL.items.selectPhone : PILL.items[state]
-  const width = pillWidth(items)
+}
+
+const islandItems = (state: Pill, phoneOn: boolean) =>
+  state === "notch" ? PILL.items.select : state === "select" && phoneOn ? PILL.items.selectPhone : PILL.items[state]
+
+function IslandContent({ state, phoneOn, phonePressed, recordPressed, finishPressed, undoDim, recText }: IslandProps) {
+  const items = islandItems(state, phoneOn)
   const [lead, , c2, c3, c4, c5] = items
   return (
-    <div
-      className={`island ${state}${gone ? " gone" : ""}`}
-      style={{ left: PILL.cx, top: PILL.top, width, height: PILL.h }}
-      aria-hidden={gone}
-    >
-      <div className="island-content" key={state === "select" && phoneOn ? "select-phone" : state}>
-        {state === "select" && (
-          <>
-            <Chip w={lead} on={!phoneOn}>
-              Area
+    <>
+      {state === "select" && (
+        <>
+          <Chip w={lead} on={!phoneOn}>
+            Area
+          </Chip>
+          <Chip w={items[1]}>Full Screen</Chip>
+          <Chip w={c2} on={phoneOn} pressed={phonePressed}>
+            iPhone
+          </Chip>
+          {phoneOn && (
+            <Chip w={c3} primary pressed={recordPressed}>
+              Record
             </Chip>
-            <Chip w={items[1]}>Full Screen</Chip>
-            <Chip w={c2} on={phoneOn} pressed={phonePressed}>
-              iPhone
-            </Chip>
-            {phoneOn && (
-              <Chip w={c3} primary pressed={recordPressed}>
-                Record
-              </Chip>
-            )}
-            <Divider />
-            <Chip w={phoneOn ? c5 : c4} round>
-              <svg viewBox="0 0 10 10" aria-hidden>
-                <path d="M2 2l6 6M8 2L2 8" />
-              </svg>
-            </Chip>
-          </>
-        )}
-        {state === "recording" && (
-          <>
-            <span className="island-lead" style={{ width: lead }}>
-              <span className="rec-slot">
-                <i className="rec-halo" />
-                <i className="rec-dot" />
-              </span>
-              <b>{recText}</b>
-            </span>
-            <Divider />
-            <Chip w={c2} dim={undoDim}>
-              Undo
-            </Chip>
-            <Chip w={c3}>Cancel</Chip>
-            <Chip w={c4} primary pressed={finishPressed}>
-              Finish
-            </Chip>
-          </>
-        )}
-        {state === "processing" && (
+          )}
+          <Divider />
+          <Chip w={phoneOn ? c5 : c4} round>
+            <svg viewBox="0 0 10 10" aria-hidden>
+              <path d="M2 2l6 6M8 2L2 8" />
+            </svg>
+          </Chip>
+        </>
+      )}
+      {state === "recording" && (
+        <>
           <span className="island-lead" style={{ width: lead }}>
-            <span className="orbit">
-              {Array.from({ length: 8 }, (_, i) => (
-                <i key={i} style={{ transform: `rotate(${i * 45}deg) translateY(-7.2px)`, animationDelay: `${(i / 8) * 0.476 - 0.476}s` }} />
-              ))}
+            <span className="rec-slot">
+              <i className="rec-halo" />
+              <i className="rec-dot" />
             </span>
-            <b>Processing…</b>
+            <b>{recText}</b>
           </span>
-        )}
-        {state === "copied" && (
-          <>
-            <span className="island-lead" style={{ width: lead }}>
-              <span className="check">
-                <svg viewBox="0 0 12 12" aria-hidden>
-                  <path d="M2.6 6.3l2.2 2.2 4.6-4.9" />
-                </svg>
-              </span>
-              <b>Copied</b>
-            </span>
-            <Divider />
-            <Chip w={c2} primary>
-              Paste
-            </Chip>
-            <Chip w={c3}>Inspect</Chip>
-            <Chip w={c4} round>
-              <svg viewBox="0 0 10 10" aria-hidden>
-                <path d="M2 2l6 6M8 2L2 8" />
+          <Divider />
+          <Chip w={c2} dim={undoDim}>
+            Undo
+          </Chip>
+          <Chip w={c3}>Cancel</Chip>
+          <Chip w={c4} primary pressed={finishPressed}>
+            Finish
+          </Chip>
+        </>
+      )}
+      {state === "processing" && (
+        <span className="island-lead" style={{ width: lead }}>
+          <span className="orbit">
+            {Array.from({ length: 8 }, (_, i) => (
+              <i key={i} style={{ transform: `rotate(${i * 45}deg) translateY(-7.2px)`, animationDelay: `${(i / 8) * 0.476 - 0.476}s` }} />
+            ))}
+          </span>
+          <b>Processing…</b>
+        </span>
+      )}
+      {state === "copied" && (
+        <>
+          <span className="island-lead" style={{ width: lead }}>
+            <span className="check">
+              <svg viewBox="0 0 12 12" aria-hidden>
+                <path d="M2.6 6.3l2.2 2.2 4.6-4.9" />
               </svg>
-            </Chip>
-          </>
-        )}
+            </span>
+            <b>Copied</b>
+          </span>
+          <Divider />
+          <Chip w={c2} primary>
+            Paste
+          </Chip>
+          <Chip w={c3}>Inspect</Chip>
+          <Chip w={c4} round>
+            <svg viewBox="0 0 10 10" aria-hidden>
+              <path d="M2 2l6 6M8 2L2 8" />
+            </svg>
+          </Chip>
+        </>
+      )}
+    </>
+  )
+}
+
+type Leaving = { state: Pill; phoneOn: boolean; opacity: number } | null
+
+const IslandInner = memo(function IslandInner({ gone, leaving, ...props }: IslandProps & { gone: boolean; leaving: Leaving }) {
+  const { state, phoneOn } = props
+  const width = pillWidth(islandItems(state, phoneOn))
+  return (
+    <div className={`island ${state}${gone ? " gone" : ""}`} style={{ left: PILL.cx, top: PILL.top, width, height: PILL.h }} aria-hidden={gone}>
+      {leaving && (
+        <div className="island-content island-leaving" style={{ opacity: leaving.opacity }} aria-hidden>
+          <IslandContent {...props} state={leaving.state} phoneOn={leaving.phoneOn} recText={clock(T.finish - T.record)} phonePressed={false} recordPressed={false} finishPressed={false} />
+        </div>
+      )}
+      <div className="island-content" key={state === "select" && phoneOn ? "select-phone" : state}>
+        <IslandContent {...props} />
       </div>
     </div>
   )
 })
 
+// The HUD's content cross-fades when its state changes: the old chips fade out in place over
+// 140 ms while the new ones fade in, instead of vanishing in one frame.
+const ISLAND_SWAPS: [number, Pill, Mode | null][] = [
+  [T.phoneClick, "select", "iphone"],
+  [T.record, "select", null],
+  [T.finish + 50, "recording", null],
+  [T.copied, "processing", null],
+]
+
 export function Island({ t, mode }: { t: number; mode: Mode }) {
   const state = pillState(t)
   const phoneOn = mode === "iphone" && t >= T.phoneClick
   const gone = state === "notch" || t >= T.paste
+  const swap = ISLAND_SWAPS.find(([at, , only]) => t >= at && t < at + 140 && (only === null || only === mode))
+  const leaving = swap
+    ? { state: swap[1], phoneOn: mode === "iphone" && swap[0] > T.phoneClick, opacity: +(1 - smoother((t - swap[0]) / 140)).toFixed(3) }
+    : null
   return (
     <IslandInner
       state={state}
@@ -232,6 +252,7 @@ export function Island({ t, mode }: { t: number; mode: Mode }) {
       undoDim={t < T.circle[1]}
       recText={state === "recording" ? clock(t - T.record) : "0:00"}
       gone={gone}
+      leaving={leaving}
     />
   )
 }
@@ -291,6 +312,7 @@ export function Ink({ t, script }: { t: number; script: Script }) {
   if (t < T.circle[0]) return null
   const fade = 1 - progress(t, T.finish, T.finish + 280)
   if (fade <= 0) return null
+  const m = motion()
   return (
     <svg className="ink" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`} style={{ opacity: fade, ...INK_SHADOW }}>
       {script.strokes.map((s) => {
@@ -299,8 +321,8 @@ export function Ink({ t, script }: { t: number; script: Script }) {
       })}
       {script.pins.map((p) => {
         if (t < p.t) return null
-        const prog = progress(t, p.t, p.t + 260)
-        const scale = prog >= 1 ? 1 : Math.max(0, easeOutBack(prog))
+        const age = t - p.t
+        const scale = age > 1200 ? 1 : Math.max(0, springAt(age, m.pin))
         return <PinMark key={p.n} n={p.n} at={p.at} scale={scale} />
       })}
     </svg>
@@ -308,13 +330,16 @@ export function Ink({ t, script }: { t: number; script: Script }) {
 }
 
 export function Ripples({ t, script }: { t: number; script: Script }) {
-  const active = script.clicks.filter((c) => t > c.t && t < c.t + 650)
+  const { rippleMs, rippleAlpha } = motion()
+  const active = script.clicks.filter((c) => t > c.t && t < c.t + rippleMs)
   if (!active.length) return null
   return (
     <svg className="ink" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`}>
       {active.map((c) => {
-        const p = progress(t, c.t, c.t + 650)
-        return <circle key={c.t} cx={c.at[0]} cy={c.at[1]} r={6 + 22 * easeOut(p)} fill="none" stroke="#fff" strokeWidth={2} opacity={0.7 * (1 - p)} />
+        const p = progress(t, c.t, c.t + rippleMs)
+        // A quick ring that opens fast and fades on a convex tail.
+        const fade = (1 - p) * (1 - p)
+        return <circle key={c.t} cx={c.at[0]} cy={c.at[1]} r={6 + 16 * easeOutCubic(p)} fill="none" stroke="#fff" strokeWidth={1.5} opacity={rippleAlpha * fade} />
       })}
     </svg>
   )
@@ -383,28 +408,34 @@ export function Keys({ t, mode }: { t: number; mode: Mode }) {
 
 // The spoken words follow the pen: each clause's pill sits beside the mark it describes.
 // Both clauses occupy the same CSS grid cell so the pill size stays constant and never reflows.
+const ramp = (t: number, a: number, b: number) => (t <= a ? 0 : t >= b ? 1 : (t - a) / (b - a))
+
 export function Caption({ t, script }: { t: number; script: Script }) {
   const { words: all, clause2 } = script.narration
   const first = all[0][1]
   if (t < first - 300 || t > T.finish + 400) return null
+  const m = motion()
   const swap = all[clause2][1] - 60
   const c1Words = all.slice(0, clause2)
   const c2Words = all.slice(clause2)
 
-  const envIn = easeOut(progress(t, first - 280, first - 20))
-  const envOut = 1 - progress(t, T.finish, T.finish + 380)
+  const envIn = easeOutCubic(progress(t, first - 280, first - 20))
+  const envOut = 1 - easeOutCubic(progress(t, T.finish, T.finish + 320))
   const opacity = Math.min(envIn, envOut)
   if (opacity <= 0.005) return null
 
-  const glideProg = progress(t, swap - 220, swap + 260)
-  const glide = glideProg < 0.5 ? 4 * glideProg * glideProg * glideProg : 1 - Math.pow(-2 * glideProg + 2, 3) / 2
+  // The pill travels to the second mark on a minimum-jerk curve while the clauses cross.
+  const glide = smoother(progress(t, swap - 240, swap + 300))
   const [a, b] = script.speech
   const x = a[0] + (b[0] - a[0]) * glide
-  const y = a[1] + (b[1] - a[1]) * glide + (1 - envIn) * 5
+  const y = a[1] + (b[1] - a[1]) * glide + (1 - envIn) * 4
 
-  const c1Out = easeOut(progress(t, swap - 170, swap + 50))
-  const c2In = easeOut(progress(t, swap - 40, swap + 200))
-  const talking = all.some(([, at, end]) => t >= at - 20 && t < end + 140)
+  const D = m.clauseMs
+  const c1Out = easeOutCubic(progress(t, swap - 0.6 * D, swap + 0.1 * D))
+  const c2In = easeOutCubic(progress(t, swap - 0.25 * D, swap + 0.75 * D))
+  // Loudness envelope for the wave: eases up into speech and back down after it.
+  let talk = 0
+  for (const [, at, end] of all) talk = Math.max(talk, Math.min(ramp(t, at - 90, at + 30), 1 - ramp(t, end + 60, end + 260)))
 
   const renderWord = ([w, at, end]: [string, number, number], i: number) => {
     const dt = t - (at - 35)
@@ -416,26 +447,20 @@ export function Caption({ t, script }: { t: number; script: Script }) {
         </span>
       )
     }
-    const appear = easeOut(Math.min(1, dt / 230))
-    const active = t >= at - 20 && t < end + 160
-    const spokenSpan = Math.max(120, end - at + 180)
-    const glow = active ? Math.sin(Math.min(1, Math.max(0, (t - (at - 20)) / spokenSpan)) * Math.PI) : 0
-    const lead = dt < 260 ? Math.sin((dt / 260) * Math.PI) : 0
-    const lum = Math.max(glow, lead)
-    const rise = (1 - appear) * 4.5
-    const blur = appear < 0.98 ? (1 - appear) * 3.5 : 0
+    const appear = easeOutCubic(dt / m.wordMs)
+    const rise = (1 - appear) * m.wordRise
+    const blur = (1 - appear) * m.wordBlur
+    // The word being spoken sits at full white; spoken words settle back to 68%.
+    const now = Math.min(ramp(t, at - 80, at), 1 - ramp(t, end + 120, end + 340))
     return (
       <span key={i} className="w-slot">
         <span
-          className={active ? "w now" : "w said"}
+          className="w"
           style={{
             opacity: appear,
-            transform: rise > 0.05 ? `translate3d(0, ${rise.toFixed(2)}px, 0)` : undefined,
-            filter: blur > 0.08 ? `blur(${blur.toFixed(2)}px)` : undefined,
-            textShadow:
-              lum > 0.04
-                ? `0 0 ${(10 * lum).toFixed(1)}px rgba(255, 255, 255, ${(0.65 * lum).toFixed(2)}), 0 0 ${(18 * lum).toFixed(1)}px rgba(255, 110, 90, ${(0.32 * lum).toFixed(2)})`
-                : undefined,
+            color: `rgba(255, 255, 255, ${(0.68 + 0.32 * now).toFixed(3)})`,
+            transform: rise > 0.02 ? `translate3d(0, ${rise.toFixed(2)}px, 0)` : undefined,
+            filter: blur > 0.05 ? `blur(${blur.toFixed(2)}px)` : undefined,
           }}
         >
           {text}
@@ -443,6 +468,12 @@ export function Caption({ t, script }: { t: number; script: Script }) {
       </span>
     )
   }
+
+  const clauseStyle = (shown: number, dir: number): React.CSSProperties => ({
+    opacity: shown,
+    transform: shown < 0.999 ? `translate3d(0, ${(dir * 3 * (1 - shown)).toFixed(2)}px, 0)` : undefined,
+    filter: shown > 0.001 && shown < 0.999 && m.wordBlur > 0 ? `blur(${(m.wordBlur * (1 - shown)).toFixed(2)}px)` : undefined,
+  })
 
   return (
     <div
@@ -454,31 +485,15 @@ export function Caption({ t, script }: { t: number; script: Script }) {
     >
       <span className="wave">
         {[0, 1, 2, 3, 4].map((i) => {
-          const amp = talking ? 0.35 + 0.65 * Math.abs(Math.sin(t / (90 + i * 23) + i * 1.7)) : 0.16
-          return <i key={i} style={{ transform: `scaleY(${amp})` }} />
+          const amp = 0.16 + talk * (0.19 + 0.65 * Math.abs(Math.sin(t / (90 + i * 23) + i * 1.7)))
+          return <i key={i} style={{ transform: `scaleY(${amp.toFixed(3)})` }} />
         })}
       </span>
       <div className="caption-clauses">
-        <p
-          className="caption-clause"
-          style={{
-            opacity: 1 - c1Out,
-            transform: c1Out > 0.005 ? `translate3d(0, ${(-6 * c1Out).toFixed(2)}px, 0)` : undefined,
-            filter: c1Out > 0.02 && c1Out < 0.99 ? `blur(${(3 * c1Out).toFixed(2)}px)` : undefined,
-          }}
-          aria-hidden={c1Out >= 0.99}
-        >
+        <p className="caption-clause" style={clauseStyle(1 - c1Out, -1)} aria-hidden={c1Out >= 0.99}>
           {c1Words.map(renderWord)}
         </p>
-        <p
-          className="caption-clause"
-          style={{
-            opacity: c2In,
-            transform: c2In < 0.995 ? `translate3d(0, ${(6 * (1 - c2In)).toFixed(2)}px, 0)` : undefined,
-            filter: c2In > 0.01 && c2In < 0.98 ? `blur(${(3 * (1 - c2In)).toFixed(2)}px)` : undefined,
-          }}
-          aria-hidden={c2In <= 0.01}
-        >
+        <p className="caption-clause" style={clauseStyle(c2In, 1)} aria-hidden={c2In <= 0.01}>
           {c2Words.map(renderWord)}
         </p>
       </div>
@@ -502,7 +517,7 @@ export const KeyframeScene = memo(function KeyframeScene({
   const area = captureArea(mode)
   return (
     <div className="sheet-scene wallpaper" style={{ width: STAGE.w, height: STAGE.h, transform: `scale(${scale}) translate(${-area.x}px, ${-area.y}px)` }}>
-      {mode === "mac" ? <MacWindow fix={0} settle={0} /> : <PhoneMirror fix={0} settle={0} />}
+      {mode === "mac" ? <MacWindow fix={BROKEN} /> : <PhoneMirror fix={BROKEN} />}
       <svg className="ink" viewBox={`0 0 ${STAGE.w} ${STAGE.h}`} style={INK_SHADOW}>
         {script.strokes
           .filter((st) => frame.strokes.includes(st.id))
@@ -570,11 +585,35 @@ export const ContactSheet = memo(function ContactSheet({
   )
 })
 
-export function fixAmount(t: number) {
-  const p = progress(t, T.fix[0], T.fix[1])
-  // Row padding uses a crisp monotonic easeOut without overshoot so sibling rows never shiver across pixel boundaries.
-  const rowFix = easeOut(progress(t, T.fix[0], T.fix[0] + 380))
-  return { fix: easeOutBack(p), rowFix, settle: progress(t, T.fix[1] - 150, T.fix[1] + 1100), p }
+// The fix lands in diff order: the badge first, then the rows and the button row together. Those two
+// share a start because the rows push the buttons down while the buttons rise out of their clip; any
+// offset between them makes the button row bob down, up and down again. A spring within `eps` of rest snaps to exactly 1: the rows use a coarser eps
+// because their padding is layout, and a long sub-pixel creep only shows as rounding shimmer.
+const settled = (ms: number, s: { duration: number; bounce: number }, eps = 0.001) => {
+  const v = springAt(ms, s)
+  return ms > 250 && Math.abs(1 - v) < eps ? 1 : v
 }
+
+// The sheen starts as each element locks in, about 40% of its spring's duration after it starts.
+const sheenAt = (ms: number, s: { duration: number }, sheenMs: number) => {
+  const p = (ms - s.duration * 400) / sheenMs
+  return p < 0 || p > 1 ? -1 : (p + smoother(p)) / 2
+}
+
+export function fixState(t: number): Fix {
+  if (t < T.fix[0]) return BROKEN
+  const m = motion()
+  const ms = t - T.fix[0]
+  return {
+    badge: settled(ms, m.badge),
+    rows: settled(ms - m.stagger, m.rows, 0.01),
+    actions: settled(ms - m.stagger, m.actions),
+    badgeSheen: sheenAt(ms, m.badge, m.sheenMs),
+    actionsSheen: sheenAt(ms - m.stagger, m.actions, m.sheenMs),
+  }
+}
+
+// When each diff hunk lands on the stage (ms after T.fix[0]): the badge, then rows and buttons.
+export const hunkDelay = (hunk: number) => (hunk === 0 ? 0 : motion().stagger)
 
 export const phoneLive = (t: number) => Math.min(progress(t, T.phoneRecord, T.phoneRecord + 300), 1 - progress(t, T.finish, T.finish + 300))

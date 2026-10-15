@@ -35,7 +35,7 @@ const browserName = arg("browser", "chromium")
 const query = arg("query", "")
 
 const viewport = size === "iphone" ? { width: 393, height: 852 } : { width: 1280, height: 860 }
-const dpr = size === "iphone" ? 2 : 1
+const dpr = Number(arg("dpr", size === "iphone" ? "2" : "1"))
 
 mkdirSync(out, { recursive: true })
 if (frames) mkdirSync(join(out, "frames"), { recursive: true })

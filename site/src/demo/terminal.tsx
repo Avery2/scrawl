@@ -1,7 +1,8 @@
-import { memo, type ReactNode, useLayoutEffect, useRef, useState } from "react"
+import { memo, type ReactNode, type RefObject, useLayoutEffect, useRef, useState } from "react"
 import { TrafficLights } from "./apps"
 import { AGENT, type Mode, type Script, summaryText, T } from "./script"
-import { ContactSheet, terminalActive } from "./stage-parts"
+import { motion, smoother } from "./motion"
+import { ContactSheet, hunkDelay, terminalActive } from "./stage-parts"
 
 // OpenCode's TUI (packages/tui) inside Ghostty, using the v2 "opencode" dark theme tokens:
 // background #0a0a0a / raised #141414 / prompt #1e1e1e, text #eeeeee / muted #808080,
@@ -95,6 +96,7 @@ const STREAM_TOKENS: { text: string; code?: boolean; dt: number }[] = [
 ]
 
 function Prompt({
+  still,
   mode,
   pasteStage,
   submitted,
@@ -103,6 +105,7 @@ function Prompt({
   running,
   spinFrame,
 }: {
+  still?: boolean
   mode: Mode
   pasteStage: number
   submitted: boolean
@@ -111,16 +114,19 @@ function Prompt({
   running: boolean
   spinFrame: number
 }) {
-  const lines = pasteStage >= 2 ? summaryText(mode, true) : null
+  // The pasted lines are laid out with the chip and fade in one by one, so the prompt grows once,
+  // eased, instead of stepping a line at a time.
+  const lines = pasteStage >= 1 ? summaryText(mode, true) : null
   return (
     <div className="tp">
       <div className="tp-box">
         <span className="tp-bar" />
         <div className="tp-inner">
+          <AutoHeight watch={pasteStage > 0}>
           <div className="tp-text">
             {pasteStage >= 1 ? (
               <>
-                <span className="tx-paste enter-pop">[Image 1]</span>{" "}
+                <span className={`tx-paste${still ? "" : " enter-pop"}`}>[Image 1]</span>{" "}
                 {lines &&
                   lines.map((line, idx) => {
                     const show = pasteStage >= idx + 2
@@ -140,6 +146,7 @@ function Prompt({
               </span>
             )}
           </div>
+          </AutoHeight>
           <div className="tp-meta">
             <span className="tx-build">Build</span> <span className="tx-mute">·</span> Claude Opus 4.6 <span className="tx-mute">anthropic</span>
           </div>
@@ -173,6 +180,21 @@ function Prompt({
           </span>
         </span>
       </div>
+    </div>
+  )
+}
+
+// Eases its height to its content's whenever `watch` changes (measured synchronously, so the
+// first frame of the change is already part of the glide).
+function AutoHeight({ watch, children }: { watch: unknown; children: ReactNode }) {
+  const inner = useRef<HTMLDivElement>(null)
+  const [height, setHeight] = useState<number | null>(null)
+  useLayoutEffect(() => {
+    if (inner.current) setHeight(inner.current.offsetHeight)
+  }, [watch])
+  return (
+    <div className="auto-height" style={{ height: height ?? undefined }}>
+      <div ref={inner}>{children}</div>
     </div>
   )
 }
@@ -211,36 +233,51 @@ const DIFF: [number, " " | "-" | "+", Tok[]][] = (
   ] as const
 ).map(([n, sign, code]) => [n, sign, tsx(code)])
 
-const Diff = memo(function Diff({ applied }: { applied: boolean }) {
+// Each + line takes a brief green tint as its hunk lands on the stage (badge, rows, then buttons),
+// so the diff line and the element it moves read as cause and effect. Instant attack, convex decay.
+const HUNK_OF_LINE = [-1, -1, 0, -1, 1, -1, 2]
+
+const Diff = memo(function Diff({ fixAge, tint }: { fixAge: number; tint: number }) {
   return (
-    <div className={`tdiff${applied ? " applied" : ""}`}>
-      {DIFF.map(([n, sign, tokens], i) => (
-        <div
-          key={i}
-          className={`td-line${sign === "+" ? " add" : sign === "-" ? " del" : ""}`}
-          style={{ animationDelay: `${i * 34}ms` }}
-        >
-          <span className="td-num">{n}</span>
-          <span className="td-sign">{sign === " " ? " " : sign}</span>
-          <span className="td-code">
-            {tokens.map(([s, c], j) =>
-              c ? (
-                <span key={j} className={c}>
-                  {s}
-                </span>
-              ) : (
-                s
-              ),
-            )}
-          </span>
-        </div>
-      ))}
+    <div className="tdiff">
+      {DIFF.map(([n, sign, tokens], i) => {
+        const hunk = HUNK_OF_LINE[i]
+        const age = hunk >= 0 && fixAge >= 0 ? fixAge - hunkDelay(hunk) : -1
+        const glow = age < 0 ? 0 : age < 90 ? age / 90 : Math.pow(Math.max(0, 1 - (age - 90) / 900), 2)
+        const a = tint * glow
+        return (
+          <div
+            key={i}
+            className={`td-line${sign === "+" ? " add" : sign === "-" ? " del" : ""}`}
+            style={{
+              animationDelay: `${i * 34}ms`,
+              boxShadow: a > 0.002 ? `inset 0 0 0 999px rgba(127, 216, 143, ${a.toFixed(3)})` : undefined,
+            }}
+          >
+            <span className="td-num">{n}</span>
+            <span className="td-sign">{sign === " " ? " " : sign}</span>
+            <span className="td-code">
+              {tokens.map(([s, c], j) =>
+                c ? (
+                  <span key={j} className={c}>
+                    {s}
+                  </span>
+                ) : (
+                  s
+                ),
+              )}
+            </span>
+          </div>
+        )
+      })}
     </div>
   )
 })
 
-function StreamedResponse({ streamElapsed, done }: { streamElapsed: number; done: boolean }) {
-  // Find the index of the first pending token so the zero-width streaming caret sits right at the leading edge.
+// Tokens arrive at their burst times and fade from a dim start to full text colour; the caret rides
+// the leading edge. Every token is laid out from the start (pending ones are transparent), so an
+// arriving word never rewraps the line before it.
+function StreamedResponse({ streamElapsed, done, from, fadeMs }: { streamElapsed: number; done: boolean; from: number; fadeMs: number }) {
   let firstPending = STREAM_TOKENS.length
   for (let i = 0; i < STREAM_TOKENS.length; i++) {
     if (streamElapsed < STREAM_TOKENS[i].dt) {
@@ -249,79 +286,65 @@ function StreamedResponse({ streamElapsed, done }: { streamElapsed: number; done
     }
   }
   const showCaret = !done && streamElapsed >= 0
+  const caret = (
+    <span className="tstream-cur-wrap" aria-hidden>
+      <i className="tstream-cur" />
+    </span>
+  )
 
   return (
     <div className="ta-text enter">
       {STREAM_TOKENS.map((tok, i) => {
         const age = streamElapsed - tok.dt
         const visible = done || age >= 0
-        const freshCls =
-          !done && visible
-            ? age < 70
-              ? " fresh-3"
-              : age < 145
-                ? " fresh-2"
-                : age < 230
-                  ? " fresh-1"
-                  : ""
-            : ""
+        const k = done ? 1 : Math.min(1, Math.max(0, age) / fadeMs)
+        const opacity = visible ? from + (1 - from) * (1 - (1 - k) * (1 - k)) : 0
         const inner = tok.code ? <span className="tx-code">{tok.text}</span> : tok.text
         return (
           <span key={i} className="tok-slot">
-            {showCaret && i === firstPending && (
-              <span className="tstream-cur-wrap" aria-hidden>
-                <i className="tstream-cur" />
-              </span>
-            )}
-            <span className={`tok${visible ? "" : " pending"}${freshCls}`}>{inner}</span>
+            {showCaret && i === firstPending && caret}
+            <span className="tok" style={{ opacity: opacity >= 0.999 ? undefined : +opacity.toFixed(3) }}>
+              {inner}
+            </span>
           </span>
         )
       })}
-      {showCaret && firstPending === STREAM_TOKENS.length && (
-        <span className="tstream-cur-wrap" aria-hidden>
-          <i className="tstream-cur" />
-        </span>
-      )}
+      {showCaret && firstPending === STREAM_TOKENS.length && caret}
     </div>
   )
 }
 
 function Session({
   step,
-  diffApplied,
+  fixAge,
   streamElapsed,
   brailleFrame,
   mode,
   script,
+  viewRef,
+  contentRef,
   children,
 }: {
+  viewRef: RefObject<HTMLDivElement | null>
+  contentRef: RefObject<HTMLDivElement | null>
   step: number
-  diffApplied: boolean
+  fixAge: number
   streamElapsed: number
   brailleFrame: number
   mode: Mode
   script: Script
   children: ReactNode
 }) {
+  const m = motion()
   const summary = summaryText(mode, true)
-  const viewRef = useRef<HTMLDivElement>(null)
-  const contentRef = useRef<HTMLDivElement>(null)
-  const [offset, setOffset] = useState(0)
   const hasStream = streamElapsed >= 0
   const done = step >= 4
 
-  // Sticky-bottom scrollbox: content starts at the top and scrolls once it overflows.
-  useLayoutEffect(() => {
-    const view = viewRef.current
-    const content = contentRef.current
-    if (!view || !content) return
-    setOffset(Math.min(0, view.clientHeight - content.scrollHeight))
-  }, [step, hasStream, done])
-
+  // The scroll offset is driven by useScrollFollow (sticky bottom), never by React.
   return (
     <div className="tui-session">
       <div ref={viewRef} className="ts-view">
-        <div ref={contentRef} className="ts-content" style={{ transform: `translate3d(0, ${offset}px, 0)` }}>
+        <div ref={contentRef} className="ts-content">
           <div className="tu-msg enter">
             <span className="tu-bar" />
             <div className="tu-inner">
@@ -356,11 +379,15 @@ function Session({
                     <span className="tt-edit-done">← Edit src/components/HeaderCard.tsx</span>
                   )}
                 </div>
-                {step >= 3 && <Diff applied={diffApplied} />}
+                {step >= 3 && (
+                  <div className="reveal-rows">
+                    <Diff fixAge={fixAge} tint={m.tint} />
+                  </div>
+                )}
               </div>
             </div>
           )}
-          {(hasStream || done) && <StreamedResponse streamElapsed={streamElapsed} done={done} />}
+          {(hasStream || done) && <StreamedResponse streamElapsed={streamElapsed} done={done} from={m.streamFrom} fadeMs={m.streamMs} />}
           {done && (
             <div className="ta-foot enter">
               <span className="tx-build">Build</span>
@@ -398,18 +425,24 @@ const TerminalInner = memo(function TerminalInner({
   pasteStage,
   submitted,
   step,
-  diffApplied,
+  fixAge,
   streamElapsed,
   spinFrame,
   brailleFrame,
   mode,
   script,
+  leave,
+  viewRef,
+  contentRef,
 }: {
+  leave: number
+  viewRef: RefObject<HTMLDivElement | null>
+  contentRef: RefObject<HTMLDivElement | null>
   active: boolean
   pasteStage: number
   submitted: boolean
   step: number
-  diffApplied: boolean
+  fixAge: number
   streamElapsed: number
   spinFrame: number
   brailleFrame: number
@@ -437,10 +470,19 @@ const TerminalInner = memo(function TerminalInner({
         <span className="term-title">{title}</span>
       </div>
       <div className="tui">
+        {submitted && leave >= 0 && (
+          <div className="tui-leaving" style={{ opacity: leave }} aria-hidden>
+            <Home>
+              <Prompt still mode={mode} pasteStage={4} submitted={false} done={false} focused={false} running={false} spinFrame={0} />
+            </Home>
+          </div>
+        )}
         {submitted ? (
           <Session
+            viewRef={viewRef}
+            contentRef={contentRef}
             step={step}
-            diffApplied={diffApplied}
+            fixAge={fixAge}
             streamElapsed={streamElapsed}
             brailleFrame={brailleFrame}
             mode={mode}
@@ -456,12 +498,49 @@ const TerminalInner = memo(function TerminalInner({
   )
 })
 
+// Sticky-bottom scrolling on a critically damped spring stepped by the demo clock: the content
+// starts at the top and glides up as it overflows, keeping its velocity when a new block retargets
+// it mid-glide. A seek (a backward or large step) lands at once.
+function useScrollFollow(t: number, viewRef: RefObject<HTMLDivElement | null>, contentRef: RefObject<HTMLDivElement | null>, ms: number) {
+  const state = useRef({ x: 0, v: 0, t: 0, el: null as HTMLDivElement | null })
+  useLayoutEffect(() => {
+    const view = viewRef.current
+    const content = contentRef.current
+    const s = state.current
+    if (!view || !content) {
+      s.el = null
+      return
+    }
+    const target = Math.min(0, view.clientHeight - content.offsetHeight)
+    const dt = (t - s.t) / 1000
+    if (s.el !== content || dt < 0 || dt > 0.25 || ms <= 0) {
+      s.x = target
+      s.v = 0
+    } else if (dt > 0) {
+      const w = (2 * Math.PI) / (ms / 1000)
+      const x0 = s.x - target
+      const decay = Math.exp(-w * dt)
+      const a = s.v + w * x0
+      s.x = target + (x0 + a * dt) * decay
+      s.v = (s.v - w * a * dt) * decay
+      if (Math.abs(s.x - target) < 0.01 && Math.abs(s.v) < 0.5) {
+        s.x = target
+        s.v = 0
+      }
+    }
+    s.t = t
+    s.el = content
+    content.style.transform = `translate3d(0, ${s.x.toFixed(2)}px, 0)`
+  })
+}
+
 export function Terminal({ t, mode, script }: { t: number; mode: Mode; script: Script }) {
   const active = terminalActive(t)
   const submitted = t >= T.submit
   const step = t >= T.done ? 4 : t >= T.diff ? 3 : t >= T.edit ? 2 : t >= T.read ? 1 : 0
-  const diffApplied = t >= T.fix[0]
-  const streamElapsed = t >= T.done ? 1200 : t >= STREAM_START ? Math.floor((t - STREAM_START) / 30) * 30 : -1
+  // Frame-exact ages only while something is moving, so the memoized terminal skips idle frames.
+  const fixAge = t >= T.fix[0] && t < T.fix[0] + 1600 ? Math.round(t - T.fix[0]) : t >= T.fix[0] + 1600 ? 1600 : -1
+  const streamElapsed = t >= T.done ? 1200 : t >= STREAM_START ? Math.round(t - STREAM_START) : -1
   const running = submitted && step < 4
   const pasteStage =
     t >= T.submit || t < T.paste
@@ -475,13 +554,21 @@ export function Terminal({ t, mode, script }: { t: number; mode: Mode; script: S
             : 4
   const spinFrame = running ? Math.floor(t / 40) % 54 : 0
   const brailleFrame = step === 2 ? Math.floor(t / 80) % BRAILLE.length : 0
+  // Submitting dissolves the home screen into the session over 220 ms rather than cutting.
+  const leave = t >= T.submit && t < T.submit + 220 ? +(1 - smoother((t - T.submit) / 220)).toFixed(3) : -1
+  const viewRef = useRef<HTMLDivElement>(null)
+  const contentRef = useRef<HTMLDivElement>(null)
+  useScrollFollow(t, viewRef, contentRef, motion().scrollMs)
   return (
     <TerminalInner
+      leave={leave}
+      viewRef={viewRef}
+      contentRef={contentRef}
       active={active}
       pasteStage={pasteStage}
       submitted={submitted}
       step={step}
-      diffApplied={diffApplied}
+      fixAge={fixAge}
       streamElapsed={streamElapsed}
       spinFrame={spinFrame}
       brailleFrame={brailleFrame}

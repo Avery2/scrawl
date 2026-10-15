@@ -24,34 +24,22 @@ export function TrafficLights({ inactive }: { inactive?: boolean }) {
   )
 }
 
-export function DeployCard({
-  fix,
-  rowFix,
-  settle,
-  refs,
-  compact,
-}: {
-  fix: number
-  rowFix?: number
-  settle: number
-  refs?: CardRefs
-  compact?: boolean
-}) {
+// How far the fix has carried each changed element (spring values, 0 broken → 1 fixed) and where
+// the single lock-in sheen is on each (-1 when it isn't passing).
+export type Fix = { badge: number; rows: number; actions: number; badgeSheen: number; actionsSheen: number }
+export const BROKEN: Fix = { badge: 0, rows: 0, actions: 0, badgeSheen: -1, actionsSheen: -1 }
+
+// A soft band of light crossing its element once: p runs 0 → 1, the band enters and leaves outside.
+function Sheen({ p, alpha }: { p: number; alpha: number }) {
+  if (p < 0 || p > 1 || alpha <= 0) return null
+  return <i className="sheen" style={{ backgroundPosition: `${(130 - 160 * p).toFixed(2)}% 0`, opacity: alpha }} />
+}
+
+export function DeployCard({ fix, sheen, refs, compact }: { fix: Fix; sheen: number; refs?: CardRefs; compact?: boolean }) {
   const badgeX = compact ? -46 : -60
-  const rf = Math.min(1, Math.max(0, rowFix ?? fix))
-  // Motion-trail & lock-in glow intensity while the elements glide into place and settle.
-  const moving = fix > 0.005 && settle < 0.995
-  const glowEnv = moving ? Math.sin(Math.min(1, Math.max(0, rf * 0.75 + settle * 0.25)) * Math.PI) : 0
+  const rf = Math.max(0, fix.rows)
   return (
-    <div
-      className={`card${compact ? " compact" : ""}`}
-      style={{
-        boxShadow:
-          glowEnv > 0.01
-            ? `0 0 0 1.5px rgba(48, 209, 88, ${(0.58 * glowEnv).toFixed(2)}), 0 0 ${(22 * glowEnv).toFixed(1)}px rgba(48, 209, 88, ${(0.22 * glowEnv).toFixed(2)})`
-            : undefined,
-      }}
-    >
+    <div className={`card${compact ? " compact" : ""}`}>
       <div className="card-head">
         <h3 ref={refs?.title} className="card-title">
           Deploy Activity
@@ -59,22 +47,17 @@ export function DeployCard({
         <span
           ref={refs?.badge}
           className="badge"
-          style={{
-            transform: `translate3d(${lerp(badgeX, 0, fix)}px, ${lerp(-8, 0, fix)}px, 0)`,
-            boxShadow:
-              glowEnv > 0.02
-                ? `0 0 ${(14 * glowEnv).toFixed(1)}px rgba(48, 209, 88, ${(0.55 * glowEnv).toFixed(2)}), ${(-8 * (1 - rf) * glowEnv).toFixed(1)}px 0 ${(12 * glowEnv).toFixed(1)}px rgba(90, 200, 250, ${(0.35 * glowEnv).toFixed(2)})`
-                : undefined,
-          }}
+          style={{ transform: fix.badge === 1 ? undefined : `translate3d(${lerp(badgeX, 0, fix.badge).toFixed(2)}px, ${lerp(-8, 0, fix.badge).toFixed(2)}px, 0)` }}
         >
           <i />
           Live
+          <Sheen p={fix.badgeSheen} alpha={sheen} />
         </span>
       </div>
       <p className="card-sub">Last 24 hours · 128 deploys</p>
       <ul className="rows">
         {ROWS.map(([name, sha, env, status, ago]) => (
-          <li key={name} style={{ paddingBlock: lerp(1, compact ? 5 : 6.5, rf) }}>
+          <li key={name} style={{ paddingBlock: `${lerp(1, compact ? 5 : 6.5, rf).toFixed(2)}px` }}>
             <span className="row-name">
               {name}
               {!compact && <em>{sha}</em>}
@@ -89,15 +72,15 @@ export function DeployCard({
         ))}
       </ul>
       <div ref={refs?.actions} className="actions">
-        <div
-          className="actions-inner"
-          style={{
-            transform: `translate3d(0, ${lerp(14, 0, fix)}px, 0)`,
-            filter: glowEnv > 0.03 ? `drop-shadow(0 ${(4 * (1 - rf)).toFixed(1)}px ${(10 * glowEnv).toFixed(1)}px rgba(10, 132, 255, ${(0.45 * glowEnv).toFixed(2)}))` : undefined,
-          }}
-        >
-          <button>Retry failed</button>
-          <button className="primary">Promote</button>
+        <div className="actions-inner" style={{ transform: fix.actions === 1 ? undefined : `translate3d(0, ${lerp(14, 0, fix.actions).toFixed(2)}px, 0)` }}>
+          <button>
+            Retry failed
+            <Sheen p={fix.actionsSheen} alpha={sheen} />
+          </button>
+          <button className="primary">
+            Promote
+            <Sheen p={fix.actionsSheen - 0.12} alpha={sheen} />
+          </button>
         </div>
       </div>
     </div>
@@ -135,19 +118,7 @@ const Spark = memo(function Spark() {
   )
 })
 
-export const MacWindow = memo(function MacWindow({
-  fix,
-  rowFix,
-  settle,
-  refs,
-  inactive,
-}: {
-  fix: number
-  rowFix?: number
-  settle: number
-  refs?: CardRefs
-  inactive?: boolean
-}) {
+export const MacWindow = memo(function MacWindow({ fix, sheen = 0, refs, inactive }: { fix: Fix; sheen?: number; refs?: CardRefs; inactive?: boolean }) {
   return (
     <div className={`win${inactive ? " inactive" : ""}`} style={{ left: MAC_WINDOW.x, top: MAC_WINDOW.y, width: MAC_WINDOW.w, height: MAC_WINDOW.h }}>
       <aside className="win-side">
@@ -210,7 +181,7 @@ export const MacWindow = memo(function MacWindow({
               <small>p95 9m 40s</small>
             </div>
           </div>
-          <DeployCard fix={fix} rowFix={rowFix} settle={settle} refs={refs} />
+          <DeployCard fix={fix} sheen={sheen} refs={refs} />
           <div className="card incidents">
             <div className="card-head">
               <h4>Incidents</h4>
@@ -260,19 +231,7 @@ const PhoneStatus = memo(function PhoneStatus() {
   )
 })
 
-export const PhoneMirror = memo(function PhoneMirror({
-  fix,
-  rowFix,
-  settle,
-  refs,
-  live,
-}: {
-  fix: number
-  rowFix?: number
-  settle: number
-  refs?: CardRefs
-  live?: number
-}) {
+export const PhoneMirror = memo(function PhoneMirror({ fix, sheen = 0, refs, live }: { fix: Fix; sheen?: number; refs?: CardRefs; live?: number }) {
   return (
     <div
       className="phone"
@@ -292,7 +251,7 @@ export const PhoneMirror = memo(function PhoneMirror({
           <span>‹ Pulse</span>
           <h2>Deploys</h2>
         </div>
-        <DeployCard fix={fix} rowFix={rowFix} settle={settle} refs={refs} compact />
+        <DeployCard fix={fix} sheen={sheen} refs={refs} compact />
         <div className="phone-section">
           <b>Incidents</b>
           <div className="phone-incident">

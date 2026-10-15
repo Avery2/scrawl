@@ -1,6 +1,6 @@
 import { type KeyboardEvent, type ReactNode, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { Copy } from "./Copy"
-import { MacWindow } from "./demo/apps"
+import { BROKEN, MacWindow } from "./demo/apps"
 import { measureAnchors } from "./demo/measure"
 import { AREA, type Anchors, buildScript, clock, type Point, type Script, STAGE, summaryText, T, WORDS } from "./demo/script"
 import { ContactSheet, FrameBadge, KeyframeScene } from "./demo/stage-parts"
@@ -64,7 +64,7 @@ function useMacScript() {
   const probe = (
     <div className="bundle-probe" aria-hidden>
       <div ref={stageRef} style={{ width: STAGE.w, height: STAGE.h }}>
-        <MacWindow fix={0} settle={0} refs={{ badge: badgeRef, actions: actionsRef, title: titleRef }} />
+        <MacWindow fix={BROKEN} refs={{ badge: badgeRef, actions: actionsRef, title: titleRef }} />
       </div>
     </div>
   )
