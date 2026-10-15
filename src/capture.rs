@@ -1280,7 +1280,10 @@ fn build_sck_filter_and_config(
     }?;
 
     let max_dim = target.frame.width.max(target.frame.height).max(1.0);
-    let scale = (1280.0 / max_dim).min(2.0);
+    // Full-screen captures get auto-cropped to a window or region afterwards (`scrawl autocrop`),
+    // so they need enough pixels for a crop to a quarter of the screen to stay sharp.
+    let long_edge = if target.mode == CaptureMode::Display { 2560.0 } else { 1280.0 };
+    let scale = (long_edge / max_dim).min(2.0);
     let capture_width = ((target.frame.width * scale).round() as u32).max(48) & !1;
     let capture_height = ((target.frame.height * scale).round() as u32).max(48) & !1;
 
