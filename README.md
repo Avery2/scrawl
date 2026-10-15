@@ -139,7 +139,7 @@ Touches aren't drawn on screen in either capture method. Each touch goes on the 
 phase, and the label of the element under it) and Scrawl on the Mac draws taps and swipes from it.
 
 ScrawlKit stays completely inert on devices that haven't been configured (no gesture recognizers,
-overlay window, or network calls). To pair your iPhone with this Mac, print a setup link (and
+overlay window, network calls, files, or background `URLSession`). To pair your iPhone with this Mac, print a setup link (and
 terminal QR code) and open it on the phone:
 
 ```sh
@@ -160,6 +160,64 @@ You can also AirDrop the `.mp4` and `.json` pair to the Mac and run `scrawl impo
 - Markers become flags.
 - App events (`Scrawl.event("Done tapped")`) appear in `summary.md` under the keyframe that was on
   screen when they happened (`  · 0:12 app: Done tapped`).
+
+#### Sending to an HTTPS endpoint
+
+A setup link can point at a hosted endpoint instead of a Mac, for phones that aren't on your LAN or
+tailnet (for example `ledger://scrawl?url=https%3A%2F%2Fproblems.example.com%2Fapi%2Fscrawl%2Fledger&token=pbcap_…`).
+It speaks the same protocol as the Mac: `GET {url}/health` and `POST {url}/ingest` with a bearer
+token, where the body is a 4-byte big-endian timeline length, the timeline JSON, then the MP4. When
+any configured URL is `https`, recordings go through a durable outbox instead of the LAN path
+(plain `http` URLs keep the direct POST plus USB fallback):
+
+- **Saved before sending.** On Send, the framed payload and a small metadata file (target,
+  `recordedAt`, attempts, last error) are written to `Application Support/ScrawlOutbox`. They're
+  protected until the phone's first unlock, so uploads can run while it's locked, and excluded from
+  backup. The recording never goes to `Documents/Scrawl` (it's staged in `tmp`) and isn't added to
+  `Scrawl.shared.recordings`. An entry is deleted only after a 2xx.
+- **Background upload.** Uploads are file uploads on a background `URLSession`
+  (`dev.kitlangton.scrawl.outbox.<bundle ID>`), so they survive the app being suspended or killed
+  and never load the movie into memory. The session is recreated whenever the app is configured, and
+  it picks up uploads still in flight from an earlier launch.
+- **Retries.** A 401 or 403 (the link was revoked) and a 413 (too large) are permanent: the entry
+  stays on disk, marked failed. Anything else (offline, timeouts, 5xx, other statuses) is retried
+  with backoff (15 s, doubling up to 30 min), and immediately when the network comes back, the app
+  comes to the foreground, or it launches. An entry never uploads twice at once. The server dedupes
+  on person and `recordedAt`, so resending after a lost reply is safe. Opening a new setup link
+  retries the entries that failed with the old one.
+- **Strip.** If the upload finishes within about 4 seconds, the strip says "Sent to …" as on the
+  LAN. Otherwise it says "Queued · sends when online" with a success haptic: the recording is safe on
+  the phone. A queued recording that sends later while the app is open gets a light tap. Permanent
+  failures say "Scrawl link expired · Ask Kit for a new one" or "Too large to send", with Share,
+  which shares copies of the recording and leaves the entry queued.
+- **Revoked links.** The `/health` check at the start of a recording also goes to the HTTPS
+  endpoint. A 401 there shows "Scrawl link expired" beside the strip, but the recording carries on
+  and is kept in the outbox, marked failed, until the link is renewed.
+
+The endpoint rejects bodies over 95 MB, so HTTPS recordings are smaller and capped:
+
+| Capture | Video | Audio | Per second | Cap | At the cap |
+| --- | --- | --- | --- | --- | --- |
+| `.appFrames` to a Mac | 6 Mbps | 96 kbps | ≈ 0.76 MB | none | — |
+| `.appFrames` to HTTPS | 3 Mbps | 96 kbps | ≈ 0.39 MB | 3:00 | ≈ 70 MB |
+| `.replayKit` to HTTPS | not settable (est. 8–12 Mbps) | | ≈ 1–1.5 MB | 0:45 | ≈ 45–68 MB |
+
+3 Mbps at 880×1912 and 30 fps is about 0.06 bits per pixel. That's plenty for app UI, which is mostly
+static between scrolls and transitions, and the 25 MB of headroom covers the encoder overshooting its
+average. Ten seconds before the cap, the strip shows "Length limit · Sending in 10 s" with a warning
+haptic, then sends. A payload that's still over the limit is never uploaded: it's marked "Too large
+to send" and kept for Share.
+
+Apps with an app delegate can optionally forward background session events, so iOS can relaunch a
+killed app to finish reporting uploads. Without this, finished uploads are picked up at the next
+launch:
+
+```swift
+func application(_: UIApplication, handleEventsForBackgroundURLSession identifier: String,
+                 completionHandler: @escaping () -> Void) {
+  Scrawl.handleBackgroundURLSessionEvents(identifier: identifier, completionHandler: completionHandler)
+}
+```
 
 #### App context
 
@@ -247,5 +305,7 @@ taskpolicy -c utility cargo test -j 3 --offline -- --test-threads=2
   frames.
 - **ScrawlKit:** `scrawl import` on a recording and its timeline (or hand-write a timeline for any
   phone video), then check the ripples and trails on frames and the app-event lines in the summary.
+  `swift test` runs the outbox tests on the Mac against a `URLProtocol` stub of the ingest endpoint
+  (persisting, retry classification, resends, deletion only on 2xx).
 - **Transcription:** `scrawl-helper transcribe <wav or movie>` prints words with timings;
   `scrawl reprocess <bundle> --out …` reruns transcription and keyframe selection on a real bundle.
