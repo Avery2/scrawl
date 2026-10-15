@@ -53,6 +53,8 @@ const POSITIVE_COLOR: u32 = 0x69d89f;
 // Dynamic Island capsule geometry. GPUI boxes are border-box, so the hairline border is part of
 // the inset: R_outer (20) = R_chip (16) + border (1) + pad (3), on every side.
 const ISLAND_H: f32 = 40.0;
+/// Width the recording pill opens from when a recording starts without the picker.
+const ISLAND_OPEN_FROM_W: f32 = 120.0;
 const ISLAND_RADIUS: f32 = ISLAND_H / 2.0;
 const ISLAND_INSET: f32 = 4.0;
 const ISLAND_PAD: f32 = ISLAND_INSET - 1.0;
@@ -1949,7 +1951,9 @@ impl ScrawlCoordinator {
             _metal_overlay: metal_overlay,
         });
         if matches!(self.island_phase, IslandPhase::Hidden) {
-            self.island_width = self.island_target_width.max(240.0);
+            // Started straight from the shortcut (no picker to morph from): open from a compact
+            // capsule so the shell springs out to its width, Dynamic Island style.
+            self.island_width = ISLAND_OPEN_FROM_W;
             self.island_velocity = 0.0;
             self.island_scale = 0.92;
             self.island_scale_velocity = 0.0;
@@ -2050,7 +2054,7 @@ impl ScrawlCoordinator {
             _metal_overlay: metal_overlay,
         });
         if matches!(self.island_phase, IslandPhase::Hidden) {
-            self.island_width = self.island_target_width.max(240.0);
+            self.island_width = ISLAND_OPEN_FROM_W;
             self.island_velocity = 0.0;
             self.island_scale = 0.92;
             self.island_scale_velocity = 0.0;
@@ -2276,6 +2280,12 @@ impl Render for HudPillWindow {
             } else if has_prev && phase_age < 0.145 {
                 let t_in = ease_out_cubic(((phase_age - 0.055) / 0.090).clamp(0.0, 1.0));
                 (target_phase, 3.5 * (1.0 - t_in), 0.15 + 0.85 * t_in)
+            } else if !has_prev && matches!(target_phase, IslandPhase::Recording) && phase_age < 0.22
+            {
+                // Opening straight into Recording: the shell springs out from a compact capsule
+                // first, so the contents wait ~80 ms (until it's most of the way open) and then unblur.
+                let t_open = ease_out_cubic(((phase_age - 0.08) / 0.14).clamp(0.0, 1.0));
+                (target_phase, 3.5 * (1.0 - t_open), t_open)
             } else if !has_prev && phase_age < 0.11 {
                 let t_open = ease_out_cubic((phase_age / 0.11).clamp(0.0, 1.0));
                 (target_phase, 3.5 * (1.0 - t_open), t_open)
