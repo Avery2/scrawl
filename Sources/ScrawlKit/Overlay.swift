@@ -104,7 +104,7 @@
         .ignoresSafeArea()
         .allowsHitTesting(false)
 
-        StripPlacement(mode: stripMode, actions: actions)
+        StripPlacement(mode: stripMode, actions: actions, notice: scrawl.isRecording ? scrawl.notice : nil)
       }
     }
 
@@ -119,7 +119,8 @@
       case .idle: return nil
       case .sending: return .sending
       case let .sent(target): return .sent(target)
-      case .failed: return .failed
+      case .queued: return .queued
+      case .failed: return .failed(scrawl.deliveryFailure)
       }
     }
 

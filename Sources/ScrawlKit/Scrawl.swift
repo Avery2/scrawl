@@ -1,4 +1,5 @@
 #if os(iOS)
+  import Network
   import Security
   import SwiftUI
   import UIKit
@@ -228,12 +229,19 @@
       case idle
       case sending
       case sent(String)
+      /// Saved on the phone and sending in the background (HTTPS endpoints): offline or slow.
+      case queued
       case failed
     }
 
     public private(set) var isRecording = false
     public private(set) var isDrawing = false
     public private(set) var uploadStatus: UploadStatus = .idle
+    /// Why the last delivery failed: no Mac answered (LAN; it waits for USB pickup or Share), the
+    /// HTTPS endpoint answered 401/403 (link revoked) or 413, or it couldn't be saved for sending.
+    private(set) var deliveryFailure = ScrawlStrip.Failure.unreachable
+    /// A short message beside the strip while recording (link expired, the length cap).
+    private(set) var notice: ScrawlStrip.Notice?
     /// A discarded recording is waiting out its Undo window.
     private(set) var isDiscardPending = false
     public private(set) var startedAt: Date?
@@ -255,7 +263,23 @@
       let timelineData: Data
       let readyMarker: URL
       let sentMarker: URL
+      let recordedAt: String
     }
+
+    /// Recordings for HTTPS endpoints must stay under the 95 MB upload limit: app-frame video at
+    /// `AppFrameRecorder.hostedVideoBitRate` is about 0.39 MB a second, so 3 minutes is about
+    /// 70 MB. ReplayKit's bitrate can't be set (native resolution, an estimated 8–12 Mbps), so its
+    /// recordings stop sooner. The strip warns `limitWarning` before the cap, then sends.
+    static func hostedRecordingLimit(for method: ScrawlCaptureMethod) -> Duration {
+      switch method {
+      case .appFrames: .seconds(180)
+      case .replayKit: .seconds(45)
+      }
+    }
+
+    static let limitWarning: Duration = .seconds(10)
+    /// How long a hosted upload may take before the strip says it's queued instead of waiting.
+    private static let quickSendWindow: Duration = .seconds(4)
 
     private static let undoWindow: Duration = .seconds(5)
     @ObservationIgnored private var events: [[String: Any]] = []
@@ -285,6 +309,21 @@
     /// The Scrawl address that answered when the current recording started.
     @ObservationIgnored private var reachableURL: URL?
     @ObservationIgnored private var lastSetupURLHandled: (url: URL, at: ContinuousClock.Instant)?
+    /// Durable delivery to an HTTPS endpoint; exists only while paired with one.
+    @ObservationIgnored private var outbox: Outbox?
+    @ObservationIgnored private var outboxCredentials: (target: URL, token: String)?
+    @ObservationIgnored private var outboxObservers: [any NSObjectProtocol] = []
+    @ObservationIgnored private var pathMonitor: NWPathMonitor?
+    @ObservationIgnored private var backgroundEventsCompletion: (() -> Void)?
+    /// The HTTPS endpoint's /health answered 401: recordings are kept, marked failed.
+    @ObservationIgnored private var pairingRevoked = false
+    /// The outbox entry the strip is reporting on (sending or queued).
+    @ObservationIgnored private var shownEntry: String?
+    /// The permanently failed outbox entry the strip's Share button shares.
+    @ObservationIgnored private var failedEntry: String?
+    @ObservationIgnored private var limitTask: Task<Void, Never>?
+    @ObservationIgnored private var noticeID = 0
+    @ObservationIgnored private var statusID = 0
 
     /// Whether to record the microphone with the screen.
     public var narration = true
@@ -397,6 +436,125 @@
     func syncSystemIntegration() {
       SystemEditingGestures.setSuppressed(isConfigured && suppressesSystemEditingGestures && threeFingerTriggers > 0)
       KeyboardTracker.shared.setTracking(isConfigured)
+      syncOutbox()
+    }
+
+    // MARK: - HTTPS Outbox
+
+    /// The background `URLSession` identifier the outbox uploads on.
+    public static var backgroundSessionIdentifier: String {
+      "dev.kitlangton.scrawl.outbox.\(Bundle.main.bundleIdentifier ?? "app")"
+    }
+
+    /// Optional: forward `application(_:handleEventsForBackgroundURLSession:completionHandler:)`
+    /// here so iOS can relaunch a killed app to finish reporting background uploads. Returns
+    /// `false` (without calling `completionHandler`) for sessions that aren't ScrawlKit's. Without
+    /// it, finished uploads are still picked up the next time the app launches.
+    @discardableResult
+    public static func handleBackgroundURLSessionEvents(identifier: String, completionHandler: @escaping () -> Void) -> Bool {
+      guard identifier == backgroundSessionIdentifier else { return false }
+      shared.syncOutbox()
+      guard let outbox = shared.outbox else {
+        completionHandler()
+        return true
+      }
+      shared.backgroundEventsCompletion = completionHandler
+      outbox.handleBackgroundEvents {
+        Task { @MainActor in
+          let completion = Scrawl.shared.backgroundEventsCompletion
+          Scrawl.shared.backgroundEventsCompletion = nil
+          completion?()
+        }
+      }
+      return true
+    }
+
+    /// The configured HTTPS endpoint, if any. With one, recordings go through the outbox; plain
+    /// `http` URLs are Macs on the LAN.
+    private var hostedURL: URL? {
+      serverURLs.first { $0.scheme?.lowercased() == "https" }
+    }
+
+    /// Creates the outbox (and its retry triggers) while paired with an HTTPS endpoint and tears it
+    /// down otherwise: unpaired devices have no session, monitor, or files.
+    private func syncOutbox() {
+      let bearer = token?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      guard isConfigured, let target = hostedURL, !bearer.isEmpty else {
+        tearDownOutbox()
+        return
+      }
+      let outbox = outbox ?? makeOutbox()
+      outbox.setCredentials(target: target, token: bearer)
+      if let previous = outboxCredentials, previous.target != target || previous.token != bearer {
+        // A new link: what failed with the old one (revoked) gets another go.
+        pairingRevoked = false
+        outbox.retryFailed()
+      }
+      outboxCredentials = (target, bearer)
+    }
+
+    private func makeOutbox() -> Outbox {
+      let outbox = Outbox(
+        directory: URL.applicationSupportDirectory.appending(path: "ScrawlOutbox", directoryHint: .isDirectory),
+        configuration: Outbox.backgroundConfiguration(identifier: Self.backgroundSessionIdentifier)
+      ) { event in
+        Task { @MainActor in Scrawl.shared.handle(event) }
+      }
+      self.outbox = outbox
+      let center = NotificationCenter.default
+      outboxObservers = [
+        center.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { _ in
+          MainActor.assumeIsolated { Scrawl.shared.outbox?.kick(force: true) }
+        },
+      ]
+      // Back online: try everything waiting now rather than at its backoff time.
+      let monitor = NWPathMonitor()
+      let reachability = Reachability()
+      monitor.pathUpdateHandler = { [weak outbox] path in
+        if reachability.update(path.status == .satisfied) { outbox?.kick(force: true) }
+      }
+      monitor.start(queue: DispatchQueue(label: "dev.kitlangton.scrawl.outbox.path"))
+      pathMonitor = monitor
+      // Launch: whatever was waiting from earlier sessions.
+      outbox.kick(force: true)
+      return outbox
+    }
+
+    private func tearDownOutbox() {
+      guard let outbox else { return }
+      outbox.invalidate()
+      self.outbox = nil
+      outboxCredentials = nil
+      pathMonitor?.cancel()
+      pathMonitor = nil
+      for observer in outboxObservers {
+        NotificationCenter.default.removeObserver(observer)
+      }
+      outboxObservers = []
+    }
+
+    private func handle(_ event: Outbox.Event) {
+      let isActive = UIApplication.shared.applicationState == .active
+      switch event {
+      case let .sent(id, title):
+        if shownEntry == id {
+          shownEntry = nil
+          Task { await presentSent(title) }
+        } else if isActive, !isRecording {
+          // A queued recording went out later: a light confirmation.
+          UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        }
+      case let .retrying(id, _, _):
+        // Offline or slow: no need to keep the strip spinning.
+        if shownEntry == id, uploadStatus == .sending {
+          Task { await presentQueued(id) }
+        }
+      case let .failed(id, failure):
+        if failure == .unauthorized { pairingRevoked = true }
+        guard shownEntry == id || (isActive && !isRecording && !isStarting && uploadStatus == .idle && !isDiscardPending) else { return }
+        shownEntry = nil
+        Task { await presentFailure(failure == .unauthorized ? .linkExpired : .tooLarge, entry: id) }
+      }
     }
 
     /// Logs something the app did ("Done tapped", "rest started"), placed on the recording's timeline.
@@ -418,7 +576,8 @@
 
     public func start() {
       guard isConfigured, !isRecording, !isStarting else { return }
-      let recorder = captureMethod.makeRecorder()
+      let hosted = hostedURL != nil
+      let recorder = captureMethod.makeRecorder(hosted: hosted)
       guard recorder.isAvailable else { return }
       if isDiscardPending { finalizeDiscard() }
       markers = []
@@ -438,8 +597,16 @@
       isDrawing = false
       uploadStatus = .idle
       failedRecording = nil
+      failedEntry = nil
+      shownEntry = nil
+      statusID += 1
       isStarting = true
       showOverlay()
+      if hosted {
+        syncOutbox()
+        // Known revoked from an earlier check: say so, but record anyway.
+        if pairingRevoked { showNotice(.linkExpired, for: .seconds(5)) }
+      }
       // Reaching the Mac now raises iOS's local network prompt at the start, not at stop time.
       Task { await self.findMac() }
       self.recorder = recorder
@@ -453,6 +620,7 @@
           KeyboardTracker.shared.recordingWillBegin()
           ScrawlAppContext.shared.begin(at: startedAt)
           self.isRecording = true
+          if hosted { self.startLimit(for: recorder.method, startedAt: startedAt) }
         case let .failure(error):
           print("Scrawl: could not start recording: \(error.localizedDescription)")
           self.recorder = nil
@@ -493,9 +661,14 @@
       self.recorder = nil
       isRecording = false
       isDrawing = false
+      limitTask?.cancel()
+      limitTask = nil
+      notice = nil
       let discardToken = discarding ? beginUndoWindow() : nil
       if discardToken == nil { uploadStatus = .sending }
-      let directory = Self.directory
+      // Recordings for an HTTPS endpoint (often showing private data) stay out of Documents,
+      // which is backed up: they're staged in tmp and live on only inside the outbox.
+      let directory = hostedURL != nil ? Self.stagingDirectory : Self.directory
       try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
       let stamp = startedAt.formatted(.iso8601.year().month().day().timeSeparator(.omitted).time(includingFractionalSeconds: false))
         .replacingOccurrences(of: ":", with: "")
@@ -550,7 +723,8 @@
             recording: Recording(movie: movie, timeline: timeline),
             timelineData: timelineData,
             readyMarker: readyMarker,
-            sentMarker: sentMarker
+            sentMarker: sentMarker,
+            recordedAt: startedAt.ISO8601Format()
           )
           guard let discardToken else {
             await self.deliver(finished)
@@ -598,6 +772,10 @@
     }
 
     private func deliver(_ finished: FinishedRecording) async {
+      if hostedURL != nil {
+        await deliverHosted(finished)
+        return
+      }
       // `.ready` lets the Mac pick the recording up over USB if the network fails.
       try? Data("ready".utf8).write(to: finished.readyMarker)
       recordings.append(finished.recording)
@@ -611,9 +789,43 @@
       UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     }
 
-    /// Where recordings are kept: Documents/Scrawl.
+    /// Where recordings for a Mac are kept: Documents/Scrawl. (Recordings for an HTTPS endpoint
+    /// are kept in the outbox, Application Support/ScrawlOutbox, until they're sent.)
     public static var directory: URL {
       URL.documentsDirectory.appending(path: "Scrawl", directoryHint: .isDirectory)
+    }
+
+    /// Where a recording for an HTTPS endpoint is written before it becomes an outbox entry.
+    private static var stagingDirectory: URL {
+      URL.temporaryDirectory.appending(path: "ScrawlStaging", directoryHint: .isDirectory)
+    }
+
+    /// Warns shortly before an HTTPS recording's length cap, then sends it.
+    private func startLimit(for method: ScrawlCaptureMethod, startedAt: Date) {
+      limitTask?.cancel()
+      let limit = Self.hostedRecordingLimit(for: method)
+      limitTask = Task { [weak self] in
+        try? await Task.sleep(for: limit - Self.limitWarning)
+        guard let self, !Task.isCancelled, self.isRecording, self.startedAt == startedAt else { return }
+        self.showNotice(.init("Length limit", detail: "Sending in \(Self.limitWarning.components.seconds) s"), for: nil)
+        UINotificationFeedbackGenerator().notificationOccurred(.warning)
+        try? await Task.sleep(for: Self.limitWarning)
+        guard !Task.isCancelled, self.isRecording, self.startedAt == startedAt else { return }
+        self.stop()
+      }
+    }
+
+    /// Shows `text` beside the strip while recording, for `duration` (or until it stops).
+    private func showNotice(_ text: ScrawlStrip.Notice, for duration: Duration?) {
+      noticeID += 1
+      let id = noticeID
+      notice = text
+      guard let duration else { return }
+      Task { [weak self] in
+        try? await Task.sleep(for: duration)
+        guard let self, self.noticeID == id else { return }
+        self.notice = nil
+      }
     }
 
     // MARK: - Freehand Drawing on the Overlay
@@ -846,61 +1058,156 @@
       if let target = deliveredTarget {
         try? FileManager.default.removeItem(at: readyMarker)
         try? FileManager.default.removeItem(at: sentMarker)
-        uploadStatus = .sent(target)
-        UINotificationFeedbackGenerator().notificationOccurred(.success)
-        try? await Task.sleep(for: .milliseconds(2200))
-        guard case .sent = uploadStatus else { return }
-        uploadStatus = .idle
-        await hideOverlayAfterExit()
+        await presentSent(target)
       } else {
         // Keep `.ready` so the Mac still picks the recording up the next time the phone is cabled.
         // The share sheet only opens if the strip's Share button is tapped.
-        failedRecording = recording
-        uploadStatus = .failed
-        UINotificationFeedbackGenerator().notificationOccurred(.warning)
-        try? await Task.sleep(for: .seconds(8))
-        guard uploadStatus == .failed else { return }
-        uploadStatus = .idle
-        failedRecording = nil
-        await hideOverlayAfterExit()
+        await presentFailure(.unreachable, recording: recording)
       }
+    }
+
+    /// HTTPS endpoint: the recording becomes an outbox entry (on disk before anything is sent),
+    /// then the strip waits briefly for the upload. Quick: "Sent to …". Otherwise "Queued", and
+    /// the outbox keeps trying in the background until a 2xx.
+    private func deliverHosted(_ finished: FinishedRecording) async {
+      syncOutbox()
+      guard let outbox, let target = hostedURL else {
+        await presentFailure(.notSaved, recording: finished.recording)
+        return
+      }
+      let entry: Outbox.Entry
+      do {
+        entry = try await outbox.enqueue(
+          timeline: finished.timelineData,
+          movie: finished.recording.movie,
+          target: target,
+          recordedAt: finished.recordedAt,
+          failure: pairingRevoked ? .unauthorized : nil
+        )
+      } catch {
+        // The staged files stay so Share still has them.
+        print("Scrawl: could not save the recording for sending: \(error.localizedDescription)")
+        await presentFailure(.notSaved, recording: finished.recording)
+        return
+      }
+      // The outbox holds the only copy from here on.
+      Self.delete(finished)
+      if let failure = entry.failure {
+        await presentFailure(failure == .unauthorized ? .linkExpired : .tooLarge, entry: entry.id)
+        return
+      }
+      shownEntry = entry.id
+      outbox.kick(force: true)
+      try? await Task.sleep(for: Self.quickSendWindow)
+      guard shownEntry == entry.id, uploadStatus == .sending else { return }
+      await presentQueued(entry.id)
+    }
+
+    private func presentSent(_ target: String) async {
+      statusID += 1
+      let id = statusID
+      uploadStatus = .sent(target)
+      UINotificationFeedbackGenerator().notificationOccurred(.success)
+      try? await Task.sleep(for: .milliseconds(2200))
+      guard statusID == id, case .sent = uploadStatus else { return }
+      uploadStatus = .idle
+      await hideOverlayAfterExit()
+    }
+
+    /// Saved and sending in the background: calm, with a success haptic. A send while the bubble
+    /// is up still turns it into "Sent to …".
+    private func presentQueued(_ entry: String) async {
+      statusID += 1
+      let id = statusID
+      shownEntry = entry
+      uploadStatus = .queued
+      UINotificationFeedbackGenerator().notificationOccurred(.success)
+      try? await Task.sleep(for: .milliseconds(3500))
+      guard statusID == id, uploadStatus == .queued else { return }
+      shownEntry = nil
+      uploadStatus = .idle
+      await hideOverlayAfterExit()
+    }
+
+    /// The failed bubble, with Share (of a LAN `recording`, or of an outbox `entry`).
+    private func presentFailure(_ failure: ScrawlStrip.Failure, recording: Recording? = nil, entry: String? = nil) async {
+      statusID += 1
+      let id = statusID
+      deliveryFailure = failure
+      failedRecording = recording
+      failedEntry = entry
+      showOverlay()
+      uploadStatus = .failed
+      UINotificationFeedbackGenerator().notificationOccurred(.warning)
+      try? await Task.sleep(for: .seconds(8))
+      guard statusID == id, uploadStatus == .failed else { return }
+      uploadStatus = .idle
+      failedRecording = nil
+      failedEntry = nil
+      await hideOverlayAfterExit()
     }
 
     /// The failed bubble's Share button.
     func shareFailedRecording() {
-      guard let recording = failedRecording else { return }
+      let recording = failedRecording
+      let entry = failedEntry
+      guard recording != nil || entry != nil else { return }
       failedRecording = nil
+      failedEntry = nil
       uploadStatus = .idle
-      if sharesWhenDone { Self.share(recording) }
       Task { await self.hideOverlayAfterExit() }
+      guard sharesWhenDone else { return }
+      if let recording {
+        Self.share([recording.movie, recording.timeline])
+      } else if let entry, let outbox {
+        // The payload stays queued; the share sheet gets temporary copies of its files.
+        Task {
+          let folder = URL.temporaryDirectory.appending(path: "ScrawlShare", directoryHint: .isDirectory)
+          guard let files = try? await outbox.extract(id: entry, into: folder) else { return }
+          Self.share([files.movie, files.timeline]) {
+            try? FileManager.default.removeItem(at: files.movie)
+            try? FileManager.default.removeItem(at: files.timeline)
+          }
+        }
+      }
     }
 
-    /// Checks each Scrawl address and remembers the first that answers.
+    /// Checks each Scrawl address (Macs and the HTTPS endpoint alike) and remembers the first that
+    /// answers. The HTTPS endpoint answering 401 means the link was revoked: the strip says so,
+    /// the recording carries on, and it's kept in the outbox as failed until the link is renewed.
     private func findMac() async {
       reachableURL = nil
       let urls = serverURLs
       guard let bearerToken = token?.trimmingCharacters(in: .whitespacesAndNewlines),
             !bearerToken.isEmpty
       else { return }
-      reachableURL = await withTaskGroup(of: URL?.self) { group in
+      let (reachable, revoked) = await withTaskGroup(of: (URL, Int?).self) { group in
         for base in urls {
           group.addTask {
             var request = URLRequest(url: base.appending(path: "health"))
             request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
             request.timeoutInterval = 4
-            guard let (_, response) = try? await URLSession.shared.data(for: request),
-                  (response as? HTTPURLResponse)?.statusCode == 200
-            else { return nil }
-            return base
+            let response = try? await URLSession.shared.data(for: request).1
+            return (base, (response as? HTTPURLResponse)?.statusCode)
           }
         }
-        for await result in group {
-          if let result {
+        var revoked = false
+        for await (base, status) in group {
+          if status == 200 {
             group.cancelAll()
-            return result
+            return (Optional(base), false)
           }
+          if status == 401 || status == 403, base.scheme?.lowercased() == "https" { revoked = true }
         }
-        return nil
+        return (nil, revoked)
+      }
+      reachableURL = reachable
+      guard hostedURL != nil else { return }
+      if reachable?.scheme?.lowercased() == "https" {
+        pairingRevoked = false
+      } else if revoked {
+        pairingRevoked = true
+        if isRecording || isStarting { showNotice(.linkExpired, for: .seconds(5)) }
       }
     }
 
@@ -951,17 +1258,34 @@
         .first { $0.activationState == .foregroundActive } ?? UIApplication.shared.connectedScenes.first as? UIWindowScene
     }
 
-    private static func share(_ recording: Recording) {
+    private static func share(_ files: [URL], completion: (@MainActor () -> Void)? = nil) {
       guard let scene = activeScene,
             let root = scene.windows.first(where: { $0.isKeyWindow && !($0 is OverlayWindow) })?.rootViewController
-      else { return }
+      else {
+        completion?()
+        return
+      }
       var top = root
       while let presented = top.presentedViewController { top = presented }
-      let sheet = UIActivityViewController(activityItems: [recording.movie, recording.timeline], applicationActivities: nil)
+      let sheet = UIActivityViewController(activityItems: files, applicationActivities: nil)
       sheet.popoverPresentationController?.sourceView = top.view
+      sheet.completionWithItemsHandler = { _, _, _, _ in
+        MainActor.assumeIsolated { completion?() }
+      }
       top.present(sheet, animated: true)
     }
 
     private static func round(_ value: Double) -> Double { (value * 1000).rounded() / 1000 }
+  }
+
+  /// Whether the network came back, from `NWPathMonitor` updates (which arrive on one queue).
+  private final class Reachability: @unchecked Sendable {
+    private var wasSatisfied: Bool?
+
+    /// True when `satisfied` follows an unsatisfied path (not for the first update).
+    func update(_ satisfied: Bool) -> Bool {
+      defer { wasSatisfied = satisfied }
+      return satisfied && wasSatisfied == false
+    }
   }
 #endif

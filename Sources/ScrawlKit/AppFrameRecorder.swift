@@ -21,13 +21,19 @@
     /// (880×1912 on a 440×956-point phone).
     nonisolated static let pixelsPerPoint: CGFloat = 2
     nonisolated static let framesPerSecond: Float = 30
+    /// Average H.264 bitrate for recordings sent to a Mac: about 0.76 MB a second with audio.
     nonisolated static let videoBitRate = 6_000_000
+    /// For HTTPS endpoints, whose uploads must stay under 95 MB: 3 Mbps video plus 96 kbps audio
+    /// is about 0.39 MB a second, so the 3-minute cap (`Scrawl.hostedRecordingLimit`) comes to
+    /// about 70 MB, leaving room for the encoder overshooting its average.
+    nonisolated static let hostedVideoBitRate = 3_000_000
     nonisolated static let audioBitRate = 96000
 
     private enum State { case idle, starting, recording, finished }
 
     var onInterruption: (@MainActor @Sendable () -> Void)?
     private(set) var recordsAudio = false
+    private let videoBitRate: Int
     var method: ScrawlCaptureMethod { .appFrames }
     var isAvailable: Bool { true }
 
@@ -41,6 +47,11 @@
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
     private let temporaryMovie = FileManager.default.temporaryDirectory
       .appending(path: "scrawl-\(UUID().uuidString).mp4")
+
+    init(videoBitRate: Int = AppFrameRecorder.videoBitRate) {
+      self.videoBitRate = videoBitRate
+      super.init()
+    }
 
     func start(microphone wantsMicrophone: Bool, completion: @escaping @MainActor @Sendable (Result<Date, any Error>) -> Void) {
       guard state == .idle else { return }
@@ -98,7 +109,7 @@
       canvas = CGSize(width: Self.even(points.width * Self.pixelsPerPoint), height: Self.even(points.height * Self.pixelsPerPoint))
       do {
         try? FileManager.default.removeItem(at: temporaryMovie)
-        let writer = try MovieWriter(url: temporaryMovie, size: canvas, audio: microphone != nil)
+        let writer = try MovieWriter(url: temporaryMovie, size: canvas, audio: microphone != nil, videoBitRate: videoBitRate)
         let start = MovieWriter.now()
         let startedAt = Date()
         try writer.begin(at: start)
@@ -321,7 +332,7 @@
       CMClockGetTime(CMClockGetHostTimeClock())
     }
 
-    init(url: URL, size: CGSize, audio withAudio: Bool) throws {
+    init(url: URL, size: CGSize, audio withAudio: Bool, videoBitRate: Int = AppFrameRecorder.videoBitRate) throws {
       writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
       writer.shouldOptimizeForNetworkUse = false
 
@@ -335,7 +346,7 @@
           AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
         ],
         AVVideoCompressionPropertiesKey: [
-          AVVideoAverageBitRateKey: AppFrameRecorder.videoBitRate,
+          AVVideoAverageBitRateKey: videoBitRate,
           AVVideoExpectedSourceFrameRateKey: Int(AppFrameRecorder.framesPerSecond),
           AVVideoMaxKeyFrameIntervalKey: Int(AppFrameRecorder.framesPerSecond),
           AVVideoMaxKeyFrameIntervalDurationKey: 1.0,

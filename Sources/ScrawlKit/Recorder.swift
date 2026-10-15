@@ -35,9 +35,10 @@
 
   extension ScrawlCaptureMethod {
     @MainActor
-    func makeRecorder() -> any ScrawlRecorder {
+    /// `hosted`: the recording goes to an HTTPS endpoint, so it has to fit under its upload limit.
+    func makeRecorder(hosted: Bool) -> any ScrawlRecorder {
       switch self {
-      case .appFrames: AppFrameRecorder()
+      case .appFrames: AppFrameRecorder(videoBitRate: hosted ? AppFrameRecorder.hostedVideoBitRate : AppFrameRecorder.videoBitRate)
       case .replayKit: ReplayKitRecorder()
       }
     }

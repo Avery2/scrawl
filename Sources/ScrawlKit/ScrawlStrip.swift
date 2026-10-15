@@ -34,11 +34,13 @@
       case recording(startedAt: Date, isDrawing: Bool)
       case sending
       case sent(String)
-      case failed
+      /// Saved on the phone; sends in the background when it can.
+      case queued
+      case failed(Failure)
       case discarded
 
       enum Phase {
-        case recording, sending, sent, failed, discarded
+        case recording, sending, sent, queued, failed, discarded
       }
 
       var phase: Phase {
@@ -46,10 +48,38 @@
         case .recording: .recording
         case .sending: .sending
         case .sent: .sent
+        case .queued: .queued
         case .failed: .failed
         case .discarded: .discarded
         }
       }
+    }
+
+    /// Why a recording didn't send; every failure keeps Share.
+    enum Failure: Equatable {
+      case unreachable, linkExpired, tooLarge, notSaved
+
+      var notice: Notice {
+        switch self {
+        case .unreachable: Notice("Mac didn't answer")
+        case .linkExpired: Notice("Scrawl link expired", detail: "Ask Kit for a new one")
+        case .tooLarge: Notice("Too large to send")
+        case .notSaved: Notice("Couldn't save to send")
+        }
+      }
+    }
+
+    /// A short message in a bubble: one line, or two with `detail` (so long ones stay narrow).
+    struct Notice: Equatable {
+      var title: String
+      var detail: String?
+
+      init(_ title: String, detail: String? = nil) {
+        self.title = title
+        self.detail = detail
+      }
+
+      static let linkExpired = Failure.linkExpired.notice
     }
 
     struct Actions {
@@ -209,11 +239,16 @@
           .font(.system(size: 17, weight: .semibold))
           .foregroundStyle(.green)
           .accessibilityLabel("Sent")
+      case .queued:
+        Image(systemName: "tray.and.arrow.up")
+          .font(.system(size: 16, weight: .medium))
+          .foregroundStyle(.white.opacity(0.85))
+          .accessibilityLabel("Recording queued")
       case .failed:
         Image(systemName: "exclamationmark.triangle.fill")
           .font(.system(size: 16, weight: .medium))
           .foregroundStyle(.yellow)
-          .accessibilityLabel("Mac didn't answer")
+          .accessibilityLabel("Not sent")
       case .discarded:
         Image(systemName: "trash")
           .font(.system(size: 16, weight: .medium))
@@ -230,9 +265,13 @@
           ElapsedText(startedAt: model.startedAt)
         case let .sent(target):
           Text("Sent to \(Self.shortened(target))")
-        case .failed:
+        case .queued:
+          Text("Queued · sends when online")
+        case let .notice(notice):
+          noticeText(notice)
+        case let .failed(failure):
           HStack(spacing: 8) {
-            Text("Mac didn't answer")
+            noticeText(failure.notice)
             Button { actions.share() } label: {
               Label("Share", systemImage: "square.and.arrow.up")
                 .padding(.horizontal, 9)
@@ -265,6 +304,20 @@
       .padding(.horizontal, 12)
       .padding(.vertical, 8)
       .fixedSize()
+    }
+
+    @ViewBuilder private func noticeText(_ notice: Notice) -> some View {
+      if let detail = notice.detail {
+        VStack(alignment: .leading, spacing: 1) {
+          Text(notice.title)
+          Text(detail)
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.white.opacity(0.75))
+        }
+        .accessibilityElement(children: .combine)
+      } else {
+        Text(notice.title)
+      }
     }
 
     private static func shortened(_ target: String) -> String {
@@ -410,7 +463,21 @@
     }
 
     enum Bubble: Equatable {
-      case elapsed, sent(String), failed, discarded
+      case elapsed, sent(String), queued, failed(ScrawlStrip.Failure), discarded
+      /// A message while recording (link expired, the length cap); not tappable.
+      case notice(ScrawlStrip.Notice)
+
+      var isNotice: Bool {
+        if case .notice = self { true } else { false }
+      }
+
+      /// Bubbles beside the dot rather than the status circle.
+      var isRecording: Bool {
+        switch self {
+        case .elapsed, .notice: true
+        default: false
+        }
+      }
     }
 
     private(set) var geometry = Geometry()
@@ -496,6 +563,7 @@
     /// Where the controls gather from or into, relative to the strip's centre.
     @ObservationIgnored private var gatherY = 0.0
     @ObservationIgnored private var bubbleActive = false
+    @ObservationIgnored private var notice: ScrawlStrip.Notice?
     @ObservationIgnored private var bubbleY = 0.0
     @ObservationIgnored private var measured: (bubble: Bubble, size: CGSize)?
     @ObservationIgnored private var restPoint: CGPoint?
@@ -527,7 +595,9 @@
         strip.timers.removeAll()
         strip.exiting = false
         switch next {
-        case .recording: strip.toStrip(from: previous)
+        case .recording:
+          strip.toStrip(from: previous)
+          if strip.notice != nil { strip.after(StripMotion.bubbleDelayAfterPour) { $0.showRecordingBubble() } }
         case nil: strip.toGone(from: previous)
         case let status?: strip.toStatus(status, mode: mode, from: previous)
         }
@@ -543,12 +613,32 @@
       let change: (LiquidStrip) -> Void = { strip in
         if isHolding {
           strip.showBubble(.elapsed)
-        } else if strip.bubble == .elapsed, strip.bubbleActive {
-          strip.hideBubble()
+        } else if strip.bubbleActive {
+          strip.showRecordingBubble()
         }
       }
       if reduceMotion { applyInstant(change) } else { change(self) }
       wake()
+    }
+
+    /// A message beside the dot while recording; holding the dot shows the time over it.
+    func setNotice(_ notice: ScrawlStrip.Notice?) {
+      guard notice != self.notice else { return }
+      self.notice = notice
+      guard phase == .recording, !holding else { return }
+      let change: (LiquidStrip) -> Void = { $0.showRecordingBubble() }
+      if reduceMotion { applyInstant(change) } else { change(self) }
+      wake()
+    }
+
+    /// While recording and not held: the notice if there is one, otherwise no bubble.
+    private func showRecordingBubble() {
+      guard phase == .recording, !holding else { return }
+      if let notice {
+        showBubble(.notice(notice))
+      } else if bubbleActive {
+        hideBubble()
+      }
     }
 
     /// The bubble's text measured at its natural size.
@@ -672,7 +762,8 @@
       if fromStrip { after(StripMotion.iconSwapDelay, swap) } else { swap(self) }
       let bubble: Bubble? = switch mode {
       case let .sent(title)?: .sent(title)
-      case .failed?: .failed
+      case .queued?: .queued
+      case let .failed(failure)?: .failed(failure)
       case .discarded?: .discarded
       default: nil
       }
@@ -715,7 +806,7 @@
     private func showBubble(_ kind: Bubble) {
       bubbleActive = true
       bubble = kind
-      bubbleY = kind == .elapsed
+      bubbleY = kind.isRecording
         ? Metrics.rowCenters[Metrics.dotIndex]
         : (values[Key.top.rawValue].target + values[Key.bottom.rawValue].target) / 2
       to(.bubbleGap, Metrics.bubbleGap, StripMotion.bubbleBud)
@@ -891,7 +982,7 @@
       next.bubbleGap = gap
       next.bubbleCenter = CGPoint(x: left + bubbleWidth / 2, y: centerY)
       next.bubbleOpacity = min(max(self[.bubbleAlpha], 0), 1) * alpha
-      next.bubbleInteractive = bubbleActive && self[.bubbleAlpha] > 0.5
+      next.bubbleInteractive = bubbleActive && self[.bubbleAlpha] > 0.5 && !(bubble?.isNotice ?? false)
       if bubbleWidth > 1, self[.bubbleAlpha] > 0.01 || gap > Metrics.hiddenBubbleGap + 1 {
         next.bubble = CGRect(x: left, y: centerY - bubbleHeight / 2, width: bubbleWidth, height: bubbleHeight)
       }
@@ -1138,6 +1229,8 @@
     let actions: ScrawlStrip.Actions
     /// Pins the edge (previews) instead of the remembered one.
     var sideOverride: StripSide?
+    /// A message beside the dot while recording.
+    var notice: ScrawlStrip.Notice?
 
     @AppStorage("dev.kitlangton.scrawl.strip.side") private var storedSide = StripSide.trailing
     /// 0 is the top of the space the strip can move in, 1 the bottom.
@@ -1167,11 +1260,13 @@
         liquid.side = side
         liquid.reduceMotion = reduceMotion
         latest = mode
+        liquid.setNotice(notice)
         DispatchQueue.main.async {
           isReady = true
           liquid.apply(latest)
         }
       }
+      .onChange(of: notice) { _, notice in liquid.setNotice(notice) }
       .onChange(of: mode) { _, next in
         latest = next
         if isReady { liquid.apply(next) }
@@ -1310,12 +1405,13 @@
     private struct StripPreview: View {
       let mode: ScrawlStrip.Mode
       var side = StripSide.trailing
+      var notice: ScrawlStrip.Notice?
 
       var body: some View {
         ZStack {
           LinearGradient(colors: [.indigo, .teal, .orange], startPoint: .top, endPoint: .bottom)
             .ignoresSafeArea()
-          StripPlacement(mode: mode, actions: .init(), sideOverride: side)
+          StripPlacement(mode: mode, actions: .init(), sideOverride: side, notice: notice)
         }
       }
     }
@@ -1334,7 +1430,11 @@
         (.recording(startedAt: .now, isDrawing: false), 1.4),
         (.discarded, 2.4),
         (.sending, 1.4),
-        (.failed, 2.6),
+        (.queued, 2.0),
+        (nil, 1.2),
+        (.recording(startedAt: .now, isDrawing: false), 1.4),
+        (.sending, 1.4),
+        (.failed(.unreachable), 2.6),
         (nil, 1.2),
       ]
       @State private var step = 0
@@ -1379,7 +1479,19 @@
     }
 
     #Preview("Failed") {
-      StripPreview(mode: .failed)
+      StripPreview(mode: .failed(.unreachable))
+    }
+
+    #Preview("Queued") {
+      StripPreview(mode: .queued)
+    }
+
+    #Preview("Link expired") {
+      StripPreview(mode: .failed(.linkExpired))
+    }
+
+    #Preview("Recording, link expired") {
+      StripPreview(mode: .recording(startedAt: .now.addingTimeInterval(-3), isDrawing: false), notice: .linkExpired)
     }
 
     #Preview("Discarded") {
