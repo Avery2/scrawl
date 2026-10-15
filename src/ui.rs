@@ -23,8 +23,8 @@ use screencapturekit::prelude::*;
 use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
 
 use crate::capture::{
-    LiveOverlayEvent, ScreenCaptureSession, SharedCaptureTelemetry, current_mouse_screen,
-    discover_target, install_global_hotkeys, list_selectable_windows,
+    LiveOverlayEvent, ScreenCaptureSession, SharedCaptureTelemetry, ShortcutChord,
+    current_mouse_screen, discover_target, install_global_hotkeys, list_selectable_windows,
     record_external_frontmost_app, region_target, scrawl_log, selectable_window_at,
     set_escape_hotkey_enabled, shortcut_from_key_and_mods, start_global_input_tap,
     update_global_shortcut,
@@ -246,6 +246,7 @@ fn island_content_width(window: &Window, phase: IslandPhase, clock: &str, iphone
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum MenuAction {
     ToggleCapture,
+    ChooseTarget,
     RecordIphone,
     OpenLatest,
     OpenInbox(PathBuf),
@@ -271,6 +272,11 @@ objc2::define_class!(
         #[unsafe(method(toggleCapture:))]
         fn toggle_capture(&self, _sender: &AnyObject) {
             let _ = self.ivars().sender.try_send(MenuAction::ToggleCapture);
+        }
+
+        #[unsafe(method(chooseTarget:))]
+        fn choose_target(&self, _sender: &AnyObject) {
+            let _ = self.ivars().sender.try_send(MenuAction::ChooseTarget);
         }
 
         #[unsafe(method(recordIphone:))]
@@ -450,7 +456,13 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
         menu.addItem(&item);
     };
 
-    add("Record Scrawl  ⌥⇧S", sel!(toggleCapture:));
+    let shortcut = crate::capture::ShortcutConfig::load().label;
+    add(&format!("Record Screen  {shortcut}"), sel!(toggleCapture:));
+    let choose = crate::capture::picker_label(&shortcut).map_or_else(
+        || "Choose What to Record…".to_owned(),
+        |l| format!("Choose What to Record…  {l}"),
+    );
+    add(&choose, sel!(chooseTarget:));
     add("Record iPhone", sel!(recordIphone:));
     add("Open Latest Bundle", sel!(openLatest:));
     add("Generate Demo Bundle", sel!(runDemo:));
@@ -896,6 +908,58 @@ pub enum IslandPhase {
     Dismissing,
 }
 
+/// Where capture stands, as far as the capture shortcuts care.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CaptureState {
+    /// Nothing open (or a finished capture's island). `mirror`: the iPhone mirror is showing.
+    Idle {
+        mirror: bool,
+    },
+    Selecting(SelectionMode),
+    Recording {
+        elapsed_ms: u64,
+    },
+    Processing,
+}
+
+/// What a capture shortcut does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShortcutAction {
+    /// Record the display under the cursor, auto-cropped, without the picker.
+    RecordScreen,
+    /// From the picker: record what it is on (the phone, else the full screen it shows).
+    RecordSelected,
+    RecordIphone,
+    OpenPicker,
+    ClosePicker,
+    Finish,
+    Ignore,
+}
+
+/// A second press this soon after a recording starts is a double press, not "finish".
+const DOUBLE_PRESS_MS: u64 = 400;
+
+/// ⌥⇧S records the screen at once (the phone if its mirror is up) and finishes a recording;
+/// ⌥⇧⌘S opens or closes the picker. In the picker ⌥⇧S records what it is on.
+fn route_shortcut(chord: ShortcutChord, state: CaptureState) -> ShortcutAction {
+    match (state, chord) {
+        (CaptureState::Recording { elapsed_ms }, _) if elapsed_ms < DOUBLE_PRESS_MS => {
+            ShortcutAction::Ignore
+        }
+        (CaptureState::Recording { .. }, _) => ShortcutAction::Finish,
+        (CaptureState::Processing, _) => ShortcutAction::Ignore,
+        (CaptureState::Selecting(_), ShortcutChord::Record) => ShortcutAction::RecordSelected,
+        (CaptureState::Selecting(_), ShortcutChord::Picker) => ShortcutAction::ClosePicker,
+        (CaptureState::Idle { mirror: true }, ShortcutChord::Record) => {
+            ShortcutAction::RecordIphone
+        }
+        (CaptureState::Idle { mirror: false }, ShortcutChord::Record) => {
+            ShortcutAction::RecordScreen
+        }
+        (CaptureState::Idle { .. }, ShortcutChord::Picker) => ShortcutAction::OpenPicker,
+    }
+}
+
 enum CaptureSource {
     Screen {
         session: ScreenCaptureSession,
@@ -908,6 +972,7 @@ enum CaptureSource {
 }
 
 struct ActiveRecording {
+    started: Instant,
     target: TargetInfo,
     bundle_dir: PathBuf,
     source: CaptureSource,
@@ -1122,6 +1187,43 @@ impl ScrawlCoordinator {
 
     pub fn is_selecting(&self) -> bool {
         matches!(self.island_phase, IslandPhase::Selecting { .. })
+    }
+
+    fn capture_state(&self) -> CaptureState {
+        if let Some(rec) = &self.active_recording {
+            CaptureState::Recording {
+                elapsed_ms: rec.started.elapsed().as_millis() as u64,
+            }
+        } else if self.is_processing() {
+            CaptureState::Processing
+        } else if let IslandPhase::Selecting { mode } = self.island_phase {
+            CaptureState::Selecting(mode)
+        } else {
+            CaptureState::Idle {
+                mirror: self.iphone_preview.is_some(),
+            }
+        }
+    }
+
+    /// ⌥⇧S, ⌥⇧⌘S and the menu items that stand for them.
+    pub fn handle_shortcut(&mut self, chord: ShortcutChord, cx: &mut Context<Self>) {
+        let action = route_shortcut(chord, self.capture_state());
+        scrawl_log(format!("shortcut {chord:?} -> {action:?}"));
+        match action {
+            ShortcutAction::RecordScreen => self.record_screen_now(cx),
+            ShortcutAction::RecordSelected => self.record_selected_mode(cx),
+            ShortcutAction::RecordIphone => self.start_recording_iphone(cx),
+            ShortcutAction::OpenPicker => self.begin_target_selection(cx),
+            ShortcutAction::ClosePicker => self.dismiss_island(cx),
+            ShortcutAction::Finish => self.finish_recording(cx),
+            ShortcutAction::Ignore => {}
+        }
+    }
+
+    /// Records the display under the cursor straight away (no picker), auto-cropped.
+    pub fn record_screen_now(&mut self, cx: &mut Context<Self>) {
+        let target = discover_target(None);
+        self.start_recording_with_target(target, cx);
     }
 
     pub fn is_island_visible(&self) -> bool {
@@ -1611,7 +1713,8 @@ impl ScrawlCoordinator {
         self.telemetry.begin_picker_session();
         self.sync_picker_overlay();
         if self.picker_metal_overlay.is_none() {
-            let overlay = MetalLaserOverlay::open(Arc::clone(&self.telemetry))
+            let [x, y, w, h] = self.display_rect.map(f64::from);
+            let overlay = MetalLaserOverlay::open(Arc::clone(&self.telemetry), Some([x, y, w, h]))
                 .map_err(|error| scrawl_log(format!("Metal overlay failed: {error}")))
                 .ok();
             if let Some(ref ov) = overlay {
@@ -1639,13 +1742,12 @@ impl ScrawlCoordinator {
         start_metric("picker_prep_ms", started);
     }
 
+    /// From the picker: the full screen it highlights.
     pub fn start_recording_full_screen(&mut self, cx: &mut Context<Self>) {
-        let target = discover_target(None);
+        let [x, y, w, h] = self.display_rect;
+        let centre = [f64::from(x + w / 2.0), f64::from(y + h / 2.0)];
+        let target = crate::capture::discover_target_at(None, Some(centre));
         self.start_recording_with_target(target, cx);
-    }
-
-    pub fn start_recording(&mut self, cx: &mut Context<Self>) {
-        self.begin_target_selection(cx);
     }
 
     pub fn start_recording_with_target(&mut self, target: TargetInfo, cx: &mut Context<Self>) {
@@ -1657,6 +1759,12 @@ impl ScrawlCoordinator {
             "start_recording_with_target invoked: mode={:?} frame={:?}",
             target.mode, target.frame
         ));
+        // Without the picker the start needs its own cue: the overlay flashes an edge glow.
+        let quick = !self.is_selecting();
+        self.telemetry.start_glow.store(
+            quick && target.mode == CaptureMode::Display,
+            std::sync::atomic::Ordering::Release,
+        );
         if let IslandPhase::Selecting { mode } = self.island_phase {
             self.remember_mode(mode);
         }
@@ -1679,10 +1787,14 @@ impl ScrawlCoordinator {
         let stage = Instant::now();
         // Reuse the continuous 120Hz Metal overlay opened in `begin_target_selection` so the
         // cutout and border never swap windows or jump a single pixel when recording starts.
+        let f = target.frame;
         let metal_overlay = self.picker_metal_overlay.take().or_else(|| {
-            let ov = MetalLaserOverlay::open(Arc::clone(&self.telemetry))
-                .map_err(|error| scrawl_log(format!("Metal overlay failed: {error}")))
-                .ok();
+            let ov = MetalLaserOverlay::open(
+                Arc::clone(&self.telemetry),
+                Some([f.x, f.y, f.width, f.height]),
+            )
+            .map_err(|error| scrawl_log(format!("Metal overlay failed: {error}")))
+            .ok();
             if let Some(ref o) = ov {
                 self.telemetry
                     .excluded_window_ids
@@ -1721,6 +1833,7 @@ impl ScrawlCoordinator {
             )
         });
         self.active_recording = Some(ActiveRecording {
+            started: Instant::now(),
             target,
             bundle_dir,
             source: CaptureSource::Screen {
@@ -1820,11 +1933,12 @@ impl ScrawlCoordinator {
             }
         };
         let metal_overlay = self.picker_metal_overlay.take().or_else(|| {
-            MetalLaserOverlay::open(Arc::clone(&self.telemetry))
+            MetalLaserOverlay::open(Arc::clone(&self.telemetry), None)
                 .map_err(|error| scrawl_log(format!("Metal overlay failed: {error}")))
                 .ok()
         });
         self.active_recording = Some(ActiveRecording {
+            started: Instant::now(),
             target,
             bundle_dir,
             source: CaptureSource::Phone(session),
@@ -2912,7 +3026,9 @@ impl Render for BundleReviewWindow {
                         .child(
                             hint_button("empty-record", "Record", Some(shortcut_label), true)
                                 .on_click(move |_, _, cx| {
-                                    c_start.update(cx, |coord, cx| coord.start_recording(cx));
+                                    c_start.update(cx, |coord, cx| {
+                                        coord.handle_shortcut(ShortcutChord::Record, cx);
+                                    });
                                 }),
                         )
                         .child(
@@ -2987,14 +3103,14 @@ impl Render for BundleReviewWindow {
                         mods.control,
                         mods.alt,
                         mods.shift,
-                    ) && coord.telemetry.matches_shortcut(
+                    ) && let Some(chord) = coord.telemetry.matches_shortcut(
                         cfg.key_code as u16,
                         mods.platform,
                         mods.control,
                         mods.alt,
                         mods.shift,
                     ) {
-                        coord.telemetry.emit_toggle_shortcut();
+                        coord.telemetry.emit_capture_shortcut(chord);
                         return true;
                     }
                     false
@@ -3819,7 +3935,9 @@ pub fn run_app(
         }
         if start_recording_immediately {
             let coord_clone = coordinator.clone();
-            coord_clone.update(cx, |coord, cx| coord.start_recording(cx));
+            coord_clone.update(cx, |coord, cx| {
+                coord.handle_shortcut(ShortcutChord::Record, cx);
+            });
         }
         if start_iphone_immediately {
             coordinator.update(cx, |coord, cx| coord.start_recording_iphone(cx));
@@ -3876,11 +3994,15 @@ pub fn run_app(
                             match action {
                                 MenuAction::ToggleCapture => {
                                     loop_coord.update(cx, |coord, cx| {
-                                        if coord.is_recording() {
-                                            coord.finish_recording(cx);
-                                        } else if coord.is_selecting() {
-                                            coord.start_recording_full_screen(cx);
-                                        } else {
+                                        coord.handle_shortcut(ShortcutChord::Record, cx);
+                                    });
+                                }
+                                MenuAction::ChooseTarget => {
+                                    loop_coord.update(cx, |coord, cx| {
+                                        if !coord.is_recording()
+                                            && !coord.is_processing()
+                                            && !coord.is_selecting()
+                                        {
                                             coord.begin_target_selection(cx);
                                         }
                                     });
@@ -3949,23 +4071,8 @@ pub fn run_app(
                     let mut should_open_pill = false;
                     while let Ok(ev) = ui_receiver.try_recv() {
                         loop_coord.update(cx, |coord, cx| match ev {
-                            LiveOverlayEvent::ToggleCaptureShortcut => {
-                                if coord.is_recording() {
-                                    coord.finish_recording(cx);
-                                } else if coord.is_selecting() {
-                                    if matches!(
-                                        coord.island_phase,
-                                        IslandPhase::Selecting {
-                                            mode: SelectionMode::Iphone
-                                        }
-                                    ) {
-                                        coord.start_recording_iphone(cx);
-                                    } else {
-                                        coord.start_recording_full_screen(cx);
-                                    }
-                                } else if !coord.is_processing() {
-                                    coord.begin_target_selection(cx);
-                                }
+                            LiveOverlayEvent::CaptureShortcut(chord) => {
+                                coord.handle_shortcut(chord, cx);
                             }
                             LiveOverlayEvent::PasteLatestShortcut => {
                                 if !coord.is_recording() && !coord.is_selecting() {
@@ -4163,6 +4270,68 @@ mod tests {
         assert_eq!(ISLAND_PAD + 1.0, ISLAND_INSET);
         assert_eq!(CHIP_H + 2.0 * ISLAND_INSET, ISLAND_H);
         assert!(ISLAND_H <= PILL_WINDOW_H);
+    }
+
+    #[test]
+    fn the_shortcut_records_at_once_and_the_picker_moves_to_cmd() {
+        use ShortcutAction::*;
+        use ShortcutChord::{Picker, Record};
+        let idle = CaptureState::Idle { mirror: false };
+        // Idle: ⌥⇧S records the screen, ⌥⇧⌘S opens the picker.
+        assert_eq!(route_shortcut(Record, idle), RecordScreen);
+        assert_eq!(route_shortcut(Picker, idle), OpenPicker);
+        // The iPhone mirror is up: ⌥⇧S records the phone.
+        let mirror = CaptureState::Idle { mirror: true };
+        assert_eq!(route_shortcut(Record, mirror), RecordIphone);
+        assert_eq!(route_shortcut(Picker, mirror), OpenPicker);
+        // In the picker: ⌥⇧S records what it is on, ⌥⇧⌘S closes it.
+        for mode in [
+            SelectionMode::Area,
+            SelectionMode::Window,
+            SelectionMode::Screen,
+            SelectionMode::Iphone,
+        ] {
+            assert_eq!(
+                route_shortcut(Record, CaptureState::Selecting(mode)),
+                RecordSelected
+            );
+            assert_eq!(
+                route_shortcut(Picker, CaptureState::Selecting(mode)),
+                ClosePicker
+            );
+        }
+        // Recording: either chord finishes.
+        let recording = CaptureState::Recording { elapsed_ms: 5_000 };
+        assert_eq!(route_shortcut(Record, recording), Finish);
+        assert_eq!(route_shortcut(Picker, recording), Finish);
+        // Still writing the last bundle: nothing.
+        assert_eq!(route_shortcut(Record, CaptureState::Processing), Ignore);
+        assert_eq!(route_shortcut(Picker, CaptureState::Processing), Ignore);
+    }
+
+    #[test]
+    fn a_double_press_does_not_finish_the_capture_it_just_started() {
+        let at = |elapsed_ms| CaptureState::Recording { elapsed_ms };
+        assert_eq!(
+            route_shortcut(ShortcutChord::Record, at(0)),
+            ShortcutAction::Ignore
+        );
+        assert_eq!(
+            route_shortcut(ShortcutChord::Record, at(250)),
+            ShortcutAction::Ignore
+        );
+        assert_eq!(
+            route_shortcut(ShortcutChord::Record, at(399)),
+            ShortcutAction::Ignore
+        );
+        assert_eq!(
+            route_shortcut(ShortcutChord::Picker, at(150)),
+            ShortcutAction::Ignore
+        );
+        assert_eq!(
+            route_shortcut(ShortcutChord::Record, at(400)),
+            ShortcutAction::Finish
+        );
     }
 
     #[test]

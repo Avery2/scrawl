@@ -149,6 +149,9 @@ const HOTKEY_SIG: u32 = u32::from_be_bytes(*b"SCRW");
 const HOTKEY_ID_TOGGLE: u32 = 1;
 const HOTKEY_ID_ESCAPE: u32 = 2;
 const HOTKEY_ID_ALT1: u32 = 3;
+/// The picker chord: the configured shortcut plus ⌘ (`HOTKEY_ID_PICKER`), and ⌘⌥⇧S.
+const HOTKEY_ID_PICKER: u32 = 50;
+const HOTKEY_ID_PICKER_ALT1: u32 = 51;
 const HOTKEY_ID_PASTE_BASE: u32 = 100;
 
 #[repr(C, packed(2))]
@@ -287,10 +290,19 @@ unsafe extern "C" {
     static kCFRunLoopCommonModes: *const c_void;
 }
 
+/// Which capture shortcut was pressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShortcutChord {
+    /// ⌥⇧S (or the configured shortcut): record now, or finish.
+    Record,
+    /// ⌥⇧⌘S (the configured shortcut plus ⌘): choose what to record.
+    Picker,
+}
+
 /// Live UI events emitted by the global input monitor to drive Scrawl's HUD & Review windows.
 #[derive(Clone, Debug)]
 pub enum LiveOverlayEvent {
-    ToggleCaptureShortcut,
+    CaptureShortcut(ShortcutChord),
     PasteLatestShortcut,
     UndoStroke,
     CancelCapture,
@@ -444,6 +456,7 @@ impl ShortcutConfig {
 
 struct CarbonHotKeyState {
     toggle_ref: usize,
+    picker_ref: usize,
 }
 
 static CARBON_HOTKEYS: std::sync::OnceLock<Mutex<CarbonHotKeyState>> = std::sync::OnceLock::new();
@@ -507,8 +520,11 @@ unsafe extern "C" fn carbon_hotkey_handler(
             id if id >= HOTKEY_ID_PASTE_BASE => {
                 telemetry.emit_paste_shortcut();
             }
+            id if id >= HOTKEY_ID_PICKER => {
+                telemetry.emit_capture_shortcut(ShortcutChord::Picker);
+            }
             _ => {
-                telemetry.emit_toggle_shortcut();
+                telemetry.emit_capture_shortcut(ShortcutChord::Record);
             }
         }
     }
@@ -568,6 +584,7 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
                 dispatcher
             };
             let mut next_alt_id = HOTKEY_ID_ALT1;
+            let mut next_picker_id = HOTKEY_ID_PICKER_ALT1;
             let mut codes = vec![s_code];
             if s_code != u32::from(KEY_S) {
                 codes.push(u32::from(KEY_S));
@@ -588,13 +605,21 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
                         "⌃⌥⌘S",
                     ),
                 ] {
+                    let picker = mods == CARBON_CMD_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY;
+                    let id = if picker {
+                        next_picker_id += 1;
+                        next_picker_id - 1
+                    } else {
+                        next_alt_id += 1;
+                        next_alt_id - 1
+                    };
                     let mut r: *mut c_void = ptr::null_mut();
                     let rc = RegisterEventHotKey(
                         code,
                         mods,
                         EventHotKeyID {
                             signature: HOTKEY_SIG,
-                            id: next_alt_id,
+                            id,
                         },
                         target,
                         0,
@@ -603,7 +628,6 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
                     scrawl_log(format!(
                         "RegisterEventHotKey({name}, code={code}, mods={mods}) -> rc={rc} ref={r:p}"
                     ));
-                    next_alt_id += 1;
                 }
             }
             // Register ⌥⇧V (plus ⌃⌥⇧V, ⌘⌥⇧V, ⌃⌥⌘V) for pasting both Image + Text of the latest capture.
@@ -648,7 +672,10 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
                 }
             }
         }
-        Mutex::new(CarbonHotKeyState { toggle_ref: 0 })
+        Mutex::new(CarbonHotKeyState {
+            toggle_ref: 0,
+            picker_ref: 0,
+        })
     });
     let shortcut = telemetry
         .shortcut
@@ -675,6 +702,10 @@ pub fn update_global_shortcut(telemetry: &SharedCaptureTelemetry, config: Shortc
     if state.toggle_ref != 0 {
         unsafe { UnregisterEventHotKey(state.toggle_ref as *mut c_void) };
         state.toggle_ref = 0;
+    }
+    if state.picker_ref != 0 {
+        unsafe { UnregisterEventHotKey(state.picker_ref as *mut c_void) };
+        state.picker_ref = 0;
     }
     let mut new_ref: *mut c_void = ptr::null_mut();
     let target = unsafe {
@@ -704,6 +735,79 @@ pub fn update_global_shortcut(telemetry: &SharedCaptureTelemetry, config: Shortc
     ));
     if status == 0 && !new_ref.is_null() {
         state.toggle_ref = new_ref as usize;
+    }
+    // The picker: the same chord plus ⌘ (already registered when that's ⌘⌥⇧S).
+    if config.carbon_modifiers & CARBON_CMD_KEY == 0 {
+        let mut picker_ref: *mut c_void = ptr::null_mut();
+        let status = unsafe {
+            RegisterEventHotKey(
+                config.key_code,
+                config.carbon_modifiers | CARBON_CMD_KEY,
+                EventHotKeyID {
+                    signature: HOTKEY_SIG,
+                    id: HOTKEY_ID_PICKER,
+                },
+                target,
+                0,
+                &raw mut picker_ref,
+            )
+        };
+        if status == 0 && !picker_ref.is_null() {
+            state.picker_ref = picker_ref as usize;
+        }
+    }
+}
+
+/// The picker shortcut's label: the shortcut's modifiers plus ⌘ (`⌥⇧S` → `⌥⇧⌘S`), or `None`
+/// when the shortcut already uses ⌘.
+pub fn picker_label(label: &str) -> Option<String> {
+    if label.contains('⌘') {
+        return None;
+    }
+    let split = label
+        .char_indices()
+        .find(|(_, c)| !matches!(c, '⌃' | '⌥' | '⇧'))
+        .map_or(label.len(), |(i, _)| i);
+    Some(format!("{}⌘{}", &label[..split], &label[split..]))
+}
+
+/// Which capture chord a key press is, if any. The configured shortcut records and, plus ⌘,
+/// opens the picker; ⌥⇧S (also with ⌃) and ⌃⌥⌘S always record, ⌘⌥⇧S always opens the
+/// picker, on the active layout's S key or the ANSI one.
+pub fn shortcut_chord(
+    cfg: &ShortcutConfig,
+    s_code: u16,
+    keycode: u16,
+    cmd: bool,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+) -> Option<ShortcutChord> {
+    let want_cmd = (cfg.carbon_modifiers & CARBON_CMD_KEY) != 0;
+    let want_ctrl = (cfg.carbon_modifiers & CARBON_CONTROL_KEY) != 0;
+    let want_alt = (cfg.carbon_modifiers & CARBON_OPTION_KEY) != 0;
+    let want_shift = (cfg.carbon_modifiers & CARBON_SHIFT_KEY) != 0;
+    if u32::from(keycode) == cfg.key_code
+        && ctrl == want_ctrl
+        && alt == want_alt
+        && shift == want_shift
+    {
+        if cmd == want_cmd {
+            return Some(ShortcutChord::Record);
+        }
+        if cmd && !want_cmd {
+            return Some(ShortcutChord::Picker);
+        }
+    }
+    let is_s_key = keycode == s_code || keycode == KEY_S;
+    if !is_s_key || !alt {
+        None
+    } else if shift && cmd {
+        Some(ShortcutChord::Picker)
+    } else if shift || (ctrl && cmd) {
+        Some(ShortcutChord::Record)
+    } else {
+        None
     }
 }
 
@@ -823,6 +927,29 @@ fn clean_label(input: &str) -> String {
 
 /// Discovers the current capture target (either a specific window/app or the main display).
 pub fn discover_target(window_query: Option<&str>) -> TargetInfo {
+    discover_target_at(window_query, current_mouse_location().map(|p| [p.x, p.y]))
+}
+
+/// Which display to record: the one under `point`, else the one holding the focused window's
+/// centre, else the first. Frames and points are global, top-left origin.
+pub fn pick_display(
+    displays: &[[f64; 4]],
+    point: Option<[f64; 2]>,
+    focused: Option<[f64; 4]>,
+) -> usize {
+    let inside = |p: [f64; 2]| {
+        displays
+            .iter()
+            .position(|&[x, y, w, h]| p[0] >= x && p[0] < x + w && p[1] >= y && p[1] < y + h)
+    };
+    point
+        .and_then(inside)
+        .or_else(|| focused.and_then(|[x, y, w, h]| inside([x + w / 2.0, y + h / 2.0])))
+        .unwrap_or(0)
+}
+
+/// Like `discover_target`, recording the display under `point` (see `pick_display`).
+pub fn discover_target_at(window_query: Option<&str>, point: Option<[f64; 2]>) -> TargetInfo {
     let frontmost = frontmost_app_info();
     if let Ok(content) = SCShareableContent::get() {
         let our_pid = std::process::id() as i32;
@@ -867,21 +994,30 @@ pub fn discover_target(window_query: Option<&str>) -> TargetInfo {
             }
         }
 
-        if let Some(display) = content.displays().into_iter().next() {
+        let displays = content.displays();
+        let front_window = frontmost.as_ref().and_then(|(pid, _, _)| {
+            content.windows().into_iter().find(|w| {
+                w.is_on_screen()
+                    && w.window_layer() == 0
+                    && w.owning_application()
+                        .as_ref()
+                        .is_some_and(|a| a.process_id() == *pid)
+            })
+        });
+        let rects: Vec<[f64; 4]> = displays
+            .iter()
+            .map(|d| {
+                let f = d.frame();
+                [f.origin.x, f.origin.y, f.size.width, f.size.height]
+            })
+            .collect();
+        let focused = front_window.as_ref().map(|w| {
+            let f = w.frame();
+            [f.origin.x, f.origin.y, f.size.width, f.size.height]
+        });
+        if let Some(display) = displays.get(pick_display(&rects, point, focused)) {
             let frame = display.frame();
-            let window_title = frontmost.as_ref().and_then(|(pid, _, _)| {
-                content
-                    .windows()
-                    .into_iter()
-                    .find(|w| {
-                        w.is_on_screen()
-                            && w.window_layer() == 0
-                            && w.owning_application()
-                                .as_ref()
-                                .is_some_and(|a| a.process_id() == *pid)
-                    })
-                    .and_then(|w| w.title())
-            });
+            let window_title = front_window.as_ref().and_then(|w| w.title());
             return TargetInfo {
                 mode: CaptureMode::Display,
                 app: frontmost.as_ref().map(|(_, name, _)| name.clone()),
@@ -1121,6 +1257,81 @@ mod tests {
             "{x}, {y}"
         );
         assert_eq!(button.as_deref(), Some("left"));
+    }
+
+    #[test]
+    fn shortcut_chords_record_or_open_the_picker() {
+        use ShortcutChord::{Picker, Record};
+        let s = 1_u16; // the S key on this layout
+        let default = ShortcutConfig {
+            key_code: u32::from(s),
+            carbon_modifiers: CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
+            label: "⌥⇧S".into(),
+        };
+        // (cmd, ctrl, alt, shift)
+        let chord = |cfg: &ShortcutConfig, key, (cmd, ctrl, alt, shift)| {
+            shortcut_chord(cfg, s, key, cmd, ctrl, alt, shift)
+        };
+        assert_eq!(
+            chord(&default, s, (false, false, true, true)),
+            Some(Record),
+            "⌥⇧S"
+        );
+        assert_eq!(
+            chord(&default, s, (true, false, true, true)),
+            Some(Picker),
+            "⌥⇧⌘S"
+        );
+        assert_eq!(
+            chord(&default, s, (false, true, true, true)),
+            Some(Record),
+            "⌃⌥⇧S"
+        );
+        assert_eq!(
+            chord(&default, s, (true, true, true, false)),
+            Some(Record),
+            "⌃⌥⌘S"
+        );
+        assert_eq!(
+            chord(&default, s, (true, true, true, true)),
+            Some(Picker),
+            "hyper S"
+        );
+        assert_eq!(chord(&default, s, (false, false, false, true)), None, "⇧S");
+        assert_eq!(chord(&default, s, (true, false, false, false)), None, "⌘S");
+        assert_eq!(
+            chord(&default, KEY_S, (false, false, true, true)),
+            Some(Record),
+            "ANSI S"
+        );
+        assert_eq!(chord(&default, 2, (false, false, true, true)), None, "⌥⇧D");
+
+        // A configured ⌃⌥R records; with ⌘ it opens the picker. ⌥⇧S still records.
+        let custom = ShortcutConfig {
+            key_code: 15,
+            carbon_modifiers: CARBON_CONTROL_KEY | CARBON_OPTION_KEY,
+            label: "⌃⌥R".into(),
+        };
+        assert_eq!(chord(&custom, 15, (false, true, true, false)), Some(Record));
+        assert_eq!(chord(&custom, 15, (true, true, true, false)), Some(Picker));
+        assert_eq!(chord(&custom, 15, (false, false, true, false)), None);
+        assert_eq!(chord(&custom, s, (false, false, true, true)), Some(Record));
+
+        assert_eq!(picker_label("⌥⇧S").as_deref(), Some("⌥⇧⌘S"));
+        assert_eq!(picker_label("⌃⌥R").as_deref(), Some("⌃⌥⌘R"));
+        assert_eq!(picker_label("⌘⇧2"), None);
+    }
+
+    #[test]
+    fn recordings_use_the_display_under_the_cursor() {
+        let displays = [[0.0, 0.0, 1728.0, 1117.0], [1728.0, -200.0, 2560.0, 1440.0]];
+        assert_eq!(pick_display(&displays, Some([2000.0, 300.0]), None), 1);
+        assert_eq!(pick_display(&displays, Some([100.0, 100.0]), None), 0);
+        // No cursor: the display holding the focused window's centre.
+        let focused = Some([1900.0, 0.0, 800.0, 600.0]);
+        assert_eq!(pick_display(&displays, None, focused), 1);
+        assert_eq!(pick_display(&displays, Some([-50.0, 0.0]), focused), 1);
+        assert_eq!(pick_display(&displays, None, None), 0);
     }
 
     #[test]
@@ -1701,6 +1912,8 @@ pub struct SharedCaptureTelemetry {
     /// a click landed on Scrawl itself.
     pub passthrough_window_ids: Mutex<Vec<u32>>,
     tap_port: AtomicU64,
+    /// A Screen recording started straight from the shortcut: the overlay flashes an edge glow.
+    pub start_glow: AtomicBool,
     /// Whether the event tap is delivering. It can't be enabled without Input Monitoring, and
     /// macOS turns it off under Secure Input; the HID poller records clicks while it is off.
     tap_live: AtomicBool,
@@ -1737,12 +1950,13 @@ impl SharedCaptureTelemetry {
             passthrough_window_ids: Mutex::new(Vec::new()),
             tap_port: AtomicU64::new(0),
             tap_live: AtomicBool::new(false),
+            start_glow: AtomicBool::new(false),
             last_shortcut_ms: AtomicU64::new(0),
             drag_start: Mutex::new(None),
         })
     }
 
-    pub fn emit_toggle_shortcut(&self) {
+    pub fn emit_capture_shortcut(&self, chord: ShortcutChord) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1754,10 +1968,10 @@ impl SharedCaptureTelemetry {
                 .compare_exchange(prev, now_ms, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
-            scrawl_log("emit_toggle_shortcut -> sending ToggleCaptureShortcut");
+            scrawl_log(format!("emit_capture_shortcut -> {chord:?}"));
             let _ = self
                 .ui_sender
-                .try_send(LiveOverlayEvent::ToggleCaptureShortcut);
+                .try_send(LiveOverlayEvent::CaptureShortcut(chord));
         }
     }
 
@@ -1787,26 +2001,13 @@ impl SharedCaptureTelemetry {
         ctrl: bool,
         alt: bool,
         shift: bool,
-    ) -> bool {
+    ) -> Option<ShortcutChord> {
         let cfg = self
             .shortcut
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let want_cmd = (cfg.carbon_modifiers & CARBON_CMD_KEY) != 0;
-        let want_ctrl = (cfg.carbon_modifiers & CARBON_CONTROL_KEY) != 0;
-        let want_alt = (cfg.carbon_modifiers & CARBON_OPTION_KEY) != 0;
-        let want_shift = (cfg.carbon_modifiers & CARBON_SHIFT_KEY) != 0;
-        let custom_match = u32::from(keycode) == cfg.key_code
-            && cmd == want_cmd
-            && ctrl == want_ctrl
-            && alt == want_alt
-            && shift == want_shift;
-        // Support ⌥⇧S, ⌃⌥⇧S, ⌘⌥⇧S, and ⌃⌥⌘S on both the active layout's 's' key and ANSI 's'.
-        let s_code = layout_s_keycode();
-        let is_s_key = keycode == s_code || keycode == KEY_S;
-        let builtin_s = is_s_key && alt && (shift || (ctrl && cmd));
-        custom_match || builtin_s
+        shortcut_chord(&cfg, layout_s_keycode(), keycode, cmd, ctrl, alt, shift)
     }
 
     pub fn set_capture_mode(&self, mode: CaptureMode) {
@@ -2204,8 +2405,8 @@ unsafe extern "C" fn tap_callback(
 
     if event_type == EVENT_KEY_DOWN {
         let keycode = unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_KEYCODE) } as u16;
-        if telemetry.matches_shortcut(keycode, cmd, ctrl, alt, shift) {
-            telemetry.emit_toggle_shortcut();
+        if let Some(chord) = telemetry.matches_shortcut(keycode, cmd, ctrl, alt, shift) {
+            telemetry.emit_capture_shortcut(chord);
             return event;
         }
     }
@@ -2445,13 +2646,20 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
             ));
             prev_mod_mask = key_state;
         }
-        let shortcut_now = (key_cfg
-            && telemetry.matches_shortcut(cfg_keycode, cmd, ctrl, alt, shift))
-            || (key_s && telemetry.matches_shortcut(s_code, cmd, ctrl, alt, shift));
-        if shortcut_now && !prev_shortcut {
-            telemetry.emit_toggle_shortcut();
+        let shortcut_now = key_cfg
+            .then(|| telemetry.matches_shortcut(cfg_keycode, cmd, ctrl, alt, shift))
+            .flatten()
+            .or_else(|| {
+                key_s
+                    .then(|| telemetry.matches_shortcut(s_code, cmd, ctrl, alt, shift))
+                    .flatten()
+            });
+        if let Some(chord) = shortcut_now
+            && !prev_shortcut
+        {
+            telemetry.emit_capture_shortcut(chord);
         }
-        prev_shortcut = shortcut_now;
+        prev_shortcut = shortcut_now.is_some();
 
         let paste_now = key_v && alt && (shift || (ctrl && cmd));
         if paste_now && !prev_paste && !telemetry.active.load(Ordering::Acquire) {

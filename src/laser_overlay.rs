@@ -41,6 +41,7 @@ struct LaserUniforms {
     constrain_rect: f32,
     _pad1: f32,
     target_rect: [f32; 4],
+    glow: [f32; 4],
 }
 
 #[repr(C)]
@@ -69,16 +70,42 @@ pub struct MetalLaserOverlay {
 }
 
 impl MetalLaserOverlay {
-    pub fn open(telemetry: Arc<SharedCaptureTelemetry>) -> Result<Self, String> {
+    /// Opens over the screen holding the centre of `on` (global points, top-left origin, like
+    /// capture targets), else the main screen.
+    pub fn open(
+        telemetry: Arc<SharedCaptureTelemetry>,
+        on: Option<[f64; 4]>,
+    ) -> Result<Self, String> {
         let mtm = MainThreadMarker::new().ok_or("Metal overlay requires the main thread")?;
-        let screen = NSScreen::mainScreen(mtm)
-            .or_else(|| NSScreen::screens(mtm).firstObject())
+        let screens = NSScreen::screens(mtm);
+        let primary_h = screens.firstObject().map_or(0.0, |s| s.frame().size.height);
+        // AppKit frames have a bottom-left origin on the primary screen; capture frames top-left.
+        let top_left = |f: NSRect| {
+            [
+                f.origin.x,
+                primary_h - f.origin.y - f.size.height,
+                f.size.width,
+                f.size.height,
+            ]
+        };
+        let screen = on
+            .and_then(|[x, y, w, h]| {
+                let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+                screens.iter().find(|s| {
+                    let [sx, sy, sw, sh] = top_left(s.frame());
+                    cx >= sx && cx < sx + sw && cy >= sy && cy < sy + sh
+                })
+            })
+            .or_else(|| NSScreen::mainScreen(mtm))
+            .or_else(|| screens.firstObject())
             .ok_or("No screen available for Metal overlay")?;
         let frame = screen.frame();
         let scale = (screen.backingScaleFactor() as f32).max(1.0);
+        let [ox, oy, _, _] = top_left(frame);
 
         let shared = Arc::new(SharedMetalOverlay::new(
             telemetry,
+            [ox as f32, oy as f32],
             frame.size.width as f32,
             frame.size.height as f32,
             scale,
@@ -175,6 +202,8 @@ extern "C" fn display_link_callback(
 
 struct SharedMetalOverlay {
     telemetry: Arc<SharedCaptureTelemetry>,
+    /// The screen's top-left in global points: telemetry is global, the shader draws locally.
+    origin: [f32; 2],
     renderer: Mutex<MetalLaserRenderer>,
 }
 
@@ -193,6 +222,7 @@ struct MetalLaserRenderer {
 impl SharedMetalOverlay {
     fn new(
         telemetry: Arc<SharedCaptureTelemetry>,
+        origin: [f32; 2],
         width: f32,
         height: f32,
         scale: f32,
@@ -239,6 +269,7 @@ impl SharedMetalOverlay {
 
         Ok(Self {
             telemetry,
+            origin,
             renderer: Mutex::new(MetalLaserRenderer {
                 command_queue: device.new_command_queue(),
                 layer,
@@ -316,6 +347,8 @@ impl SharedMetalOverlay {
             let constrained = mode > 0.5 && tx > -10_000.0;
             (tx, ty, tw, th, constrained, mode)
         };
+        let [ox, oy] = self.origin;
+        let (tx, ty) = (tx - ox, ty - oy);
         let to_screen = |nx: f32, ny: f32| -> [f32; 2] { [tx + nx * tw, ty + ny * th] };
 
         let committed_strokes = self
@@ -421,11 +454,14 @@ impl SharedMetalOverlay {
         }
 
         let shift_held = self.telemetry.shift_held.load(Ordering::Acquire);
-        let pointer = *self
-            .telemetry
-            .pointer_screen
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pointer = {
+            let [px, py] = *self
+                .telemetry
+                .pointer_screen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            [px - ox, py - oy]
+        };
 
         if segments.is_empty() {
             segments.push(PathSegment::default());
@@ -472,6 +508,14 @@ impl SharedMetalOverlay {
                 constrain_rect: if is_constrained { 1.0 } else { 0.0 },
                 _pad1: mode_code,
                 target_rect: [tx, ty, tw, th],
+                glow: [
+                    f32::from(u8::from(
+                        is_active && self.telemetry.start_glow.load(Ordering::Acquire),
+                    )),
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
             };
 
             let cmd = renderer.command_queue.new_command_buffer();

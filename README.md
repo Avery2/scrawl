@@ -2,12 +2,12 @@
 
 Show an agent a problem instead of describing it.
 
-Press a shortcut (`⌥⇧S`), then talk, click around, and draw on the screen. Scrawl records the screen, your voice, and your marks, then packs them into a compact bundle: a contact sheet of annotated keyframes (`contact-sheet.png`), individual full-resolution keyframes (`frames/frame-XX.png`), a time-aligned transcript and interaction timeline (`summary.md`), and a structured manifest (`scrawl.json`).
+Press a shortcut (`⌥⇧S`) and Scrawl starts recording the screen. Talk, click around, draw on it, and press `⌥⇧S` again to finish. Scrawl records the screen, your voice, and your marks, then packs them into a compact bundle: a contact sheet of annotated keyframes (`contact-sheet.png`), individual full-resolution keyframes (`frames/frame-XX.png`), a time-aligned transcript and interaction timeline (`summary.md`), and a structured manifest (`scrawl.json`).
 
 ## Usage
 
 ```sh
-# Launch the GPUI menu-bar and review app (global shortcut: ⌥⇧S)
+# Launch the GPUI menu-bar and review app (⌥⇧S records, ⌥⇧⌘S picks what to record)
 cargo run -- app
 
 # Generate a realistic multi-frame demo bundle and print its agent summary
@@ -44,7 +44,11 @@ cargo run -- autocrop latest --serve --open
 
 ## Capture Controls
 
-- `⌥⇧S`: Start or finish a capture session from any app (`⌃⌥⇧S` also works)
+- `⌥⇧S`: Start recording the display under the pointer straight away, auto-cropped (see below), or
+  finish the recording (`⌃⌥⇧S` also works). A second press within 0.4 s of the start is ignored, so
+  a double press doesn't leave an empty capture. While the iPhone mirror is up it records the phone.
+- `⌥⇧⌘S` or **Choose What to Record…** in the menu bar: open the picker (Area, Window, Screen,
+  iPhone). With your own shortcut set in the review window, the picker is that shortcut plus `⌘`.
 - `⌥⇧V`: Paste both `contact-sheet.png` and `summary.md` into the active app or terminal (`⌃⌥⇧V` also works)
 - **Normal pointer**: Clicks and scrolls pass straight through to the app underneath
 - **Hold `⇧` (Shift) + move**: Draw a persistent red marker stroke (`#ff3b30`) on screen that fades out after release
@@ -52,16 +56,17 @@ cargo run -- autocrop latest --serve --open
 - **`Esc`**: Cancel the active selection or capture
 
 While picking a target, the island shows the modes **Area**, **Window**, **Screen**, and **iPhone**
-(when one is cabled):
+(when one is cabled). It opens on the mode you used last:
 
 - `1`–`4` jump to a mode; `Tab`/`→` and `⇧Tab`/`←` step through them; `Space` toggles Area and Window
 - Area: drag a region. Window: click a window. Screen and iPhone: `⏎`, `S`, `⌥⇧S`, **Record**, or
   clicking the selected mode again starts recording (`⏎`/`⌥⇧S` record the full screen from Area and
-  Window too)
+  Window too); `⌥⇧⌘S` closes the picker
 
 ## Auto-crop (Screen captures)
 
-Instead of picking an area up front, record the whole screen (**Screen** in the picker, or `3`).
+Instead of picking an area up front, record the whole screen: `⌥⇧S`, or **Screen** in the picker
+(`3`). Area and Window captures aren't cropped.
 Scrawl works out where you were gesturing and crops each keyframe to it. While a Screen capture
 records, Scrawl logs:
 
@@ -380,7 +385,7 @@ taskpolicy -c utility cargo test -j 3 --offline -- --test-threads=2
 ./scripts/install-app.sh
 ```
 
-- **iPhone:** connect a phone, open the picker, choose iPhone, talk, draw over the mirror, press M,
+- **iPhone:** connect a phone, open the picker (`⌥⇧⌘S`), choose iPhone, talk, draw over the mirror, press M,
   Finish. Inspect the bundle's `summary.md`, `scrawl.json` (`source`, `device`), contact sheet, and
   frames.
 - **ScrawlKit:** `scrawl import` on a recording and its timeline (or hand-write a timeline for any

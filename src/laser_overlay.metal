@@ -13,6 +13,8 @@ struct LaserUniforms {
     float constrain_rect;
     float _pad1;
     float4 target_rect;
+    // x: 1 when a full-screen recording started straight from the shortcut (no picker).
+    float4 glow;
 };
 
 // Each segment connects A -> B in logical screen points.
@@ -182,6 +184,17 @@ fragment float4 laser_fragment(
         // Picker open before any drag starts: uniform 0.32 * picker_fade dim.
         out.rgb = float3(0.0);
         out.a = 0.32 * clamp(-u._pad1, 0.0, 1.0);
+    } else if (u.glow.x > 0.5) {
+        // Full-screen recording started from the shortcut: a soft red glow along the display's
+        // edges rises in 0.12s and is gone by 1.1s, so the start is visible without the picker.
+        float env = smoothstep(0.0, 0.12, u.now_sec) * (1.0 - smoothstep(0.35, 1.1, u.now_sec));
+        if (env > 0.002) {
+            float2 lo = u.target_rect.xy;
+            float2 hi = lo + u.target_rect.zw;
+            float d = max(min(min(p.x - lo.x, hi.x - p.x), min(p.y - lo.y, hi.y - p.y)), 0.0);
+            out.rgb = float3(1.0, 0.23, 0.19);
+            out.a = exp(-d / 22.0) * 0.45 * env;
+        }
     } else if (intro_fade > 0.002) {
         // Full-screen recording: simple 0.15s dim fade out.
         out.rgb = float3(0.0);
