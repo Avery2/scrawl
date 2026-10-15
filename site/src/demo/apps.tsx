@@ -39,13 +39,34 @@ export function DeployCard({
 }) {
   const badgeX = compact ? -46 : -60
   const rf = Math.min(1, Math.max(0, rowFix ?? fix))
+  // Motion-trail & lock-in glow intensity while the elements glide into place and settle.
+  const moving = fix > 0.005 && settle < 0.995
+  const glowEnv = moving ? Math.sin(Math.min(1, Math.max(0, rf * 0.75 + settle * 0.25)) * Math.PI) : 0
   return (
-    <div className={`card${compact ? " compact" : ""}`} style={{ boxShadow: settle > 0 && settle < 1 ? `0 0 0 1.5px rgba(48,209,88,${0.55 * (1 - settle)})` : undefined }}>
+    <div
+      className={`card${compact ? " compact" : ""}`}
+      style={{
+        boxShadow:
+          glowEnv > 0.01
+            ? `0 0 0 1.5px rgba(48, 209, 88, ${(0.58 * glowEnv).toFixed(2)}), 0 0 ${(22 * glowEnv).toFixed(1)}px rgba(48, 209, 88, ${(0.22 * glowEnv).toFixed(2)})`
+            : undefined,
+      }}
+    >
       <div className="card-head">
         <h3 ref={refs?.title} className="card-title">
           Deploy Activity
         </h3>
-        <span ref={refs?.badge} className="badge" style={{ transform: `translate3d(${lerp(badgeX, 0, fix)}px, ${lerp(-8, 0, fix)}px, 0)` }}>
+        <span
+          ref={refs?.badge}
+          className="badge"
+          style={{
+            transform: `translate3d(${lerp(badgeX, 0, fix)}px, ${lerp(-8, 0, fix)}px, 0)`,
+            boxShadow:
+              glowEnv > 0.02
+                ? `0 0 ${(14 * glowEnv).toFixed(1)}px rgba(48, 209, 88, ${(0.55 * glowEnv).toFixed(2)}), ${(-8 * (1 - rf) * glowEnv).toFixed(1)}px 0 ${(12 * glowEnv).toFixed(1)}px rgba(90, 200, 250, ${(0.35 * glowEnv).toFixed(2)})`
+                : undefined,
+          }}
+        >
           <i />
           Live
         </span>
@@ -68,7 +89,13 @@ export function DeployCard({
         ))}
       </ul>
       <div ref={refs?.actions} className="actions">
-        <div className="actions-inner" style={{ transform: `translate3d(0, ${lerp(14, 0, fix)}px, 0)` }}>
+        <div
+          className="actions-inner"
+          style={{
+            transform: `translate3d(0, ${lerp(14, 0, fix)}px, 0)`,
+            filter: glowEnv > 0.03 ? `drop-shadow(0 ${(4 * (1 - rf)).toFixed(1)}px ${(10 * glowEnv).toFixed(1)}px rgba(10, 132, 255, ${(0.45 * glowEnv).toFixed(2)}))` : undefined,
+          }}
+        >
           <button>Retry failed</button>
           <button className="primary">Promote</button>
         </div>

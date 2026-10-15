@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
+import { type ComponentType, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { MacWindow, PhoneMirror } from "./apps"
+import type { StageGpuOverlay as StageGpuOverlayType } from "./gpu-fx"
 import { INK_SHADOW, InkPath, inkPath } from "./ink"
 import { measureAnchors, sameAnchors } from "./measure"
 import { AGENT, type Anchors, BEATS, buildScript, cursorAt, type Mode, STAGE, T } from "./script"
@@ -172,6 +173,21 @@ export function Demo() {
   const [user, setUser] = useState<UserStroke[]>([])
   const [shiftDown, setShiftDown] = useState(false)
   const [drawMode, setDrawMode] = useState(false)
+  const [GpuOverlay, setGpuOverlay] = useState<ComponentType<Parameters<typeof StageGpuOverlayType>[0]> | null>(null)
+
+  // Lazy-load the WebGPU/WebGL2 stage effects overlay after first paint so initial load/LCP stays untouched.
+  useEffect(() => {
+    let cancelled = false
+    const raf = requestAnimationFrame(() => {
+      import("./gpu-fx").then((mod) => {
+        if (!cancelled) setGpuOverlay(() => mod.StageGpuOverlay)
+      })
+    })
+    return () => {
+      cancelled = true
+      cancelAnimationFrame(raf)
+    }
+  }, [])
 
   useEffect(() => {
     const timer = window.setTimeout(() => sfx.preloadNarration(), 120)
@@ -450,6 +466,16 @@ export function Demo() {
           )}
           {cursor && <Cursor c={cursor} crosshair={mode === "mac" && t >= T.select && t < T.record} ibeam={overTerminal && t >= T.promptClick - 400 && t < T.paste + 120} />}
         </div>
+        {GpuOverlay && (
+          <GpuOverlay
+            t={t}
+            mode={mode}
+            script={script}
+            userStrokes={user}
+            stageRef={stageRef}
+            wrapRef={wrapRef}
+          />
+        )}
         {!started && (
           <button
             className="stage-play liquid-glass"
