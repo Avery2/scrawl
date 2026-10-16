@@ -6,6 +6,8 @@
 //   scrawl-helper frames MOVIE --out-dir DIR (--every MS | --at MS,MS…) [--max-edge PX]
 //   scrawl-helper audio MOVIE OUT.wav                   16 kHz mono PCM of every audio track, mixed
 //   scrawl-helper probe MOVIE                           duration and video size
+//   scrawl-helper permissions                           what Scrawl has been granted, as JSON
+//   scrawl-helper onboarding [--shortcut L] [--render DIR]   the welcome window (Onboarding.swift)
 //
 // Every timestamp in the output is integer milliseconds. Scrawl drives the long-running
 // `mirror` command over stdin (`stop`, `cancel`) and reads its events from stdout.
@@ -125,11 +127,15 @@ case "probe":
 case "guide":
   let kind = (arguments.count >= 2 ? GuidePermission(rawValue: arguments[1]) : nil) ?? .accessibility
   PermissionGuide.run(permission: kind, bundlePath: option("--bundle", in: arguments))
+case "permissions":
+  emit(Permissions.statuses())
+case "onboarding":
+  Onboarding.run(arguments: arguments)
 case "qr":
   guard arguments.count >= 2, let qr = renderQR(arguments[1]) else {
     fail("qr needs a text argument")
   }
   emit(["qr": qr])
 default:
-  fail("usage: scrawl-helper devices|mirror|transcribe|frames|audio|probe|guide|qr …")
+  fail("usage: scrawl-helper devices|mirror|transcribe|frames|audio|probe|guide|permissions|onboarding|qr …")
 }

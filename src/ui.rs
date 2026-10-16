@@ -259,7 +259,7 @@ enum MenuAction {
     OpenLatest,
     OpenInbox(PathBuf),
     RunDemo,
-    PermissionGuide,
+    Welcome,
     CheckForUpdates,
     Quit,
 }
@@ -302,9 +302,9 @@ objc2::define_class!(
             let _ = self.ivars().sender.try_send(MenuAction::RunDemo);
         }
 
-        #[unsafe(method(permissionGuide:))]
-        fn permission_guide(&self, _sender: &AnyObject) {
-            let _ = self.ivars().sender.try_send(MenuAction::PermissionGuide);
+        #[unsafe(method(welcome:))]
+        fn welcome(&self, _sender: &AnyObject) {
+            let _ = self.ivars().sender.try_send(MenuAction::Welcome);
         }
 
         #[unsafe(method(checkForUpdates:))]
@@ -471,7 +471,7 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
     add("Open Latest Bundle", sel!(openLatest:));
     add("Generate Demo Bundle", sel!(runDemo:));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
-    add("Permissions Guide…", sel!(permissionGuide:));
+    add("Welcome to Scrawl…", sel!(welcome:));
     add("Check for Updates…", sel!(checkForUpdates:));
     add("Quit Scrawl", sel!(quitApp:));
 
@@ -985,6 +985,8 @@ pub struct ScrawlCoordinator {
     /// The picker opened on Area because the last recording was the iPhone and no phone had been
     /// seen yet: switch to the phone when discovery finds one, unless Kit picked a mode himself.
     open_iphone_when_found: bool,
+    /// The welcome window, while it's open (`crate::onboarding`).
+    onboarding: Option<crate::onboarding::Session>,
     /// ⌥⇧S held as a ⌘Tab-style switcher (`crate::hold`).
     switcher: crate::hold::Switcher,
     /// The modifiers held when the shortcut went down; releasing any of them commits.
@@ -1042,6 +1044,7 @@ impl ScrawlCoordinator {
             inbox: crate::inbox::Inbox::load_default(),
             last_mode: SelectionMode::load_last_used(),
             open_iphone_when_found: false,
+            onboarding: None,
             switcher: crate::hold::Switcher::default(),
             hold_mods: 0,
             hold_picker: false,
@@ -1150,6 +1153,75 @@ impl ScrawlCoordinator {
 
     pub fn is_selecting(&self) -> bool {
         matches!(self.island_phase, IslandPhase::Selecting { .. })
+    }
+
+    pub fn open_onboarding(&mut self, flow: crate::onboarding::Flow) {
+        // Drop the old window before the new one opens.
+        self.onboarding = None;
+        let sender = self.telemetry.ui_sender.clone();
+        let events = move |event| {
+            let _ = sender.send(LiveOverlayEvent::Onboarding(event));
+        };
+        match crate::onboarding::Session::open(flow, &self.shortcut_label(), events) {
+            Ok(session) => self.onboarding = Some(session),
+            Err(error) => scrawl_log(format!("onboarding could not open: {error:#}")),
+        }
+    }
+
+    fn onboarding_event(&mut self, event: crate::onboarding::Event, cx: &mut Context<Self>) {
+        use crate::onboarding::{Effect, Event, Progress};
+        let effect = match event {
+            Event::Launch(grants) => {
+                let mut progress = Progress::load();
+                if progress.note(&grants) {
+                    progress.save();
+                }
+                if self.onboarding.is_none()
+                    && let Some(flow) = crate::onboarding::launch_plan(&progress, &grants)
+                {
+                    self.open_onboarding(flow);
+                }
+                Effect::None
+            }
+            Event::Grants(grants) => {
+                let mut progress = Progress::load();
+                if progress.note(&grants) {
+                    progress.save();
+                }
+                self.onboarding
+                    .as_mut()
+                    .map_or(Effect::None, |session| session.grants(grants))
+            }
+            Event::Action(action) => self
+                .onboarding
+                .as_mut()
+                .map_or(Effect::None, |session| session.action(&action)),
+            Event::Exited => {
+                self.onboarding = None;
+                Effect::None
+            }
+        };
+        match effect {
+            Effect::Close => {
+                let mut progress = Progress::load();
+                progress.seen = true;
+                progress.resume = None;
+                progress.save();
+                self.onboarding = None;
+            }
+            Effect::Relaunch { resume } => {
+                if let Some(step) = resume {
+                    let mut progress = Progress::load();
+                    progress.seen = false;
+                    progress.resume = Some(step);
+                    progress.save();
+                }
+                self.onboarding = None;
+                crate::onboarding::relaunch();
+                cx.quit();
+            }
+            _ => {}
+        }
     }
 
     fn activity(&self) -> crate::hold::Activity {
@@ -1551,6 +1623,24 @@ impl ScrawlCoordinator {
     /// Moves the island to `phase`, triggering a `.blurReplace` cross-transition on the inner content
     /// while the outer shell springs its width smoothly (`stiffness: 400, damping: 30` equivalent).
     fn set_island_phase(&mut self, phase: IslandPhase) {
+        use crate::onboarding::Input;
+        let capture = match (self.island_phase, phase) {
+            (IslandPhase::Recording, IslandPhase::Recording) => None,
+            (_, IslandPhase::Recording) => Some(Input::CaptureStarted),
+            (IslandPhase::Recording | IslandPhase::Processing, IslandPhase::Completed { .. }) => {
+                Some(Input::CaptureEnded { completed: true })
+            }
+            (
+                IslandPhase::Recording | IslandPhase::Processing,
+                IslandPhase::Hidden | IslandPhase::Dismissing,
+            ) => Some(Input::CaptureEnded { completed: false }),
+            _ => None,
+        };
+        if let Some(input) = capture
+            && let Some(session) = self.onboarding.as_mut()
+        {
+            session.input(input);
+        }
         let changed = std::mem::discriminant(&self.island_phase) != std::mem::discriminant(&phase);
         if changed {
             self.island_prev_phase = self.island_phase;
@@ -1857,6 +1947,19 @@ impl ScrawlCoordinator {
 
     pub fn start_recording_with_target(&mut self, target: TargetInfo, cx: &mut Context<Self>) {
         if self.is_recording() || self.is_processing() {
+            return;
+        }
+        // No surprise prompt mid-capture: Screen Recording is granted in onboarding.
+        if !crate::capture::screen_capture_granted() {
+            scrawl_log("Screen recording not granted; opening its onboarding step");
+            self.dismiss_island(cx);
+            match self.onboarding.as_mut() {
+                Some(session) => session.show(),
+                None => self.open_onboarding(crate::onboarding::Flow::fix(
+                    crate::onboarding::Permission::ScreenRecording,
+                    None,
+                )),
+            }
             return;
         }
         let started = Instant::now();
@@ -4121,6 +4224,16 @@ pub fn run_app(
         crate::sparkle::start();
         let menu_rx = install_status_bar();
 
+        // Onboarding opens on first launch, or for a permission that went away.
+        if screenshot_out.is_none() && std::env::var_os("SCRAWL_NO_ONBOARDING").is_none() {
+            let sender = telemetry.ui_sender.clone();
+            std::thread::spawn(move || {
+                if let Some(grants) = crate::onboarding::read_grants() {
+                    let event = crate::onboarding::Event::Launch(grants);
+                    let _ = sender.send(LiveOverlayEvent::Onboarding(event));
+                }
+            });
+        }
         let has_initial = initial_bundle.is_some();
         let coordinator = cx.new(|_| ScrawlCoordinator::new(telemetry, initial_bundle));
         set_status_inbox_count(coordinator.read(cx).inbox.len());
@@ -4246,8 +4359,13 @@ pub fn run_app(
                                         open_review_window(&loop_coord, cx);
                                     }
                                 }
-                                MenuAction::PermissionGuide => {
-                                    crate::helper::show_permission_guide("accessibility");
+                                MenuAction::Welcome => {
+                                    loop_coord.update(cx, |coord, _| {
+                                        coord.open_onboarding(crate::onboarding::Flow::tour(
+                                            crate::onboarding::Step::Welcome,
+                                            None,
+                                        ));
+                                    });
                                 }
                                 MenuAction::CheckForUpdates => {
                                     crate::sparkle::check_for_updates();
@@ -4279,6 +4397,9 @@ pub fn run_app(
                                 cx.notify();
                             }
                             LiveOverlayEvent::PhoneEnded => coord.phone_ended(cx),
+                            LiveOverlayEvent::Onboarding(event) => {
+                                coord.onboarding_event(event, cx)
+                            }
                             LiveOverlayEvent::IngestedBundle {
                                 dir,
                                 bundle,

@@ -88,19 +88,11 @@ pub struct PhoneDevice {
     pub height: u32,
 }
 
-/// Spawns the floating drag-into-System-Settings guide for `"accessibility"`,
-/// `"input-monitoring"`, or `"screen-recording"`.
-pub fn show_permission_guide(permission: &str) {
-    let Ok(helper_bin) = path() else {
-        return;
-    };
-    let mut cmd = Command::new(helper_bin);
-    cmd.arg("guide")
-        .arg(permission)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let _ = cmd.spawn();
+/// What macOS has granted Scrawl, from a fresh helper process (a long-running one can miss a
+/// Screen Recording grant).
+pub fn permissions()
+-> Result<std::collections::BTreeMap<crate::onboarding::Permission, crate::onboarding::Status>> {
+    run(&[os("permissions")], Duration::from_secs(5))
 }
 
 /// Cabled iPhones and iPads, from the USB registry (no camera permission needed). `id` is the

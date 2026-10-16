@@ -42,6 +42,38 @@ cargo run -- reprocess latest --out /tmp/again.scrawl
 cargo run -- autocrop latest --serve --open
 ```
 
+## Welcome and permissions
+
+On first launch Scrawl opens a welcome window: what it does, how ⌥⇧S works, then each permission
+on its own step, then a first capture. A step's check appears by itself once macOS grants it (it
+re-reads the grants every 0.5 s), and steps already granted are passed.
+
+| Permission | Used for | |
+|---|---|---|
+| Screen & System Audio Recording | Recording the screen (ScreenCaptureKit) | required |
+| Microphone | Your narration | required |
+| Input Monitoring | The event tap that sees clicks and ⇧-drags in every app | required |
+| Accessibility | `⌥⇧V`, which posts ⌘V into the app in front | optional |
+| Camera | The cabled iPhone mirror (macOS treats it as a camera) | optional |
+
+Speech recognition isn't asked for: SpeechAnalyzer transcribes without it. Captures never prompt
+for Screen Recording; without it, ⌥⇧S opens that step instead. After granting Screen Recording macOS
+may need Scrawl relaunched; the step offers **Relaunch Scrawl** and the tour resumes after it.
+Progress is `"onboarding"` in `~/.config/scrawl/config.json`: once seen, the tour only comes back
+from **Welcome to Scrawl…** in the menu, but a required permission that was granted and is gone
+again reopens its own step at launch. `SCRAWL_NO_ONBOARDING=1` skips it.
+
+To replay it from scratch:
+
+```sh
+tccutil reset All dev.kitlangton.scrawl
+jq 'del(.onboarding)' ~/.config/scrawl/config.json > /tmp/c.json && mv /tmp/c.json ~/.config/scrawl/config.json
+# then quit and reopen Scrawl
+```
+
+Preview every step without the app: `target/debug/scrawl-helper onboarding --render /tmp/onboarding
+--icon assets/app-icon.png`.
+
 ## Capture Controls
 
 - **Tap `⌥⇧S`** (release within 0.25 s): record the display under the pointer straight away,
@@ -394,12 +426,14 @@ word was spoken. Hex's local API is the fallback when SpeechAnalyzer is unavaila
 
 `scrawl-helper` is a small Swift executable built by `build.rs` from `helper/` and shipped inside
 `Scrawl.app` next to `scrawl`. It owns the Swift-only or unbound Apple frameworks: SpeechAnalyzer,
-CoreMediaIO/AVFoundation iPhone capture with the mirror window, and AVFoundation movie decoding.
+CoreMediaIO/AVFoundation iPhone capture with the mirror window, AVFoundation movie decoding, and the
+SwiftUI welcome window (`onboarding`).
 Scrawl runs it as a subprocess (JSON on stdout; `stop`/`cancel` on stdin for the mirror). Run it
 directly to test a piece in isolation:
 
 ```sh
 target/debug/scrawl-helper devices
+target/debug/scrawl-helper permissions
 target/debug/scrawl-helper transcribe audio.wav
 target/debug/scrawl-helper frames recording.mov --out-dir /tmp/f --at 1000,2000 --max-edge 1600
 ```

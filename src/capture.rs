@@ -247,6 +247,7 @@ unsafe extern "C" {
     fn CGEventTapIsEnabled(tap: *mut c_void) -> bool;
     fn CGEventSourceButtonState(state_id: u32, button: u32) -> bool;
     fn CGPreflightListenEventAccess() -> bool;
+    fn CGRequestListenEventAccess() -> bool;
     fn CGEventCreate(source: *const c_void) -> EventRef;
     fn CGEventCreateMouseEvent(
         source: *const c_void,
@@ -300,6 +301,8 @@ pub enum LiveOverlayEvent {
     RequestSnapshot,
     /// The iPhone mirror ended on its own (unplugged, never found, or access denied).
     PhoneEnded,
+    /// The welcome window: a button, fresh permission states, or the helper exiting.
+    Onboarding(crate::onboarding::Event),
     /// A ScrawlKit recording was ingested from an iPhone and compiled into a `.scrawl` bundle.
     IngestedBundle {
         dir: PathBuf,
@@ -742,6 +745,26 @@ pub fn is_capture_shortcut(
         && shift == want_shift;
     let is_s_key = keycode == s_code || keycode == KEY_S;
     custom || (is_s_key && alt && (shift || (ctrl && cmd)))
+}
+
+/// Whether this running copy of Scrawl may record the screen. A grant made while it runs may
+/// only show up here after a relaunch.
+pub fn screen_capture_granted() -> bool {
+    unsafe { CGPreflightScreenCaptureAccess() }
+}
+
+/// The system prompt for Screen Recording (once; later calls do nothing).
+pub fn request_screen_capture() {
+    unsafe {
+        let _ = CGRequestScreenCaptureAccess();
+    }
+}
+
+/// The system prompt for Input Monitoring (once; later calls do nothing).
+pub fn request_listen_access() {
+    unsafe {
+        let _ = CGRequestListenEventAccess();
+    }
 }
 
 /// The ⌃⌥⇧⌘ modifier flags held right now (as `CGEventFlags` bits).
@@ -1656,15 +1679,11 @@ fn build_sck_filter_and_config(
     let content = match SCShareableContent::get() {
         Ok(c) => c,
         Err(err) => {
-            scrawl_log(format!("SCShareableContent::get() failed: {err:?}"));
-            unsafe {
-                if !CGPreflightScreenCaptureAccess() {
-                    scrawl_log(
-                        "Screen capture access not granted; calling CGRequestScreenCaptureAccess()",
-                    );
-                    let _ = CGRequestScreenCaptureAccess();
-                }
-            }
+            // Screen Recording is asked for in onboarding, never mid-capture.
+            scrawl_log(format!(
+                "SCShareableContent::get() failed: {err:?} (screen recording granted: {})",
+                screen_capture_granted()
+            ));
             return None;
         }
     };
