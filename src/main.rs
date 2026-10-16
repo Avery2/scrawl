@@ -368,7 +368,34 @@ pub type FullFrames = Box<dyn Fn(&[u64]) -> Result<Vec<RgbaFrame>>>;
 /// Keyframes at native size from a Mac screen recording, whose clock starts `offset_ms` into the
 /// capture. Each frame comes back stamped with the capture time it was asked for.
 pub fn movie_keyframes(movie: PathBuf, offset_ms: u64) -> FullFrames {
-    Box::new(move |times: &[u64]| movie_frames_at(&movie, times, offset_ms, 0))
+    movie_keyframes_with_cache(movie, offset_ms, Vec::new())
+}
+
+fn movie_keyframes_with_cache(
+    movie: PathBuf,
+    offset_ms: u64,
+    predecoded: Vec<RgbaFrame>,
+) -> FullFrames {
+    let cache = std::sync::Mutex::new(predecoded);
+    Box::new(move |times: &[u64]| {
+        let mut pool = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = Vec::with_capacity(times.len());
+        let mut missing = Vec::new();
+        for &t in times {
+            if let Some(idx) = pool.iter().position(|f| f.t_ms == t) {
+                out.push(pool.swap_remove(idx));
+            } else {
+                missing.push(t);
+            }
+        }
+        drop(pool);
+        if !missing.is_empty() {
+            out.extend(movie_frames_at(&movie, &missing, offset_ms, 0)?);
+        }
+        Ok(out)
+    })
 }
 
 /// Frames of a movie whose clock starts `offset_ms` into the bundle's, at bundle times.
@@ -419,12 +446,35 @@ pub fn finalize_capture_bundle(
         let _ = std::fs::write(&wav_path, &audio.wav_bytes);
     }
     let wav_path = bundle_dir.join("audio.wav");
-    let transcribe_started = std::time::Instant::now();
-    let transcript = transcribe::transcribe(
-        wav_path.exists().then_some(wav_path.as_path()),
-        recorded_audio.as_ref(),
-    );
-    let transcribe_ms = transcribe_started.elapsed().as_millis() as u64;
+    let has_wav = wav_path.exists();
+    let ((transcript, transcribe_ms), predecoded) = std::thread::scope(|scope| {
+        let transcribe_handle = scope.spawn(|| {
+            let t0 = std::time::Instant::now();
+            let tr = transcribe::transcribe(
+                has_wav.then_some(wav_path.as_path()),
+                recorded_audio.as_ref(),
+            );
+            (tr, t0.elapsed().as_millis() as u64)
+        });
+        let pre = if let Some(ref movie) = video_path
+            && !frames.is_empty()
+        {
+            let mut preview_marks = marks_of(&strokes);
+            let preview = select_keyframes(
+                &frames,
+                &strokes,
+                &mut preview_marks,
+                &events,
+                &TranscriptData::default(),
+                MAX_KEYFRAMES,
+            );
+            let times: Vec<u64> = preview.iter().map(|(k, _)| k.t).collect();
+            movie_frames_at(movie, &times, video_offset_ms, 0).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        (transcribe_handle.join().unwrap(), pre)
+    });
 
     build_bundle_from_parts(
         bundle_dir,
@@ -439,7 +489,8 @@ pub fn finalize_capture_bundle(
         SourceExtras {
             activity,
             video_offset_ms,
-            full_frames: video_path.map(|movie| movie_keyframes(movie, video_offset_ms)),
+            full_frames: video_path
+                .map(|movie| movie_keyframes_with_cache(movie, video_offset_ms, predecoded)),
             timings: StageTimings {
                 started_at: Some(started_at),
                 stop_ms,
@@ -1133,20 +1184,26 @@ fn main() -> Result<()> {
                     None => None,
                 };
                 let wav = out.join("audio.wav");
-                let transcribe_started = std::time::Instant::now();
-                let transcript = transcribe::transcribe(
-                    recorded.as_ref().map(|_| wav.as_path()),
-                    recorded.as_ref(),
-                );
-                let transcribe_ms = transcribe_started.elapsed().as_millis() as u64;
-                // Small candidates, then the keyframes from the movie at full size, as at capture.
                 let offset = old.video_offset_ms;
-                let candidates_started = std::time::Instant::now();
-                let mut frames = helper::frames(&copied, helper::FrameTimes::Every(220), 640)?;
+                let ((transcript, transcribe_ms), joined) = std::thread::scope(|scope| {
+                    let frames = scope.spawn(|| {
+                        let t0 = std::time::Instant::now();
+                        let res = helper::frames(&copied, helper::FrameTimes::Every(220), 640);
+                        (res, t0.elapsed().as_millis() as u64)
+                    });
+                    let t0 = std::time::Instant::now();
+                    let tr = transcribe::transcribe(
+                        recorded.as_ref().map(|_| wav.as_path()),
+                        recorded.as_ref(),
+                    );
+                    ((tr, t0.elapsed().as_millis() as u64), frames.join())
+                });
+                let (frames, candidates_ms) =
+                    joined.map_err(|_| anyhow::anyhow!("Frame decoding panicked"))?;
+                let mut frames = frames?;
                 for frame in &mut frames {
                     frame.t_ms += offset;
                 }
-                let candidates_ms = candidates_started.elapsed().as_millis() as u64;
                 let full_frames = Some(movie_keyframes(copied.clone(), offset));
                 build_bundle_from_parts(
                     &out,

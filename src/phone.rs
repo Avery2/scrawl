@@ -454,28 +454,28 @@ pub fn build_movie_bundle(
         capture.target.frame.height = f64::from(probe.height);
     }
     let wav = bundle_dir.join("audio.wav");
-    let audio_started = Instant::now();
-    let audio = (probe.audio_tracks > 0)
-        .then(|| helper::export_audio(&capture.movie, &wav))
-        .and_then(|exported| {
-            exported
-                .and_then(|()| crate::hex::recorded_audio_from_wav(std::fs::read(&wav)?))
-                .inspect_err(|error| scrawl_log(format!("Phone audio export failed: {error:#}")))
-                .ok()
-        });
-    let audio_ms = audio_started.elapsed().as_millis() as u64;
     let every = (probe.duration_ms / MAX_CANDIDATES).max(250);
-    let ((transcript, transcribe_ms), joined) = std::thread::scope(|scope| {
+    let ((transcript, audio_ms, transcribe_ms), joined) = std::thread::scope(|scope| {
         let frames = scope.spawn(|| {
             let t0 = Instant::now();
             let res = helper::frames(&capture.movie, FrameTimes::Every(every), CANDIDATE_EDGE);
             (res, t0.elapsed().as_millis() as u64)
         });
+        let audio_started = Instant::now();
+        let audio = (probe.audio_tracks > 0)
+            .then(|| helper::export_audio(&capture.movie, &wav))
+            .and_then(|exported| {
+                exported
+                    .and_then(|()| crate::hex::recorded_audio_from_wav(std::fs::read(&wav)?))
+                    .inspect_err(|error| scrawl_log(format!("Phone audio export failed: {error:#}")))
+                    .ok()
+            });
+        let audio_ms = audio_started.elapsed().as_millis() as u64;
         let t0 = Instant::now();
         let transcript =
             crate::transcribe::transcribe(audio.as_ref().map(|_| wav.as_path()), audio.as_ref());
         let transcribe_ms = t0.elapsed().as_millis() as u64;
-        ((transcript, transcribe_ms), frames.join())
+        ((transcript, audio_ms, transcribe_ms), frames.join())
     });
     let (frames, candidates_ms) = joined.map_err(|_| anyhow::anyhow!("Frame decoding panicked"))?;
     let frames = frames?;
