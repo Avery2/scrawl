@@ -11,6 +11,9 @@
     private var regions: [OverlayRegion: CGRect] = [:]
     private unowned let scrawl: Scrawl
     private var drawingTouch: UITouch?
+    /// The red ink, under the strip. UIKit layers rather than SwiftUI, so a touch redraws only the
+    /// stroke's live tip.
+    let ink = InkView()
 
     init(windowScene: UIWindowScene, scrawl: Scrawl) {
       self.scrawl = scrawl
@@ -22,6 +25,11 @@
       })
       host.view.backgroundColor = .clear
       rootViewController = host
+      ink.frame = bounds
+      // Index 0: under the root view whenever UIKit adds it.
+      insertSubview(ink, at: 0)
+      ink.onStroke = { [unowned scrawl] samples in scrawl.record(stroke: samples) }
+      ink.onFade = { [unowned scrawl] strokes, uptime in scrawl.recordFade(of: strokes, at: uptime) }
       isHidden = false
     }
 
@@ -39,12 +47,13 @@
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-      guard scrawl.isRecording, scrawl.isDrawing, let touch = touches.first else {
-        super.touchesBegan(touches, with: event)
+      // One finger draws at a time; others are ignored until it lifts.
+      guard scrawl.isRecording, scrawl.isDrawing, drawingTouch == nil, let touch = touches.first else {
+        if drawingTouch == nil { super.touchesBegan(touches, with: event) }
         return
       }
       drawingTouch = touch
-      scrawl.beginDrawStroke(at: touch.location(in: self))
+      ink.began(touch, with: event)
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -52,7 +61,7 @@
         super.touchesMoved(touches, with: event)
         return
       }
-      scrawl.moveDrawStroke(to: active.location(in: self))
+      ink.moved(active, with: event)
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -60,7 +69,7 @@
         super.touchesEnded(touches, with: event)
         return
       }
-      scrawl.endDrawStroke(at: active.location(in: self))
+      ink.ended(active, with: event)
       drawingTouch = nil
     }
 
@@ -69,8 +78,14 @@
         super.touchesCancelled(touches, with: event)
         return
       }
-      scrawl.endDrawStroke(at: active.location(in: self))
+      ink.ended(active, with: event)
       drawingTouch = nil
+    }
+
+    /// Removes the ink (a recording started or finished).
+    func clearInk(animated: Bool) {
+      drawingTouch = nil
+      ink.clear(animated: animated)
     }
   }
 
@@ -79,33 +94,8 @@
     let reportFrame: @MainActor (OverlayRegion, CGRect) -> Void
 
     var body: some View {
-      ZStack {
-        // Freehand red strokes drawn on the screen while `isDrawing` is active.
-        Canvas { context, _ in
-          for stroke in scrawl.completedStrokes where stroke.count >= 2 {
-            var path = Path()
-            path.addLines(stroke)
-            context.stroke(
-              path,
-              with: .color(.scrawlRed),
-              style: StrokeStyle(lineWidth: 4.5, lineCap: .round, lineJoin: .round)
-            )
-          }
-          if scrawl.activeStroke.count >= 2 {
-            var path = Path()
-            path.addLines(scrawl.activeStroke)
-            context.stroke(
-              path,
-              with: .color(.scrawlRed),
-              style: StrokeStyle(lineWidth: 4.5, lineCap: .round, lineJoin: .round)
-            )
-          }
-        }
-        .ignoresSafeArea()
-        .allowsHitTesting(false)
-
-        StripPlacement(mode: stripMode, actions: actions, notice: scrawl.isRecording ? scrawl.notice : nil)
-      }
+      // The ink is `OverlayWindow.ink`, under this view.
+      StripPlacement(mode: stripMode, actions: actions, notice: scrawl.isRecording ? scrawl.notice : nil)
     }
 
     private var stripMode: ScrawlStrip.Mode? {

@@ -251,8 +251,11 @@
     private(set) var isDiscardPending = false
     public private(set) var startedAt: Date?
     public private(set) var markers: [TimeInterval] = []
-    /// Completed and in-progress finger strokes drawn while `isDrawing` is active.
+    /// The strokes drawn in this recording so far (smoothed), whether or not they've faded from
+    /// the screen.
     public private(set) var completedStrokes: [[CGPoint]] = []
+    /// Always empty: the stroke being drawn lives in the overlay's ink layer.
+    @available(*, deprecated, message: "The stroke being drawn isn't published any more.")
     public private(set) var activeStroke: [CGPoint] = []
     /// The recordings made so far, newest last.
     public private(set) var recordings: [Recording] = []
@@ -288,8 +291,6 @@
     @ObservationIgnored private var events: [[String: Any]] = []
     @ObservationIgnored private var touchLog: [[String: Any]] = []
     @ObservationIgnored private var strokeLog: [[String: Any]] = []
-    @ObservationIgnored private var activeStrokeSamples: [[Double]] = []
-    @ObservationIgnored private var activeStrokeStart: TimeInterval = 0
     @ObservationIgnored private var lastTouchLog: [Int: TimeInterval] = [:]
     @ObservationIgnored private var touchLabels: [Int: String] = [:]
     /// Small sequential IDs per finger (1, 2, 3…), stable for a touch's lifetime.
@@ -680,9 +681,8 @@
       events = []
       touchLog = []
       strokeLog = []
-      activeStrokeSamples = []
       completedStrokes = []
-      activeStroke = []
+      overlay?.clearInk(animated: false)
       lastTouchLog = [:]
       touchLabels = [:]
       // Fingers already down (the three-finger trigger) are never drawn or logged: only touches
@@ -804,7 +804,7 @@
       info.merge(ScrawlAppContext.shared.end()) { current, _ in current }
       self.startedAt = nil
       completedStrokes = []
-      activeStroke = []
+      overlay?.clearInk(animated: true)
       recorder.stop(writingTo: movie) { [weak self] error in
         Task { @MainActor in
           guard let self else { return }
@@ -930,34 +930,34 @@
 
     // MARK: - Freehand Drawing on the Overlay
 
-    func beginDrawStroke(at point: CGPoint) {
-      guard let startedAt else { return }
-      let t = Self.round(Date().timeIntervalSince(startedAt))
-      activeStrokeStart = t
-      activeStroke = [point]
-      activeStrokeSamples = [[Self.round(point.x), Self.round(point.y), t]]
-    }
-
-    func moveDrawStroke(to point: CGPoint) {
-      guard let startedAt, !activeStroke.isEmpty else { return }
-      let t = Self.round(Date().timeIntervalSince(startedAt))
-      activeStroke.append(point)
-      activeStrokeSamples.append([Self.round(point.x), Self.round(point.y), t])
-    }
-
-    func endDrawStroke(at point: CGPoint) {
-      guard let startedAt, !activeStroke.isEmpty else { return }
-      let t = Self.round(Date().timeIntervalSince(startedAt))
-      activeStroke.append(point)
-      activeStrokeSamples.append([Self.round(point.x), Self.round(point.y), t])
-      completedStrokes.append(activeStroke)
-      activeStroke = []
+    /// A finished stroke from the overlay: its smoothed samples (never predicted ones) go on the
+    /// timeline at their touches' own times. Returns its index there.
+    func record(stroke samples: [InkSample]) -> Int? {
+      guard let startedAt, let first = samples.first, let last = samples.last else { return nil }
+      let offset = Self.recordingOffset(from: startedAt)
+      let points = samples.map { [Self.round($0.point.x), Self.round($0.point.y), Self.round(max($0.time + offset, 0))] }
+      completedStrokes.append(samples.map(\.point))
       strokeLog.append([
-        "t0": activeStrokeStart,
-        "t1": t,
-        "points": activeStrokeSamples,
+        "t0": Self.round(max(first.time + offset, 0)),
+        "t1": Self.round(max(last.time + offset, 0)),
+        "points": points,
       ])
-      activeStrokeSamples = []
+      return strokeLog.count - 1
+    }
+
+    /// The overlay started fading these strokes at `uptime`: `fadeAt` on the timeline says when
+    /// they left the screen.
+    func recordFade(of strokes: [Int], at uptime: TimeInterval) {
+      guard let startedAt else { return }
+      let t = Self.round(max(uptime + Self.recordingOffset(from: startedAt), 0))
+      for index in strokes where strokeLog.indices.contains(index) {
+        strokeLog[index]["fadeAt"] = t
+      }
+    }
+
+    /// Add to a touch timestamp (seconds since boot) to get seconds into the recording.
+    private static func recordingOffset(from startedAt: Date) -> TimeInterval {
+      Date().timeIntervalSince(startedAt) - ProcessInfo.processInfo.systemUptime
     }
 
     // MARK: - Internals

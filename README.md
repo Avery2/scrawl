@@ -223,6 +223,22 @@ the button you tap to become a status circle, buds the "Sent to …", "Discarded
 answer · Share" bubble off on a neck, and stretches as you throw it. On iOS 26 it's Liquid Glass and
 the neck is the glass itself blending; Reduce Motion cross-fades instead.
 
+Drawn strokes are smooth and fade on their own:
+
+- **Sampling.** Every coalesced touch is a sample, at the touch's own timestamp, so a busy main
+  thread doesn't make strokes jagged. A one-euro filter (one cutoff from the 2D speed) takes out
+  jitter as they come in, and a centered smoothing takes out the rest behind the tip without lag.
+- **Look.** The line is a centripetal Catmull-Rom curve, 4.6 pt wide when drawn slowly and down to
+  55% when fast (from speed, never pressure, like the Mac's ink), with tapered ends.
+- **Drawing.** Finished stretches go into layers that never change, so each touch redraws only the
+  live tip, which runs ahead through iOS's predicted touches. Predicted points are dropped on the
+  next touch and never recorded.
+- **Fading.** A stroke fades out (300 ms, ease-out) 1.5 s after the pen last lifted. Putting the pen
+  down again before then holds every stroke on screen, so a circle and then an arrow fade together.
+- **Timeline.** It gets the smoothed, unpredicted points, plus `fadeAt` (when the stroke began
+  fading) on each stroke that faded during the recording. On keyframes the Mac draws a stroke from
+  when it began until 1.2 s after it ended, or with the rest of its mark.
+
 Touches aren't drawn on screen in either capture method. Each touch goes on the timeline (position,
 phase, and the label of the element under it) and Scrawl on the Mac draws taps and swipes from it.
 
