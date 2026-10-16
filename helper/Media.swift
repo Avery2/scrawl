@@ -9,10 +9,49 @@ enum Transcriber {
     var found = await SpeechTranscriber.supportedLocale(equivalentTo: Locale.current)
     if found == nil { found = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: "en-US")) }
     guard let locale = found else { throw HelperError("SpeechTranscriber has no supported locale") }
-    let transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: [], reportingOptions: [], attributeOptions: [.audioTimeRange])
-    if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+    let probeTranscriber = SpeechTranscriber(locale: locale, transcriptionOptions: [], reportingOptions: [], attributeOptions: [.audioTimeRange])
+    if let request = try await AssetInventory.assetInstallationRequest(supporting: [probeTranscriber]) {
       try await request.downloadAndInstall()
     }
+    if let chunks = try? splitWavAtSilences(url), chunks.files.count > 1 {
+      defer { try? FileManager.default.removeItem(at: chunks.dir) }
+      let ordered = try await withThrowingTaskGroup(of: (Int, [[String: Any]], [[String: Any]]).self) { group in
+        for (idx, item) in chunks.files.enumerated() {
+          group.addTask {
+            let (segs, wrds) = try await transcribeSingle(item.url, locale: locale, offsetMs: item.offsetMs)
+            return (idx, segs, wrds)
+          }
+        }
+        var collected: [(Int, [[String: Any]], [[String: Any]])] = []
+        for try await res in group {
+          collected.append(res)
+        }
+        return collected.sorted { $0.0 < $1.0 }
+      }
+      var segments: [[String: Any]] = []
+      var words: [[String: Any]] = []
+      for (_, segs, wrds) in ordered {
+        segments.append(contentsOf: segs)
+        words.append(contentsOf: wrds)
+      }
+      return [
+        "locale": locale.identifier,
+        "text": segments.compactMap { $0["text"] as? String }.joined(separator: " "),
+        "segments": segments,
+        "words": words,
+      ]
+    }
+    let (segments, words) = try await transcribeSingle(url, locale: locale, offsetMs: 0)
+    return [
+      "locale": locale.identifier,
+      "text": segments.compactMap { $0["text"] as? String }.joined(separator: " "),
+      "segments": segments,
+      "words": words,
+    ]
+  }
+
+  private static func transcribeSingle(_ url: URL, locale: Locale, offsetMs: Int) async throws -> ([[String: Any]], [[String: Any]]) {
+    let transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: [], reportingOptions: [], attributeOptions: [.audioTimeRange])
     let file = try AVAudioFile(forReading: url)
     let analyzer = try await SpeechAnalyzer(inputAudioFile: file, modules: [transcriber], finishAfterFile: true)
     var segments: [[String: Any]] = []
@@ -24,17 +63,96 @@ enum Transcriber {
         guard let range = run.audioTimeRange else { continue }
         let word = String(result.text[run.range].characters).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !word.isEmpty else { continue }
-        words.append(["t0": ms(range.start), "t1": ms(range.end), "text": word])
+        words.append(["t0": ms(range.start) + offsetMs, "t1": ms(range.end) + offsetMs, "text": word])
       }
-      segments.append(["t0": ms(result.range.start), "t1": ms(result.range.end), "text": text])
+      segments.append(["t0": ms(result.range.start) + offsetMs, "t1": ms(result.range.end) + offsetMs, "text": text])
     }
     withExtendedLifetime(analyzer) {}
-    return [
-      "locale": locale.identifier,
-      "text": segments.compactMap { $0["text"] as? String }.joined(separator: " "),
-      "segments": segments,
-      "words": words,
-    ]
+    return (segments, words)
+  }
+
+  private struct WavChunks {
+    let dir: URL
+    let files: [(offsetMs: Int, url: URL)]
+  }
+
+  /// Splits a 16 kHz mono 16-bit WAV longer than 22 s at silence midpoints (>= 300 ms) so
+  /// long recordings transcribe across concurrent SpeechAnalyzer instances without cutting words.
+  private static func splitWavAtSilences(_ url: URL) throws -> WavChunks? {
+    let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+    guard let fileSize = attrs[.size] as? Int, fileSize >= 22 * 32000 + 44 else { return nil }
+    let data = try Data(contentsOf: url)
+    guard data.count >= 44 else { return nil }
+    let pcmStart = 44
+    let pcmBytes = data.count - pcmStart
+    let sampleCount = pcmBytes / 2
+    let durationMs = sampleCount / 16
+    guard durationMs >= 22000 else { return nil }
+
+    let windowSamples = 800 // 50 ms at 16 kHz
+    let thresholdSq = (0.012 * 32768.0) * (0.012 * 32768.0)
+    var silences: [(midMs: Int, lenMs: Int)] = []
+    data.withUnsafeBytes { rawBuf in
+      let base = rawBuf.baseAddress!.advanced(by: pcmStart).assumingMemoryBound(to: Int16.self)
+      var silenceStartMs: Int? = nil
+      var i = 0
+      while i + windowSamples <= sampleCount {
+        var sumSq: Double = 0
+        for j in 0..<windowSamples {
+          let v = Double(Int16(littleEndian: base[i + j]))
+          sumSq += v * v
+        }
+        let meanSq = sumSq / Double(windowSamples)
+        let tMs = i / 16
+        if meanSq <= thresholdSq {
+          if silenceStartMs == nil { silenceStartMs = tMs }
+        } else if let s0 = silenceStartMs {
+          if tMs - s0 >= 300 {
+            silences.append(((s0 + tMs) / 2, tMs - s0))
+          }
+          silenceStartMs = nil
+        }
+        i += windowSamples
+      }
+    }
+    guard !silences.isEmpty else { return nil }
+    let targetChunks = min(6, max(2, (durationMs + 19999) / 20000))
+    var cuts = [0]
+    for k in 1..<targetChunks {
+      let ideal = (durationMs * k) / targetChunks
+      let candidates = silences.filter { abs($0.midMs - ideal) <= 8000 && $0.midMs > cuts.last! + 5000 && $0.midMs < durationMs - 5000 }
+      if let best = candidates.min(by: { abs($0.midMs - ideal) < abs($1.midMs - ideal) }) {
+        cuts.append(best.midMs)
+      }
+    }
+    cuts.append(durationMs)
+    guard cuts.count > 2 else { return nil }
+
+    let dir = FileManager.default.temporaryDirectory.appending(path: "scrawl-wav-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    var files: [(offsetMs: Int, url: URL)] = []
+    for idx in 0..<(cuts.count - 1) {
+      let c0 = cuts[idx]
+      let c1 = cuts[idx + 1]
+      let byte0 = pcmStart + c0 * 32
+      let byte1 = min(data.count, pcmStart + c1 * 32)
+      let sliceLen = byte1 - byte0
+      guard sliceLen > 0 else { continue }
+      var header = Data()
+      func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { header.append(contentsOf: $0) } }
+      func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { header.append(contentsOf: $0) } }
+      header.append(contentsOf: Array("RIFF".utf8)); u32(UInt32(36 + sliceLen))
+      header.append(contentsOf: Array("WAVE".utf8))
+      header.append(contentsOf: Array("fmt ".utf8)); u32(16); u16(1); u16(1); u32(16000); u32(32000); u16(2); u16(16)
+      header.append(contentsOf: Array("data".utf8)); u32(UInt32(sliceLen))
+      var chunkData = Data(capacity: 44 + sliceLen)
+      chunkData.append(header)
+      chunkData.append(data[byte0..<byte1])
+      let chunkUrl = dir.appending(path: "chunk-\(idx).wav")
+      try chunkData.write(to: chunkUrl)
+      files.append((c0, chunkUrl))
+    }
+    return WavChunks(dir: dir, files: files)
   }
 
   private static func ms(_ time: CMTime) -> Int {
