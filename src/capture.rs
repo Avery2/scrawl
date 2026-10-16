@@ -2746,16 +2746,12 @@ pub fn write_bundle_artifacts(
         let _ = std::fs::set_permissions(out_dir, std::fs::Permissions::from_mode(0o700));
     }
 
-    // Two frame workers plus the calling thread keep CPU and encoder memory bounded.
     thread::scope(|scope| -> Result<()> {
         let workers: Vec<_> = annotated_frames
-            .chunks(annotated_frames.len().div_ceil(2).max(1))
-            .map(|frames| {
+            .iter()
+            .map(|(kf, frame)| {
                 scope.spawn(move || -> Result<()> {
-                    for (kf, frame) in frames {
-                        crate::render::save_png(frame, &out_dir.join(&kf.file))?;
-                    }
-                    Ok(())
+                    crate::render::save_png(frame, &out_dir.join(&kf.file))
                 })
             })
             .collect();

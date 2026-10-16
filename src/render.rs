@@ -21,7 +21,7 @@ pub fn encode_png(frame: &RgbaFrame) -> anyhow::Result<Vec<u8>> {
         expected == Some(frame.rgba.len()),
         "Invalid RGBA buffer length"
     );
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity((frame.rgba.len() / 8).max(16_384));
     {
         let mut encoder = png::Encoder::new(&mut bytes, frame.width, frame.height);
         encoder.set_color(png::ColorType::Rgba);
@@ -744,38 +744,88 @@ fn blit_scaled(dst: &mut RgbaFrame, src: &RgbaFrame, rect: [f32; 4], radius: f32
     if src.width == 0 || src.height == 0 || w <= 0.0 || h <= 0.0 {
         return;
     }
+    let r = radius.max(0.0).min(w * 0.5).min(h * 0.5);
+    let src_w = src.width as usize;
+    let dst_w = dst.width as usize;
+    let px_start = (x.floor() as i32).max(0);
+    let px_end = ((x + w).ceil() as i32).min(dst.width as i32);
+    let inv_w = src.width as f32 / w;
+    let inv_h = src.height as f32 / h;
+    let max_sx = src.width.saturating_sub(1) as f32;
+    let max_sy = src.height.saturating_sub(1) as f32;
+
     for py in (y.floor() as i32).max(0)..((y + h).ceil() as i32).min(dst.height as i32) {
-        let sy = ((py as f32 + 0.5 - y) / h * src.height as f32 - 0.5)
-            .clamp(0.0, src.height.saturating_sub(1) as f32);
-        let y0 = sy.floor() as u32;
-        let y1 = (y0 + 1).min(src.height - 1);
-        let fy = sy.fract();
-        for px in (x.floor() as i32).max(0)..((x + w).ceil() as i32).min(dst.width as i32) {
-            let coverage = (0.5 - rounded_distance(px as f32 + 0.5, py as f32 + 0.5, rect, radius))
-                .clamp(0.0, 1.0);
-            if coverage <= 0.0 {
+        let cy = py as f32 + 0.5;
+        let sy = ((cy - y) * inv_h - 0.5).clamp(0.0, max_sy);
+        let y0 = sy.floor() as usize;
+        let y1 = (y0 + 1).min(src_w.max(1) - 1).min(src.height as usize - 1);
+        let fy = sy - y0 as f32;
+        let w_y0 = 1.0 - fy;
+        let row0 = y0 * src_w * 4;
+        let row1 = y1 * src_w * 4;
+        let dst_row = py as usize * dst_w * 4;
+        let y_inside_band = cy >= y + r + 0.5 && cy <= y + h - r - 0.5;
+        let y_inside_box = cy >= y + 0.5 && cy <= y + h - 0.5;
+
+        for px in px_start..px_end {
+            let cx = px as f32 + 0.5;
+            let full_cov = (y_inside_band && cx >= x + 0.5 && cx <= x + w - 0.5)
+                || (y_inside_box && cx >= x + r + 0.5 && cx <= x + w - r - 0.5);
+            let coverage = if full_cov {
+                1.0
+            } else {
+                let c = (0.5 - rounded_distance(cx, cy, rect, radius)).clamp(0.0, 1.0);
+                if c <= 0.0 {
+                    continue;
+                }
+                c
+            };
+            let sx = ((cx - x) * inv_w - 0.5).clamp(0.0, max_sx);
+            let x0 = sx.floor() as usize;
+            let x1 = (x0 + 1).min(src_w - 1);
+            let fx = sx - x0 as f32;
+            let w00 = (1.0 - fx) * w_y0;
+            let w10 = fx * w_y0;
+            let w01 = (1.0 - fx) * fy;
+            let w11 = fx * fy;
+
+            let i00 = row0 + x0 * 4;
+            let i10 = row0 + x1 * 4;
+            let i01 = row1 + x0 * 4;
+            let i11 = row1 + x1 * 4;
+            let p00 = &src.rgba[i00..i00 + 4];
+            let p10 = &src.rgba[i10..i10 + 4];
+            let p01 = &src.rgba[i01..i01 + 4];
+            let p11 = &src.rgba[i11..i11 + 4];
+
+            if full_cov && (p00[3] & p10[3] & p01[3] & p11[3]) == 255 {
+                let out_i = dst_row + px as usize * 4;
+                dst.rgba[out_i] = (p00[0] as f32 * w00
+                    + p10[0] as f32 * w10
+                    + p01[0] as f32 * w01
+                    + p11[0] as f32 * w11)
+                    .round() as u8;
+                dst.rgba[out_i + 1] = (p00[1] as f32 * w00
+                    + p10[1] as f32 * w10
+                    + p01[1] as f32 * w01
+                    + p11[1] as f32 * w11)
+                    .round() as u8;
+                dst.rgba[out_i + 2] = (p00[2] as f32 * w00
+                    + p10[2] as f32 * w10
+                    + p01[2] as f32 * w01
+                    + p11[2] as f32 * w11)
+                    .round() as u8;
+                dst.rgba[out_i + 3] = 255;
                 continue;
             }
-            let sx = ((px as f32 + 0.5 - x) / w * src.width as f32 - 0.5)
-                .clamp(0.0, src.width.saturating_sub(1) as f32);
-            let x0 = sx.floor() as u32;
-            let x1 = (x0 + 1).min(src.width - 1);
-            let fx = sx.fract();
+
             let mut accum = [0.0f32; 4];
-            for (xx, yy, weight) in [
-                (x0, y0, (1.0 - fx) * (1.0 - fy)),
-                (x1, y0, fx * (1.0 - fy)),
-                (x0, y1, (1.0 - fx) * fy),
-                (x1, y1, fx * fy),
-            ] {
-                let i = (yy as usize * src.width as usize + xx as usize) * 4;
-                if let Some(p) = src.rgba.get(i..i + 4) {
-                    let a = p[3] as f32 / 255.0;
-                    for c in 0..3 {
-                        accum[c] += p[c] as f32 * a * weight;
-                    }
-                    accum[3] += a * weight;
+            for (p, weight) in [(p00, w00), (p10, w10), (p01, w01), (p11, w11)] {
+                let a = p[3] as f32 / 255.0;
+                for c in 0..3 {
+                    accum[c] += p[c] as f32 * a * weight;
                 }
+                accum[3] += a * weight;
             }
             if accum[3] > 0.0 {
                 blend(

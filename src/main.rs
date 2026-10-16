@@ -641,22 +641,36 @@ pub fn build_bundle_from_parts(
         autocrop: cropped.as_ref().map(|(info, _)| info.clone()),
     };
 
-    let full_sheet = cropped
-        .as_ref()
-        .map(|(_, full)| render_contact_sheet(&bundle, full));
-    let contact_sheet = render_contact_sheet(&bundle, &annotated_frames);
+    let (full_sheet, contact_sheet) = std::thread::scope(|scope| {
+        let full_handle = cropped
+            .as_ref()
+            .map(|(_, full)| scope.spawn(|| render_contact_sheet(&bundle, full)));
+        let sheet = render_contact_sheet(&bundle, &annotated_frames);
+        (full_handle.map(|h| h.join().unwrap()), sheet)
+    });
     let rendered_at = std::time::Instant::now();
-    if let (Some((info, full)), Some(sheet)) = (&cropped, &full_sheet) {
-        autocrop::write_full_frames(bundle_dir, info, full, sheet)?;
-    }
     let summary = summary_markdown(&bundle, bundle_dir);
-    write_bundle_artifacts(
-        bundle_dir,
-        &bundle,
-        &annotated_frames,
-        &contact_sheet,
-        &summary,
-    )?;
+    std::thread::scope(|scope| -> Result<()> {
+        let full_write = match (&cropped, &full_sheet) {
+            (Some((info, full)), Some(sheet)) => {
+                Some(scope.spawn(|| autocrop::write_full_frames(bundle_dir, info, full, sheet)))
+            }
+            _ => None,
+        };
+        write_bundle_artifacts(
+            bundle_dir,
+            &bundle,
+            &annotated_frames,
+            &contact_sheet,
+            &summary,
+        )?;
+        if let Some(handle) = full_write {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("Full-frame writer panicked"))??;
+        }
+        Ok(())
+    })?;
     let finished = std::time::Instant::now();
     let select_ms = (select_only_at - started).as_millis() as u64;
     let decode_ms = (selected_at - select_only_at).as_millis() as u64;
