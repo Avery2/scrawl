@@ -78,8 +78,76 @@ final class StubServer: URLProtocol, @unchecked Sendable {
 final class EventLog: @unchecked Sendable {
   private let lock = NSLock()
   private var events: [Outbox.Event] = []
-  func append(_ event: Outbox.Event) { lock.withLock { events.append(event) } }
+  /// Also follows the events, the way `Scrawl` drives the strip.
+  let delivery = DeliveryProbe()
+  func append(_ event: Outbox.Event) {
+    lock.withLock { events.append(event) }
+    delivery.apply(event)
+  }
+
   var all: [Outbox.Event] { lock.withLock { events } }
+}
+
+/// Feeds a `DeliveryTracker` the outbox's events and a network path, keeping every change in
+/// what the strip would say.
+final class DeliveryProbe: @unchecked Sendable {
+  private let lock = NSLock()
+  private var tracker: DeliveryTracker?
+  private var pathSatisfied = true
+  private var log: [DeliveryTracker.Display] = []
+
+  func track(_ entry: String) {
+    lock.withLock {
+      tracker = DeliveryTracker(entry: entry, pathSatisfied: pathSatisfied, now: Date())
+      note()
+    }
+  }
+
+  func apply(_ event: Outbox.Event) {
+    lock.withLock {
+      tracker?.apply(event, at: Date())
+      note()
+    }
+  }
+
+  func setPath(satisfied: Bool) {
+    lock.withLock {
+      pathSatisfied = satisfied
+      tracker?.setPath(satisfied: satisfied, at: Date())
+      note()
+    }
+  }
+
+  /// What the strip says now (also logged if it changed with time alone).
+  var current: DeliveryTracker.Display? {
+    lock.withLock {
+      note()
+      return log.last
+    }
+  }
+
+  var displays: [DeliveryTracker.Display] { lock.withLock { log } }
+
+  /// The states in order, ignoring progress within "Sending…".
+  var states: [String] {
+    displays.map { display in
+      switch display {
+      case .sending: "sending"
+      case .stillSending: "stillSending"
+      case .queued: "queued"
+      case .sent: "sent"
+      case .failed: "failed"
+      }
+    }
+    .reduce(into: []) { states, state in
+      if states.last != state { states.append(state) }
+    }
+  }
+
+  private func note() {
+    guard let display = tracker?.display(at: Date()), log.last != display else { return }
+    log.append(display)
+  }
 }
 
 /// Polls until `condition` holds or `timeout` passes.
@@ -292,6 +360,64 @@ struct OutboxTests {
     #expect(try Data(contentsOf: files.movie) == movieBytes)
   }
 
+  // MARK: - What the strip says
+
+  @Test func aSlowUploadIsSendingUntilItLandsNeverQueued() async throws {
+    // Ledger I-37: online, but the upload took longer than the old 4 s window.
+    StubServer.reset([.init(delay: 5)])
+    let outbox = makeOutbox()
+    let entry = try await outbox.enqueue(timeline: timeline, movie: movie, target: target, recordedAt: "2026-10-14T18:00:00Z")
+    events.delivery.track(entry.id)
+    outbox.kick(force: true)
+    try await Task.sleep(for: .milliseconds(4500))
+    // Past the old window, still online and still going: "Sending…".
+    #expect({ if case .sending = events.delivery.current { true } else { false } }())
+    #expect(await eventually(5) { events.all.contains(.sent(id: entry.id, sessionTitle: "Problems · Ledger")) })
+    #expect(events.delivery.states == ["sending", "sent"])
+    #expect(events.delivery.current == .sent(sessionTitle: "Problems · Ledger"))
+    #expect(events.all.first == .started(id: entry.id))
+  }
+
+  @Test func anUnsatisfiedPathIsQueuedThenSendingWhenItsBack() async throws {
+    // A background session waits for the network instead of failing: the reply is late.
+    StubServer.reset([.init(delay: 1.5)])
+    let outbox = makeOutbox()
+    let entry = try await outbox.enqueue(timeline: timeline, movie: movie, target: target, recordedAt: "2026-10-14T18:00:00Z")
+    events.delivery.setPath(satisfied: false)
+    events.delivery.track(entry.id)
+    outbox.kick(force: true)
+    #expect(await eventually { events.all.contains(.started(id: entry.id)) })
+    #expect(events.delivery.current == .queued)
+    events.delivery.setPath(satisfied: true)
+    #expect(await eventually { events.all.contains(.sent(id: entry.id, sessionTitle: "Problems · Ledger")) })
+    #expect(events.delivery.states == ["queued", "sending", "sent"])
+  }
+
+  @Test func aFailedAttemptIsQueuedThenSendingOnRetryThenSent() async throws {
+    StubServer.reset([.init(status: 503), .init(delay: 0.5)])
+    let outbox = makeOutbox()
+    let entry = try await outbox.enqueue(timeline: timeline, movie: movie, target: target, recordedAt: "2026-10-14T18:00:00Z")
+    events.delivery.track(entry.id)
+    outbox.kick(force: true)
+    #expect(await eventually { events.all.contains { if case .retrying = $0 { true } else { false } } })
+    #expect(events.delivery.current == .queued)
+    // The network came back (or the app was foregrounded): the retry starts now.
+    outbox.kick(force: true)
+    #expect(await eventually { events.all.contains(.sent(id: entry.id, sessionTitle: "Problems · Ledger")) })
+    #expect(events.delivery.states == ["sending", "queued", "sending", "sent"])
+  }
+
+  @Test func otherClientErrorsFailWithoutQueueing() async throws {
+    StubServer.reset([.init(status: 422)])
+    let outbox = makeOutbox()
+    let entry = try await outbox.enqueue(timeline: timeline, movie: movie, target: target, recordedAt: "2026-10-14T18:00:00Z")
+    events.delivery.track(entry.id)
+    outbox.kick(force: true)
+    #expect(await eventually { events.all.contains(.failed(id: entry.id, .rejected)) })
+    #expect(events.delivery.states == ["sending", "failed"])
+    #expect(events.delivery.current == .failed(.rejected))
+  }
+
   @Test func classification() {
     #expect(Outbox.classify(status: 200) == .success)
     #expect(Outbox.classify(status: 201) == .success)
@@ -305,6 +431,12 @@ struct OutboxTests {
     #expect(Outbox.classify(status: 404) == .permanent(.rejected))
     #expect(Outbox.classify(status: 411) == .permanent(.rejected))
     #expect(Outbox.classify(status: nil) == .retry)
+    #expect(Outbox.reportsProgress(percent: 1, after: nil, now: Date()))
+    let last = (percent: 41, at: Date(timeIntervalSinceReferenceDate: 0))
+    #expect(Outbox.reportsProgress(percent: 42, after: last, now: last.at.addingTimeInterval(0.1)))
+    #expect(!Outbox.reportsProgress(percent: 41, after: last, now: last.at.addingTimeInterval(4.9)))
+    // Slow but moving: a heartbeat, so it doesn't look stalled.
+    #expect(Outbox.reportsProgress(percent: 41, after: last, now: last.at.addingTimeInterval(5)))
     #expect(Outbox.backoff(afterAttempts: 1) == 15)
     #expect(Outbox.backoff(afterAttempts: 2) == 30)
     #expect(Outbox.backoff(afterAttempts: 20) == 1800)

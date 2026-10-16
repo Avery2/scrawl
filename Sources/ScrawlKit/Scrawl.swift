@@ -229,7 +229,8 @@
       case idle
       case sending
       case sent(String)
-      /// Saved on the phone and sending in the background (HTTPS endpoints): offline or slow.
+      /// Saved on the phone and sending in the background (HTTPS endpoints): offline, or waiting
+      /// to retry after a failed attempt.
       case queued
       case failed
     }
@@ -242,6 +243,10 @@
     private(set) var deliveryFailure = ScrawlStrip.Failure.unreachable
     /// A short message beside the strip while recording (link expired, the length cap).
     private(set) var notice: ScrawlStrip.Notice?
+    /// How much of the shown HTTPS upload has gone out (0…1), once it reports bytes.
+    private(set) var sendProgress: Double?
+    /// The shown HTTPS upload is running on a working network but hasn't moved in a while.
+    private(set) var isSendStalled = false
     /// A discarded recording is waiting out its Undo window.
     private(set) var isDiscardPending = false
     public private(set) var startedAt: Date?
@@ -278,8 +283,6 @@
     }
 
     static let limitWarning: Duration = .seconds(10)
-    /// How long a hosted upload may take before the strip says it's queued instead of waiting.
-    private static let quickSendWindow: Duration = .seconds(4)
 
     private static let undoWindow: Duration = .seconds(5)
     @ObservationIgnored private var events: [[String: Any]] = []
@@ -317,8 +320,18 @@
     @ObservationIgnored private var backgroundEventsCompletion: (() -> Void)?
     /// The HTTPS endpoint's /health answered 401: recordings are kept, marked failed.
     @ObservationIgnored private var pairingRevoked = false
-    /// The outbox entry the strip is reporting on (sending or queued).
+    /// The outbox entry the strip is reporting on while it's sending or queued.
     @ObservationIgnored private var shownEntry: String?
+    /// What the strip should say about the last recording sent to the HTTPS endpoint, until it
+    /// lands or fails (or a new recording starts).
+    @ObservationIgnored private var delivery: DeliveryTracker?
+    /// From `NWPathMonitor`; assumed online until it says otherwise.
+    @ObservationIgnored private var pathSatisfied = true
+    /// Re-checks `delivery` when its upload would count as stalled.
+    @ObservationIgnored private var stallCheck: Task<Void, Never>?
+    /// An HTTPS upload landed while its "Sent to …" couldn't be shown (the app was in the
+    /// background, or the strip was busy or gone): shown at the next chance.
+    @ObservationIgnored private var pendingSent: String?
     /// The permanently failed outbox entry the strip's Share button shares.
     @ObservationIgnored private var failedEntry: String?
     @ObservationIgnored private var limitTask: Task<Void, Never>?
@@ -506,12 +519,17 @@
         center.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { _ in
           MainActor.assumeIsolated { Scrawl.shared.outbox?.kick(force: true) }
         },
+        center.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+          MainActor.assumeIsolated { Scrawl.shared.showPendingSent() }
+        },
       ]
       // Back online: try everything waiting now rather than at its backoff time.
       let monitor = NWPathMonitor()
       let reachability = Reachability()
       monitor.pathUpdateHandler = { [weak outbox] path in
-        if reachability.update(path.status == .satisfied) { outbox?.kick(force: true) }
+        let satisfied = path.status == .satisfied
+        if reachability.update(satisfied) { outbox?.kick(force: true) }
+        Task { @MainActor in Scrawl.shared.pathChanged(satisfied: satisfied) }
       }
       monitor.start(queue: DispatchQueue(label: "dev.kitlangton.scrawl.outbox.path"))
       pathMonitor = monitor
@@ -527,6 +545,11 @@
       outboxCredentials = nil
       pathMonitor?.cancel()
       pathMonitor = nil
+      pathSatisfied = true
+      delivery = nil
+      stallCheck?.cancel()
+      stallCheck = nil
+      pendingSent = nil
       for observer in outboxObservers {
         NotificationCenter.default.removeObserver(observer)
       }
@@ -534,27 +557,100 @@
     }
 
     private func handle(_ event: Outbox.Event) {
-      let isActive = UIApplication.shared.applicationState == .active
+      if case .failed(_, .unauthorized) = event { pairingRevoked = true }
+      if var delivery, delivery.entry == event.id {
+        delivery.apply(event, at: Date())
+        self.delivery = delivery
+        refreshDelivery()
+        return
+      }
       switch event {
-      case let .sent(id, title):
-        if shownEntry == id {
+      case let .sent(_, title):
+        // Sent from an earlier recording or launch: say so when there's a chance.
+        pendingSent = title
+        showPendingSent()
+      case let .failed(id, failure):
+        guard isIdleForStatus else { return }
+        Task { await presentFailure(ScrawlStrip.Failure(failure), entry: id) }
+      case .started, .progress, .retrying:
+        break
+      }
+    }
+
+    private func pathChanged(satisfied: Bool) {
+      guard satisfied != pathSatisfied else { return }
+      pathSatisfied = satisfied
+      delivery?.setPath(satisfied: satisfied, at: Date())
+      refreshDelivery()
+    }
+
+    /// Nothing is recording or on the strip, and the app is in front.
+    private var isIdleForStatus: Bool {
+      UIApplication.shared.applicationState == .active && !isRecording && !isStarting
+        && uploadStatus == .idle && !isDiscardPending
+    }
+
+    /// Whether the strip is showing the tracked upload's "Sending…" or "Queued".
+    private var showsDelivery: Bool {
+      delivery != nil && shownEntry == delivery?.entry && (uploadStatus == .sending || uploadStatus == .queued)
+    }
+
+    /// Puts what `delivery` says on the strip (while it's showing it) and finishes it once it has
+    /// landed or failed.
+    private func refreshDelivery() {
+      stallCheck?.cancel()
+      stallCheck = nil
+      guard let delivery else { return }
+      let now = Date()
+      let display = delivery.display(at: now)
+      let showing = showsDelivery
+      switch display {
+      case let .sending(progress), let .stillSending(progress):
+        sendProgress = progress
+        isSendStalled = display == .stillSending(progress: progress)
+        if showing, uploadStatus == .queued {
+          // A retry started on a working network: back to "Sending…".
+          statusID += 1
+          uploadStatus = .sending
+        }
+        if let next = delivery.nextChange(after: now) {
+          stallCheck = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(next.timeIntervalSince(now) + 0.05))
+            guard !Task.isCancelled else { return }
+            self?.refreshDelivery()
+          }
+        }
+      case .queued:
+        if showing, uploadStatus == .sending { presentQueued() }
+      case let .sent(title):
+        self.delivery = nil
+        if showing, UIApplication.shared.applicationState == .active {
           shownEntry = nil
           Task { await presentSent(title) }
-        } else if isActive, !isRecording {
-          // A queued recording went out later: a light confirmation.
-          UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        } else {
+          // Shown in place (if the strip is still up) or on its own when the app is next in front.
+          pendingSent = title
+          showPendingSent()
         }
-      case let .retrying(id, _, _):
-        // Offline or slow: no need to keep the strip spinning.
-        if shownEntry == id, uploadStatus == .sending {
-          Task { await presentQueued(id) }
-        }
-      case let .failed(id, failure):
-        if failure == .unauthorized { pairingRevoked = true }
-        guard shownEntry == id || (isActive && !isRecording && !isStarting && uploadStatus == .idle && !isDiscardPending) else { return }
+      case let .failed(failure):
+        self.delivery = nil
+        guard showing || isIdleForStatus else { return }
         shownEntry = nil
-        Task { await presentFailure(ScrawlStrip.Failure(failure), entry: id) }
+        Task { await presentFailure(ScrawlStrip.Failure(failure), entry: delivery.entry) }
       }
+    }
+
+    /// Shows a "Sent to …" that couldn't be shown when the upload landed: in place of a strip still
+    /// saying "Sending…" for it, or by bringing the strip back briefly.
+    private func showPendingSent() {
+      guard let title = pendingSent, UIApplication.shared.applicationState == .active,
+            !isRecording, !isStarting, !isDiscardPending
+      else { return }
+      let staleStatus = delivery == nil && shownEntry != nil && (uploadStatus == .sending || uploadStatus == .queued)
+      guard uploadStatus == .idle || staleStatus else { return }
+      shownEntry = nil
+      showOverlay()
+      Task { await presentSent(title) }
     }
 
     /// Logs something the app did ("Done tapped", "rest started"), placed on the recording's timeline.
@@ -598,7 +694,11 @@
       uploadStatus = .idle
       failedRecording = nil
       failedEntry = nil
+      // An upload still going is no longer on the strip; when it lands it says so on its own.
       shownEntry = nil
+      delivery = nil
+      stallCheck?.cancel()
+      stallCheck = nil
       statusID += 1
       isStarting = true
       showOverlay()
@@ -1066,9 +1166,10 @@
       }
     }
 
-    /// HTTPS endpoint: the recording becomes an outbox entry (on disk before anything is sent),
-    /// then the strip waits briefly for the upload. Quick: "Sent to …". Otherwise "Queued", and
-    /// the outbox keeps trying in the background until a 2xx.
+    /// HTTPS endpoint: the recording becomes an outbox entry (on disk before anything is sent) and
+    /// the strip follows its upload: "Sending…" while it runs on a working network, however long
+    /// that takes, "Queued" while offline or waiting to retry, then "Sent to …". The outbox keeps
+    /// trying in the background until a 2xx.
     private func deliverHosted(_ finished: FinishedRecording) async {
       syncOutbox()
       guard let outbox, let target = hostedURL else {
@@ -1096,16 +1197,22 @@
         await presentFailure(ScrawlStrip.Failure(failure), entry: entry.id)
         return
       }
-      shownEntry = entry.id
+      // Unless a new recording took the strip over while this one was being written.
+      if uploadStatus == .sending {
+        shownEntry = entry.id
+        sendProgress = nil
+        isSendStalled = false
+        delivery = DeliveryTracker(entry: entry.id, pathSatisfied: pathSatisfied, now: Date())
+      }
       outbox.kick(force: true)
-      try? await Task.sleep(for: Self.quickSendWindow)
-      guard shownEntry == entry.id, uploadStatus == .sending else { return }
-      await presentQueued(entry.id)
+      refreshDelivery()
     }
 
     private func presentSent(_ target: String) async {
       statusID += 1
       let id = statusID
+      // This one says it for any earlier upload that landed meanwhile.
+      pendingSent = nil
       uploadStatus = .sent(target)
       UINotificationFeedbackGenerator().notificationOccurred(.success)
       try? await Task.sleep(for: .milliseconds(2200))
@@ -1114,19 +1221,21 @@
       await hideOverlayAfterExit()
     }
 
-    /// Saved and sending in the background: calm, with a success haptic. A send while the bubble
-    /// is up still turns it into "Sent to …".
-    private func presentQueued(_ entry: String) async {
+    /// Offline, or waiting to retry: calm, with a success haptic (the recording is safe on the
+    /// phone), then the strip leaves. While it's up, a retry starting turns it back into
+    /// "Sending…"; when the upload lands, "Sent to …" shows whether or not it's still up.
+    private func presentQueued() {
       statusID += 1
       let id = statusID
-      shownEntry = entry
       uploadStatus = .queued
       UINotificationFeedbackGenerator().notificationOccurred(.success)
-      try? await Task.sleep(for: .milliseconds(3500))
-      guard statusID == id, uploadStatus == .queued else { return }
-      shownEntry = nil
-      uploadStatus = .idle
-      await hideOverlayAfterExit()
+      Task { [weak self] in
+        try? await Task.sleep(for: .milliseconds(3500))
+        guard let self, self.statusID == id, self.uploadStatus == .queued else { return }
+        self.shownEntry = nil
+        self.uploadStatus = .idle
+        await self.hideOverlayAfterExit()
+      }
     }
 
     /// The failed bubble, with Share (of a LAN `recording`, or of an outbox `entry`).
@@ -1250,6 +1359,11 @@
     private func hideOverlayAfterExit() async {
       try? await Task.sleep(for: StripMotion.overlayLinger)
       guard !isRecording, !isStarting, uploadStatus == .idle, !isDiscardPending else { return }
+      if pendingSent != nil, UIApplication.shared.applicationState == .active {
+        // An upload landed meanwhile: its "Sent to …" comes back in the same window.
+        showPendingSent()
+        return
+      }
       hideOverlay()
     }
 

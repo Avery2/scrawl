@@ -117,7 +117,7 @@
       }
       switch scrawl.uploadStatus {
       case .idle: return nil
-      case .sending: return .sending
+      case .sending: return .sending(.init(progress: scrawl.sendProgress, stalled: scrawl.isSendStalled))
       case let .sent(target): return .sent(target)
       case .queued: return .queued
       case .failed: return .failed(scrawl.deliveryFailure)

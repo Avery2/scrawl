@@ -44,10 +44,30 @@ final class Outbox: NSObject, @unchecked Sendable {
   }
 
   enum Event: Sendable, Equatable {
+    /// An upload attempt began (the task may still wait for a network).
+    case started(id: String)
+    /// Bytes went out: `fraction` of the payload so far. Sent when the whole percent changes, or
+    /// every `progressInterval` while bytes keep moving more slowly than that.
+    case progress(id: String, fraction: Double)
     case sent(id: String, sessionTitle: String)
     /// A transient failure; the entry is tried again at `next` (or sooner on a kick).
     case retrying(id: String, error: String, next: Date)
     case failed(id: String, Failure)
+
+    var id: String {
+      switch self {
+      case let .started(id), let .progress(id, _), let .sent(id, _), let .retrying(id, _, _), let .failed(id, _): id
+      }
+    }
+  }
+
+  static let progressInterval: TimeInterval = 5
+
+  /// Whether bytes sent up to `percent` are worth an event after `last` was reported: a new whole
+  /// percent, or a heartbeat every `progressInterval` while it creeps.
+  static func reportsProgress(percent: Int, after last: (percent: Int, at: Date)?, now: Date) -> Bool {
+    guard let last else { return true }
+    return percent != last.percent || now.timeIntervalSince(last.at) >= progressInterval
   }
 
   enum Outcome: Equatable {
@@ -85,6 +105,8 @@ final class Outbox: NSObject, @unchecked Sendable {
   /// Entry ID → task identifier for uploads in progress.
   private var inFlight: [String: Int] = [:]
   private var responses: [Int: Data] = [:]
+  /// Task identifier → the last progress reported for it.
+  private var reported: [Int: (percent: Int, at: Date)] = [:]
   /// The session's surviving tasks have been collected; until then kicks wait.
   private var isReconnected = false
   private var pendingKick: Bool?
@@ -363,6 +385,17 @@ final class Outbox: NSObject, @unchecked Sendable {
     entry.nextAttemptAt = nil
     save(entry)
     task.resume()
+    onEvent(.started(id: entry.id))
+  }
+
+  private func sentBodyData(_ task: URLSessionTask, sent: Int64, expected: Int64) {
+    guard let id = task.taskDescription, inFlight[id] == task.taskIdentifier, expected > 0 else { return }
+    let fraction = min(max(Double(sent) / Double(expected), 0), 1)
+    let percent = Int(fraction * 100)
+    let now = now()
+    guard Self.reportsProgress(percent: percent, after: reported[task.taskIdentifier], now: now) else { return }
+    reported[task.taskIdentifier] = (percent, now)
+    onEvent(.progress(id: id, fraction: fraction))
   }
 
   private func scheduleRetry(at date: Date?) {
@@ -378,6 +411,7 @@ final class Outbox: NSObject, @unchecked Sendable {
 
   private func finished(_ task: URLSessionTask, error: (any Error)?) {
     let body = responses.removeValue(forKey: task.taskIdentifier) ?? Data()
+    reported[task.taskIdentifier] = nil
     guard let id = task.taskDescription else { return }
     if inFlight[id] == task.taskIdentifier { inFlight[id] = nil }
     // Removed while uploading (cancelled), already handled, or the session was torn down (the
@@ -418,6 +452,16 @@ extension Outbox: URLSessionDataDelegate {
 
   func urlSession(_: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
     finished(task, error: error)
+  }
+
+  func urlSession(
+    _: URLSession,
+    task: URLSessionTask,
+    didSendBodyData _: Int64,
+    totalBytesSent: Int64,
+    totalBytesExpectedToSend: Int64
+  ) {
+    sentBodyData(task, sent: totalBytesSent, expected: totalBytesExpectedToSend)
   }
 
   func urlSessionDidFinishEvents(forBackgroundURLSession _: URLSession) {

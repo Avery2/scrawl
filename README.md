@@ -274,11 +274,17 @@ any configured URL is `https`, recordings go through a durable outbox instead of
   comes to the foreground, or it launches. An entry never uploads twice at once. The server dedupes
   on person and `recordedAt`, so resending after a lost reply is safe. Opening a new setup link
   retries the entries that failed with the old one.
-- **Strip.** If the upload finishes within about 4 seconds, the strip says "Sent to …" as on the
-  LAN. Otherwise it says "Queued · sends when online" with a success haptic: the recording is safe on
-  the phone. A queued recording that sends later while the app is open gets a light tap. Permanent
-  failures say "Scrawl link expired · Ask Kit for a new one" or "Too large to send", with Share,
-  which shares copies of the recording and leaves the entry queued.
+- **Strip.** While the upload runs on a working network (`NWPathMonitor` says `.satisfied`), the
+  strip stays up as a small status circle with a progress ring, saying "Sending…" however long it
+  takes. Touches on it reach the app. With no bytes going out for 30 seconds it says "Still
+  sending…", never "Queued". When the upload lands it turns into "Sent to …" with a success haptic.
+  "Queued · sends when online" (with a success haptic, since the recording is safe on the phone) is
+  only for no network or a failed attempt waiting to retry; it leaves after a few seconds, and if a
+  retry starts while it's up it goes back to "Sending…". If the upload lands after the strip has
+  gone (a new recording took over, it was queued, or the app was in the background), the strip comes
+  back briefly with "Sent to …", as soon as the app is in front. Permanent failures say "Scrawl link
+  expired · Ask Kit for a new one", "Too large to send" or "Couldn't send", with Share, which shares
+  copies of the recording and leaves the entry queued.
 - **Revoked links.** The `/health` check at the start of a recording also goes to the HTTPS
   endpoint. A 401 there shows "Scrawl link expired" beside the strip, but the recording carries on
   and is kept in the outbox, marked failed, until the link is renewed.
@@ -395,6 +401,7 @@ taskpolicy -c utility cargo test -j 3 --offline -- --test-threads=2
 - **ScrawlKit:** `scrawl import` on a recording and its timeline (or hand-write a timeline for any
   phone video), then check the ripples and trails on frames and the app-event lines in the summary.
   `swift test` runs the outbox tests on the Mac against a `URLProtocol` stub of the ingest endpoint
-  (persisting, retry classification, resends, deletion only on 2xx).
+  (persisting, retry classification, resends, deletion only on 2xx, and what the strip says through
+  slow uploads, no network, and retries).
 - **Transcription:** `scrawl-helper transcribe <wav or movie>` prints words with timings;
   `scrawl reprocess <bundle> --out …` reruns transcription and keyframe selection on a real bundle.

@@ -32,7 +32,7 @@
   struct ScrawlStrip: View {
     enum Mode: Equatable {
       case recording(startedAt: Date, isDrawing: Bool)
-      case sending
+      case sending(Sending)
       case sent(String)
       /// Saved on the phone; sends in the background when it can.
       case queued
@@ -53,6 +53,13 @@
         case .discarded: .discarded
         }
       }
+    }
+
+    /// An upload in progress: `progress` (0…1) once it reports bytes; `stalled` when it's on a
+    /// working network but hasn't moved in a while.
+    struct Sending: Equatable {
+      var progress: Double?
+      var stalled = false
     }
 
     /// Why a recording didn't send; every failure keeps Share.
@@ -160,9 +167,10 @@
 
     /// Invisible rectangles that tell `OverlayWindow` where touches belong to the strip. Each is
     /// measured before `.position`, which expands a view to fill its parent: measured after it, the
-    /// region was the whole screen and the overlay swallowed every tap meant for the app.
+    /// region was the whole screen and the overlay swallowed every tap meant for the app. The status
+    /// circle (sending, sent, …) has no controls, so touches on it reach the app.
     @ViewBuilder private func regions(_ geometry: LiquidStrip.Geometry) -> some View {
-      if geometry.alpha > 0.05, !geometry.body.isEmpty {
+      if geometry.alpha > 0.05, geometry.controlsLive, !geometry.body.isEmpty {
         Color.clear
           .frame(width: geometry.body.width, height: geometry.body.height)
           .reportFrame(.strip, to: actions.reportFrame)
@@ -239,10 +247,26 @@
       case .recording:
         EmptyView()
       case .sending:
-        ProgressView()
-          .controlSize(.small)
-          .tint(.white)
+        if let progress = model.sendProgress {
+          ZStack {
+            Circle()
+              .stroke(.white.opacity(0.22), lineWidth: 2.5)
+            Circle()
+              .trim(from: 0, to: max(progress, 0.02))
+              .stroke(.white, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+              .rotationEffect(.degrees(-90))
+              .animation(.easeOut(duration: 0.3), value: progress)
+          }
+          .frame(width: 22, height: 22)
+          .accessibilityElement()
           .accessibilityLabel("Sending recording")
+          .accessibilityValue(Text(progress, format: .percent.precision(.fractionLength(0))))
+        } else {
+          ProgressView()
+            .controlSize(.small)
+            .tint(.white)
+            .accessibilityLabel("Sending recording")
+        }
       case .sent:
         Image(systemName: "checkmark")
           .font(.system(size: 17, weight: .semibold))
@@ -274,6 +298,8 @@
           ElapsedText(startedAt: model.startedAt)
         case let .sent(target):
           Text("Sent to \(Self.shortened(target))")
+        case let .sending(stalled):
+          Text(stalled ? "Still sending…" : "Sending…")
         case .queued:
           Text("Queued · sends when online")
         case let .notice(notice):
@@ -413,6 +439,8 @@
     /// Bubbles bud off once the pour has landed (or sooner between statuses).
     static let bubbleDelayAfterPour = 0.3
     static let bubbleDelay = 0.18
+    /// "Sending…" waits this long, so a quick upload goes straight to "Sent to …".
+    static let sendingBubbleDelay = 1.2
     static let shakeDelay = 0.06
     /// Sideways kick (points per second) for the failed shake.
     static let shakeVelocity = 900.0
@@ -473,11 +501,16 @@
 
     enum Bubble: Equatable {
       case elapsed, sent(String), queued, failed(ScrawlStrip.Failure), discarded
-      /// A message while recording (link expired, the length cap); not tappable.
+      case sending(stalled: Bool)
+      /// A message while recording (link expired, the length cap).
       case notice(ScrawlStrip.Notice)
 
-      var isNotice: Bool {
-        if case .notice = self { true } else { false }
+      /// Only bubbles with a button (Share, Undo) take touches; the rest let them reach the app.
+      var isInteractive: Bool {
+        switch self {
+        case .failed, .discarded: true
+        default: false
+        }
       }
 
       /// Bubbles beside the dot rather than the status circle.
@@ -497,6 +530,9 @@
     private(set) var isPresent = false
     private(set) var startedAt = Date()
     private(set) var isDrawing = false
+    /// How much of the upload has gone out, while sending.
+    private(set) var sendProgress: Double?
+    @ObservationIgnored private var sendStalled = false
 
     @ObservationIgnored var side = StripSide.trailing {
       didSet { if side != oldValue { wake() } }
@@ -587,6 +623,18 @@
       if case let .recording(startedAt, isDrawing) = mode {
         if self.startedAt != startedAt { self.startedAt = startedAt }
         if self.isDrawing != isDrawing { self.isDrawing = isDrawing }
+      }
+      if case let .sending(sending) = mode {
+        if sendProgress != sending.progress { sendProgress = sending.progress }
+        if sendStalled != sending.stalled {
+          sendStalled = sending.stalled
+          // Already saying "Sending…": the text changes in place.
+          if phase == .sending, bubbleActive, case .sending = bubble {
+            let change: (LiquidStrip) -> Void = { $0.showBubble(.sending(stalled: $0.sendStalled)) }
+            if reduceMotion { applyInstant(change) } else { change(self) }
+            wake()
+          }
+        }
       }
       let previous = phase
       let next = mode?.phase
@@ -778,6 +826,8 @@
       }
       if let bubble {
         after(fromStrip ? StripMotion.bubbleDelayAfterPour : StripMotion.bubbleDelay) { $0.showBubble(bubble) }
+      } else if status == .sending {
+        after(StripMotion.sendingBubbleDelay) { $0.showBubble(.sending(stalled: $0.sendStalled)) }
       }
       if status == .failed {
         after(StripMotion.shakeDelay) { strip in
@@ -991,7 +1041,7 @@
       next.bubbleGap = gap
       next.bubbleCenter = CGPoint(x: left + bubbleWidth / 2, y: centerY)
       next.bubbleOpacity = min(max(self[.bubbleAlpha], 0), 1) * alpha
-      next.bubbleInteractive = bubbleActive && self[.bubbleAlpha] > 0.5 && !(bubble?.isNotice ?? false)
+      next.bubbleInteractive = bubbleActive && self[.bubbleAlpha] > 0.5 && (bubble?.isInteractive ?? false)
       if bubbleWidth > 1, self[.bubbleAlpha] > 0.01 || gap > Metrics.hiddenBubbleGap + 1 {
         next.bubble = CGRect(x: left, y: centerY - bubbleHeight / 2, width: bubbleWidth, height: bubbleHeight)
       }
@@ -1433,16 +1483,16 @@
         (nil, 0.8),
         (.recording(startedAt: .now, isDrawing: false), 1.4),
         (.recording(startedAt: .now, isDrawing: true), 1.0),
-        (.sending, 1.4),
+        (.sending(.init()), 1.4),
         (.sent("Fix the onboarding flow"), 2.2),
         (nil, 1.2),
         (.recording(startedAt: .now, isDrawing: false), 1.4),
         (.discarded, 2.4),
-        (.sending, 1.4),
+        (.sending(.init()), 1.4),
         (.queued, 2.0),
         (nil, 1.2),
         (.recording(startedAt: .now, isDrawing: false), 1.4),
-        (.sending, 1.4),
+        (.sending(.init()), 1.4),
         (.failed(.unreachable), 2.6),
         (nil, 1.2),
       ]
@@ -1480,7 +1530,7 @@
     }
 
     #Preview("Sending") {
-      StripPreview(mode: .sending)
+      StripPreview(mode: .sending(.init(progress: 0.42)))
     }
 
     #Preview("Sent") {
