@@ -66,46 +66,66 @@ enum Media {
     guard durationMs > 0 else { throw HelperError("Movie has no duration") }
     try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
 
-    let generator = AVAssetImageGenerator(asset: asset)
-    generator.appliesPreferredTrackTransform = true
-    if maxEdge > 0 { generator.maximumSize = CGSize(width: maxEdge, height: maxEdge) }
-    var requested: [Int]
-    if let everyMs, everyMs > 0 {
-      requested = Array(stride(from: 0, to: durationMs, by: everyMs))
-      let tolerance = CMTime(value: CMTimeValue(everyMs / 2), timescale: 1000)
-      generator.requestedTimeToleranceBefore = tolerance
-      generator.requestedTimeToleranceAfter = tolerance
+    let isEvery = (everyMs ?? 0) > 0
+    let requested: [Int] = if let everyMs, everyMs > 0 {
+      Array(stride(from: 0, to: durationMs, by: everyMs))
     } else {
-      requested = (atMs ?? []).map { min(max(0, $0), max(0, durationMs - 1)) }
-      let tolerance = CMTime(value: 80, timescale: 1000)
-      generator.requestedTimeToleranceBefore = tolerance
-      generator.requestedTimeToleranceAfter = tolerance
+      (atMs ?? []).map { min(max(0, $0), max(0, durationMs - 1)) }
     }
     guard !requested.isEmpty else { return [] }
+    let tolerance = isEvery
+      ? CMTime(value: CMTimeValue((everyMs ?? 1) / 2), timescale: 1000)
+      : CMTime(value: 80, timescale: 1000)
+    let workerCount = min(6, requested.count)
+    let chunkSize = (requested.count + workerCount - 1) / workerCount
 
-    var out: [[String: Any]] = []
-    let times = requested.map { CMTime(value: CMTimeValue($0), timescale: 1000) }
-    var index = 0
-    for await result in generator.images(for: times) {
-      defer { index += 1 }
-      guard let image = try? result.image else { continue }
-      let reqTime = result.requestedTime.seconds.isFinite
-        ? Int((result.requestedTime.seconds * 1000).rounded())
-        : requested[min(index, requested.count - 1)]
-      let actual = (try? result.actualTime).map { Int(($0.seconds * 1000).rounded()) } ?? reqTime
-      let file = outDir.appending(path: String(format: "frame-%04d.rgba", index))
-      try writeRGBA(image, to: file)
-      out.append(["t": reqTime, "actual": actual, "width": image.width, "height": image.height, "file": file.path])
+    let indexed = try await withThrowingTaskGroup(of: [(Int, [String: Any])].self) { group in
+      for worker in 0..<workerCount {
+        let start = worker * chunkSize
+        let end = min(start + chunkSize, requested.count)
+        if start >= end { continue }
+        let sliceReq = Array(requested[start..<end])
+        group.addTask {
+          let generator = AVAssetImageGenerator(asset: asset)
+          generator.appliesPreferredTrackTransform = true
+          if maxEdge > 0 { generator.maximumSize = CGSize(width: maxEdge, height: maxEdge) }
+          generator.requestedTimeToleranceBefore = tolerance
+          generator.requestedTimeToleranceAfter = tolerance
+          let sliceTimes = sliceReq.map { CMTime(value: CMTimeValue($0), timescale: 1000) }
+          var local: [(Int, [String: Any])] = []
+          var offset = 0
+          for await result in generator.images(for: sliceTimes) {
+            let curIndex = start + offset
+            offset += 1
+            guard let image = try? result.image else { continue }
+            let reqTime = result.requestedTime.seconds.isFinite
+              ? Int((result.requestedTime.seconds * 1000).rounded())
+              : sliceReq[min(offset - 1, sliceReq.count - 1)]
+            let actual = (try? result.actualTime).map { Int(($0.seconds * 1000).rounded()) } ?? reqTime
+            let file = outDir.appending(path: String(format: "frame-%04d.rgba", curIndex))
+            try writeRGBA(image, to: file)
+            local.append((curIndex, ["t": reqTime, "actual": actual, "width": image.width, "height": image.height, "file": file.path]))
+          }
+          return local
+        }
+      }
+      var pairs: [(Int, [String: Any])] = []
+      for try await batch in group {
+        pairs.append(contentsOf: batch)
+      }
+      return pairs
     }
-    return out
+    return indexed.sorted { $0.0 < $1.0 }.map(\.1)
   }
+
+  private static let srgbSpace = CGColorSpace(name: CGColorSpace.sRGB)!
 
   private static func writeRGBA(_ image: CGImage, to url: URL) throws {
     let width = image.width, height = image.height
     var pixels = Data(count: width * height * 4)
     let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
       guard let context = CGContext(data: buffer.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
-                                    space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                                    space: srgbSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
       else { return false }
       context.interpolationQuality = .high
       context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
