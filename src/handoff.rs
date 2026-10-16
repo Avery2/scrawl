@@ -423,10 +423,21 @@ fn ssh(host: &str) -> Command {
     command
 }
 
+/// Bundle files too big to hold up queueing the session; they follow in the background.
+const HEAVY_MEDIA: [&str; 5] = [
+    "recording.mp4",
+    "recording.mov",
+    "audio.wav",
+    "frames-full",
+    "contact-sheet-full.png",
+];
+/// Present in a copied bundle while its heavy media is still arriving.
+pub const MEDIA_PENDING: &str = ".media-pending";
+
 /// Copies a bundle to the same path on `host`, so the agent there can open its files.
 /// Syncs the contact sheet, keyframe PNGs, manifest, and summary synchronously so the session
 /// can be queued immediately, then streams heavy media (`recording.mp4`/`.mov`, `frames-full`)
-/// in the background for `scrawl zoom`.
+/// in the background for `scrawl zoom`, marked by [`MEDIA_PENDING`] until it lands.
 pub fn sync_bundle_to(host: &str, bundle_dir: &Path) -> Result<()> {
     use std::process::Stdio;
     let parent = bundle_dir.parent().context("Bundle has no parent")?;
@@ -448,8 +459,22 @@ pub fn sync_bundle_to(host: &str, bundle_dir: &Path) -> Result<()> {
         .spawn()
         .context("Could not start tar")?;
     let parent_q = shell_quote(&parent.to_string_lossy());
+    let name_str = name.to_string_lossy().into_owned();
+    let heavy: Vec<String> = HEAVY_MEDIA
+        .iter()
+        .filter(|rel| bundle_dir.join(rel).exists())
+        .map(|rel| format!("{name_str}/{rel}"))
+        .collect();
+    let bundle_q = shell_quote(&parent.join(&name_str).to_string_lossy());
+    // The marker goes up with the light files, before the session is prompted, so `scrawl zoom`
+    // there knows the video is still on its way rather than missing.
+    let mark_pending = if heavy.is_empty() {
+        String::new()
+    } else {
+        format!(" && touch {bundle_q}/{MEDIA_PENDING}")
+    };
     let output = ssh(host)
-        .arg(format!("mkdir -p {parent_q} && tar -C {parent_q} -xf -"))
+        .arg(format!("mkdir -p {parent_q} && tar -C {parent_q} -xf -{mark_pending}"))
         .stdin(tar.stdout.take().context("No tar output")?)
         .output()
         .context("Could not start ssh")?;
@@ -460,22 +485,21 @@ pub fn sync_bundle_to(host: &str, bundle_dir: &Path) -> Result<()> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
 
-    let name_str = name.to_string_lossy();
-    let mut heavy: Vec<String> = Vec::new();
-    for rel in [
-        "recording.mp4",
-        "recording.mov",
-        "audio.wav",
-        "frames-full",
-        "contact-sheet-full.png",
-    ] {
-        if bundle_dir.join(rel).exists() {
-            heavy.push(format!("{name_str}/{rel}"));
-        }
-    }
     if !heavy.is_empty() {
         let host_owned = host.to_owned();
         let parent_owned = parent.to_path_buf();
+        // Unpack into a staging folder and move into the bundle only once complete, so nothing on
+        // the other side ever reads a half-copied video; then clear the marker.
+        let staging_q = shell_quote(
+            &parent
+                .join(format!(".{name_str}.incoming"))
+                .to_string_lossy(),
+        );
+        let remote = format!(
+            "rm -rf {staging_q} && mkdir -p {staging_q} && tar -C {staging_q} -xf - && \
+             for f in {staging_q}/*/*; do rm -rf {bundle_q}/\"$(basename \"$f\")\" && mv \"$f\" {bundle_q}/; done; \
+             rm -rf {staging_q} {bundle_q}/{MEDIA_PENDING}"
+        );
         std::thread::spawn(move || {
             let Ok(mut bg_tar) = Command::new("/usr/bin/tar")
                 .arg("-C")
@@ -491,7 +515,7 @@ pub fn sync_bundle_to(host: &str, bundle_dir: &Path) -> Result<()> {
             };
             if let Some(stdout) = bg_tar.stdout.take() {
                 let _ = ssh(&host_owned)
-                    .arg(format!("mkdir -p {parent_q} && tar -C {parent_q} -xf -"))
+                    .arg(remote)
                     .stdin(stdout)
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
