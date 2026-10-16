@@ -69,6 +69,9 @@ pub struct ActivityLog {
     /// Calls to the window list and the time they took, for the log line at the end.
     pub snapshot_calls: u32,
     pub snapshot_time: Duration,
+    /// When the finish sequence began and how long stopping capture streams took.
+    pub stop_started: Option<Instant>,
+    pub stop_ms: Option<u64>,
 }
 
 impl ActivityLog {

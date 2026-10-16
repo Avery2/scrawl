@@ -444,6 +444,7 @@ pub fn build_movie_bundle(
     bundle_dir: &Path,
     mut capture: MovieCapture,
 ) -> Result<(PathBuf, ScrawlBundle, String)> {
+    let started_at = Instant::now();
     let probe = helper::probe(&capture.movie)?;
     ensure!(probe.duration_ms > 0, "The recording is empty");
     if probe.width > 0 && probe.height > 0 {
@@ -453,6 +454,7 @@ pub fn build_movie_bundle(
         capture.target.frame.height = f64::from(probe.height);
     }
     let wav = bundle_dir.join("audio.wav");
+    let audio_started = Instant::now();
     let audio = (probe.audio_tracks > 0)
         .then(|| helper::export_audio(&capture.movie, &wav))
         .and_then(|exported| {
@@ -461,15 +463,22 @@ pub fn build_movie_bundle(
                 .inspect_err(|error| scrawl_log(format!("Phone audio export failed: {error:#}")))
                 .ok()
         });
+    let audio_ms = audio_started.elapsed().as_millis() as u64;
     let every = (probe.duration_ms / MAX_CANDIDATES).max(250);
-    let (transcript, frames) = std::thread::scope(|scope| {
-        let frames = scope
-            .spawn(|| helper::frames(&capture.movie, FrameTimes::Every(every), CANDIDATE_EDGE));
+    let ((transcript, transcribe_ms), joined) = std::thread::scope(|scope| {
+        let frames = scope.spawn(|| {
+            let t0 = Instant::now();
+            let res = helper::frames(&capture.movie, FrameTimes::Every(every), CANDIDATE_EDGE);
+            (res, t0.elapsed().as_millis() as u64)
+        });
+        let t0 = Instant::now();
         let transcript =
             crate::transcribe::transcribe(audio.as_ref().map(|_| wav.as_path()), audio.as_ref());
-        (transcript, frames.join())
+        let transcribe_ms = t0.elapsed().as_millis() as u64;
+        ((transcript, transcribe_ms), frames.join())
     });
-    let frames = frames.map_err(|_| anyhow::anyhow!("Frame decoding panicked"))??;
+    let (frames, candidates_ms) = joined.map_err(|_| anyhow::anyhow!("Frame decoding panicked"))?;
+    let frames = frames?;
     ensure!(!frames.is_empty(), "No frames could be decoded");
     let movie = capture.movie.clone();
     let extras = crate::SourceExtras {
@@ -482,6 +491,13 @@ pub fn build_movie_bundle(
         full_frames: Some(Box::new(move |times: &[u64]| -> Result<Vec<RgbaFrame>> {
             helper::frames(&movie, FrameTimes::At(times), PHONE_FRAME_EDGE)
         })),
+        timings: crate::StageTimings {
+            started_at: Some(started_at),
+            audio_ms: Some(audio_ms),
+            candidates_ms: Some(candidates_ms),
+            transcribe_ms: Some(transcribe_ms),
+            ..Default::default()
+        },
         ..Default::default()
     };
     crate::build_bundle_from_parts(

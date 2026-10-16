@@ -2158,15 +2158,24 @@ impl ScrawlCoordinator {
                             return (finalized, duration_ms);
                         }
                     };
-                    let (recording, recorded_audio) = std::thread::scope(|s| {
+                    let stop_started = Instant::now();
+                    let (recording, recorded_audio, mut activity) = std::thread::scope(|s| {
                         let screen_handle = s.spawn(|| screen_session.stop());
+                        let win_handle = s.spawn(|| {
+                            window_log
+                                .map(crate::windows::WindowLogger::stop)
+                                .unwrap_or_default()
+                        });
                         let audio = audio_recorder.and_then(|r| r.stop().ok());
-                        (screen_handle.join().unwrap(), audio)
+                        (
+                            screen_handle.join().unwrap(),
+                            audio,
+                            win_handle.join().unwrap_or_default(),
+                        )
                     });
+                    activity.stop_started = Some(stop_started);
+                    activity.stop_ms = Some(stop_started.elapsed().as_millis() as u64);
                     let duration_ms = recording.duration_ms;
-                    let activity = window_log
-                        .map(crate::windows::WindowLogger::stop)
-                        .unwrap_or_default();
                     let finalized = crate::finalize_capture_bundle(
                         &bundle_dir,
                         target,

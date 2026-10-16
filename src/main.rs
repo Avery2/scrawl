@@ -112,6 +112,10 @@ enum Command {
         /// Output `.scrawl` bundle directory (a new bundle; the original is untouched).
         #[arg(long)]
         out: PathBuf,
+        /// Run N iterations of the finish pipeline (with candidate frames pre-loaded for Screen
+        /// captures) to benchmark finish-to-done wall clock.
+        #[arg(long, hide = true)]
+        bench: Option<u32>,
     },
     /// Print the agent-ready summary or JSON manifest for a `.scrawl` bundle (or `latest`).
     Inspect {
@@ -325,6 +329,16 @@ fn merge_full_keyframes(
     (merged, matched)
 }
 
+/// Per-stage timing breakdown logged on every finish (`finish timings: ...`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StageTimings {
+    pub started_at: Option<std::time::Instant>,
+    pub stop_ms: Option<u64>,
+    pub audio_ms: Option<u64>,
+    pub candidates_ms: Option<u64>,
+    pub transcribe_ms: Option<u64>,
+}
+
 /// What a source other than this Mac's screen adds to a bundle.
 #[derive(Default)]
 pub struct SourceExtras {
@@ -345,6 +359,7 @@ pub struct SourceExtras {
     /// Decodes the chosen keyframes again at full quality, for sources that select on small
     /// candidate frames (phone movies).
     pub full_frames: Option<FullFrames>,
+    pub timings: StageTimings,
 }
 
 /// Decodes frames at these times at full quality.
@@ -390,6 +405,8 @@ pub fn finalize_capture_bundle(
     note: Option<String>,
     activity: windows::ActivityLog,
 ) -> Result<(PathBuf, ScrawlBundle, String)> {
+    let started_at = activity.stop_started.unwrap_or_else(std::time::Instant::now);
+    let stop_ms = activity.stop_ms;
     let capture::ScreenRecording {
         frames,
         video: video_path,
@@ -402,10 +419,12 @@ pub fn finalize_capture_bundle(
         let _ = std::fs::write(&wav_path, &audio.wav_bytes);
     }
     let wav_path = bundle_dir.join("audio.wav");
+    let transcribe_started = std::time::Instant::now();
     let transcript = transcribe::transcribe(
         wav_path.exists().then_some(wav_path.as_path()),
         recorded_audio.as_ref(),
     );
+    let transcribe_ms = transcribe_started.elapsed().as_millis() as u64;
 
     build_bundle_from_parts(
         bundle_dir,
@@ -421,6 +440,12 @@ pub fn finalize_capture_bundle(
             activity,
             video_offset_ms,
             full_frames: video_path.map(|movie| movie_keyframes(movie, video_offset_ms)),
+            timings: StageTimings {
+                started_at: Some(started_at),
+                stop_ms,
+                transcribe_ms: Some(transcribe_ms),
+                ..StageTimings::default()
+            },
             ..SourceExtras::default()
         },
     )
@@ -439,6 +464,10 @@ pub fn build_bundle_from_parts(
     note: Option<String>,
     extras: SourceExtras,
 ) -> Result<(PathBuf, ScrawlBundle, String)> {
+    let total_started = extras
+        .timings
+        .started_at
+        .unwrap_or_else(std::time::Instant::now);
     let mut marks = marks_of(&strokes);
     for (i, &t) in extras.flags.iter().enumerate() {
         marks.push(Mark {
@@ -466,6 +495,7 @@ pub fn build_bundle_from_parts(
         &transcript,
         MAX_KEYFRAMES,
     );
+    let select_only_at = std::time::Instant::now();
     // Only the first candidate is needed from here on (auto-crop's baseline); free the rest
     // before the full-size keyframes arrive.
     let baseline = {
@@ -560,12 +590,14 @@ pub fn build_bundle_from_parts(
         autocrop: cropped.as_ref().map(|(info, _)| info.clone()),
     };
 
-    if let Some((info, full)) = &cropped {
-        let sheet = render_contact_sheet(&bundle, full);
-        autocrop::write_full_frames(bundle_dir, info, full, &sheet)?;
-    }
+    let full_sheet = cropped
+        .as_ref()
+        .map(|(_, full)| render_contact_sheet(&bundle, full));
     let contact_sheet = render_contact_sheet(&bundle, &annotated_frames);
     let rendered_at = std::time::Instant::now();
+    if let (Some((info, full)), Some(sheet)) = (&cropped, &full_sheet) {
+        autocrop::write_full_frames(bundle_dir, info, full, sheet)?;
+    }
     let summary = summary_markdown(&bundle, bundle_dir);
     write_bundle_artifacts(
         bundle_dir,
@@ -574,8 +606,36 @@ pub fn build_bundle_from_parts(
         &contact_sheet,
         &summary,
     )?;
+    let finished = std::time::Instant::now();
+    let select_ms = (select_only_at - started).as_millis() as u64;
+    let decode_ms = (selected_at - select_only_at).as_millis() as u64;
+    let autocrop_ms = (annotated_at - selected_at).as_millis() as u64;
+    let sheet_ms = (rendered_at - annotated_at).as_millis() as u64;
+    let write_ms = (finished - rendered_at).as_millis() as u64;
+    let total_ms = (finished - total_started).as_millis() as u64;
+    let mut parts = Vec::with_capacity(10);
+    if let Some(ms) = extras.timings.stop_ms {
+        parts.push(format!("stop {ms}ms"));
+    }
+    if let Some(ms) = extras.timings.audio_ms {
+        parts.push(format!("audio {ms}ms"));
+    }
+    if let Some(ms) = extras.timings.candidates_ms {
+        parts.push(format!("candidates {ms}ms"));
+    }
+    if let Some(ms) = extras.timings.transcribe_ms {
+        parts.push(format!("transcribe {ms}ms"));
+    }
+    parts.extend([
+        format!("select {select_ms}ms"),
+        format!("decode {decode_ms}ms"),
+        format!("autocrop {autocrop_ms}ms"),
+        format!("sheet {sheet_ms}ms"),
+        format!("write {write_ms}ms"),
+        format!("total {total_ms}ms"),
+    ]);
+    capture::scrawl_log(format!("finish timings: {}", parts.join(" · ")));
     if bench {
-        let finished = std::time::Instant::now();
         for (name, elapsed) in [
             ("selection_ms", selected_at - started),
             ("annotation_ms", annotated_at - selected_at),
@@ -891,7 +951,7 @@ fn main() -> Result<()> {
             print!("{summary}");
             Ok(())
         }
-        Command::Reprocess { bundle, out } => {
+        Command::Reprocess { bundle, out, bench } => {
             let (dir, old) = handoff::load_bundle(&bundle)?;
             let video = old
                 .video
@@ -899,6 +959,140 @@ fn main() -> Result<()> {
                 .map(|v| dir.join(v))
                 .filter(|p| p.is_file())
                 .context("The bundle has no video to reprocess")?;
+            let flags: Vec<u64> = old
+                .marks
+                .iter()
+                .filter(|m| m.shape == Shape::Flag)
+                .map(|m| m.t0)
+                .collect();
+            if let Some(iters) = bench {
+                let iters = iters.max(1);
+                let video_name = video.file_name().context("Bad video name")?.to_owned();
+                let mut runs_ms = Vec::with_capacity(iters as usize);
+                if let Some(device) = old.device.clone() {
+                    for i in 0..iters {
+                        let iter_out = if i + 1 == iters {
+                            out.clone()
+                        } else {
+                            out.with_file_name(format!("bench-{i}.scrawl"))
+                        };
+                        let _ = std::fs::remove_dir_all(&iter_out);
+                        std::fs::create_dir_all(&iter_out)?;
+                        let linked = iter_out.join(&video_name);
+                        std::fs::hard_link(&video, &linked)
+                            .or_else(|_| std::fs::copy(&video, &linked).map(|_| ()))?;
+                        let t0 = std::time::Instant::now();
+                        phone::build_movie_bundle(
+                            &iter_out,
+                            phone::MovieCapture {
+                                movie: linked,
+                                target: old.target.clone(),
+                                device: device.clone(),
+                                events: old.events.clone(),
+                                strokes: old.strokes.clone(),
+                                flags: flags.clone(),
+                                note: old.note.clone(),
+                                context: old.context.clone(),
+                                context_changes: old.context_changes.clone(),
+                                screens: old.screens.clone(),
+                            },
+                        )?;
+                        let _ = handoff::copy_bundle_to_clipboard(&iter_out);
+                        runs_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+                        if i + 1 != iters {
+                            let _ = std::fs::remove_dir_all(&iter_out);
+                        }
+                    }
+                } else {
+                    let offset = old.video_offset_ms;
+                    let raw_candidates = helper::frames(
+                        &video,
+                        helper::FrameTimes::Every(220),
+                        capture::CANDIDATE_EDGE as u32,
+                    )?;
+                    let mut candidate_buf =
+                        capture::CandidateBuffer::new(capture::CANDIDATE_BUDGET_BYTES);
+                    for mut frame in raw_candidates {
+                        frame.t_ms += offset;
+                        let urgent = old.strokes.iter().any(|s| s.t1.abs_diff(frame.t_ms) <= 150)
+                            || old.events.iter().any(|e| match e {
+                                InteractionEvent::Click { t, .. }
+                                | InteractionEvent::Point { t, .. } => {
+                                    t.abs_diff(frame.t_ms) <= 150
+                                }
+                                InteractionEvent::Drag { t1, .. } => t1.abs_diff(frame.t_ms) <= 150,
+                                _ => false,
+                            });
+                        candidate_buf.push(frame, urgent);
+                    }
+                    let candidates = candidate_buf.into_frames();
+                    let wav_bytes = old
+                        .audio
+                        .as_ref()
+                        .map(|a| dir.join(a))
+                        .filter(|p| p.is_file())
+                        .map(std::fs::read)
+                        .transpose()?;
+                    for i in 0..iters {
+                        let iter_out = if i + 1 == iters {
+                            out.clone()
+                        } else {
+                            out.with_file_name(format!("bench-{i}.scrawl"))
+                        };
+                        let _ = std::fs::remove_dir_all(&iter_out);
+                        std::fs::create_dir_all(&iter_out)?;
+                        let linked = iter_out.join(&video_name);
+                        std::fs::hard_link(&video, &linked)
+                            .or_else(|_| std::fs::copy(&video, &linked).map(|_| ()))?;
+                        let iter_frames = candidates.clone();
+                        let iter_strokes = old.strokes.clone();
+                        let iter_events = old.events.clone();
+                        let iter_target = old.target.clone();
+                        let iter_note = old.note.clone();
+                        let mut iter_activity = windows::ActivityLog {
+                            windows: old.windows.clone(),
+                            cursor: old.cursor.clone(),
+                            ..Default::default()
+                        };
+                        let iter_wav = wav_bytes.clone();
+                        let t0 = std::time::Instant::now();
+                        let recorded = iter_wav
+                            .map(hex::recorded_audio_from_wav)
+                            .transpose()?;
+                        iter_activity.stop_started = Some(t0);
+                        iter_activity.stop_ms = Some(t0.elapsed().as_millis() as u64);
+                        finalize_capture_bundle(
+                            &iter_out,
+                            iter_target,
+                            capture::ScreenRecording {
+                                frames: iter_frames,
+                                video: Some(linked),
+                                duration_ms: old.duration_ms,
+                                video_offset_ms: offset,
+                            },
+                            iter_strokes,
+                            iter_events,
+                            recorded,
+                            iter_note,
+                            iter_activity,
+                        )?;
+                        let _ = handoff::copy_bundle_to_clipboard(&iter_out);
+                        runs_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+                        if i + 1 != iters {
+                            let _ = std::fs::remove_dir_all(&iter_out);
+                        }
+                    }
+                }
+                let mut sorted = runs_ms.clone();
+                sorted.sort_by(|a, b| a.total_cmp(b));
+                let median = sorted[sorted.len() / 2];
+                eprintln!(
+                    "BENCH_FINISH runs_ms={:?} median_ms={:.1}",
+                    runs_ms.iter().map(|v| (*v * 10.0).round() / 10.0).collect::<Vec<_>>(),
+                    median
+                );
+                return Ok(());
+            }
             ensure!(!out.exists(), "{} already exists", out.display());
             std::fs::create_dir_all(&out)?;
             let copied = out.join(video.file_name().context("Bad video name")?);
@@ -907,12 +1101,6 @@ fn main() -> Result<()> {
             if timeline_src.is_file() {
                 let _ = std::fs::copy(&timeline_src, out.join("timeline.json"));
             }
-            let flags: Vec<u64> = old
-                .marks
-                .iter()
-                .filter(|m| m.shape == Shape::Flag)
-                .map(|m| m.t0)
-                .collect();
             let summary = if let Some(device) = old.device.clone() {
                 phone::build_movie_bundle(
                     &out,
@@ -931,6 +1119,7 @@ fn main() -> Result<()> {
                 )?
                 .2
             } else {
+                let started_at = std::time::Instant::now();
                 let audio = old
                     .audio
                     .as_ref()
@@ -944,16 +1133,20 @@ fn main() -> Result<()> {
                     None => None,
                 };
                 let wav = out.join("audio.wav");
+                let transcribe_started = std::time::Instant::now();
                 let transcript = transcribe::transcribe(
                     recorded.as_ref().map(|_| wav.as_path()),
                     recorded.as_ref(),
                 );
+                let transcribe_ms = transcribe_started.elapsed().as_millis() as u64;
                 // Small candidates, then the keyframes from the movie at full size, as at capture.
                 let offset = old.video_offset_ms;
+                let candidates_started = std::time::Instant::now();
                 let mut frames = helper::frames(&copied, helper::FrameTimes::Every(220), 640)?;
                 for frame in &mut frames {
                     frame.t_ms += offset;
                 }
+                let candidates_ms = candidates_started.elapsed().as_millis() as u64;
                 let full_frames = Some(movie_keyframes(copied.clone(), offset));
                 build_bundle_from_parts(
                     &out,
@@ -973,6 +1166,12 @@ fn main() -> Result<()> {
                         },
                         full_frames,
                         video_offset_ms: offset,
+                        timings: StageTimings {
+                            started_at: Some(started_at),
+                            candidates_ms: Some(candidates_ms),
+                            transcribe_ms: Some(transcribe_ms),
+                            ..Default::default()
+                        },
                         ..SourceExtras::default()
                     },
                 )?
