@@ -1067,3 +1067,34 @@ mod tests {
         assert!(cfg_after.usb_apps.is_empty());
     }
 }
+
+#[cfg(test)]
+mod sync_live_check {
+    /// Manual: `cargo test sync_to_pro -- --ignored` copies a dummy bundle to `pro` and checks the
+    /// heavy media lands atomically and the marker clears.
+    #[test]
+    #[ignore]
+    fn sync_to_pro() {
+        let base = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join("Library/Caches/scrawl-sync-live");
+        let _ = std::fs::remove_dir_all(&base);
+        let bundle = base.join("scrawl-synctest.scrawl");
+        std::fs::create_dir_all(bundle.join("frames-full")).unwrap();
+        std::fs::write(bundle.join("summary.md"), "hi").unwrap();
+        std::fs::write(bundle.join("recording.mp4"), vec![7u8; 8_000_000]).unwrap();
+        std::fs::write(bundle.join("frames-full/frame-01.png"), b"png").unwrap();
+        super::sync_bundle_to("pro", &bundle).unwrap();
+        let q = super::shell_quote(&bundle.to_string_lossy());
+        let check = format!("ls -a {q}; ls {q}/frames-full; wc -c < {q}/recording.mp4");
+        let mut out = String::new();
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let o = super::ssh("pro").arg(&check).output().unwrap();
+            out = String::from_utf8_lossy(&o.stdout).into_owned();
+            if !out.contains(super::MEDIA_PENDING) && out.contains("8000000") {
+                break;
+            }
+        }
+        let _ = super::ssh("pro").arg(format!("rm -rf {}", super::shell_quote(&base.to_string_lossy()))).status();
+        assert!(out.contains("8000000") && out.contains("frame-01.png") && !out.contains(super::MEDIA_PENDING), "{out}");
+    }
+}
