@@ -1573,7 +1573,7 @@ impl ScreenCaptureSession {
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push(frame, urgent);
                     }
-                    thread::sleep(Duration::from_millis(30));
+                    thread::park_timeout(Duration::from_millis(30));
                 }
                 if let Some(stream) = stream {
                     let _ = stream.stop_capture();
@@ -1597,6 +1597,9 @@ impl ScreenCaptureSession {
 
     pub fn request_immediate_frame(&self) {
         self.urgent_snapshot.store(true, Ordering::Release);
+        if let Some(ref handle) = self.sampler_thread {
+            handle.thread().unpark();
+        }
     }
 
     pub fn elapsed_ms(&self) -> u64 {
@@ -1609,7 +1612,10 @@ impl ScreenCaptureSession {
         let video_path = self
             .sampler_thread
             .take()
-            .and_then(|handle| handle.join().ok())
+            .and_then(|handle| {
+                handle.thread().unpark();
+                handle.join().ok()
+            })
             .flatten();
         let buffer = std::mem::replace(
             &mut *self
@@ -1637,6 +1643,7 @@ impl Drop for ScreenCaptureSession {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
         if let Some(handle) = self.sampler_thread.take() {
+            handle.thread().unpark();
             let _ = handle.join();
         }
     }

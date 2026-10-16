@@ -40,9 +40,14 @@ fn run<T: for<'de> Deserialize<'de>>(args: &[&std::ffi::OsStr], timeout: Duratio
         .context("Could not start scrawl-helper")?;
     let mut stdout = child.stdout.take().context("No helper stdout")?;
     let mut stderr = child.stderr.take().context("No helper stderr")?;
+    let caller = std::thread::current();
+    let eof = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_eof = std::sync::Arc::clone(&eof);
     let reader = std::thread::spawn(move || {
         let mut out = Vec::new();
         let _ = stdout.read_to_end(&mut out);
+        reader_eof.store(true, std::sync::atomic::Ordering::Release);
+        caller.unpark();
         out
     });
     let deadline = Instant::now() + timeout;
@@ -50,12 +55,16 @@ fn run<T: for<'de> Deserialize<'de>>(args: &[&std::ffi::OsStr], timeout: Duratio
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if Instant::now() > deadline {
+        if eof.load(std::sync::atomic::Ordering::Acquire) {
+            break child.wait()?;
+        }
+        let now = Instant::now();
+        if now >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             bail!("scrawl-helper {:?} timed out", args.first());
         }
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::park_timeout(deadline - now);
     };
     let out = reader.join().unwrap_or_default();
     if !status.success() {

@@ -391,7 +391,10 @@ impl WindowLogger {
         let log = self
             .worker
             .take()
-            .and_then(|w| w.join().ok())
+            .and_then(|w| {
+                w.thread().unpark();
+                w.join().ok()
+            })
             .unwrap_or_default();
         if log.snapshot_calls > 0 {
             crate::capture::scrawl_log(format!(
@@ -409,6 +412,9 @@ impl WindowLogger {
 impl Drop for WindowLogger {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
+        if let Some(ref w) = self.worker {
+            w.thread().unpark();
+        }
     }
 }
 
@@ -456,7 +462,7 @@ fn run(
         if finishing {
             return log;
         }
-        thread::sleep(TICK);
+        thread::park_timeout(TICK);
     }
 }
 
