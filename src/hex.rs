@@ -126,12 +126,11 @@ impl AudioRecorder {
         );
         let sample_count = samples_16k.len();
         let duration_ms = sample_count as u64 * 1_000 / SAMPLE_RATE as u64;
-        let speech_islands = detect_speech_islands(&samples_16k, SAMPLE_RATE);
         let wav_bytes = encode_wav_16k(&samples_16k)?;
         Ok(RecordedAudio {
             sample_count,
             duration_ms,
-            speech_islands,
+            speech_islands: Vec::new(),
             wav_bytes,
         })
     }
@@ -203,16 +202,27 @@ pub fn recorded_audio_from_wav(wav_bytes: Vec<u8>) -> Result<RecordedAudio> {
         spec.sample_rate == SAMPLE_RATE && spec.channels == 1 && spec.bits_per_sample == 16,
         "Expected 16 kHz mono 16-bit audio"
     );
-    let samples: Vec<f32> = reader
-        .into_samples::<i16>()
-        .map(|s| s.map(|v| f32::from(v) / 32_768.0))
-        .collect::<std::result::Result<_, _>>()?;
+    let sample_count = reader.duration() as usize;
     Ok(RecordedAudio {
-        sample_count: samples.len(),
-        duration_ms: samples.len() as u64 * 1_000 / u64::from(SAMPLE_RATE),
-        speech_islands: detect_speech_islands(&samples, SAMPLE_RATE),
+        sample_count,
+        duration_ms: sample_count as u64 * 1_000 / u64::from(SAMPLE_RATE),
+        speech_islands: Vec::new(),
         wav_bytes,
     })
+}
+
+fn speech_islands_from_wav(wav_bytes: &[u8]) -> Vec<(u64, u64)> {
+    let Ok(reader) = hound::WavReader::new(Cursor::new(wav_bytes)) else {
+        return Vec::new();
+    };
+    let Ok(samples): std::result::Result<Vec<f32>, _> = reader
+        .into_samples::<i16>()
+        .map(|s| s.map(|v| f32::from(v) / 32_768.0))
+        .collect()
+    else {
+        return Vec::new();
+    };
+    detect_speech_islands(&samples, SAMPLE_RATE)
 }
 
 /// Energy-based speech estimates, quantized to 50 ms. These are not ASR timestamps.
@@ -252,7 +262,7 @@ pub fn detect_speech_islands(samples_16k: &[f32], sample_rate: u32) -> Vec<(u64,
 }
 
 pub fn encode_wav_16k(samples_16k: &[f32]) -> Result<Vec<u8>> {
-    let mut bytes = Cursor::new(Vec::new());
+    let mut bytes = Cursor::new(Vec::with_capacity(44 + samples_16k.len() * 2));
     {
         let mut writer = hound::WavWriter::new(
             &mut bytes,
@@ -263,14 +273,16 @@ pub fn encode_wav_16k(samples_16k: &[f32]) -> Result<Vec<u8>> {
                 sample_format: hound::SampleFormat::Int,
             },
         )?;
+        let mut i16_writer = writer.get_i16_writer(samples_16k.len() as u32);
         for &sample in samples_16k {
             let sample = if sample.is_finite() {
                 sample.clamp(-1.0, 1.0)
             } else {
                 0.0
             };
-            writer.write_sample((sample * 32_768.0).round().clamp(-32_768.0, 32_767.0) as i16)?;
+            i16_writer.write_sample((sample * 32_768.0).round().clamp(-32_768.0, 32_767.0) as i16);
         }
+        i16_writer.flush()?;
         writer.finalize()?;
     }
     Ok(bytes.into_inner())
@@ -489,7 +501,14 @@ fn transcript_response(
             .get("durationMs")
             .and_then(|v| v.as_u64())
             .unwrap_or(audio.duration_ms);
-        (segments, words) = align_transcript_to_islands(&text, duration, &audio.speech_islands);
+        let computed;
+        let islands = if !audio.speech_islands.is_empty() {
+            &audio.speech_islands
+        } else {
+            computed = speech_islands_from_wav(&audio.wav_bytes);
+            &computed
+        };
+        (segments, words) = align_transcript_to_islands(&text, duration, islands);
     } else if segments.is_empty() {
         segments = words
             .iter()

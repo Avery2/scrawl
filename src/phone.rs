@@ -455,11 +455,29 @@ pub fn build_movie_bundle(
     }
     let wav = bundle_dir.join("audio.wav");
     let every = (probe.duration_ms / MAX_CANDIDATES).max(250);
+    let mut mark_times: Vec<u64> = crate::sketch::marks_of(&capture.strokes)
+        .into_iter()
+        .map(|m| m.t1)
+        .chain(capture.flags.iter().copied())
+        .collect();
+    mark_times.sort_unstable();
+    mark_times.dedup();
+    let direct_marks = mark_times.len() >= crate::MAX_KEYFRAMES;
+    if direct_marks {
+        mark_times.truncate(crate::MAX_KEYFRAMES);
+    }
     let ((transcript, audio_ms, transcribe_ms), joined) = std::thread::scope(|scope| {
         let frames = scope.spawn(|| {
             let t0 = Instant::now();
+            if direct_marks {
+                let direct =
+                    helper::frames(&capture.movie, FrameTimes::At(&mark_times), PHONE_FRAME_EDGE);
+                if direct.as_ref().is_ok_and(|f| !f.is_empty()) {
+                    return (direct, t0.elapsed().as_millis() as u64, true);
+                }
+            }
             let res = helper::frames(&capture.movie, FrameTimes::Every(every), CANDIDATE_EDGE);
-            (res, t0.elapsed().as_millis() as u64)
+            (res, t0.elapsed().as_millis() as u64, false)
         });
         let audio_started = Instant::now();
         let audio = (probe.audio_tracks > 0)
@@ -477,7 +495,8 @@ pub fn build_movie_bundle(
         let transcribe_ms = t0.elapsed().as_millis() as u64;
         ((transcript, audio_ms, transcribe_ms), frames.join())
     });
-    let (frames, candidates_ms) = joined.map_err(|_| anyhow::anyhow!("Frame decoding panicked"))?;
+    let (frames, candidates_ms, already_full) =
+        joined.map_err(|_| anyhow::anyhow!("Frame decoding panicked"))?;
     let frames = frames?;
     ensure!(!frames.is_empty(), "No frames could be decoded");
     let movie = capture.movie.clone();
@@ -488,9 +507,11 @@ pub fn build_movie_bundle(
         context_changes: capture.context_changes,
         screens: capture.screens,
         flags: capture.flags,
-        full_frames: Some(Box::new(move |times: &[u64]| -> Result<Vec<RgbaFrame>> {
-            helper::frames(&movie, FrameTimes::At(times), PHONE_FRAME_EDGE)
-        })),
+        full_frames: (!already_full).then(|| -> crate::FullFrames {
+            Box::new(move |times: &[u64]| -> Result<Vec<RgbaFrame>> {
+                helper::frames(&movie, FrameTimes::At(times), PHONE_FRAME_EDGE)
+            })
+        }),
         timings: crate::StageTimings {
             started_at: Some(started_at),
             audio_ms: Some(audio_ms),

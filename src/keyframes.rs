@@ -246,11 +246,6 @@ pub fn select_keyframes(
     }
     let mut frames: Vec<_> = frames.iter().collect();
     frames.sort_by_key(|frame| frame.t_ms);
-    let thumbnails: Vec<_> = frames.iter().map(|frame| luma_thumbnail(frame)).collect();
-    let deltas: Vec<_> = thumbnails
-        .windows(2)
-        .map(|pair| scene_transition_diff(&pair[0], &pair[1]))
-        .collect();
     let mut candidates = Vec::new();
     for (i, mark) in marks.iter().enumerate() {
         candidates.push(Candidate {
@@ -263,125 +258,136 @@ pub fn select_keyframes(
             cursor: None,
         });
     }
-    for event in settled_events(events) {
-        match &event {
-            InteractionEvent::Click { t, x, y, .. }
-            | InteractionEvent::Drag {
-                t, x1: x, y1: y, ..
-            } => {
-                let end = match &event {
-                    InteractionEvent::Drag { t1, .. } => *t1,
-                    _ => *t,
-                };
-                let before = frames
-                    .partition_point(|frame| frame.t_ms < *t)
-                    .saturating_sub(1);
-                // A short delay captures the result of the action rather than the
-                // mouse-down state. Prefer an actual post-action frame when present.
-                let first_after = frames.partition_point(|frame| frame.t_ms < end);
-                let after = nearest_frame(&frames, end.saturating_add(250))
-                    .max(first_after.min(frames.len() - 1));
-                let delta = thumbnail_diff(&thumbnails[before], &thumbnails[after]);
-                candidates.push(Candidate {
-                    frame: after,
-                    span: (*t, end),
-                    score: 60.0 + 30.0 * delta,
-                    reason: KeyframeReason::Click,
+    let thumbnails: Vec<_> = if marks.len() < max_keyframes {
+        frames.iter().map(|frame| luma_thumbnail(frame)).collect()
+    } else {
+        Vec::new()
+    };
+    if marks.len() < max_keyframes {
+        let deltas: Vec<_> = thumbnails
+            .windows(2)
+            .map(|pair| scene_transition_diff(&pair[0], &pair[1]))
+            .collect();
+        for event in settled_events(events) {
+            match &event {
+                InteractionEvent::Click { t, x, y, .. }
+                | InteractionEvent::Drag {
+                    t, x1: x, y1: y, ..
+                } => {
+                    let end = match &event {
+                        InteractionEvent::Drag { t1, .. } => *t1,
+                        _ => *t,
+                    };
+                    let before = frames
+                        .partition_point(|frame| frame.t_ms < *t)
+                        .saturating_sub(1);
+                    // A short delay captures the result of the action rather than the
+                    // mouse-down state. Prefer an actual post-action frame when present.
+                    let first_after = frames.partition_point(|frame| frame.t_ms < end);
+                    let after = nearest_frame(&frames, end.saturating_add(250))
+                        .max(first_after.min(frames.len() - 1));
+                    let delta = thumbnail_diff(&thumbnails[before], &thumbnails[after]);
+                    candidates.push(Candidate {
+                        frame: after,
+                        span: (*t, end),
+                        score: 60.0 + 30.0 * delta,
+                        reason: KeyframeReason::Click,
+                        mark: None,
+                        event: describe_event(&event),
+                        cursor: Some([*x, *y]),
+                    });
+                }
+                InteractionEvent::Point { t, x, y, .. } => candidates.push(Candidate {
+                    frame: nearest_frame(&frames, *t),
+                    span: (*t, *t),
+                    score: 55.0,
+                    reason: KeyframeReason::Laser,
                     mark: None,
                     event: describe_event(&event),
                     cursor: Some([*x, *y]),
-                });
+                }),
+                _ => {}
             }
-            InteractionEvent::Point { t, x, y, .. } => candidates.push(Candidate {
-                frame: nearest_frame(&frames, *t),
-                span: (*t, *t),
+        }
+        for stroke in strokes.iter().filter(|s| s.laser) {
+            let cursor = stroke.normalized_points().last().copied();
+            let label = stroke
+                .on
+                .as_ref()
+                .map(|on| format!(" “{on}”"))
+                .unwrap_or_default();
+            let position = cursor
+                .map(|[x, y]| format!(" (x {x:.2}, y {y:.2})"))
+                .unwrap_or_default();
+            candidates.push(Candidate {
+                frame: nearest_frame(&frames, stroke.t1),
+                span: (stroke.t0, stroke.t1),
                 score: 55.0,
                 reason: KeyframeReason::Laser,
                 mark: None,
-                event: describe_event(&event),
-                cursor: Some([*x, *y]),
-            }),
-            _ => {}
+                event: format!("pointed at{label}{position}"),
+                cursor,
+            });
         }
-    }
-    for stroke in strokes.iter().filter(|s| s.laser) {
-        let cursor = stroke.normalized_points().last().copied();
-        let label = stroke
-            .on
-            .as_ref()
-            .map(|on| format!(" “{on}”"))
-            .unwrap_or_default();
-        let position = cursor
-            .map(|[x, y]| format!(" (x {x:.2}, y {y:.2})"))
-            .unwrap_or_default();
-        candidates.push(Candidate {
-            frame: nearest_frame(&frames, stroke.t1),
-            span: (stroke.t0, stroke.t1),
-            score: 55.0,
-            reason: KeyframeReason::Laser,
-            mark: None,
-            event: format!("pointed at{label}{position}"),
-            cursor,
-        });
-    }
-    // A run of changing frames is one transition. Its last changed frame is
-    // the settled view, avoiding several near-identical animation keyframes.
-    let mut transitions: Vec<(usize, (u64, u64), f32)> = Vec::new();
-    let mut transition: Option<(usize, u64, f32)> = None;
-    for (i, &delta) in deltas.iter().enumerate() {
-        if delta > 0.08 {
-            let start_t = transition.map_or(frames[i].t_ms, |(_, t0, _)| t0);
-            transition = Some((
-                i + 1,
-                start_t,
-                transition.map_or(delta, |(_, _, max)| max.max(delta)),
-            ));
-        } else if let Some((frame, start_t, diff)) = transition.take() {
+        // A run of changing frames is one transition. Its last changed frame is
+        // the settled view, avoiding several near-identical animation keyframes.
+        let mut transitions: Vec<(usize, (u64, u64), f32)> = Vec::new();
+        let mut transition: Option<(usize, u64, f32)> = None;
+        for (i, &delta) in deltas.iter().enumerate() {
+            if delta > 0.08 {
+                let start_t = transition.map_or(frames[i].t_ms, |(_, t0, _)| t0);
+                transition = Some((
+                    i + 1,
+                    start_t,
+                    transition.map_or(delta, |(_, _, max)| max.max(delta)),
+                ));
+            } else if let Some((frame, start_t, diff)) = transition.take() {
+                transitions.push((frame, (start_t, frames[frame].t_ms), diff));
+            }
+        }
+        if let Some((frame, start_t, diff)) = transition {
             transitions.push((frame, (start_t, frames[frame].t_ms), diff));
         }
-    }
-    if let Some((frame, start_t, diff)) = transition {
-        transitions.push((frame, (start_t, frames[frame].t_ms), diff));
-    }
-    for &(frame, span, diff) in &transitions {
-        candidates.push(scene_candidate(frame, span, diff));
-    }
-    // A pointing word is a deliberate cue ("if I say now, find the right image"). It looks for
-    // a transition that starts around the word; otherwise it takes what was on screen as it
-    // was said. Speech alone never cuts a keyframe over an unchanged screen: cues must show
-    // something new (checked during selection), and pauses never cut at all.
-    if !transcript.estimated {
-        for word in &transcript.words {
-            let Some((cue, score, strong)) = spoken_cue(&word.text) else {
-                continue;
-            };
-            let snapped = transitions
-                .iter()
-                .filter(|(_, (start, _), _)| {
-                    start.saturating_add(300) >= word.t0 && *start <= word.t0 + 1_200
-                })
-                .min_by_key(|(_, (start, _), _)| start.abs_diff(word.t0));
-            let (frame, score, event) = match snapped {
-                Some(&(frame, _, diff)) => (
+        for &(frame, span, diff) in &transitions {
+            candidates.push(scene_candidate(frame, span, diff));
+        }
+        // A pointing word is a deliberate cue ("if I say now, find the right image"). It looks for
+        // a transition that starts around the word; otherwise it takes what was on screen as it
+        // was said. Speech alone never cuts a keyframe over an unchanged screen: cues must show
+        // something new (checked during selection), and pauses never cut at all.
+        if !transcript.estimated {
+            for word in &transcript.words {
+                let Some((cue, score, strong)) = spoken_cue(&word.text) else {
+                    continue;
+                };
+                let snapped = transitions
+                    .iter()
+                    .filter(|(_, (start, _), _)| {
+                        start.saturating_add(300) >= word.t0 && *start <= word.t0 + 1_200
+                    })
+                    .min_by_key(|(_, (start, _), _)| start.abs_diff(word.t0));
+                let (frame, score, event) = match snapped {
+                    Some(&(frame, _, diff)) => (
+                        frame,
+                        score.max(40.0 + 40.0 * diff) + if strong { 6.0 } else { 1.0 },
+                        format!("said “{cue}” as the screen changed"),
+                    ),
+                    None => (
+                        nearest_frame(&frames, word.t0 + 150),
+                        score,
+                        format!("said “{cue}”"),
+                    ),
+                };
+                candidates.push(Candidate {
                     frame,
-                    score.max(40.0 + 40.0 * diff) + if strong { 6.0 } else { 1.0 },
-                    format!("said “{cue}” as the screen changed"),
-                ),
-                None => (
-                    nearest_frame(&frames, word.t0 + 150),
+                    span: (word.t0, word.t0),
                     score,
-                    format!("said “{cue}”"),
-                ),
-            };
-            candidates.push(Candidate {
-                frame,
-                span: (word.t0, word.t0),
-                score,
-                reason: KeyframeReason::Speech,
-                mark: None,
-                event,
-                cursor: None,
-            });
+                    reason: KeyframeReason::Speech,
+                    mark: None,
+                    event,
+                    cursor: None,
+                });
+            }
         }
     }
     if candidates.is_empty() {
