@@ -590,13 +590,20 @@ pub fn render_contact_sheet(
     bundle: &ScrawlBundle,
     annotated_frames: &[(Keyframe, RgbaFrame)],
 ) -> RgbaFrame {
+    render_contact_sheet_for_duration(bundle.duration_ms, annotated_frames)
+}
+
+pub fn render_contact_sheet_for_duration(
+    duration_ms: u64,
+    annotated_frames: &[(Keyframe, RgbaFrame)],
+) -> RgbaFrame {
     const CELL: f32 = 640.0;
     const PAD: f32 = 16.0;
     const GAP: f32 = 14.0;
     let frames = &annotated_frames[..annotated_frames.len().min(MAX_KEYFRAMES)];
     if frames.is_empty() {
         let mut sheet = solid(640, 360, [20, 20, 20, 255]);
-        sheet.t_ms = bundle.duration_ms;
+        sheet.t_ms = duration_ms;
         return sheet;
     }
     // Phone frames are portrait: three narrower cells to a row keep the sheet compact.
@@ -624,7 +631,7 @@ pub fn render_contact_sheet(
         + GAP * row_heights.len().saturating_sub(1) as f32)
         .ceil() as u32;
     let mut sheet = solid(width, height, [20, 20, 20, 255]);
-    sheet.t_ms = bundle.duration_ms;
+    sheet.t_ms = duration_ms;
     let mut row_y = PAD;
     for (row, row_height) in row_heights.iter().enumerate() {
         for col in 0..columns {

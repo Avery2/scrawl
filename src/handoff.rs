@@ -424,6 +424,9 @@ fn ssh(host: &str) -> Command {
 }
 
 /// Copies a bundle to the same path on `host`, so the agent there can open its files.
+/// Syncs the contact sheet, keyframe PNGs, manifest, and summary synchronously so the session
+/// can be queued immediately, then streams heavy media (`recording.mp4`/`.mov`, `frames-full`)
+/// in the background for `scrawl zoom`.
 pub fn sync_bundle_to(host: &str, bundle_dir: &Path) -> Result<()> {
     use std::process::Stdio;
     let parent = bundle_dir.parent().context("Bundle has no parent")?;
@@ -431,6 +434,13 @@ pub fn sync_bundle_to(host: &str, bundle_dir: &Path) -> Result<()> {
     let mut tar = Command::new("/usr/bin/tar")
         .arg("-C")
         .arg(parent)
+        .args([
+            "--exclude=*/recording.mp4",
+            "--exclude=*/recording.mov",
+            "--exclude=*/audio.wav",
+            "--exclude=*/frames-full",
+            "--exclude=*/contact-sheet-full.png",
+        ])
         .arg("-cf")
         .arg("-")
         .arg(name)
@@ -449,6 +459,47 @@ pub fn sync_bundle_to(host: &str, bundle_dir: &Path) -> Result<()> {
         "Copying the bundle to {host} failed: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
+
+    let name_str = name.to_string_lossy();
+    let mut heavy: Vec<String> = Vec::new();
+    for rel in [
+        "recording.mp4",
+        "recording.mov",
+        "audio.wav",
+        "frames-full",
+        "contact-sheet-full.png",
+    ] {
+        if bundle_dir.join(rel).exists() {
+            heavy.push(format!("{name_str}/{rel}"));
+        }
+    }
+    if !heavy.is_empty() {
+        let host_owned = host.to_owned();
+        let parent_owned = parent.to_path_buf();
+        std::thread::spawn(move || {
+            let Ok(mut bg_tar) = Command::new("/usr/bin/tar")
+                .arg("-C")
+                .arg(&parent_owned)
+                .arg("-cf")
+                .arg("-")
+                .args(&heavy)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            else {
+                return;
+            };
+            if let Some(stdout) = bg_tar.stdout.take() {
+                let _ = ssh(&host_owned)
+                    .arg(format!("mkdir -p {parent_q} && tar -C {parent_q} -xf -"))
+                    .stdin(stdout)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            let _ = bg_tar.wait();
+        });
+    }
     Ok(())
 }
 

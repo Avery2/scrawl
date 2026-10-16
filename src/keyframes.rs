@@ -259,7 +259,26 @@ pub fn select_keyframes(
         });
     }
     let thumbnails: Vec<_> = if marks.len() < max_keyframes {
-        frames.iter().map(|frame| luma_thumbnail(frame)).collect()
+        if frames.len() >= 128 {
+            let chunk_size = frames.len().div_ceil(6).max(1);
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = frames
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || -> Vec<[f32; THUMB_PIXELS]> {
+                            chunk.iter().map(|frame| luma_thumbnail(frame)).collect()
+                        })
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(frames.len());
+                for worker in workers {
+                    out.extend(worker.join().unwrap());
+                }
+                out
+            })
+        } else {
+            frames.iter().map(|frame| luma_thumbnail(frame)).collect()
+        }
     } else {
         Vec::new()
     };

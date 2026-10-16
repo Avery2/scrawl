@@ -339,6 +339,97 @@ pub struct StageTimings {
     pub transcribe_ms: Option<u64>,
 }
 
+/// Pre-rendered keyframe visuals and encoded PNGs computed while transcription is running.
+pub struct PreparedVisuals {
+    pub keyframes: Vec<model::Keyframe>,
+    pub autocrop: Option<model::AutocropInfo>,
+    pub contact_sheet_png: Vec<u8>,
+    pub frame_pngs: Vec<(String, Vec<u8>)>,
+    pub full_sheet_png: Option<Vec<u8>>,
+    pub full_frame_pngs: Vec<(String, Vec<u8>)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_visuals(
+    selected: Vec<(model::Keyframe, RgbaFrame)>,
+    baseline: Option<&RgbaFrame>,
+    crop_settings: Option<&autocrop::Settings>,
+    target: &TargetInfo,
+    duration_ms: u64,
+    strokes: &[Stroke],
+    marks: &[Mark],
+    events: &[InteractionEvent],
+    activity: &windows::ActivityLog,
+) -> Option<PreparedVisuals> {
+    if selected.is_empty() {
+        return None;
+    }
+    let (annotated_frames, cropped) = autocrop::annotate_and_crop(
+        selected,
+        baseline,
+        crop_settings,
+        target,
+        duration_ms,
+        strokes,
+        marks,
+        events,
+        &activity.windows,
+        &activity.cursor,
+    );
+    let keyframes: Vec<model::Keyframe> =
+        annotated_frames.iter().map(|(kf, _)| kf.clone()).collect();
+    let (full_sheet, contact_sheet) = std::thread::scope(|scope| {
+        let full_handle = cropped.as_ref().map(|(_, full)| {
+            scope.spawn(|| render::render_contact_sheet_for_duration(duration_ms, full))
+        });
+        let sheet = render::render_contact_sheet_for_duration(duration_ms, &annotated_frames);
+        (full_handle.map(|h| h.join().ok()).flatten(), sheet)
+    });
+    let contact_sheet_png = render::encode_png(&contact_sheet).ok()?;
+    let frame_pngs: Vec<(String, Vec<u8>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = annotated_frames
+            .iter()
+            .map(|(kf, frame)| {
+                scope.spawn(move || render::encode_png(frame).ok().map(|b| (kf.file.clone(), b)))
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().ok().flatten()).collect::<Option<Vec<_>>>()
+    })?;
+    let (autocrop, full_sheet_png, full_frame_pngs) = match (cropped, full_sheet) {
+        (Some((info, full)), Some(sheet)) => {
+            let sheet_png = render::encode_png(&sheet).ok()?;
+            let full_pngs: Vec<(String, Vec<u8>)> = std::thread::scope(|scope| {
+                let workers: Vec<_> = full
+                    .iter()
+                    .map(|(kf, frame)| {
+                        scope.spawn(move || {
+                            let name = std::path::Path::new(&kf.file)
+                                .file_name()
+                                .and_then(|n| n.to_str())?
+                                .to_owned();
+                            render::encode_png(frame).ok().map(|b| (name, b))
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|w| w.join().ok().flatten())
+                    .collect::<Option<Vec<_>>>()
+            })?;
+            (Some(info), Some(sheet_png), full_pngs)
+        }
+        _ => (None, None, Vec::new()),
+    };
+    Some(PreparedVisuals {
+        keyframes,
+        autocrop,
+        contact_sheet_png,
+        frame_pngs,
+        full_sheet_png,
+        full_frame_pngs,
+    })
+}
+
 /// What a source other than this Mac's screen adds to a bundle.
 #[derive(Default)]
 pub struct SourceExtras {
@@ -359,6 +450,7 @@ pub struct SourceExtras {
     /// Decodes the chosen keyframes again at full quality, for sources that select on small
     /// candidate frames (phone movies).
     pub full_frames: Option<FullFrames>,
+    pub prepared: Option<PreparedVisuals>,
     pub timings: StageTimings,
 }
 
@@ -447,7 +539,10 @@ pub fn finalize_capture_bundle(
     }
     let wav_path = bundle_dir.join("audio.wav");
     let has_wav = wav_path.exists();
-    let ((transcript, transcribe_ms), predecoded) = std::thread::scope(|scope| {
+    let crop_settings = (target.mode == CaptureMode::Display)
+        .then(autocrop::Settings::configured)
+        .flatten();
+    let ((transcript, transcribe_ms), (predecoded, prepared)) = std::thread::scope(|scope| {
         let transcribe_handle = scope.spawn(|| {
             let t0 = std::time::Instant::now();
             let tr = transcribe::transcribe(
@@ -460,6 +555,7 @@ pub fn finalize_capture_bundle(
             && !frames.is_empty()
         {
             let mut preview_marks = marks_of(&strokes);
+            let marks_fill = preview_marks.len() >= MAX_KEYFRAMES;
             let preview = select_keyframes(
                 &frames,
                 &strokes,
@@ -469,9 +565,31 @@ pub fn finalize_capture_bundle(
                 MAX_KEYFRAMES,
             );
             let times: Vec<u64> = preview.iter().map(|(k, _)| k.t).collect();
-            movie_frames_at(movie, &times, video_offset_ms, 0).unwrap_or_default()
+            let decoded = movie_frames_at(movie, &times, video_offset_ms, 0).unwrap_or_default();
+            if duration_ms >= 20_000 {
+                let cache = if marks_fill {
+                    Vec::new()
+                } else {
+                    decoded.clone()
+                };
+                let (merged, _) = merge_full_keyframes(preview, decoded);
+                let vis = prepare_visuals(
+                    merged,
+                    frames.first(),
+                    crop_settings.as_ref(),
+                    &target,
+                    duration_ms,
+                    &strokes,
+                    &preview_marks,
+                    &events,
+                    &activity,
+                );
+                (cache, vis)
+            } else {
+                (decoded, None)
+            }
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         (transcribe_handle.join().unwrap(), pre)
     });
@@ -489,8 +607,10 @@ pub fn finalize_capture_bundle(
         SourceExtras {
             activity,
             video_offset_ms,
+            autocrop: Some(crop_settings),
             full_frames: video_path
                 .map(|movie| movie_keyframes_with_cache(movie, video_offset_ms, predecoded)),
+            prepared,
             timings: StageTimings {
                 started_at: Some(started_at),
                 stop_ms,
@@ -547,6 +667,119 @@ pub fn build_bundle_from_parts(
         MAX_KEYFRAMES,
     );
     let select_only_at = std::time::Instant::now();
+    let matches_prepared = extras.prepared.as_ref().is_some_and(|prep| {
+        prep.keyframes.len() == selected.len()
+            && prep.keyframes.iter().zip(&selected).all(|(a, (b, _))| {
+                a.index == b.index
+                    && a.t == b.t
+                    && a.mark_id == b.mark_id
+                    && a.cursor == b.cursor
+                    && a.file == b.file
+            })
+    });
+    if matches_prepared {
+        drop(frames);
+        let prep = extras.prepared.unwrap();
+        let keyframes: Vec<model::Keyframe> = selected.into_iter().map(|(kf, _)| kf).collect();
+        let selected_at = std::time::Instant::now();
+        let annotated_at = selected_at;
+        let rendered_at = selected_at;
+        let id = bundle_dir
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("scrawl-bundle")
+            .to_string();
+        let video_rel = video_path.and_then(|p| {
+            p.exists()
+                .then(|| p.file_name()?.to_str().map(str::to_owned))
+                .flatten()
+        });
+        let audio_rel = bundle_dir
+            .join("audio.wav")
+            .exists()
+            .then(|| "audio.wav".to_string());
+        let bundle = ScrawlBundle {
+            version: 1,
+            id,
+            created_at_ms: now_epoch_ms(),
+            duration_ms,
+            target,
+            transcript,
+            note,
+            strokes,
+            marks,
+            events,
+            keyframes,
+            contact_sheet: "contact-sheet.png".into(),
+            video: video_rel,
+            video_offset_ms: extras.video_offset_ms,
+            audio: audio_rel,
+            source: extras.source,
+            device: extras.device,
+            context: extras.context,
+            context_changes: extras.context_changes,
+            screens: extras.screens,
+            windows: extras.activity.windows,
+            cursor: extras.activity.cursor,
+            autocrop: prep.autocrop,
+        };
+        let summary = summary_markdown(&bundle, bundle_dir);
+        std::fs::create_dir_all(bundle_dir.join("frames"))
+            .with_context(|| format!("could not create {}", bundle_dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(bundle_dir, std::fs::Permissions::from_mode(0o700));
+        }
+        std::fs::write(
+            bundle_dir.join(&bundle.contact_sheet),
+            &prep.contact_sheet_png,
+        )?;
+        for (rel, bytes) in &prep.frame_pngs {
+            std::fs::write(bundle_dir.join(rel), bytes)?;
+        }
+        if let (Some(info), Some(full_sheet_png)) = (&bundle.autocrop, &prep.full_sheet_png) {
+            let full_dir = bundle_dir.join(&info.full_frames);
+            std::fs::create_dir_all(&full_dir)?;
+            std::fs::write(bundle_dir.join(&info.full_contact_sheet), full_sheet_png)?;
+            for (name, bytes) in &prep.full_frame_pngs {
+                std::fs::write(full_dir.join(name), bytes)?;
+            }
+        }
+        let manifest_bytes = serde_json::to_vec_pretty(&bundle)?;
+        std::fs::write(bundle_dir.join("scrawl.json"), manifest_bytes)?;
+        std::fs::write(bundle_dir.join("summary.md"), summary.as_bytes())?;
+        let finished = std::time::Instant::now();
+        let select_ms = (select_only_at - started).as_millis() as u64;
+        let decode_ms = (selected_at - select_only_at).as_millis() as u64;
+        let autocrop_ms = (annotated_at - selected_at).as_millis() as u64;
+        let sheet_ms = (rendered_at - annotated_at).as_millis() as u64;
+        let write_ms = (finished - rendered_at).as_millis() as u64;
+        let total_ms = (finished - total_started).as_millis() as u64;
+        let mut parts = Vec::with_capacity(10);
+        if let Some(ms) = extras.timings.stop_ms {
+            parts.push(format!("stop {ms}ms"));
+        }
+        if let Some(ms) = extras.timings.audio_ms {
+            parts.push(format!("audio {ms}ms"));
+        }
+        if let Some(ms) = extras.timings.candidates_ms {
+            parts.push(format!("candidates {ms}ms"));
+        }
+        if let Some(ms) = extras.timings.transcribe_ms {
+            parts.push(format!("transcribe {ms}ms"));
+        }
+        parts.extend([
+            format!("select {select_ms}ms"),
+            format!("decode {decode_ms}ms"),
+            format!("autocrop {autocrop_ms}ms"),
+            format!("sheet {sheet_ms}ms"),
+            format!("write {write_ms}ms"),
+            format!("total {total_ms}ms"),
+        ]);
+        capture::scrawl_log(format!("finish timings: {}", parts.join(" · ")));
+        return Ok((bundle_dir.to_path_buf(), bundle, summary));
+    }
     // Only the first candidate is needed from here on (auto-crop's baseline); free the rest
     // before the full-size keyframes arrive.
     let baseline = {
