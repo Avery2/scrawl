@@ -765,7 +765,7 @@ fn blit_scaled(dst: &mut RgbaFrame, src: &RgbaFrame, rect: [f32; 4], radius: f32
         let cy = py as f32 + 0.5;
         let sy = ((cy - y) * inv_h - 0.5).clamp(0.0, max_sy);
         let y0 = sy.floor() as usize;
-        let y1 = (y0 + 1).min(src_w.max(1) - 1).min(src.height as usize - 1);
+        let y1 = (y0 + 1).min(src.height as usize - 1);
         let fy = sy - y0 as f32;
         let w_y0 = 1.0 - fy;
         let row0 = y0 * src_w * 4;
@@ -1541,6 +1541,21 @@ mod tests {
             }
             assert!(sheet.rgba.chunks_exact(4).all(|p| p[3] == 255));
         }
+    }
+
+    #[test]
+    fn portrait_frames_scale_without_smearing_lower_rows() {
+        // Rows past the frame's width once blended with row `width - 1`.
+        let mut frame = solid(100, 400, [200, 0, 0, 255]);
+        frame.rgba[200 * 100 * 4..]
+            .chunks_exact_mut(4)
+            .for_each(|p| p.copy_from_slice(&[0, 0, 200, 255]));
+        let mut sheet = solid(100, 400, [0, 0, 0, 255]);
+        blit_scaled(&mut sheet, &frame, [0.0, 0.0, 100.0, 400.0], 0.0);
+        let at = |x: usize, y: usize| &sheet.rgba[(y * 100 + x) * 4..][..4];
+        assert_eq!(at(50, 150), [200, 0, 0, 255]);
+        assert_eq!(at(50, 300), [0, 0, 200, 255]);
+        assert_eq!(at(50, 399), [0, 0, 200, 255]);
     }
 
     #[test]
