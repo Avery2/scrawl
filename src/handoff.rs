@@ -628,9 +628,44 @@ fn normalize_slug(text: &str) -> String {
         .collect()
 }
 
-pub fn send_to_opencode(bundle_dir: &Path, session_id: Option<&str>) -> Result<String> {
+/// Sends a bundle to `session_id`, else to the session its recording was addressed to, else the
+/// session the app resolves to. Sending an addressed recording elsewhere needs `reroute`.
+pub fn send_to_opencode(
+    bundle_dir: &Path,
+    session_id: Option<&str>,
+    reroute: bool,
+) -> Result<String> {
+    let addressed = recorded_destination(&resolve_bundle_dir(bundle_dir)?);
+    let session_id = choose_destination(session_id, addressed.as_deref(), reroute)?;
     let (id, _) = send_to_opencode_for_app(bundle_dir, session_id, None)?;
     Ok(id)
+}
+
+/// The session a ScrawlKit recording was addressed to: `timeline.json`'s top-level `session`.
+/// `context.session` only names the session that was on screen, and never chooses a destination.
+pub fn recorded_destination(bundle_dir: &Path) -> Option<String> {
+    let timeline: serde_json::Value =
+        serde_json::from_slice(&fs::read(bundle_dir.join("timeline.json")).ok()?).ok()?;
+    timeline
+        .get("session")?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+fn choose_destination<'a>(
+    requested: Option<&'a str>,
+    addressed: Option<&'a str>,
+    reroute: bool,
+) -> Result<Option<&'a str>> {
+    match (requested, addressed) {
+        (Some(requested), Some(addressed)) if requested != addressed && !reroute => bail!(
+            "This recording was addressed to {addressed}; pass --reroute to send it to {requested} instead"
+        ),
+        (Some(requested), _) => Ok(Some(requested)),
+        (None, addressed) => Ok(addressed),
+    }
 }
 
 pub fn send_to_opencode_for_app(
@@ -1019,6 +1054,30 @@ mod tests {
         );
         assert!(extract_frames_range(&path, 5_000, 2_000, 4).is_err());
         assert!(extract_frames_range(&path, 0, 2_000, 0).is_err());
+    }
+
+    #[test]
+    fn recordings_go_to_their_addressed_session_not_the_viewed_one() {
+        let dir = std::env::temp_dir().join(format!("scrawl-dest-{}", crate::make_bundle_id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("timeline.json"),
+            r#"{"session":"ses_ios","context":{"session":"ses_motion"}}"#,
+        )
+        .unwrap();
+        let addressed = recorded_destination(&dir);
+        assert_eq!(addressed.as_deref(), Some("ses_ios"));
+        let addressed = addressed.as_deref();
+        assert_eq!(choose_destination(None, addressed, false).unwrap(), Some("ses_ios"));
+        assert!(choose_destination(Some("ses_motion"), addressed, false).is_err());
+        assert_eq!(
+            choose_destination(Some("ses_motion"), addressed, true).unwrap(),
+            Some("ses_motion")
+        );
+        assert_eq!(choose_destination(Some("ses_ios"), addressed, false).unwrap(), Some("ses_ios"));
+        assert_eq!(choose_destination(Some("ses_x"), None, false).unwrap(), Some("ses_x"));
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(recorded_destination(&dir), None);
     }
 
     #[test]

@@ -256,9 +256,13 @@ enum Command {
         /// Path to `.scrawl` bundle directory or `latest`.
         #[arg(default_value = "latest")]
         bundle: PathBuf,
-        /// Target OpenCode session ID (`ses_...`). If omitted, uses the most recent active session.
+        /// Target OpenCode session ID (`ses_...`). If omitted, an iPhone recording goes to the
+        /// session it was addressed to, anything else to the most recent active session.
         #[arg(long)]
         session: Option<String>,
+        /// Send an iPhone recording to `--session` even though it was addressed to another.
+        #[arg(long)]
+        reroute: bool,
         /// Copy to the macOS clipboard instead of posting to OpenCode.
         #[arg(long)]
         clipboard: bool,
@@ -1740,6 +1744,7 @@ fn main() -> Result<()> {
         Command::Send {
             bundle,
             session,
+            reroute,
             clipboard,
         } => {
             let dir = handoff::resolve_bundle_dir(&bundle)?;
@@ -1747,7 +1752,8 @@ fn main() -> Result<()> {
                 handoff::copy_bundle_to_clipboard(&dir)?;
                 println!("Copied {} to clipboard", dir.display());
             } else {
-                let target_session = handoff::send_to_opencode(&dir, session.as_deref())?;
+                let target_session =
+                    handoff::send_to_opencode(&dir, session.as_deref(), reroute)?;
                 println!(
                     "Sent {} to OpenCode session {target_session}",
                     dir.display()
