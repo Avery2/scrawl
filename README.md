@@ -27,6 +27,9 @@ cargo run -- frames /tmp/demo.scrawl --from 0:02 --to 0:07
 cargo run -- send /tmp/demo.scrawl --clipboard
 cargo run -- send /tmp/demo.scrawl --session ses_...
 
+# Which session a capture of a dev site would go to (without sending)
+cargo run -- route --url http://localhost:5173/
+
 # Capture a cabled iPhone for 8 seconds from the terminal (mirror window + native video)
 cargo run -- record --iphone --duration 8
 cargo run -- devices
@@ -106,6 +109,67 @@ While picking a target, the island shows the modes **Area**, **Window**, **Scree
 - Area: drag a region. Window: click a window. Screen and iPhone: `⏎`, `S`, `⌥⇧S`, **Record**, or
   clicking the selected mode again starts recording (`⏎`/`⌥⇧S` record the full screen from Area and
   Window too)
+
+## Sending captures of a dev site to its session
+
+A capture that ends with a browser in front showing a project's dev site goes straight to that
+project's OpenCode session, the same way iPhone recordings do. It is still copied to the clipboard.
+The island says "Sending to SCRAWL…", then "Sent to SCRAWL", or "Copied · couldn't reach SCRAWL"
+when OpenCode didn't take it (the app retries it, as for iPhone recordings). Window captures use the
+captured window's app instead of the one in front. Brave, Chrome, Arc, Edge, Vivaldi, Chromium, and
+Safari work; macOS asks once whether Scrawl may control the browser, so it can read the tab's
+address. If you decline, captures stay on the clipboard.
+
+Scrawl picks the session in this order:
+
+1. **The page registered itself.** Add one dev-only line to the page:
+
+   ```html
+   <script src="http://127.0.0.1:47777/sdk.js" data-session="ses_…"></script>
+   ```
+
+   or `data-directory="/abs/path/to/project"` to use that project's most recently active session.
+   The script comes from Scrawl itself. It registers the tab, sends a heartbeat every 30 s while the
+   tab is visible, and unregisters when the tab closes (a registration lasts 2 minutes after its
+   last heartbeat). With Vite, inject it only in dev:
+
+   ```ts
+   // vite.config.ts
+   plugins: [{
+     name: "scrawl",
+     apply: "serve",
+     transformIndexHtml: () => [{
+       tag: "script",
+       attrs: { src: "http://127.0.0.1:47777/sdk.js", "data-directory": process.cwd() },
+       injectTo: "head",
+     }],
+   }]
+   ```
+
+   The script does nothing unless the page is on `localhost`, `*.localhost`, `127.x`, or `[::1]`.
+   Scrawl accepts a registration without a token only from a loopback origin calling from this Mac,
+   and only for that origin. A page anywhere else (a `*.ts.net` dev host, say) must also set
+   `data-token` to the ingest token (`ingestToken` in `~/.config/scrawl/config.json`).
+2. **Zero setup for localhost.** If the tab is on a loopback host and no page registered, Scrawl
+   finds the process listening on that port (`lsof`), its working directory and that directory's
+   git root, and sends to the most recently active open root session in the repository (any folder
+   in it). Outside a git repository only a session in that exact folder counts.
+3. Otherwise the capture is copied to the clipboard only, as before.
+
+The destination is recorded in `scrawl.json` (`destination: {session, title, via: "sdk" |
+"localhost", url, directory}`) and on the second line of `summary.md`
+(`For session: SCRAWL (ses_…) · page http://localhost:5173/`). `scrawl send` without `--session`
+sends to it again, and refuses a different `--session` unless you pass `--reroute`.
+
+To see where a capture of a URL would go, without sending anything:
+
+```sh
+scrawl route --url http://localhost:5173/
+scrawl route --browser com.brave.Browser   # the browser's front tab
+```
+
+Turn it off with **Send Dev Site Captures to OpenCode** in the menu, or `"autoSend": false` in
+`~/.config/scrawl/config.json`. `SCRAWL_NO_OPENCODE=1` also turns it off.
 
 ## Auto-crop (Screen captures)
 
