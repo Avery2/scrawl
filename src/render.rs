@@ -316,6 +316,17 @@ pub fn annotate_keyframe_in_place(
     marks: &[Mark],
     events: &[InteractionEvent],
 ) {
+    annotate_keyframe_marks_in_place(frame, keyframe, strokes, marks, events);
+    stamp_keyframe_badge_in_place(frame, keyframe);
+}
+
+pub fn annotate_keyframe_marks_in_place(
+    frame: &mut RgbaFrame,
+    keyframe: &Keyframe,
+    strokes: &[Stroke],
+    marks: &[Mark],
+    events: &[InteractionEvent],
+) {
     frame.t_ms = keyframe.t;
     let w = frame.width as f32;
     let h = frame.height as f32;
@@ -441,7 +452,54 @@ pub fn annotate_keyframe_in_place(
             draw_click_ripple(frame, [cx * w, cy * h], k);
         }
     }
+
+    let in_top_left = |[x, y]: [f32; 2]| x < 0.30 && y < 0.18;
+    let in_top_right = |[x, y]: [f32; 2]| x > 0.70 && y < 0.18;
+    let focus_pt = keyframe.cursor.or(click);
+    let stroke_in_tl = strokes.iter().enumerate().any(|(idx, s)| {
+        !s.laser
+            && (shown.iter().any(|m| m.strokes.contains(&idx))
+                || (shown.is_empty()
+                    && s.t0 <= keyframe.t
+                    && keyframe.t.saturating_sub(s.t1) <= MARK_GAP_MS))
+            && s.timed_points()
+                .into_iter()
+                .any(|(x, y, t)| t <= keyframe.t && in_top_left([x, y]))
+    });
+    let busy_top_left = focus_pt.is_some_and(in_top_left) || stroke_in_tl;
+    let busy_top_right = focus_pt.is_some_and(in_top_right);
+    frame.badge_top_right = busy_top_left && !busy_top_right;
+}
+
+pub fn stamp_keyframe_badge_in_place(frame: &mut RgbaFrame, keyframe: &Keyframe) {
+    let w = frame.width as f32;
+    let h = frame.height as f32;
+    if w == 0.0 || h == 0.0 {
+        return;
+    }
     let badge_k = (h / 480.0).min(w / 280.0).max(0.45);
+    let dodge = frame.badge_top_right;
+    draw_keyframe_badge(frame, [0.0, 0.0, w, h], keyframe, badge_k, dodge);
+}
+
+pub fn stamp_keyframe_badges(frames: &mut [(Keyframe, RgbaFrame)]) {
+    for (kf, frame) in frames {
+        stamp_keyframe_badge_in_place(frame, kf);
+    }
+}
+
+fn draw_keyframe_badge(
+    dst: &mut RgbaFrame,
+    rect: [f32; 4],
+    keyframe: &Keyframe,
+    badge_k: f32,
+    dodge_top_right: bool,
+) {
+    let [rx, ry, rw, rh] = rect;
+    if rw <= 0.0 || rh <= 0.0 {
+        return;
+    }
+    let badge_k = badge_k.max(0.45);
     let num_label = format!("#{}", keyframe.index);
     let time_label = (!keyframe.file.is_empty() || !keyframe.event.is_empty())
         .then(|| format_clock(keyframe.t));
@@ -463,31 +521,18 @@ pub fn annotate_keyframe_in_place(
         cap_w + inset * 2.0
     };
 
-    let in_top_left = |[x, y]: [f32; 2]| x < 0.30 && y < 0.18;
-    let in_top_right = |[x, y]: [f32; 2]| x > 0.70 && y < 0.18;
-    let focus_pt = keyframe.cursor.or(click);
-    let stroke_in_tl = strokes.iter().enumerate().any(|(idx, s)| {
-        !s.laser
-            && (shown.iter().any(|m| m.strokes.contains(&idx))
-                || (shown.is_empty()
-                    && s.t0 <= keyframe.t
-                    && keyframe.t.saturating_sub(s.t1) <= MARK_GAP_MS))
-            && s.timed_points()
-                .into_iter()
-                .any(|(x, y, t)| t <= keyframe.t && in_top_left([x, y]))
-    });
-    let busy_top_left = focus_pt.is_some_and(in_top_left) || stroke_in_tl;
-    let busy_top_right = focus_pt.is_some_and(in_top_right);
     let margin = 7.0 * badge_k;
-    let bx = if busy_top_left && !busy_top_right {
-        (w - badge_w - margin).max(margin)
+    let dodge =
+        dodge_top_right || keyframe.cursor.is_some_and(|[x, y]| x < 0.30 && y < 0.18);
+    let bx = if dodge {
+        (rx + rw - badge_w - margin).max(rx + margin)
     } else {
-        margin
+        rx + margin
     };
-    let by = margin;
+    let by = ry + margin;
 
     rounded(
-        frame,
+        dst,
         [
             bx - 1.0 * badge_k,
             by - 1.0 * badge_k,
@@ -498,14 +543,14 @@ pub fn annotate_keyframe_in_place(
         [0, 0, 0, 96],
     );
     rounded(
-        frame,
+        dst,
         [bx, by, badge_w, badge_h],
         outer_r,
         [255, 255, 255, 78],
     );
     let border = (1.2 * badge_k).max(1.0);
     rounded(
-        frame,
+        dst,
         [
             bx + border,
             by + border,
@@ -518,14 +563,14 @@ pub fn annotate_keyframe_in_place(
     let cap_x = bx + inset;
     let cap_y = by + inset;
     rounded(
-        frame,
+        dst,
         [cap_x, cap_y, cap_w, cap_h],
         cap_r,
         [248, 249, 252, 255],
     );
     // CoreText draws digits with optical cap-center at ~0.595 * font_size from top of mask.
     draw_text(
-        frame,
+        dst,
         &num_label,
         cap_x + (cap_w - num_w) * 0.5,
         cap_y + cap_h * 0.5 - num_size * 0.59,
@@ -535,7 +580,7 @@ pub fn annotate_keyframe_in_place(
     );
     if let Some(clock) = time_label {
         draw_text(
-            frame,
+            dst,
             &clock,
             cap_x + cap_w + 7.0 * badge_k,
             by + badge_h * 0.5 - time_size * 0.59,
@@ -669,7 +714,8 @@ const SHEET_MAX_EDGE: f32 = 1600.0;
 const SHEET_MAX_PIXELS: f32 = 1_560_000.0;
 
 /// Partition `aspects` (in chronological order) into justified rows of 1..=6 frames so that
-/// row heights are uniform and the overall sheet aspect ratio sits near the vision-model sweet spot.
+/// per-frame displayed areas are balanced across wide and tall crops and the overall sheet aspect
+/// ratio sits near the vision-model sweet spot.
 fn plan_contact_sheet_rows(aspects: &[f32]) -> Vec<std::ops::Range<usize>> {
     let n = aspects.len();
     if n == 0 {
@@ -712,19 +758,60 @@ fn plan_contact_sheet_rows(aspects: &[f32]) -> Vec<std::ops::Range<usize>> {
             let r_count = current.len() as f32;
             let mut row_aspects = [0.0f32; MAX_KEYFRAMES];
             let mut inv_sum = 0.0f32;
-            let mut log_sum = 0.0f32;
+            let mut log_row_sum = 0.0f32;
             for (r_idx, row) in current.iter().enumerate() {
                 let a: f32 = aspects[row.clone()].iter().sum();
                 row_aspects[r_idx] = a;
                 inv_sum += 1.0 / a;
-                log_sum += a.ln();
+                log_row_sum += a.ln();
             }
             let sheet_aspect = 1.0 / inv_sum;
-            let sheet_pen = (sheet_aspect / target_sheet).ln().powi(2) * 2.5;
-            let mean_log_a = log_sum / r_count;
+            let sheet_pen = (sheet_aspect / target_sheet).ln().powi(2) * 1.8;
+
+            // Relative displayed area of frame `i` in row `r` is `a_i / A_r^2`.
+            let mut areas = [0.0f32; MAX_KEYFRAMES];
+            let mut log_areas = [0.0f32; MAX_KEYFRAMES];
+            let mut log_area_sum = 0.0f32;
+            for (r_idx, row) in current.iter().enumerate() {
+                let a_r = row_aspects[r_idx];
+                let inv_a_r2 = 1.0 / (a_r * a_r);
+                for i in row.clone() {
+                    let ar = aspects[i] * inv_a_r2;
+                    areas[i] = ar;
+                    let la = ar.ln();
+                    log_areas[i] = la;
+                    log_area_sum += la;
+                }
+            }
+            let mean_log_area = log_area_sum / n as f32;
+            let area_var = log_areas[..n]
+                .iter()
+                .map(|&la| (la - mean_log_area).powi(2))
+                .sum::<f32>()
+                / n as f32;
+
+            let mut sorted_areas = areas;
+            sorted_areas[..n].sort_by(f32::total_cmp);
+            let median_area =
+                (sorted_areas[(n - 1) / 2] + sorted_areas[n / 2]).max(1e-6) * 0.5;
+            let mut under_pen = 0.0f32;
+            for &ar in &areas[..n] {
+                let ratio = ar / median_area;
+                if ratio < 0.58 {
+                    under_pen += ((0.58 - ratio) / 0.58).powi(2) * 18.0;
+                }
+                if ratio > 2.3 {
+                    under_pen += ((ratio - 2.3) / 2.3).powi(2) * 4.0;
+                }
+            }
+
+            let mean_log_a = log_row_sum / r_count;
             let mut row_var = 0.0f32;
             let mut row_pen = 0.0f32;
             let mut cramp_pen = 0.0f32;
+            if current.len() > 4 {
+                cramp_pen += (current.len() - 4) as f32 * 2.5;
+            }
             let mut tie = 0.0f32;
 
             for (r_idx, row) in current.iter().enumerate() {
@@ -749,7 +836,13 @@ fn plan_contact_sheet_rows(aspects: &[f32]) -> Vec<std::ops::Range<usize>> {
                 }
                 tie += r_idx as f32 * 1e-4 * cols as f32;
             }
-            let cost = sheet_pen + row_var * 2.5 + row_pen * 0.4 + cramp_pen + tie;
+            let cost = sheet_pen
+                + area_var * 8.0
+                + under_pen
+                + (row_var / r_count) * 0.6
+                + (row_pen / r_count) * 0.4
+                + cramp_pen
+                + tie;
             if cost < *best_cost {
                 *best_cost = cost;
                 *best_rows = current.clone();
@@ -759,7 +852,7 @@ fn plan_contact_sheet_rows(aspects: &[f32]) -> Vec<std::ops::Range<usize>> {
 
         let limit = max_cols.min(n - idx);
         for k in 1..=limit {
-            if k == 1 && n >= 4 && aspects[idx] < 1.85 {
+            if k == 1 && n >= 3 && aspects[idx] < 1.85 {
                 continue;
             }
             current.push(idx..idx + k);
@@ -881,9 +974,13 @@ pub fn render_contact_sheet_for_duration(
     let mut sheet = solid(width, height, SHEET_BG);
     sheet.t_ms = duration_ms;
 
+    let mut cells = Vec::with_capacity(frames.len());
+    let mut min_cell_w = u32::MAX;
+    let mut min_cell_h = u32::MAX;
     let mut row_y = SHEET_PAD;
     for (r_idx, row) in rows.iter().enumerate() {
         let row_h = row_heights_px[r_idx];
+        min_cell_h = min_cell_h.min(row_h);
         let k = row.len();
         let total_gap = SHEET_GAP * k.saturating_sub(1) as u32;
         let avail_w = inner_w_px.saturating_sub(total_gap);
@@ -899,12 +996,22 @@ pub fn render_contact_sheet_for_duration(
                 (avail_w as f32 * (cum_a / a_row)).round() as u32
             };
             let cell_w = x1.saturating_sub(x0).max(1);
+            min_cell_w = min_cell_w.min(cell_w);
             let cell_x = SHEET_PAD + x0 + j as u32 * SHEET_GAP;
-            let (_, image) = &frames[i];
             let rect = [cell_x as f32, row_y as f32, cell_w as f32, row_h as f32];
-            blit_scaled(&mut sheet, image, rect, 0.0);
+            cells.push((i, rect));
         }
         row_y += row_h + SHEET_GAP;
+    }
+
+    let sheet_badge_k = 0.90_f32
+        .min(min_cell_w as f32 / 120.0)
+        .min(min_cell_h as f32 / 72.0)
+        .max(0.5);
+    for (i, rect) in cells {
+        let (kf, image) = &frames[i];
+        blit_scaled(&mut sheet, image, rect, 0.0);
+        draw_keyframe_badge(&mut sheet, rect, kf, sheet_badge_k, image.badge_top_right);
     }
     sheet
 }
@@ -1972,6 +2079,40 @@ mod tests {
             }
         }
         assert!(content_rows > h * 4 / 5, "Too many empty scanlines");
+    }
+
+    #[test]
+    fn contact_sheet_balances_per_frame_area_across_wide_and_tall_crops() {
+        // Aspect mix from 17e3c-9: 5 landscape/square crops followed by 3 tall portrait crops.
+        let dims = [
+            (685, 648),
+            (1183, 837),
+            (1183, 837),
+            (694, 726),
+            (1183, 1095),
+            (694, 1416),
+            (898, 1416),
+            (898, 1416),
+        ];
+        let aspects: Vec<f32> = dims.iter().map(|&(w, h)| w as f32 / h as f32).collect();
+        let rows = plan_contact_sheet_rows(&aspects);
+        let mut areas: Vec<f32> = rows
+            .iter()
+            .flat_map(|row| {
+                let a_row: f32 = aspects[row.clone()].iter().sum();
+                aspects[row.clone()]
+                    .iter()
+                    .map(move |&a_i| a_i / (a_row * a_row))
+            })
+            .collect();
+        areas.sort_by(f32::total_cmp);
+        let n = areas.len();
+        let median = 0.5 * (areas[(n - 1) / 2] + areas[n / 2]);
+        let min_ratio = areas[0] / median;
+        assert!(
+            min_ratio >= 0.55,
+            "Tall crops were crushed relative to median frame area: min/median = {min_ratio:.2} (rows={rows:?})"
+        );
     }
 
     #[test]

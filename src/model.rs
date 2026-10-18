@@ -573,6 +573,7 @@ pub struct RgbaFrame {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    pub badge_top_right: bool,
 }
 
 impl RgbaFrame {
@@ -583,6 +584,7 @@ impl RgbaFrame {
             width,
             height,
             rgba,
+            badge_top_right: false,
         }
     }
 }

@@ -1755,7 +1755,7 @@ pub fn annotate_and_crop(
     Vec<(Keyframe, RgbaFrame)>,
     Option<(crate::model::AutocropInfo, Vec<(Keyframe, RgbaFrame)>)>,
 ) {
-    use crate::render::annotate_keyframe_in_place;
+    use crate::render::annotate_keyframe_marks_in_place;
     let plan = settings
         .filter(|_| target.mode == crate::model::CaptureMode::Display && !selected.is_empty())
         .and_then(|settings| {
@@ -1804,7 +1804,7 @@ pub fn annotate_and_crop(
                 .into_iter()
                 .map(|(kf, mut frame)| {
                     scope.spawn(move || {
-                        annotate_keyframe_in_place(&mut frame, &kf, strokes, marks, events);
+                        annotate_keyframe_marks_in_place(&mut frame, &kf, strokes, marks, events);
                         (kf, frame)
                     })
                 })
@@ -1824,19 +1824,19 @@ pub fn annotate_and_crop(
             .map(|((kf, mut raw), crop)| {
                 scope.spawn(move || {
                     let out = if crop.kind == CropKind::Full {
-                        annotate_keyframe_in_place(&mut raw, &kf, strokes, marks, events);
+                        annotate_keyframe_marks_in_place(&mut raw, &kf, strokes, marks, events);
                         raw.clone()
                     } else {
                         let mut out = crop_frame(&raw, crop.rect);
                         let view = crop_view(crop.rect, &kf, strokes, marks, events);
-                        annotate_keyframe_in_place(
+                        annotate_keyframe_marks_in_place(
                             &mut out,
                             &view.keyframe,
                             &view.strokes,
                             &view.marks,
                             &view.events,
                         );
-                        annotate_keyframe_in_place(&mut raw, &kf, strokes, marks, events);
+                        annotate_keyframe_marks_in_place(&mut raw, &kf, strokes, marks, events);
                         out
                     };
                     let r = crop.rect.map(f64::from);

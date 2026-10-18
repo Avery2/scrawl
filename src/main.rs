@@ -440,7 +440,7 @@ pub fn prepare_visuals(
     if selected.is_empty() {
         return None;
     }
-    let (annotated_frames, cropped) = autocrop::annotate_and_crop(
+    let (mut annotated_frames, mut cropped) = autocrop::annotate_and_crop(
         selected,
         baseline,
         crop_settings,
@@ -461,6 +461,10 @@ pub fn prepare_visuals(
         let sheet = render::render_contact_sheet_for_duration(duration_ms, &annotated_frames);
         (full_handle.map(|h| h.join().ok()).flatten(), sheet)
     });
+    render::stamp_keyframe_badges(&mut annotated_frames);
+    if let Some((_, full)) = &mut cropped {
+        render::stamp_keyframe_badges(full);
+    }
     let contact_sheet_png = render::encode_png(&contact_sheet).ok()?;
     let frame_pngs: Vec<(String, Vec<u8>)> = std::thread::scope(|scope| {
         let workers: Vec<_> = annotated_frames
@@ -898,7 +902,7 @@ pub fn build_bundle_from_parts(
         None if target.mode == CaptureMode::Display => autocrop::Settings::configured(),
         None => None,
     };
-    let (annotated_frames, cropped) = autocrop::annotate_and_crop(
+    let (mut annotated_frames, mut cropped) = autocrop::annotate_and_crop(
         selected,
         baseline.as_ref(),
         crop_settings.as_ref(),
@@ -964,6 +968,10 @@ pub fn build_bundle_from_parts(
         let sheet = render_contact_sheet(&bundle, &annotated_frames);
         (full_handle.map(|h| h.join().unwrap()), sheet)
     });
+    render::stamp_keyframe_badges(&mut annotated_frames);
+    if let Some((_, full)) = &mut cropped {
+        render::stamp_keyframe_badges(full);
+    }
     let rendered_at = std::time::Instant::now();
     let summary = summary_markdown(&bundle, bundle_dir);
     std::thread::scope(|scope| -> Result<()> {
