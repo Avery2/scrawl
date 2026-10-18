@@ -324,12 +324,10 @@
       let scale = min(CGFloat(width) / bounds.width, CGFloat(height) / bounds.height)
       let offsetX = (CGFloat(width) - bounds.width * scale) / 2
       let offsetY = (CGFloat(height) - bounds.height * scale) / 2
-      let bottomCoversScene = offsetX <= 0.5 && offsetY <= 0.5
-        && windows[0].isOpaque && windows[0].alpha >= 0.999 && windows[0].frame.contains(bounds)
-      if !bottomCoversScene {
-        context.setFillColor(UIColor.black.cgColor)
-        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-      }
+      // Pooled buffers hold the last frame drawn into them, and no window can be trusted to paint
+      // every pixel (`isOpaque` is true by default even on clear windows).
+      context.setFillColor(UIColor.black.cgColor)
+      context.fill(CGRect(x: 0, y: 0, width: width, height: height))
       context.translateBy(x: offsetX, y: CGFloat(height) - offsetY)
       context.scaleBy(x: scale, y: -scale)
       context.interpolationQuality = .low
@@ -351,9 +349,12 @@
       return true
     }
 
+    /// Every window that may show something, back to front. None is skipped as covered: `isOpaque`
+    /// defaults to true on every window, including clear full-screen overlays (a host app's
+    /// passthrough window, `UITextEffectsWindow` with an edit menu), and skipping what lies under
+    /// one recorded black movies.
     static func recordedWindows(in scene: UIWindowScene) -> [UIWindow] {
-      let bounds = scene.coordinateSpace.bounds
-      let sorted = scene.windows
+      scene.windows
         .enumerated()
         .filter { _, window in
           shouldRecordWindow(window)
@@ -364,14 +365,6 @@
             : lhs.element.windowLevel < rhs.element.windowLevel
         }
         .map(\.element)
-
-      // If an upper opaque window covers the whole scene, windows beneath it are completely hidden.
-      if let topOpaqueIndex = sorted.lastIndex(where: {
-        $0.isOpaque && $0.alpha >= 0.999 && $0.frame.contains(bounds)
-      }), topOpaqueIndex > 0 {
-        return Array(sorted[topOpaqueIndex...])
-      }
-      return sorted
     }
 
     static func shouldRecordWindow(_ window: UIWindow) -> Bool {

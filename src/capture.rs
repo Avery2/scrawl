@@ -462,10 +462,14 @@ pub fn scrawl_log(msg: impl AsRef<str>) {
         .as_millis();
     let line = format!("[{ts}] {}\n", msg.as_ref());
     eprint!("{line}");
+    let Some(dir) = dirs::home_dir().map(|home| home.join("Library/Logs/Scrawl")) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/private/var/folders/dd/5fz89drs5p9_r0fk7rwqqnbr0000gn/T/opencode/scrawl-debug.log")
+        .open(dir.join("scrawl.log"))
     {
         let _ = f.write_all(line.as_bytes());
     }
