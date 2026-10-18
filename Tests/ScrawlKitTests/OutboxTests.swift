@@ -207,7 +207,7 @@ struct OutboxTests {
     #expect(StubServer.received.isEmpty)
 
     outbox.kick(force: false)
-    #expect(await eventually { events.all.contains(.sent(id: entry.id, sessionTitle: "Problems · Ledger")) })
+    #expect(await eventually { events.all.contains(.sent(id: entry.id, reply: .delivered(sessionTitle: "Problems · Ledger"))) })
     let received = try #require(StubServer.received.first)
     #expect(received.request.url == target.appending(path: "ingest"))
     #expect(received.request.httpMethod == "POST")
@@ -219,6 +219,18 @@ struct OutboxTests {
     #expect(received.filesOnDisk.contains("\(entry.id).payload"))
     #expect(received.body == expectedPayload)
     #expect(await eventually { filesOnDisk.isEmpty })
+  }
+
+  @Test func aMacThatKeptItButCouldNotForwardItIsNotAskedAgain() async throws {
+    StubServer.reset([.init(body: Data(#"{"ok":true,"delivered":false,"state":"queued","sessionTitle":"UP DOWN"}"#.utf8))])
+    let outbox = makeOutbox()
+    let entry = try await outbox.enqueue(timeline: timeline, movie: movie, target: target, recordedAt: "2026-10-14T18:00:00Z")
+    outbox.kick(force: false)
+    #expect(await eventually { events.all.contains(.sent(id: entry.id, reply: .queued(sessionTitle: "UP DOWN"))) })
+    #expect(await eventually { filesOnDisk.isEmpty })
+    outbox.kick(force: true)
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(StubServer.received.count == 1)
   }
 
   @Test(arguments: [500, 502, 503, 429, 408])
@@ -242,7 +254,7 @@ struct OutboxTests {
 
     // Network back / foreground / launch: tried again now, and deleted on 2xx.
     outbox.kick(force: true)
-    #expect(await eventually { events.all.contains(.sent(id: entry.id, sessionTitle: "Problems · Ledger")) })
+    #expect(await eventually { events.all.contains(.sent(id: entry.id, reply: .delivered(sessionTitle: "Problems · Ledger"))) })
     #expect(StubServer.received.count == 2)
     #expect(await eventually { filesOnDisk.isEmpty })
   }
@@ -257,7 +269,7 @@ struct OutboxTests {
     #expect(await eventually { events.all.filter { if case .retrying = $0 { true } else { false } }.count == 2 })
     #expect(try #require(await outbox.entries().first).attempts == 2)
     outbox.kick(force: true)
-    #expect(await eventually { events.all.contains(.sent(id: entry.id, sessionTitle: "Problems · Ledger")) })
+    #expect(await eventually { events.all.contains(.sent(id: entry.id, reply: .delivered(sessionTitle: "Problems · Ledger"))) })
     #expect(await eventually { filesOnDisk.isEmpty })
   }
 
@@ -277,7 +289,7 @@ struct OutboxTests {
 
     // A renewed link sends it after all.
     outbox.retryFailed()
-    #expect(await eventually { events.all.contains(.sent(id: entry.id, sessionTitle: "Problems · Ledger")) })
+    #expect(await eventually { events.all.contains(.sent(id: entry.id, reply: .delivered(sessionTitle: "Problems · Ledger"))) })
     #expect(await eventually { filesOnDisk.isEmpty })
   }
 
@@ -291,7 +303,7 @@ struct OutboxTests {
     #expect(await eventually { events.all.contains { if case .retrying = $0 { true } else { false } } })
     #expect(filesOnDisk.count == 2)
     outbox.kick(force: true)
-    #expect(await eventually { events.all.contains(.sent(id: entry.id, sessionTitle: "Problems · Ledger")) })
+    #expect(await eventually { events.all.contains(.sent(id: entry.id, reply: .delivered(sessionTitle: "Problems · Ledger"))) })
     let bodies = StubServer.received.map(\.body)
     #expect(bodies.count == 2)
     #expect(bodies[0] == expectedPayload)
@@ -308,7 +320,7 @@ struct OutboxTests {
     }
     try await Task.sleep(for: .milliseconds(250))
     outbox.kick(force: true)
-    #expect(await eventually { events.all.contains(.sent(id: entry.id, sessionTitle: "Problems · Ledger")) })
+    #expect(await eventually { events.all.contains(.sent(id: entry.id, reply: .delivered(sessionTitle: "Problems · Ledger"))) })
     try await Task.sleep(for: .milliseconds(200))
     #expect(StubServer.received.count == 1)
   }
@@ -332,7 +344,7 @@ struct OutboxTests {
     #expect(StubServer.received.isEmpty)
     #expect(try #require(await outbox.entries().first).failure == .unauthorized)
     outbox.retryFailed()
-    #expect(await eventually { events.all.contains(.sent(id: entry.id, sessionTitle: "Problems · Ledger")) })
+    #expect(await eventually { events.all.contains(.sent(id: entry.id, reply: .delivered(sessionTitle: "Problems · Ledger"))) })
   }
 
   @Test func entriesSurviveARestartAndAreSentBySeparateOutboxes() async throws {
@@ -347,7 +359,7 @@ struct OutboxTests {
     let second = makeOutbox()
     #expect(await second.entries().map(\.id) == [entry.id])
     second.kick(force: true)
-    #expect(await eventually { events.all.contains(.sent(id: entry.id, sessionTitle: "Problems · Ledger")) })
+    #expect(await eventually { events.all.contains(.sent(id: entry.id, reply: .delivered(sessionTitle: "Problems · Ledger"))) })
     #expect(await eventually { filesOnDisk.isEmpty })
   }
 
@@ -372,9 +384,9 @@ struct OutboxTests {
     try await Task.sleep(for: .milliseconds(4500))
     // Past the old window, still online and still going: "Sending…".
     #expect({ if case .sending = events.delivery.current { true } else { false } }())
-    #expect(await eventually(5) { events.all.contains(.sent(id: entry.id, sessionTitle: "Problems · Ledger")) })
+    #expect(await eventually(5) { events.all.contains(.sent(id: entry.id, reply: .delivered(sessionTitle: "Problems · Ledger"))) })
     #expect(events.delivery.states == ["sending", "sent"])
-    #expect(events.delivery.current == .sent(sessionTitle: "Problems · Ledger"))
+    #expect(events.delivery.current == .sent(.delivered(sessionTitle: "Problems · Ledger")))
     #expect(events.all.first == .started(id: entry.id))
   }
 
@@ -389,7 +401,7 @@ struct OutboxTests {
     #expect(await eventually { events.all.contains(.started(id: entry.id)) })
     #expect(events.delivery.current == .queued)
     events.delivery.setPath(satisfied: true)
-    #expect(await eventually { events.all.contains(.sent(id: entry.id, sessionTitle: "Problems · Ledger")) })
+    #expect(await eventually { events.all.contains(.sent(id: entry.id, reply: .delivered(sessionTitle: "Problems · Ledger"))) })
     #expect(events.delivery.states == ["queued", "sending", "sent"])
   }
 
@@ -403,7 +415,7 @@ struct OutboxTests {
     #expect(events.delivery.current == .queued)
     // The network came back (or the app was foregrounded): the retry starts now.
     outbox.kick(force: true)
-    #expect(await eventually { events.all.contains(.sent(id: entry.id, sessionTitle: "Problems · Ledger")) })
+    #expect(await eventually { events.all.contains(.sent(id: entry.id, reply: .delivered(sessionTitle: "Problems · Ledger"))) })
     #expect(events.delivery.states == ["sending", "queued", "sending", "sent"])
   }
 

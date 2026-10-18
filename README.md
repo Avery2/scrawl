@@ -298,6 +298,22 @@ Opening `<scheme>://scrawl?reset=1` on the phone clears its Keychain config (`de
 For cabled USB fallback via `devicectl` (`Documents/Scrawl`), list the app bundle IDs in
 `~/.config/scrawl/config.json` under `"usbApps": ["com.kitlangton.UpDown"]`.
 
+The Mac answers an upload once it has built the bundle and queued it into the OpenCode session (or
+after up to 45 s), so the strip says what happened:
+
+| On the Mac | Reply | The strip |
+| --- | --- | --- |
+| Queued into the session | `delivered: true, state: "sent"` | Sent to UP DOWN |
+| Bundle saved, OpenCode didn't take it (retried from the Mac) | `delivered: false, state: "queued"` | On your Mac · Sends to UP DOWN when it can |
+| Still building or sending when the wait ran out | `delivered: false, state: "processing"` | On your Mac · Sending to UP DOWN… |
+| Bundle saved, no session for this app (or routing off) | `delivered: false, state: "saved"` | Saved on your Mac |
+| Bundle couldn't be built | HTTP 500 | Mac didn't answer · Share |
+
+A queued bundle gets `.deliver.json` and the Mac retries it every 15 s, backing off to 30 min, for
+a day (then it's renamed `.deliver-failed.json`; both are logged to `~/Library/Logs/Scrawl/scrawl.log`).
+The phone doesn't upload it again. Over USB the Mac writes the same reply to `<stamp>.delivery`
+before `<stamp>.sent`. Replies without `delivered` (Macs from before this) read as sent.
+
 You can also AirDrop the `.mp4` and `.json` pair to the Mac and run `scrawl import`:
 
 - Touches become taps and swipes, drawn on keyframes as ripples and finger trails and listed in the

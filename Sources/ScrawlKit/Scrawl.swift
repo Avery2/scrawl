@@ -228,7 +228,8 @@
     public enum UploadStatus: Equatable, Sendable {
       case idle
       case sending
-      case sent(String)
+      /// The server took it; what it said became of it (delivered, or on the Mac but not yet).
+      case sent(IngestReply)
       /// Saved on the phone and sending in the background (HTTPS endpoints): offline, or waiting
       /// to retry after a failed attempt.
       case queued
@@ -336,7 +337,7 @@
     @ObservationIgnored private var stallCheck: Task<Void, Never>?
     /// An HTTPS upload landed while its "Sent to …" couldn't be shown (the app was in the
     /// background, or the strip was busy or gone): shown at the next chance.
-    @ObservationIgnored private var pendingSent: String?
+    @ObservationIgnored private var pendingSent: IngestReply?
     /// The permanently failed outbox entry the strip's Share button shares.
     @ObservationIgnored private var failedEntry: String?
     @ObservationIgnored private var limitTask: Task<Void, Never>?
@@ -570,9 +571,9 @@
         return
       }
       switch event {
-      case let .sent(_, title):
+      case let .sent(_, reply):
         // Sent from an earlier recording or launch: say so when there's a chance.
-        pendingSent = title
+        pendingSent = reply
         showPendingSent()
       case let .failed(id, failure):
         guard isIdleForStatus else { return }
@@ -627,14 +628,14 @@
         }
       case .queued:
         if showing, uploadStatus == .sending { presentQueued() }
-      case let .sent(title):
+      case let .sent(reply):
         self.delivery = nil
         if showing, UIApplication.shared.applicationState == .active {
           shownEntry = nil
-          Task { await presentSent(title) }
+          Task { await presentSent(reply) }
         } else {
           // Shown in place (if the strip is still up) or on its own when the app is next in front.
-          pendingSent = title
+          pendingSent = reply
           showPendingSent()
         }
       case let .failed(failure):
@@ -648,14 +649,14 @@
     /// Shows a "Sent to …" that couldn't be shown when the upload landed: in place of a strip still
     /// saying "Sending…" for it, or by bringing the strip back briefly.
     private func showPendingSent() {
-      guard let title = pendingSent, UIApplication.shared.applicationState == .active,
+      guard let reply = pendingSent, UIApplication.shared.applicationState == .active,
             !isRecording, !isStarting, !isDiscardPending
       else { return }
       let staleStatus = delivery == nil && shownEntry != nil && (uploadStatus == .sending || uploadStatus == .queued)
       guard uploadStatus == .idle || staleStatus else { return }
       shownEntry = nil
       showOverlay()
-      Task { await presentSent(title) }
+      Task { await presentSent(reply) }
     }
 
     /// Logs something the app did ("Done tapped", "rest started"), placed on the recording's timeline.
@@ -873,7 +874,10 @@
     }
 
     private static func delete(_ finished: FinishedRecording) {
-      for file in [finished.recording.movie, finished.recording.timeline, finished.readyMarker, finished.sentMarker] {
+      for file in [
+        finished.recording.movie, finished.recording.timeline, finished.readyMarker, finished.sentMarker,
+        deliveryMarker(for: finished.sentMarker),
+      ] {
         try? FileManager.default.removeItem(at: file)
       }
     }
@@ -1180,21 +1184,24 @@
       framed.append(timelineData)
       framed.append(movieData)
 
-      // The address that answered when recording started goes alone; otherwise try them all.
+      // The address that answered when recording started goes alone, and gets longer to answer;
+      // otherwise try them all.
       let urls = reachableURL.map { [$0] } ?? serverURLs
+      let replyWait = reachableURL == nil ? 15 : 45
       let bearerToken = token?.trimmingCharacters(in: .whitespacesAndNewlines)
-      let deliveredTarget: String? = await withTaskGroup(of: String?.self) { group in
+      let deliveryMarker = Self.deliveryMarker(for: sentMarker)
+      let deliveredReply: IngestReply? = await withTaskGroup(of: IngestReply?.self) { group in
         // 1. Direct HTTP POST to Scrawl on the Mac (LAN + Tailscale in parallel). The Mac
-        // answers as soon as the upload lands and builds the bundle afterwards.
+        // answers once it has built the bundle and tried to send it on (or after `replyWait`).
         if let bearerToken, !bearerToken.isEmpty {
           for base in urls {
             group.addTask {
-              await Self.postIngest(base: base, payload: framed, token: bearerToken)
+              await Self.postIngest(base: base, payload: framed, token: bearerToken, replyWait: replyWait)
             }
           }
         }
-        // 2. USB / CoreDevice fallback: Scrawl.app copies the files with `devicectl` and writes
-        // `<stamp>.sent` back as soon as it has them.
+        // 2. USB / CoreDevice fallback: Scrawl.app copies the files with `devicectl`, builds the
+        // bundle, and writes `<stamp>.delivery` (its reply) and then `<stamp>.sent` back.
         group.addTask {
           for _ in 0 ..< 75 {
             try? await Task.sleep(for: .milliseconds(400))
@@ -1202,7 +1209,7 @@
                let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
                !text.isEmpty
             {
-              return text
+              return IngestReply(sentMarker: text, delivery: try? Data(contentsOf: deliveryMarker))
             }
           }
           return nil
@@ -1217,10 +1224,11 @@
         return nil
       }
 
-      if let target = deliveredTarget {
+      if let reply = deliveredReply {
         try? FileManager.default.removeItem(at: readyMarker)
         try? FileManager.default.removeItem(at: sentMarker)
-        await presentSent(target)
+        try? FileManager.default.removeItem(at: deliveryMarker)
+        await presentSent(reply)
       } else {
         // Keep `.ready` so the Mac still picks the recording up the next time the phone is cabled.
         // The share sheet only opens if the strip's Share button is tapped.
@@ -1270,14 +1278,16 @@
       refreshDelivery()
     }
 
-    private func presentSent(_ target: String) async {
+    /// "Sent to …", or the two-line "On your Mac" (the recording is safe there, so it's a success
+    /// too), which stays up a little longer to be read.
+    private func presentSent(_ reply: IngestReply) async {
       statusID += 1
       let id = statusID
       // This one says it for any earlier upload that landed meanwhile.
       pendingSent = nil
-      uploadStatus = .sent(target)
+      uploadStatus = .sent(reply)
       UINotificationFeedbackGenerator().notificationOccurred(.success)
-      try? await Task.sleep(for: .milliseconds(2200))
+      try? await Task.sleep(for: .milliseconds(reply.isDelivered ? 2200 : 3500))
       guard statusID == id, case .sent = uploadStatus else { return }
       uploadStatus = .idle
       await hideOverlayAfterExit()
@@ -1382,25 +1392,27 @@
       }
     }
 
-    private nonisolated static func postIngest(base: URL, payload: Data, token: String) async -> String? {
+    /// `<stamp>.delivery` beside `<stamp>.sent`: the Mac's reply over USB.
+    private nonisolated static func deliveryMarker(for sentMarker: URL) -> URL {
+      sentMarker.deletingPathExtension().appendingPathExtension("delivery")
+    }
+
+    /// Uploads to a Mac, which answers within `replyWait` seconds (`X-Scrawl-Wait`) of the upload
+    /// landing; the request's idle timeout leaves room for that.
+    private nonisolated static func postIngest(base: URL, payload: Data, token: String, replyWait: Int) async -> IngestReply? {
       let endpoint = base.appending(path: "ingest")
       var request = URLRequest(url: endpoint)
       request.httpMethod = "POST"
       request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
       request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-      request.timeoutInterval = 30
+      request.setValue(String(replyWait), forHTTPHeaderField: "X-Scrawl-Wait")
+      request.timeoutInterval = TimeInterval(replyWait + 15)
       do {
         let (data, response) = try await URLSession.shared.upload(for: request, from: payload)
         guard let http = response as? HTTPURLResponse, (200 ..< 300).contains(http.statusCode) else {
           return nil
         }
-        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let title = json["sessionTitle"] as? String,
-           !title.isEmpty
-        {
-          return title
-        }
-        return "Scrawl"
+        return IngestReply(body: data)
       } catch {
         return nil
       }

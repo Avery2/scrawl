@@ -49,7 +49,8 @@ final class Outbox: NSObject, @unchecked Sendable {
     /// Bytes went out: `fraction` of the payload so far. Sent when the whole percent changes, or
     /// every `progressInterval` while bytes keep moving more slowly than that.
     case progress(id: String, fraction: Double)
-    case sent(id: String, sessionTitle: String)
+    /// The server took it (a 2xx), and said what became of it.
+    case sent(id: String, reply: IngestReply)
     /// A transient failure; the entry is tried again at `next` (or sooner on a kick).
     case retrying(id: String, error: String, next: Date)
     case failed(id: String, Failure)
@@ -422,9 +423,7 @@ final class Outbox: NSObject, @unchecked Sendable {
     case .success:
       try? FileManager.default.removeItem(at: payloadURL(id))
       try? FileManager.default.removeItem(at: metadataURL(id))
-      let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
-      let title = (json?["sessionTitle"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Scrawl"
-      onEvent(.sent(id: id, sessionTitle: title))
+      onEvent(.sent(id: id, reply: IngestReply(body: body)))
     case let .permanent(failure):
       entry.failure = failure
       entry.lastError = "HTTP \(status ?? 0)"

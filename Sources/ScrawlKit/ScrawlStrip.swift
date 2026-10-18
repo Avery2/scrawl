@@ -33,7 +33,8 @@
     enum Mode: Equatable {
       case recording(startedAt: Date, isDrawing: Bool)
       case sending(Sending)
-      case sent(String)
+      /// The server took it; what it said became of it.
+      case sent(IngestReply)
       /// Saved on the phone; sends in the background when it can.
       case queued
       case failed(Failure)
@@ -296,8 +297,8 @@
         switch bubble {
         case .elapsed:
           ElapsedText(startedAt: model.startedAt)
-        case let .sent(target):
-          Text("Sent to \(Self.shortened(target))")
+        case let .sent(reply):
+          sentText(reply)
         case let .sending(stalled):
           Text(stalled ? "Still sending…" : "Sending…")
         case .queued:
@@ -355,8 +356,23 @@
       }
     }
 
-    private static func shortened(_ target: String) -> String {
-      target.count > 36 ? String(target.prefix(36)) + "…" : target
+    /// Delivered reads as one line; on the Mac but not yet delivered takes two, so the
+    /// session's name fits.
+    @ViewBuilder private func sentText(_ reply: IngestReply) -> some View {
+      switch reply {
+      case let .delivered(title):
+        Text("Sent to \(Self.shortened(title))")
+      case let .queued(title):
+        noticeText(Notice("On your Mac", detail: "Sends to \(Self.shortened(title, to: 24)) when it can"))
+      case let .processing(title):
+        noticeText(Notice("On your Mac", detail: "Sending to \(Self.shortened(title, to: 30))…"))
+      case .saved:
+        Text("Saved on your Mac")
+      }
+    }
+
+    private static func shortened(_ target: String, to length: Int = 36) -> String {
+      target.count > length ? String(target.prefix(length)) + "…" : target
     }
   }
 
@@ -500,7 +516,7 @@
     }
 
     enum Bubble: Equatable {
-      case elapsed, sent(String), queued, failed(ScrawlStrip.Failure), discarded
+      case elapsed, sent(IngestReply), queued, failed(ScrawlStrip.Failure), discarded
       case sending(stalled: Bool)
       /// A message while recording (link expired, the length cap).
       case notice(ScrawlStrip.Notice)
@@ -818,7 +834,7 @@
       }
       if fromStrip { after(StripMotion.iconSwapDelay, swap) } else { swap(self) }
       let bubble: Bubble? = switch mode {
-      case let .sent(title)?: .sent(title)
+      case let .sent(reply)?: .sent(reply)
       case .queued?: .queued
       case let .failed(failure)?: .failed(failure)
       case .discarded?: .discarded
@@ -1485,7 +1501,7 @@
         (.recording(startedAt: .now, isDrawing: false), 1.4),
         (.recording(startedAt: .now, isDrawing: true), 1.0),
         (.sending(.init()), 1.4),
-        (.sent("Fix the onboarding flow"), 2.2),
+        (.sent(.delivered(sessionTitle: "Fix the onboarding flow")), 2.2),
         (nil, 1.2),
         (.recording(startedAt: .now, isDrawing: false), 1.4),
         (.discarded, 2.4),
@@ -1535,7 +1551,15 @@
     }
 
     #Preview("Sent") {
-      StripPreview(mode: .sent("Fix the onboarding flow"))
+      StripPreview(mode: .sent(.delivered(sessionTitle: "Fix the onboarding flow")))
+    }
+
+    #Preview("On the Mac, retrying") {
+      StripPreview(mode: .sent(.queued(sessionTitle: "Fix the onboarding flow")))
+    }
+
+    #Preview("On the Mac, sending") {
+      StripPreview(mode: .sent(.processing(sessionTitle: "Fix the onboarding flow")))
     }
 
     #Preview("Failed") {

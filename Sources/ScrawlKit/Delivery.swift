@@ -1,5 +1,52 @@
 import Foundation
 
+/// What a Scrawl server said became of a recording it took: the JSON of its 2xx, or the `.sent`
+/// and `.delivery` markers a Mac writes back over USB.
+///
+/// The Mac answers once it has built the bundle and tried to queue it into the agent session:
+/// `{"ok":true,"delivered":bool,"state":"sent"|"queued"|"saved"|"processing","sessionTitle":…}`.
+/// Servers from before `delivered` answered as soon as the files arrived; that reads as delivered.
+public enum IngestReply: Equatable, Sendable {
+  /// Queued into the agent session `sessionTitle`.
+  case delivered(sessionTitle: String)
+  /// On the Mac, which couldn't reach the session and keeps trying on its own.
+  case queued(sessionTitle: String)
+  /// On the Mac, still being built or sent when it answered.
+  case processing(sessionTitle: String)
+  /// On the Mac and going no further (it has no session for this app).
+  case saved
+
+  /// Reads a 2xx response body.
+  init(body: Data) {
+    let json = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] ?? [:]
+    self.init(json: json, fallbackTitle: "Scrawl")
+  }
+
+  /// Reads the USB markers: `.sent` holds the session's name; `.delivery`, written first by
+  /// Macs that know it, holds the same JSON as an HTTP reply.
+  init(sentMarker title: String, delivery: Data?) {
+    let json = delivery.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] } ?? [:]
+    self.init(json: json, fallbackTitle: title)
+  }
+
+  private init(json: [String: Any], fallbackTitle: String) {
+    let title = (json["sessionTitle"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? fallbackTitle
+    guard let delivered = json["delivered"] as? Bool, !delivered else {
+      self = .delivered(sessionTitle: title)
+      return
+    }
+    switch json["state"] as? String {
+    case "queued": self = .queued(sessionTitle: title)
+    case "processing": self = .processing(sessionTitle: title)
+    default: self = .saved
+    }
+  }
+
+  public var isDelivered: Bool {
+    if case .delivered = self { true } else { false }
+  }
+}
+
 /// What the strip says about one recording on its way to an HTTPS endpoint, worked out from the
 /// outbox's events and whether the network path is satisfied (`NWPathMonitor`). Time is passed
 /// in, so it's a plain value that tests can drive.
@@ -15,7 +62,7 @@ struct DeliveryTracker: Equatable {
     case sending(progress: Double?)
     case stillSending(progress: Double?)
     case queued
-    case sent(sessionTitle: String)
+    case sent(IngestReply)
     case failed(Outbox.Failure)
   }
 
@@ -24,7 +71,7 @@ struct DeliveryTracker: Equatable {
   private enum Phase: Equatable {
     case uploading
     case waitingToRetry
-    case sent(String)
+    case sent(IngestReply)
     case failed(Outbox.Failure)
   }
 
@@ -62,8 +109,8 @@ struct DeliveryTracker: Equatable {
       lastActivity = now
     case .retrying:
       phase = .waitingToRetry
-    case let .sent(_, title):
-      phase = .sent(title)
+    case let .sent(_, reply):
+      phase = .sent(reply)
     case let .failed(_, failure):
       phase = .failed(failure)
     }
@@ -77,7 +124,7 @@ struct DeliveryTracker: Equatable {
 
   func display(at now: Date) -> Display {
     switch phase {
-    case let .sent(title): return .sent(sessionTitle: title)
+    case let .sent(reply): return .sent(reply)
     case let .failed(failure): return .failed(failure)
     case .waitingToRetry: return .queued
     case .uploading:

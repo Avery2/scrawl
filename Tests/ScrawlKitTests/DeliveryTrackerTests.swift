@@ -17,8 +17,8 @@ struct DeliveryTrackerTests {
       tracker.apply(.progress(id: id, fraction: second / 200), at: at(second))
     }
     #expect(tracker.display(at: at(120)) == .sending(progress: 0.6))
-    tracker.apply(.sent(id: id, sessionTitle: "Problems · Ledger"), at: at(130))
-    #expect(tracker.display(at: at(130)) == .sent(sessionTitle: "Problems · Ledger"))
+    tracker.apply(.sent(id: id, reply: .delivered(sessionTitle: "Problems · Ledger")), at: at(130))
+    #expect(tracker.display(at: at(130)) == .sent(.delivered(sessionTitle: "Problems · Ledger")))
   }
 
   @Test func noProgressOnAWorkingNetworkIsStillSendingNotQueued() {
@@ -60,8 +60,8 @@ struct DeliveryTrackerTests {
     #expect(tracker.display(at: at(60)) == .queued)
     tracker.apply(.started(id: id), at: at(61))
     #expect(tracker.display(at: at(61)) == .sending(progress: nil))
-    tracker.apply(.sent(id: id, sessionTitle: "Problems"), at: at(62))
-    #expect(tracker.display(at: at(62)) == .sent(sessionTitle: "Problems"))
+    tracker.apply(.sent(id: id, reply: .delivered(sessionTitle: "Problems")), at: at(62))
+    #expect(tracker.display(at: at(62)) == .sent(.delivered(sessionTitle: "Problems")))
   }
 
   @Test func permanentFailuresAreShownAsFailures() {
@@ -76,11 +76,11 @@ struct DeliveryTrackerTests {
   @Test func otherEntriesAndLateEventsAreIgnored() {
     var tracker = DeliveryTracker(entry: id, pathSatisfied: true, now: t0)
     tracker.apply(.retrying(id: "other", error: "HTTP 503", next: at(15)), at: at(1))
-    tracker.apply(.sent(id: "other", sessionTitle: "Elsewhere"), at: at(1))
+    tracker.apply(.sent(id: "other", reply: .delivered(sessionTitle: "Elsewhere")), at: at(1))
     #expect(tracker.display(at: at(1)) == .sending(progress: nil))
-    tracker.apply(.sent(id: id, sessionTitle: "Problems"), at: at(2))
+    tracker.apply(.sent(id: id, reply: .delivered(sessionTitle: "Problems")), at: at(2))
     tracker.apply(.retrying(id: id, error: "late", next: at(20)), at: at(3))
     tracker.setPath(satisfied: false, at: at(4))
-    #expect(tracker.display(at: at(4)) == .sent(sessionTitle: "Problems"))
+    #expect(tracker.display(at: at(4)) == .sent(.delivered(sessionTitle: "Problems")))
   }
 }
