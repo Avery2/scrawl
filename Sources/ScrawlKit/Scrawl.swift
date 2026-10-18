@@ -298,6 +298,10 @@
     @ObservationIgnored private var nextTouchID = 1
     /// Touches that may become a press-and-hold, by ID: where each went down.
     @ObservationIgnored private var holdStarts: [Int: CGPoint] = [:]
+    /// Touches currently moving across the screen, plus the scroll views they touched.
+    @ObservationIgnored private var draggingTouchIDs: Set<Int> = []
+    @ObservationIgnored private var trackedScrollViews: [WeakScrollView] = []
+    @ObservationIgnored private(set) var lastTouchMoveMediaTime: TimeInterval?
     /// The window the touches are measured in, for the timeline's `screen`.
     @ObservationIgnored weak var touchWindow: UIWindow?
     @ObservationIgnored private var overlay: OverlayWindow?
@@ -690,6 +694,9 @@
       touchIDs = [:]
       nextTouchID = 1
       holdStarts = [:]
+      draggingTouchIDs = []
+      trackedScrollViews = []
+      lastTouchMoveMediaTime = nil
       isDrawing = false
       uploadStatus = .idle
       failedRecording = nil
@@ -972,6 +979,25 @@
       touchIDs = [:]
       touchLabels = [:]
       holdStarts = [:]
+      draggingTouchIDs = []
+    }
+
+    /// Whether the user is actively scrolling, dragging, decelerating a scroll view, or drawing ink.
+    var isInteractingForCapture: Bool {
+      if overlay?.isActivelyDrawing == true || !draggingTouchIDs.isEmpty {
+        return true
+      }
+      if RunLoop.main.currentMode == .tracking {
+        return true
+      }
+      for entry in trackedScrollViews {
+        if let scroll = entry.value, !scroll.isHidden, scroll.window != nil,
+           scroll.isTracking || scroll.isDragging || scroll.isDecelerating
+        {
+          return true
+        }
+      }
+      return false
     }
 
     /// Touches go to the timeline while recording (moves at most 30 a second). A touch that began
@@ -990,8 +1016,32 @@
       } else {
         return
       }
+      if phase == .moved {
+        lastTouchMoveMediaTime = CACurrentMediaTime()
+        draggingTouchIDs.insert(id)
+        if holdStarts[id] == nil {
+          guard let startedAt else { return }
+          let t = Date().timeIntervalSince(startedAt)
+          if let last = lastTouchLog[id], t - last < 1.0 / 30 { return }
+          lastTouchLog[id] = t
+          let point = touch.location(in: window)
+          var entry: [String: Any] = [
+            "t": Self.round(t),
+            "id": id,
+            "x": Self.round(point.x),
+            "y": Self.round(point.y),
+            "phase": "move",
+          ]
+          if let label = touchLabels[id], !label.isEmpty {
+            entry["label"] = label
+          }
+          touchLog.append(entry)
+          return
+        }
+      }
       let point = touch.location(in: window)
       if phase == .began {
+        trackScrollViews(from: touch.view ?? window.hitTest(point, with: nil))
         if let label = Self.hitLabel(at: point, in: window) {
           touchLabels[id] = label
         } else {
@@ -1003,6 +1053,7 @@
       if ended {
         touchIDs[key] = nil
         touchLabels.removeValue(forKey: id)
+        draggingTouchIDs.remove(id)
       }
       guard let startedAt else { return }
       trackHold(id: id, at: point, phase: phase)
@@ -1027,6 +1078,17 @@
         entry["label"] = label
       }
       touchLog.append(entry)
+    }
+
+    private func trackScrollViews(from leaf: UIView?) {
+      trackedScrollViews.removeAll { $0.value == nil || $0.value?.window == nil }
+      var current = leaf
+      while let view = current {
+        if let scroll = view as? UIScrollView, !trackedScrollViews.contains(where: { $0.value === scroll }) {
+          trackedScrollViews.append(WeakScrollView(scroll))
+        }
+        current = view.superview
+      }
     }
 
     /// A light tick when a finger has held still for a moment, so a deliberate "this one" press
@@ -1400,6 +1462,14 @@
     func update(_ satisfied: Bool) -> Bool {
       defer { wasSatisfied = satisfied }
       return satisfied && wasSatisfied == false
+    }
+  }
+
+  private struct WeakScrollView {
+    weak var value: UIScrollView?
+
+    init(_ value: UIScrollView) {
+      self.value = value
     }
   }
 #endif

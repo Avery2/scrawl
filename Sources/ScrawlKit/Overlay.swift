@@ -11,6 +11,7 @@
     private var regions: [OverlayRegion: CGRect] = [:]
     private unowned let scrawl: Scrawl
     private var drawingTouch: UITouch?
+    var isActivelyDrawing: Bool { drawingTouch != nil }
     /// The red ink, under the strip. UIKit layers rather than SwiftUI, so a touch redraws only the
     /// stroke's live tip.
     let ink = InkView()

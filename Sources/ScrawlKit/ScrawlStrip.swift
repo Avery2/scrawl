@@ -1199,28 +1199,29 @@
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-      TimelineView(.periodic(from: startedAt, by: 0.5)) { context in
-        let elapsed = max(0, context.date.timeIntervalSince(startedAt))
-        ZStack {
-          Circle()
-            .stroke(.white.opacity(0.16), lineWidth: 1.25)
+      ZStack {
+        Circle()
+          .stroke(.white.opacity(0.16), lineWidth: 1.25)
+        TimelineView(.periodic(from: startedAt, by: 1)) { context in
+          let elapsed = max(0, context.date.timeIntervalSince(startedAt))
           Circle()
             .trim(from: 0, to: elapsed.truncatingRemainder(dividingBy: 60) / 60)
             .stroke(.white.opacity(0.75), style: StrokeStyle(lineWidth: 1.25, lineCap: .round))
             .rotationEffect(.degrees(-90))
-          Circle()
-            .fill(Color.scrawlRed)
-            .frame(width: 8, height: 8)
-            .phaseAnimator(reduceMotion ? [true] : [true, false]) { dot, bright in
-              dot.scaleEffect(bright ? 1 : 0.78).opacity(bright ? 1 : 0.55)
-            } animation: { _ in
-              .easeInOut(duration: 1)
-            }
+            .accessibilityLabel(Self.spoken(elapsed))
         }
-        .frame(width: 18, height: 18)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(Self.spoken(elapsed))
+        Circle()
+          .fill(Color.scrawlRed)
+          .frame(width: 8, height: 8)
+          .phaseAnimator(reduceMotion ? [true] : [true, false]) { dot, bright in
+            dot.scaleEffect(bright ? 1 : 0.78).opacity(bright ? 1 : 0.55)
+          } animation: { _ in
+            .easeInOut(duration: 1)
+          }
+          .accessibilityHidden(true)
       }
+      .frame(width: 18, height: 18)
+      .accessibilityElement(children: .combine)
     }
 
     private static func spoken(_ elapsed: TimeInterval) -> String {
