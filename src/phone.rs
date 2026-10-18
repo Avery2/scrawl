@@ -50,6 +50,8 @@ pub struct PhoneSession {
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     started_at: Instant,
     session_epoch_ms: u64,
+    /// Held while the mirror records (not while it only previews).
+    busy: Option<crate::retention::Recording>,
 }
 
 pub struct PhoneRecording {
@@ -119,6 +121,7 @@ impl PhoneSession {
         telemetry: Option<Arc<SharedCaptureTelemetry>>,
     ) -> Result<Self> {
         let session_epoch_ms = crate::now_epoch_ms();
+        let recording = movie.map(|_| crate::retention::Recording::start());
         let mut command = Command::new(helper::path()?);
         command.arg("mirror");
         if let Some(movie) = movie {
@@ -249,6 +252,7 @@ impl PhoneSession {
             cancelled,
             started_at: Instant::now(),
             session_epoch_ms,
+            busy: recording,
         })
     }
 
@@ -256,6 +260,8 @@ impl PhoneSession {
     pub fn begin_recording(&mut self, movie: &Path) {
         self.started_at = Instant::now();
         self.session_epoch_ms = crate::now_epoch_ms();
+        self.busy
+            .get_or_insert_with(crate::retention::Recording::start);
         {
             let mut state = self.lock();
             state.recording_epoch_ms = None;
@@ -622,7 +628,7 @@ pub fn finalize_live_capture(
         height: device.height,
         ..Default::default()
     };
-    build_movie_bundle(
+    let built = build_movie_bundle(
         bundle_dir,
         MovieCapture {
             movie: recording.movie,
@@ -636,7 +642,10 @@ pub fn finalize_live_capture(
             context_changes: Vec::new(),
             screens: Vec::new(),
         },
-    )
+    )?;
+    // The native video is ~18 Mbps; re-encode it a minute from now (in the app).
+    crate::retention::after_phone_capture(&built.0);
+    Ok(built)
 }
 
 // MARK: ScrawlKit import

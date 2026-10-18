@@ -203,8 +203,10 @@ pub fn zoom(
         .with_context(|| {
             if pending.exists() {
                 "The bundle's video is still copying from the other Mac; try again in a minute"
+                    .to_owned()
             } else {
-                "The bundle has no video to zoom into"
+                crate::retention::missing_media_reason(dir)
+                    .unwrap_or_else(|| "The bundle has no video to zoom into".to_owned())
             }
         })?;
     let at_ms = resolve_moment(bundle, at)?;

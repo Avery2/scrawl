@@ -31,7 +31,15 @@ pub fn path() -> Result<PathBuf> {
 
 /// Runs a helper command to completion and parses its JSON output.
 fn run<T: for<'de> Deserialize<'de>>(args: &[&std::ffi::OsStr], timeout: Duration) -> Result<T> {
-    let mut child = Command::new(path()?)
+    run_program(&path()?, args, timeout)
+}
+
+fn run_program<T: for<'de> Deserialize<'de>>(
+    program: &Path,
+    args: &[&std::ffi::OsStr],
+    timeout: Duration,
+) -> Result<T> {
+    let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -139,6 +147,27 @@ pub struct Probe {
 
 pub fn probe(movie: &Path) -> Result<Probe> {
     run(&[os("probe"), movie.as_os_str()], Duration::from_secs(30))
+}
+
+/// Re-encodes `movie` into `out` as HEVC with its long edge at most `max_edge`, audio copied and
+/// every sample at its original time. Runs at utility priority; minutes of video take seconds.
+pub fn shrink(movie: &Path, out: &Path, max_edge: u32) -> Result<crate::retention::Shrunk> {
+    let edge = max_edge.to_string();
+    let helper = path()?;
+    let args = [
+        helper.as_os_str(),
+        os("shrink"),
+        movie.as_os_str(),
+        os("--out"),
+        out.as_os_str(),
+        os("--max-edge"),
+        os(&edge),
+    ];
+    run_program(
+        Path::new("/usr/sbin/taskpolicy"),
+        &[&[os("-c"), os("utility")], &args[..]].concat(),
+        Duration::from_secs(1800),
+    )
 }
 
 /// Mixes a movie's audio to 16 kHz mono WAV, aligned to the movie's start.

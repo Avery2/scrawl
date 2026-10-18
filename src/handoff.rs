@@ -424,7 +424,7 @@ fn ssh(host: &str) -> Command {
 }
 
 /// Bundle files too big to hold up queueing the session; they follow in the background.
-const HEAVY_MEDIA: [&str; 5] = [
+pub const HEAVY_MEDIA: [&str; 5] = [
     "recording.mp4",
     "recording.mov",
     "audio.wav",
@@ -451,6 +451,7 @@ pub fn sync_bundle_to(host: &str, bundle_dir: &Path) -> Result<()> {
             "--exclude=*/audio.wav",
             "--exclude=*/frames-full",
             "--exclude=*/contact-sheet-full.png",
+            "--exclude=*/.media-sending",
         ])
         .arg("-cf")
         .arg("-")
@@ -500,7 +501,12 @@ pub fn sync_bundle_to(host: &str, bundle_dir: &Path) -> Result<()> {
              for f in {staging_q}/*/*; do rm -rf {bundle_q}/\"$(basename \"$f\")\" && mv \"$f\" {bundle_q}/; done; \
              rm -rf {staging_q} {bundle_q}/{MEDIA_PENDING}"
         );
+        // Held until the media lands, so the iPhone video isn't re-encoded or cleaned up under
+        // the copy (see `retention`).
+        let sending = bundle_dir.join(crate::retention::MEDIA_SENDING);
+        let _ = fs::write(&sending, host);
         std::thread::spawn(move || {
+            let _done = RemoveOnDrop(sending);
             let Ok(mut bg_tar) = Command::new("/usr/bin/tar")
                 .arg("-C")
                 .arg(&parent_owned)
@@ -525,6 +531,14 @@ pub fn sync_bundle_to(host: &str, bundle_dir: &Path) -> Result<()> {
         });
     }
     Ok(())
+}
+
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 fn opencode_api(method: &str, path: &str, data: Option<&serde_json::Value>) -> Result<Vec<u8>> {

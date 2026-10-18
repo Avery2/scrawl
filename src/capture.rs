@@ -1112,6 +1112,7 @@ mod tests {
             frames,
             video_offset_ms: Arc::new(AtomicU64::new(120)),
             sampler_thread: Some(worker),
+            _recording: crate::retention::Recording::start(),
         };
         let recording = session.stop();
         let frames = recording.frames;
@@ -1504,6 +1505,7 @@ pub struct ScreenCaptureSession {
     frames: Arc<Mutex<CandidateBuffer>>,
     video_offset_ms: Arc<AtomicU64>,
     sampler_thread: Option<JoinHandle<Option<PathBuf>>>,
+    _recording: crate::retention::Recording,
 }
 
 impl ScreenCaptureSession {
@@ -1615,6 +1617,7 @@ impl ScreenCaptureSession {
             frames,
             video_offset_ms,
             sampler_thread,
+            _recording: crate::retention::Recording::start(),
         }
     }
 

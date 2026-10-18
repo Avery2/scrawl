@@ -344,6 +344,8 @@ enum MenuAction {
     OpenInbox(PathBuf),
     RunDemo,
     Welcome,
+    KeepRecordings(crate::retention::Preset),
+    ShowCaptures,
     CheckForUpdates,
     Quit,
 }
@@ -391,6 +393,22 @@ objc2::define_class!(
             let _ = self.ivars().sender.try_send(MenuAction::Welcome);
         }
 
+        #[unsafe(method(keepRecordings:))]
+        fn keep_recordings(&self, sender: &NSMenuItem) {
+            let index = usize::try_from(sender.tag() - KEEP_MENU_TAG - 1).unwrap_or(usize::MAX);
+            if let Some(&preset) = crate::retention::Preset::ALL.get(index) {
+                let _ = self
+                    .ivars()
+                    .sender
+                    .try_send(MenuAction::KeepRecordings(preset));
+            }
+        }
+
+        #[unsafe(method(showCaptures:))]
+        fn show_captures(&self, _sender: &AnyObject) {
+            let _ = self.ivars().sender.try_send(MenuAction::ShowCaptures);
+        }
+
         #[unsafe(method(checkForUpdates:))]
         fn check_for_updates(&self, _sender: &AnyObject) {
             let _ = self.ivars().sender.try_send(MenuAction::CheckForUpdates);
@@ -417,12 +435,38 @@ objc2::define_class!(
         #[unsafe(method(menuNeedsUpdate:))]
         fn menu_needs_update(&self, menu: &NSMenu) {
             rebuild_inbox_menu_items(menu, self);
+            refresh_keep_menu(menu);
         }
     }
 );
 
 /// Tag on the status menu's inbox rows, so each open can replace them.
 const INBOX_MENU_TAG: isize = 0x5c4a;
+/// Tag on the Keep Recordings item; its choices are tagged one past it, in `Preset::ALL` order.
+const KEEP_MENU_TAG: isize = 0x5c50;
+
+/// Ticks the current Keep Recordings choice and shows how much the captures take up.
+fn refresh_keep_menu(menu: &NSMenu) {
+    let Some(submenu) = menu
+        .itemWithTag(KEEP_MENU_TAG)
+        .and_then(|item| item.submenu())
+    else {
+        return;
+    };
+    let current = crate::retention::Policy::load().preset();
+    for (index, preset) in crate::retention::Preset::ALL.into_iter().enumerate() {
+        if let Some(item) = submenu.itemWithTag(KEEP_MENU_TAG + 1 + index as isize) {
+            item.setState(if current == Some(preset) { 1 } else { 0 });
+        }
+    }
+    if let Some(item) = submenu.itemWithTag(KEEP_MENU_TAG + 100) {
+        let size = crate::retention::captures_size(&crate::handoff::default_captures_dir());
+        item.setTitle(&NSString::from_str(&format!(
+            "Captures use {}",
+            crate::retention::format_bytes(size)
+        )));
+    }
+}
 
 /// Lists unhandled iPhone captures at the top of the status menu, read fresh from disk so the
 /// ages are current.
@@ -554,6 +598,45 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
     add("Record iPhone", sel!(recordIphone:));
     add("Open Latest Bundle", sel!(openLatest:));
     add("Generate Demo Bundle", sel!(runDemo:));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add("Show Captures in Finder", sel!(showCaptures:));
+    let keep = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Keep Recordings"));
+    for (index, preset) in crate::retention::Preset::ALL.into_iter().enumerate() {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(preset.label()),
+                Some(sel!(keepRecordings:)),
+                &NSString::new(),
+            )
+        };
+        unsafe { item.setTarget(Some(&target)) };
+        item.setTag(KEEP_MENU_TAG + 1 + index as isize);
+        keep.addItem(&item);
+    }
+    keep.addItem(&NSMenuItem::separatorItem(mtm));
+    let size_row = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Captures use …"),
+            None,
+            &NSString::new(),
+        )
+    };
+    size_row.setEnabled(false);
+    size_row.setTag(KEEP_MENU_TAG + 100);
+    keep.addItem(&size_row);
+    let keep_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Keep Recordings"),
+            None,
+            &NSString::new(),
+        )
+    };
+    keep_item.setTag(KEEP_MENU_TAG);
+    keep_item.setSubmenu(Some(&keep));
+    menu.addItem(&keep_item);
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     add("Welcome to Scrawl…", sel!(welcome:));
     add("Check for Updates…", sel!(checkForUpdates:));
@@ -4605,6 +4688,7 @@ pub fn run_app(
         install_global_hotkeys(&telemetry);
         start_global_input_tap(Arc::clone(&telemetry));
         crate::sparkle::start();
+        crate::retention::start();
         let menu_rx = install_status_bar();
 
         // Onboarding opens on first launch, or for a permission that went away.
@@ -4749,6 +4833,21 @@ pub fn run_app(
                                             None,
                                         ));
                                     });
+                                }
+                                MenuAction::KeepRecordings(preset) => {
+                                    if let Err(error) = preset.policy().save() {
+                                        scrawl_log(format!(
+                                            "Saving Keep Recordings failed: {error:#}"
+                                        ));
+                                    }
+                                    crate::retention::nudge();
+                                }
+                                MenuAction::ShowCaptures => {
+                                    let dir = crate::handoff::default_captures_dir();
+                                    let _ = std::fs::create_dir_all(&dir);
+                                    let _ = std::process::Command::new("/usr/bin/open")
+                                        .arg(dir)
+                                        .spawn();
                                 }
                                 MenuAction::CheckForUpdates => {
                                     crate::sparkle::check_for_updates();

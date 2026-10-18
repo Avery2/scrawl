@@ -40,6 +40,10 @@ cargo run -- reprocess latest --out /tmp/again.scrawl
 
 # Tune auto-crop on a Screen capture, live
 cargo run -- autocrop latest --serve --open
+
+# Clean up old captures now (the app does it daily), or keep one forever
+cargo run -- clean --dry-run
+cargo run -- pin latest
 ```
 
 ## Welcome and permissions
@@ -188,7 +192,8 @@ phone on the right of the screen and starts recording:
 
 - The phone's own video is recorded natively (1320×2868 at up to 60 fps on an iPhone Pro Max) with
   your narration from the Mac's microphone, into the bundle as `recording.mov`. Keyframes are
-  decoded from that video, never from a screenshot of the mirror.
+  decoded from that video, never from a screenshot of the mirror. A minute after the capture the
+  video is re-encoded to HEVC at the keyframes' 1600 px (see [Keeping captures small](#keeping-captures-small)).
 - The laser, ink, pins, and clicks work over the mirror exactly as over a window. The mirror's
   on-screen rect is the capture target, so everything you draw is stored in phone-screen
   coordinates and lands in the right place on the phone keyframes. Move or resize the mirror
@@ -200,8 +205,8 @@ phone on the right of the screen and starts recording:
 Phone bundles are ordinary bundles: `scrawl.json` adds `"source": "iphone"` and a `device` object
 (name, capture `mirror` or `scrawlkit`, id, native size, screen points and scale, app and version
 for SDK recordings), and the target's `mode` is `device`. Keyframes fit a 1600 px long edge
-(736×1600 for a 1320×2868 phone); `scrawl frames` extracts native-resolution frames (via `ffmpeg`
-or `scrawl-helper frames`) when you need every pixel.
+(736×1600 for a 1320×2868 phone); `scrawl frames` and `scrawl zoom` extract more frames from the
+video when you need them.
 
 ### ScrawlKit (iOS)
 
@@ -410,6 +415,31 @@ cp scripts/scrawl-serve.plist ~/Library/LaunchAgents/dev.kitlangton.scrawl.serve
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.kitlangton.scrawl.serve.plist
 ```
 
+## Keeping captures small
+
+Captures would otherwise pile up (mostly video). The app cleans up shortly after launch and then
+daily, at low priority, and logs what it did:
+
+- **Video, audio and full-size frames** (`recording.mp4`/`.mov`, `audio.wav`, `frames-full/`) go
+  to the Trash after 7 days, as one `<bundle> media` folder. The prompt (`summary.md`,
+  `scrawl.json`, `contact-sheet.png`, `frames/`) stays, so pasting and reading still work;
+  `scrawl zoom` says the video was cleaned up.
+- **Whole bundles** go to the Trash after 30 days.
+- **Keep Recordings** in the menu bar picks Video for 7 Days (bundles 30), Video for 30 Days
+  (bundles 90), or Forever. It's stored as `"retention": {"mediaDays": 7, "bundleDays": 30}` in
+  `~/.config/scrawl/config.json`; `null` keeps forever. **Show Captures in Finder** opens the folder.
+- Never touched: a bundle under a day old or changed in the last day (a copy just arrived from
+  another Mac, a zoom), one whose media is still copying (`.media-pending` there, `.media-sending`
+  here; a marker over a day old is ignored), one being recorded or re-encoded, and one with a
+  `.pinned` file (`scrawl pin`, `scrawl pin --off`).
+- **iPhone video** from the cable is ~18 Mbps at 1320×2868. A minute after the capture (after any
+  copy to another Mac finishes, and never during a recording) `scrawl-helper shrink` re-encodes it
+  to HEVC at a 1600 px long edge, audio copied as is and every frame at its original time, and
+  swaps it in place: a 4.5-minute capture goes from 750 MB to 72 MB in about 20 s. Daily passes
+  shrink any native iPhone video that was missed.
+
+`scrawl clean --dry-run` prints what a pass would do now.
+
 ## Transcription
 
 Narration is transcribed on device by Apple's SpeechAnalyzer (macOS 26), which reports when every
@@ -439,6 +469,7 @@ target/debug/scrawl-helper devices
 target/debug/scrawl-helper permissions
 target/debug/scrawl-helper transcribe audio.wav
 target/debug/scrawl-helper frames recording.mov --out-dir /tmp/f --at 1000,2000 --max-edge 1600
+target/debug/scrawl-helper shrink recording.mov --out /tmp/small.mov --max-edge 1600
 ```
 
 ## Testing

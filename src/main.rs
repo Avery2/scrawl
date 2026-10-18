@@ -13,6 +13,7 @@ mod model;
 mod onboarding;
 mod phone;
 mod render;
+mod retention;
 mod sketch;
 mod sparkle;
 mod transcribe;
@@ -159,6 +160,27 @@ enum Command {
         /// Show the whole screen even when the bundle's keyframes are auto-cropped.
         #[arg(long)]
         full: bool,
+    },
+    /// Clean up old captures now, as the app does daily: video and audio past the Keep
+    /// Recordings setting go to the Trash, then whole bundles; native iPhone video is shrunk.
+    Clean {
+        /// Print what would happen without doing it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Captures folder to clean (defaults to Application Support).
+        #[arg(long, hide = true)]
+        captures: Option<PathBuf>,
+        /// Plan as if this many days had passed.
+        #[arg(long, hide = true, default_value_t = 0.0)]
+        days_ahead: f64,
+    },
+    /// Keep a bundle forever, out of cleanup (`--off` lets it go again).
+    Pin {
+        /// Path to `.scrawl` bundle directory or `latest`.
+        #[arg(default_value = "latest")]
+        bundle: PathBuf,
+        #[arg(long)]
+        off: bool,
     },
     /// Open the auto-crop playground for a Screen capture: each keyframe with its windows,
     /// activity and crop, and the cropped contact sheet. `--serve` reruns the crop live as
@@ -1262,7 +1284,10 @@ fn main() -> Result<()> {
                 .as_ref()
                 .map(|v| dir.join(v))
                 .filter(|p| p.is_file())
-                .context("The bundle has no video to reprocess")?;
+                .with_context(|| {
+                    retention::missing_media_reason(&dir)
+                        .unwrap_or_else(|| "The bundle has no video to reprocess".to_owned())
+                })?;
             let flags: Vec<u64> = old
                 .marks
                 .iter()
@@ -1502,6 +1527,51 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&loaded)?);
             } else {
                 print!("{}", summary_markdown(&loaded, &dir));
+            }
+            Ok(())
+        }
+        Command::Clean {
+            dry_run,
+            captures,
+            days_ahead,
+        } => {
+            let captures = captures.unwrap_or_else(handoff::default_captures_dir);
+            let policy = retention::Policy::load();
+            let ahead = Duration::from_secs_f64(days_ahead.max(0.0) * 86_400.0);
+            let (actions, report) = retention::run_pass(&captures, &policy, dry_run, ahead);
+            for action in &actions {
+                let line = match action {
+                    retention::Action::TrashMedia { bundle, .. } => {
+                        format!("trash media  {}", bundle.display())
+                    }
+                    retention::Action::TrashBundle(bundle) => {
+                        format!("trash bundle {}", bundle.display())
+                    }
+                    retention::Action::Shrink { video, .. } => {
+                        format!("shrink       {}", video.display())
+                    }
+                };
+                println!("{line}");
+            }
+            if !dry_run {
+                println!(
+                    "{} freed; {} is now {}",
+                    retention::format_bytes(report.freed),
+                    captures.display(),
+                    retention::format_bytes(retention::captures_size(&captures))
+                );
+            }
+            Ok(())
+        }
+        Command::Pin { bundle, off } => {
+            let dir = handoff::resolve_bundle_dir(&bundle)?;
+            let marker = dir.join(retention::PINNED);
+            if off {
+                let _ = std::fs::remove_file(&marker);
+                println!("Unpinned {}", dir.display());
+            } else {
+                std::fs::write(&marker, "")?;
+                println!("Pinned {}", dir.display());
             }
             Ok(())
         }

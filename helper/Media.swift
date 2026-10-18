@@ -253,6 +253,112 @@ enum Media {
     try pixels.write(to: url)
   }
 
+  /// Re-encodes a movie's video to HEVC with its long edge at most `maxEdge`, copying every audio
+  /// track as it is. Each sample keeps its presentation time, so the timeline (and every time in
+  /// `scrawl.json`) still lines up. Fails rather than writing a movie of a different length.
+  static func shrink(movie: URL, out: URL, maxEdge: Int, bitRate: Int) async throws -> [String: Any] {
+    let started = Date()
+    let asset = AVURLAsset(url: movie)
+    guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else { throw HelperError("Movie has no video") }
+    let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+    let (natural, transform) = try await videoTrack.load(.naturalSize, .preferredTransform)
+    let duration = try await asset.load(.duration)
+    let (w, h) = (abs(natural.width), abs(natural.height))
+    let scale = min(1, Double(maxEdge) / Double(max(w, h)))
+    func even(_ v: Double) -> Int { max(2, Int((v / 2).rounded()) * 2) }
+    let (outW, outH) = (even(w * scale), even(h * scale))
+
+    try? FileManager.default.removeItem(at: out)
+    let reader = try AVAssetReader(asset: asset)
+    let writer = try AVAssetWriter(outputURL: out, fileType: .mov)
+    writer.movieTimeScale = duration.timescale
+    writer.metadata = (try? await asset.load(.metadata)) ?? []
+
+    let videoOut = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: [
+      kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+      kCVPixelBufferWidthKey as String: outW,
+      kCVPixelBufferHeightKey as String: outH,
+    ])
+    videoOut.alwaysCopiesSampleData = false
+    reader.add(videoOut)
+    let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: [
+      AVVideoCodecKey: AVVideoCodecType.hevc,
+      AVVideoWidthKey: outW,
+      AVVideoHeightKey: outH,
+      AVVideoCompressionPropertiesKey: [
+        AVVideoAverageBitRateKey: bitRate,
+        AVVideoMaxKeyFrameIntervalDurationKey: 2,
+        AVVideoAllowFrameReorderingKey: true,
+      ],
+    ])
+    videoIn.transform = transform
+    videoIn.expectsMediaDataInRealTime = false
+    videoIn.mediaTimeScale = try await videoTrack.load(.naturalTimeScale)
+    writer.add(videoIn)
+
+    var pairs: [(AVAssetReaderOutput, AVAssetWriterInput)] = [(videoOut, videoIn)]
+    for track in audioTracks {
+      let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+      reader.add(output)
+      let hint = try await track.load(.formatDescriptions).first
+      let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: hint)
+      input.expectsMediaDataInRealTime = false
+      writer.add(input)
+      pairs.append((output, input))
+    }
+
+    guard reader.startReading() else { throw HelperError(reader.error?.localizedDescription ?? "Could not read the movie") }
+    guard writer.startWriting() else { throw HelperError(writer.error?.localizedDescription ?? "Could not write the movie") }
+    writer.startSession(atSourceTime: .zero)
+
+    await withTaskGroup(of: Void.self) { group in
+      for (index, (output, input)) in pairs.enumerated() {
+        nonisolated(unsafe) let output = output
+        nonisolated(unsafe) let input = input
+        nonisolated(unsafe) let reader = reader
+        group.addTask {
+          await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            let queue = DispatchQueue(label: "shrink.\(index)", qos: .utility)
+            input.requestMediaDataWhenReady(on: queue) {
+              while input.isReadyForMoreMediaData {
+                guard let buffer = output.copyNextSampleBuffer() else {
+                  input.markAsFinished()
+                  done.resume()
+                  return
+                }
+                if !input.append(buffer) {
+                  reader.cancelReading()
+                  input.markAsFinished()
+                  done.resume()
+                  return
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if reader.status == .failed { writer.cancelWriting(); throw HelperError(reader.error?.localizedDescription ?? "Reading the movie failed") }
+    await writer.finishWriting()
+    guard writer.status == .completed else { throw HelperError(writer.error?.localizedDescription ?? "Writing the movie failed") }
+
+    let written = try await AVURLAsset(url: out).load(.duration)
+    let drift = abs(written.seconds - duration.seconds)
+    guard drift < 0.1 else {
+      try? FileManager.default.removeItem(at: out)
+      throw HelperError(String(format: "The shrunk movie is %.2f s off the original", drift))
+    }
+    func size(_ url: URL) -> Int { (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0 }
+    return [
+      "before": size(movie),
+      "after": size(out),
+      "width": outW,
+      "height": outH,
+      "durationMs": Int((written.seconds * 1000).rounded()),
+      "ms": Int(Date().timeIntervalSince(started) * 1000),
+    ]
+  }
+
   /// Every audio track mixed to 16 kHz mono 16-bit PCM, padded so sample 0 is the movie's start.
   static func exportAudio(movie: URL, wav: URL) async throws -> [String: Any] {
     let asset = AVURLAsset(url: movie)

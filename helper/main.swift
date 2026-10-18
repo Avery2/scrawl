@@ -6,6 +6,7 @@
 //   scrawl-helper frames MOVIE --out-dir DIR (--every MS | --at MS,MS…) [--max-edge PX]
 //   scrawl-helper audio MOVIE OUT.wav                   16 kHz mono PCM of every audio track, mixed
 //   scrawl-helper probe MOVIE                           duration and video size
+//   scrawl-helper shrink MOVIE --out FILE.mov [--max-edge PX] [--bitrate BPS]   HEVC copy, same timeline
 //   scrawl-helper permissions                           what Scrawl has been granted, as JSON
 //   scrawl-helper onboarding [--shortcut L] [--render DIR]   the welcome window (Onboarding.swift)
 //
@@ -121,6 +122,13 @@ case "frames":
 case "audio":
   guard arguments.count >= 3 else { fail("audio needs MOVIE OUT.wav") }
   runAsync { emit(try await Media.exportAudio(movie: URL(filePath: arguments[1]), wav: URL(filePath: arguments[2]))) }
+case "shrink":
+  guard arguments.count >= 2, let out = option("--out", in: arguments) else { fail("shrink needs MOVIE --out FILE.mov") }
+  let maxEdge = option("--max-edge", in: arguments).flatMap(Int.init) ?? 1600
+  let bitRate = option("--bitrate", in: arguments).flatMap(Int.init) ?? 2_500_000
+  runAsync {
+    emit(try await Media.shrink(movie: URL(filePath: arguments[1]), out: URL(filePath: out), maxEdge: maxEdge, bitRate: bitRate))
+  }
 case "probe":
   guard arguments.count >= 2 else { fail("probe needs MOVIE") }
   runAsync { emit(try await Media.probe(URL(filePath: arguments[1]))) }
@@ -137,5 +145,5 @@ case "qr":
   }
   emit(["qr": qr])
 default:
-  fail("usage: scrawl-helper devices|mirror|transcribe|frames|audio|probe|guide|permissions|onboarding|qr …")
+  fail("usage: scrawl-helper devices|mirror|transcribe|frames|audio|probe|shrink|guide|permissions|onboarding|qr …")
 }
