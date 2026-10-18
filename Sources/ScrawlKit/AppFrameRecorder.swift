@@ -1,6 +1,7 @@
 #if os(iOS)
   import AVFoundation
   import CoreMedia
+  import os
   import QuartzCore
   import UIKit
 
@@ -11,15 +12,19 @@
   /// and toasts never appear in the movie; Scrawl on the Mac draws touches and strokes
   /// from the timeline.
   ///
-  /// Frames are drawn on the main thread (UIKit requires it) by a 30 fps display link, into pixel
-  /// buffers from the writer's pool. Video and audio are both stamped on the host clock
-  /// (`CMClockGetHostTimeClock`, the clock behind `CACurrentMediaTime`), and the writer's session
-  /// starts at the first frame, so movie time 0 is the timeline's t=0.
+  /// Frames are drawn on the main thread (UIKit requires it) into pixel buffers from the writer's
+  /// pool and handed to `MovieWriter`'s background encoding queue. `FramePacer` keeps capture at
+  /// 30 fps when idle, backs off to 10–12 fps while scrolling or dragging so 120 Hz ProMotion
+  /// frames keep their budget, and captures a settled frame once motion stops. Video and audio are
+  /// both stamped on the host clock (`CMClockGetHostTimeClock`, the clock behind `CACurrentMediaTime`),
+  /// and the writer's session starts at the first frame, so movie time 0 is the timeline's t=0.
   @MainActor
   final class AppFrameRecorder: NSObject, ScrawlRecorder {
-    /// Movie pixels per point: 2× rather than the screen's 3× keeps drawing and encoding cheap
-    /// (880×1912 on a 440×956-point phone).
-    nonisolated static let pixelsPerPoint: CGFloat = 2
+    /// Movie pixels per point: 1.5× (capped at `maxLongEdge`) keeps main-thread drawing and
+    /// encoding within a 120 Hz frame budget on Pro Max phones (660×1434 on a 440×956-point phone,
+    /// matching Scrawl's 1600 px phone keyframe cap) while keeping 10.5 pt code and UI text sharp.
+    nonisolated static let pixelsPerPoint: CGFloat = 1.5
+    nonisolated static let maxLongEdge: CGFloat = 1600
     nonisolated static let framesPerSecond: Float = 30
     /// Average H.264 bitrate for recordings sent to a Mac: about 0.76 MB a second with audio.
     nonisolated static let videoBitRate = 6_000_000
@@ -28,11 +33,14 @@
     /// about 70 MB, leaving room for the encoder overshooting its average.
     nonisolated static let hostedVideoBitRate = 3_000_000
     nonisolated static let audioBitRate = 96000
+    nonisolated static let signposter = OSSignposter(subsystem: "dev.kitlangton.scrawl", category: "PointsOfInterest")
 
     private enum State { case idle, starting, recording, finished }
 
     var onInterruption: (@MainActor @Sendable () -> Void)?
     private(set) var recordsAudio = false
+    private(set) var pacer = FramePacer()
+    static private(set) var lastMetrics: FramePacer.Metrics?
     private let videoBitRate: Int
     var method: ScrawlCaptureMethod { .appFrames }
     var isAvailable: Bool { true }
@@ -51,6 +59,16 @@
     init(videoBitRate: Int = AppFrameRecorder.videoBitRate) {
       self.videoBitRate = videoBitRate
       super.init()
+    }
+
+    nonisolated static func canvasSize(
+      for points: CGSize,
+      pixelsPerPoint: CGFloat = AppFrameRecorder.pixelsPerPoint,
+      maxLongEdge: CGFloat = AppFrameRecorder.maxLongEdge
+    ) -> CGSize {
+      let longest = max(points.width, points.height)
+      let scale = longest > 0 ? min(pixelsPerPoint, maxLongEdge / longest) : pixelsPerPoint
+      return CGSize(width: even(points.width * scale), height: even(points.height * scale))
     }
 
     func start(microphone wantsMicrophone: Bool, completion: @escaping @MainActor @Sendable (Result<Date, any Error>) -> Void) {
@@ -106,7 +124,8 @@
         return
       }
       let points = scene.coordinateSpace.bounds.size
-      canvas = CGSize(width: Self.even(points.width * Self.pixelsPerPoint), height: Self.even(points.height * Self.pixelsPerPoint))
+      canvas = Self.canvasSize(for: points)
+      pacer = FramePacer()
       do {
         try? FileManager.default.removeItem(at: temporaryMovie)
         let writer = try MovieWriter(url: temporaryMovie, size: canvas, audio: microphone != nil, videoBitRate: videoBitRate)
@@ -117,8 +136,11 @@
         self.microphone = microphone
         microphone?.attach(writer)
         state = .recording
-        renderFrame(at: start)
-        let link = CADisplayLink(target: self, selector: #selector(tick))
+        let now = CACurrentMediaTime()
+        if let drawDuration = renderFrame(at: start, interacting: false) {
+          pacer.recordCapture(at: now, drawDuration: drawDuration, turnElapsed: 0, isInteracting: false)
+        }
+        let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
         link.preferredFrameRateRange = CAFrameRateRange(minimum: 15, maximum: Self.framesPerSecond, preferred: Self.framesPerSecond)
         link.add(to: .main, forMode: .common)
         displayLink = link
@@ -139,6 +161,12 @@
       }
       let end = MovieWriter.now()
       state = .finished
+      Self.lastMetrics = pacer.metrics
+      let m = pacer.metrics
+      Self.signposter.emitEvent(
+        "CaptureSummary",
+        "frames=\(m.framesCaptured) skippedCadence=\(m.ticksSkippedCadence) skippedBudget=\(m.ticksSkippedBudget) skippedBusy=\(m.ticksSkippedWriterBusy) meanDrawMs=\(m.meanDrawMs, format: .fixed(precision: 2)) maxDrawMs=\(m.maxDrawMs, format: .fixed(precision: 2)) hitches120=\(m.estimatedHitches120Hz)"
+      )
       tearDown()
       // finishWriting has to complete even if the stop came from the app leaving the foreground.
       backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Scrawl recording") { [weak self] in
@@ -168,6 +196,7 @@
     func cancel() {
       let wasRecording = state == .recording
       state = .finished
+      Self.lastMetrics = pacer.metrics
       tearDown()
       if wasRecording { writer?.cancel() }
       writer = nil
@@ -206,25 +235,74 @@
       })
     }
 
-    @objc private func tick() {
-      renderFrame(at: MovieWriter.now())
+    @objc private func tick(_ link: CADisplayLink) {
+      guard state == .recording, let writer else { return }
+      let now = CACurrentMediaTime()
+      let time = MovieWriter.now()
+      if let moveTime = Scrawl.shared.lastTouchMoveMediaTime {
+        pacer.noteInteractionMovement(at: moveTime)
+      }
+      let interacting = Scrawl.shared.isInteractingForCapture
+      let writerReady = writer.isReadyForVideo(at: time)
+      let decision = pacer.decide(
+        linkTimestamp: link.timestamp,
+        targetTimestamp: link.targetTimestamp,
+        now: now,
+        isInteracting: interacting,
+        writerReady: writerReady
+      )
+      guard case .capture = decision else {
+        if case let .skip(reason) = decision, reason != .cadence {
+          Self.signposter.emitEvent("CaptureSkip", "\(String(describing: reason))")
+        }
+        return
+      }
+      let turnElapsed = max(0, now - link.timestamp)
+      if let drawDuration = renderFrame(at: time, interacting: interacting) {
+        pacer.recordCapture(
+          at: now,
+          drawDuration: drawDuration,
+          turnElapsed: turnElapsed,
+          isInteracting: interacting
+        )
+      }
     }
 
-    /// Draws every visible app window, back to front, into a pooled pixel buffer and appends it.
-    /// A frame is skipped (never waited for) when the encoder isn't ready.
-    private func renderFrame(at time: CMTime) {
-      guard state == .recording, let writer, writer.isReadyForVideo(at: time),
-            let pool = writer.pixelBufferPool, let scene = Scrawl.activeScene
-      else { return }
-      var pixelBuffer: CVPixelBuffer?
-      guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixelBuffer) == kCVReturnSuccess,
-            let pixelBuffer
-      else { return }
-      guard draw(scene, into: pixelBuffer) else { return }
-      writer.appendVideo(pixelBuffer, at: time)
+    /// Draws every visible app window, back to front, into a pooled pixel buffer and hands it to
+    /// the writer queue. Returns the main-thread draw duration in seconds when a frame was captured.
+    @discardableResult
+    private func renderFrame(at time: CMTime, interacting: Bool = false) -> TimeInterval? {
+      guard state == .recording, let writer, let scene = Scrawl.activeScene,
+            let pixelBuffer = writer.dequeuePixelBuffer(for: time)
+      else { return nil }
+      let signpostID = Self.signposter.makeSignpostID()
+      let interval = Self.signposter.beginInterval(
+        "CaptureDraw",
+        id: signpostID,
+        "interacting=\(interacting ? 1 : 0)"
+      )
+      let t0 = CACurrentMediaTime()
+      let drew = draw(scene, into: pixelBuffer)
+      let drawDuration = max(0, CACurrentMediaTime() - t0)
+      Self.signposter.endInterval(
+        "CaptureDraw",
+        interval,
+        "ms=\(drawDuration * 1000, format: .fixed(precision: 2))"
+      )
+      guard drew else {
+        writer.abandonPixelBuffer(pixelBuffer)
+        return nil
+      }
+      writer.enqueueVideo(pixelBuffer, at: time)
+      return drawDuration
     }
 
-    private func draw(_ scene: UIWindowScene, into pixelBuffer: CVPixelBuffer) -> Bool {
+    func draw(_ scene: UIWindowScene, into pixelBuffer: CVPixelBuffer) -> Bool {
+      let windows = Self.recordedWindows(in: scene)
+      guard !windows.isEmpty else { return false }
+      let bounds = scene.coordinateSpace.bounds
+      guard bounds.width > 0, bounds.height > 0 else { return false }
+
       CVPixelBufferLockBaseAddress(pixelBuffer, [])
       defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
       let width = CVPixelBufferGetWidth(pixelBuffer)
@@ -240,24 +318,30 @@
               bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
             )
       else { return false }
-      context.setFillColor(UIColor.black.cgColor)
-      context.fill(CGRect(x: 0, y: 0, width: width, height: height))
 
       // Fit the scene into the movie (it only differs from the start if the device rotates),
       // with UIKit's top-left origin.
-      let bounds = scene.coordinateSpace.bounds
-      guard bounds.width > 0, bounds.height > 0 else { return false }
       let scale = min(CGFloat(width) / bounds.width, CGFloat(height) / bounds.height)
       let offsetX = (CGFloat(width) - bounds.width * scale) / 2
       let offsetY = (CGFloat(height) - bounds.height * scale) / 2
+      let bottomCoversScene = offsetX <= 0.5 && offsetY <= 0.5
+        && windows[0].isOpaque && windows[0].alpha >= 0.999 && windows[0].frame.contains(bounds)
+      if !bottomCoversScene {
+        context.setFillColor(UIColor.black.cgColor)
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+      }
       context.translateBy(x: offsetX, y: CGFloat(height) - offsetY)
       context.scaleBy(x: scale, y: -scale)
-      context.interpolationQuality = .medium
+      context.interpolationQuality = .low
 
       UIGraphicsPushContext(context)
       defer { UIGraphicsPopContext() }
-      for window in Self.recordedWindows(in: scene) {
-        window.drawHierarchy(in: window.frame, afterScreenUpdates: false)
+      for window in windows {
+        if window.windowScene != nil {
+          window.drawHierarchy(in: window.frame, afterScreenUpdates: false)
+        } else {
+          window.layer.render(in: context)
+        }
       }
       // The keyboard is drawn by another process and comes out black, so a labelled panel stands
       // in for it wherever it is (mid-slide too), over anything any window drew there.
@@ -267,12 +351,12 @@
       return true
     }
 
-    private static func recordedWindows(in scene: UIWindowScene) -> [UIWindow] {
-      scene.windows
+    static func recordedWindows(in scene: UIWindowScene) -> [UIWindow] {
+      let bounds = scene.coordinateSpace.bounds
+      let sorted = scene.windows
         .enumerated()
         .filter { _, window in
-          !(window is OverlayWindow) && !isKeyboardHost(window) && !window.isHidden && window.alpha > 0.01
-            && !window.frame.isEmpty
+          shouldRecordWindow(window)
         }
         .sorted { lhs, rhs in
           lhs.element.windowLevel == rhs.element.windowLevel
@@ -280,20 +364,78 @@
             : lhs.element.windowLevel < rhs.element.windowLevel
         }
         .map(\.element)
+
+      // If an upper opaque window covers the whole scene, windows beneath it are completely hidden.
+      if let topOpaqueIndex = sorted.lastIndex(where: {
+        $0.isOpaque && $0.alpha >= 0.999 && $0.frame.contains(bounds)
+      }), topOpaqueIndex > 0 {
+        return Array(sorted[topOpaqueIndex...])
+      }
+      return sorted
+    }
+
+    static func shouldRecordWindow(_ window: UIWindow) -> Bool {
+      guard !(window is OverlayWindow), !isKeyboardHost(window),
+            !window.isHidden, window.alpha > 0.01, !window.frame.isEmpty
+      else { return false }
+      if isTextEffectsWindow(window) {
+        return hasVisibleTextEffects(in: window)
+      }
+      return true
     }
 
     /// The system's keyboard window (`UIRemoteKeyboardWindow` today): its keys are another
     /// process's layers, so drawing it costs a full-screen snapshot for black pixels. Matching by
     /// name only saves that work; the keyboard panel covers the keyboard's frame whichever window
-    /// drew there, so a renamed class still records cleanly. `UITextEffectsWindow` is kept: it
-    /// holds in-app text UI (edit menus, the loupe). The keyboard's frame includes any input
-    /// accessory view, so the panel covers that too.
+    /// drew there, so a renamed class still records cleanly. `UITextEffectsWindow` is kept when it
+    /// holds visible in-app text UI (edit menus, callout bars, the loupe); when empty, skipping it
+    /// avoids a redundant full-screen snapshot pass on every frame.
     private static func isKeyboardHost(_ window: UIWindow) -> Bool {
       NSStringFromClass(type(of: window)).contains("Keyboard")
     }
 
+    private static func isTextEffectsWindow(_ window: UIWindow) -> Bool {
+      NSStringFromClass(type(of: window)).contains("TextEffects")
+    }
+
+    /// True when a `UITextEffectsWindow` has visible non-container subviews (edit menu, callout,
+    /// magnifier loupe, or input accessory content) rather than only empty full-screen host views.
+    static func hasVisibleTextEffects(in window: UIWindow) -> Bool {
+      let windowSize = window.bounds.size
+      func check(_ view: UIView, depth: Int) -> Bool {
+        guard depth <= 6, !view.isHidden, view.alpha > 0.01,
+              view.bounds.width >= 1, view.bounds.height >= 1
+        else { return false }
+        if view is UIControl || view is UILabel || view is UIImageView || view is UIVisualEffectView {
+          return true
+        }
+        let isFullWindowContainer = abs(view.bounds.width - windowSize.width) < 1
+          && abs(view.bounds.height - windowSize.height) < 1
+        if !isFullWindowContainer, view.subviews.isEmpty {
+          if let bg = view.backgroundColor, bg != .clear {
+            return true
+          }
+          if view.layer.contents != nil || (view.layer.sublayers?.isEmpty == false) {
+            return true
+          }
+        }
+        for subview in view.subviews {
+          if check(subview, depth: depth + 1) {
+            return true
+          }
+        }
+        return false
+      }
+      for child in window.subviews {
+        if check(child, depth: 1) {
+          return true
+        }
+      }
+      return false
+    }
+
     /// H.264 wants even dimensions.
-    private static func even(_ value: CGFloat) -> CGFloat {
+    nonisolated private static func even(_ value: CGFloat) -> CGFloat {
       max(2, (value / 2).rounded() * 2)
     }
   }
@@ -312,20 +454,30 @@
 
   // MARK: - Movie Writer
 
-  /// The `AVAssetWriter` behind an app-frame recording. Video is appended on the main thread and
-  /// audio on the audio engine's tap thread, so every use of the writer holds `lock`; once finishing
-  /// starts, late samples are dropped instead of being appended to a finished input.
+  /// The `AVAssetWriter` behind an app-frame recording. Pixel-buffer pool allocation, video encoding,
+  /// and audio sample appends run on `queue` so the main thread only takes `stateLock` across a few
+  /// scalar fields (never across `AVAssetWriter` or buffer-pool calls) to dequeue a pre-allocated
+  /// buffer and hand the drawn buffer off.
   final class MovieWriter: @unchecked Sendable {
-    private let lock = NSLock()
+    private struct WriterState {
+      var start = CMTime.invalid
+      var lastQueuedVideoTime = CMTime.invalid
+      var videoInFlight = false
+      var isFinishing = false
+      var pool: CVPixelBufferPool?
+      var sparePixelBuffer: CVPixelBuffer?
+      var audioSamples = 0
+    }
+
+    private let queue = DispatchQueue(label: "dev.kitlangton.scrawl.writer", qos: .userInitiated)
+    private let stateLock = NSLock()
+    private var state = WriterState()
     private let writer: AVAssetWriter
     private let video: AVAssetWriterInput
     private let adaptor: AVAssetWriterInputPixelBufferAdaptor
     private let audio: AVAssetWriterInput?
-    private var start = CMTime.invalid
     private var lastVideoTime = CMTime.invalid
     private var lastPixelBuffer: CVPixelBuffer?
-    private var isFinishing = false
-    private var audioSamples = 0
 
     /// Now on the host clock, which video frames and (converted) audio samples share.
     static func now() -> CMTime {
@@ -385,101 +537,251 @@
     }
 
     func begin(at time: CMTime) throws {
-      lock.lock()
-      defer { lock.unlock() }
       guard writer.startWriting() else {
         throw RecorderError.cannotWrite(writer.error?.localizedDescription ?? "startWriting failed")
       }
       writer.startSession(atSourceTime: time)
-      start = time
+      let pool = adaptor.pixelBufferPool
+      var initialSpare: CVPixelBuffer?
+      if let pool {
+        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &initialSpare)
+      }
+      stateLock.lock()
+      state.start = time
+      state.pool = pool
+      state.sparePixelBuffer = initialSpare
+      stateLock.unlock()
     }
 
     /// The pool holding the adaptor's reusable pixel buffers (exists once writing has begun).
     var pixelBufferPool: CVPixelBufferPool? {
-      lock.lock()
-      defer { lock.unlock() }
-      return adaptor.pixelBufferPool
+      stateLock.lock()
+      defer { stateLock.unlock() }
+      return state.pool
     }
 
     var audioSampleCount: Int {
-      lock.lock()
-      defer { lock.unlock() }
-      return audioSamples
+      stateLock.lock()
+      defer { stateLock.unlock() }
+      return state.audioSamples
     }
 
-    /// Whether a frame at `time` would be taken right now (times must strictly increase).
+    /// Whether a frame at `time` can be accepted right now without waiting on the encoder queue.
     func isReadyForVideo(at time: CMTime) -> Bool {
-      lock.lock()
-      defer { lock.unlock() }
-      return !isFinishing && writer.status == .writing && video.isReadyForMoreMediaData
-        && (lastVideoTime.isValid ? time > lastVideoTime : time >= start)
+      stateLock.lock()
+      defer { stateLock.unlock() }
+      return !state.isFinishing && !state.videoInFlight && state.start.isValid
+        && (state.lastQueuedVideoTime.isValid ? time > state.lastQueuedVideoTime : time >= state.start)
+    }
+
+    /// Claims a pre-allocated pixel buffer (or allocates one from the pool) and marks a frame in flight.
+    func dequeuePixelBuffer(for time: CMTime) -> CVPixelBuffer? {
+      stateLock.lock()
+      guard !state.isFinishing, !state.videoInFlight, state.start.isValid,
+            state.lastQueuedVideoTime.isValid ? time > state.lastQueuedVideoTime : time >= state.start
+      else {
+        stateLock.unlock()
+        return nil
+      }
+      state.videoInFlight = true
+      if let spare = state.sparePixelBuffer {
+        state.sparePixelBuffer = nil
+        stateLock.unlock()
+        return spare
+      }
+      let pool = state.pool
+      stateLock.unlock()
+
+      guard let pool else {
+        stateLock.lock()
+        state.videoInFlight = false
+        stateLock.unlock()
+        return nil
+      }
+      var buffer: CVPixelBuffer?
+      guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer) == kCVReturnSuccess,
+            let buffer
+      else {
+        stateLock.lock()
+        state.videoInFlight = false
+        stateLock.unlock()
+        return nil
+      }
+      return buffer
+    }
+
+    /// Returns an unused pixel buffer when `draw` fails before `enqueueVideo`.
+    func abandonPixelBuffer(_ pixelBuffer: CVPixelBuffer) {
+      stateLock.lock()
+      if state.sparePixelBuffer == nil, !state.isFinishing {
+        state.sparePixelBuffer = pixelBuffer
+      }
+      state.videoInFlight = false
+      stateLock.unlock()
+    }
+
+    /// Enqueues a drawn frame for asynchronous H.264 encoding on `queue` and pre-allocates the next
+    /// spare pixel buffer off the main thread.
+    func enqueueVideo(_ pixelBuffer: CVPixelBuffer, at time: CMTime) {
+      stateLock.lock()
+      guard !state.isFinishing, state.start.isValid,
+            state.lastQueuedVideoTime.isValid ? time > state.lastQueuedVideoTime : time >= state.start
+      else {
+        state.videoInFlight = false
+        stateLock.unlock()
+        return
+      }
+      state.lastQueuedVideoTime = time
+      state.videoInFlight = true
+      stateLock.unlock()
+
+      let bufferBox = UncheckedBuffer(pixelBuffer)
+      queue.async { [self] in
+        appendVideoOnQueue(bufferBox.value, at: time)
+      }
+    }
+
+    /// Synchronous append entry point used by benchmarks to compare synchronous vs asynchronous append.
+    func appendVideoSynchronously(_ pixelBuffer: CVPixelBuffer, at time: CMTime) {
+      let bufferBox = UncheckedBuffer(pixelBuffer)
+      queue.sync {
+        stateLock.lock()
+        guard !state.isFinishing, state.start.isValid,
+              state.lastQueuedVideoTime.isValid ? time > state.lastQueuedVideoTime : time >= state.start
+        else {
+          stateLock.unlock()
+          return
+        }
+        state.lastQueuedVideoTime = time
+        state.videoInFlight = true
+        stateLock.unlock()
+        appendVideoOnQueue(bufferBox.value, at: time)
+      }
     }
 
     func appendVideo(_ pixelBuffer: CVPixelBuffer, at time: CMTime) {
-      lock.lock()
-      defer { lock.unlock() }
-      guard !isFinishing, writer.status == .writing, video.isReadyForMoreMediaData,
-            lastVideoTime.isValid ? time > lastVideoTime : time >= start
-      else { return }
-      if adaptor.append(pixelBuffer, withPresentationTime: time) {
-        lastVideoTime = time
-        lastPixelBuffer = pixelBuffer
+      enqueueVideo(pixelBuffer, at: time)
+    }
+
+    /// Waits for any queued video or audio appends to finish on `queue` (used by deterministic benchmarks).
+    func flushForTesting() {
+      queue.sync {}
+    }
+
+    private func appendVideoOnQueue(_ pixelBuffer: CVPixelBuffer, at time: CMTime) {
+      let signpostID = AppFrameRecorder.signposter.makeSignpostID()
+      let interval = AppFrameRecorder.signposter.beginInterval("VideoAppend", id: signpostID)
+      defer { AppFrameRecorder.signposter.endInterval("VideoAppend", interval) }
+
+      stateLock.lock()
+      let isFinishing = state.isFinishing
+      stateLock.unlock()
+      if !isFinishing, writer.status == .writing, video.isReadyForMoreMediaData,
+         lastVideoTime.isValid ? time > lastVideoTime : true
+      {
+        if adaptor.append(pixelBuffer, withPresentationTime: time) {
+          lastVideoTime = time
+          lastPixelBuffer = pixelBuffer
+        }
       }
+      var nextSpare: CVPixelBuffer?
+      stateLock.lock()
+      let needsSpare = !state.isFinishing && state.sparePixelBuffer == nil
+      stateLock.unlock()
+      if needsSpare, let pool = adaptor.pixelBufferPool {
+        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &nextSpare)
+      }
+      stateLock.lock()
+      if !state.isFinishing, state.sparePixelBuffer == nil {
+        state.sparePixelBuffer = nextSpare
+      }
+      state.videoInFlight = false
+      stateLock.unlock()
     }
 
     /// Appends a microphone buffer already stamped on the host clock. Audio from before the first
     /// frame is dropped.
     func appendAudio(_ sampleBuffer: CMSampleBuffer) {
-      lock.lock()
-      defer { lock.unlock() }
-      guard let audio, !isFinishing, writer.status == .writing, audio.isReadyForMoreMediaData,
-            CMSampleBufferGetPresentationTimeStamp(sampleBuffer) >= start
-      else { return }
-      if audio.append(sampleBuffer) {
-        audioSamples += 1
+      let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+      stateLock.lock()
+      let allowed = !state.isFinishing && state.start.isValid && time >= state.start
+      stateLock.unlock()
+      guard allowed, audio != nil else { return }
+      let box = UncheckedSampleBuffer(sampleBuffer)
+      queue.async { [self] in
+        stateLock.lock()
+        let isFinishing = state.isFinishing
+        stateLock.unlock()
+        guard let audio, !isFinishing, writer.status == .writing, audio.isReadyForMoreMediaData else { return }
+        if audio.append(box.value) {
+          stateLock.lock()
+          state.audioSamples += 1
+          stateLock.unlock()
+        }
       }
     }
 
     /// Ends the movie at `end` (the last frame holds until then) and finishes the file.
     func finish(at end: CMTime, completion: @escaping @Sendable ((any Error)?) -> Void) {
-      lock.lock()
-      guard !isFinishing, writer.status == .writing, lastVideoTime.isValid else {
-        let reason = writer.error?.localizedDescription ?? "no frames were recorded"
-        isFinishing = true
-        if writer.status == .writing { writer.cancelWriting() }
-        lock.unlock()
-        completion(RecorderError.cannotWrite(reason))
+      stateLock.lock()
+      let alreadyFinishing = state.isFinishing
+      state.isFinishing = true
+      state.sparePixelBuffer = nil
+      stateLock.unlock()
+      guard !alreadyFinishing else {
+        completion(RecorderError.cannotWrite("already finishing"))
         return
       }
-      // With an audio track the movie ends at the last frame rather than at `endSession`, so the
-      // last frame is repeated at `end` to make the movie as long as the timeline.
-      if let lastPixelBuffer, end > lastVideoTime, video.isReadyForMoreMediaData,
-         adaptor.append(lastPixelBuffer, withPresentationTime: end)
-      {
-        lastVideoTime = end
-      }
-      self.lastPixelBuffer = nil
-      isFinishing = true
-      video.markAsFinished()
-      audio?.markAsFinished()
-      writer.endSession(atSourceTime: max(end, lastVideoTime))
-      lock.unlock()
-      writer.finishWriting { [self] in
-        if writer.status == .completed {
-          completion(nil)
-        } else {
-          completion(RecorderError.cannotWrite(writer.error?.localizedDescription ?? "finishWriting failed"))
+      queue.async { [self] in
+        guard writer.status == .writing, lastVideoTime.isValid else {
+          let reason = writer.error?.localizedDescription ?? "no frames were recorded"
+          if writer.status == .writing { writer.cancelWriting() }
+          completion(RecorderError.cannotWrite(reason))
+          return
+        }
+        // With an audio track the movie ends at the last frame rather than at `endSession`, so the
+        // last frame is repeated at `end` to make the movie as long as the timeline.
+        if let lastPixelBuffer, end > lastVideoTime, video.isReadyForMoreMediaData,
+           adaptor.append(lastPixelBuffer, withPresentationTime: end)
+        {
+          lastVideoTime = end
+        }
+        self.lastPixelBuffer = nil
+        video.markAsFinished()
+        audio?.markAsFinished()
+        writer.endSession(atSourceTime: max(end, lastVideoTime))
+        writer.finishWriting { [self] in
+          if writer.status == .completed {
+            completion(nil)
+          } else {
+            completion(RecorderError.cannotWrite(writer.error?.localizedDescription ?? "finishWriting failed"))
+          }
         }
       }
     }
 
     func cancel() {
-      lock.lock()
-      defer { lock.unlock() }
-      guard !isFinishing else { return }
-      isFinishing = true
-      if writer.status == .writing { writer.cancelWriting() }
+      stateLock.lock()
+      let alreadyFinishing = state.isFinishing
+      state.isFinishing = true
+      state.sparePixelBuffer = nil
+      stateLock.unlock()
+      guard !alreadyFinishing else { return }
+      queue.async { [self] in
+        self.lastPixelBuffer = nil
+        if writer.status == .writing { writer.cancelWriting() }
+      }
     }
+  }
+
+  private struct UncheckedBuffer: @unchecked Sendable {
+    let value: CVPixelBuffer
+    init(_ value: CVPixelBuffer) { self.value = value }
+  }
+
+  private struct UncheckedSampleBuffer: @unchecked Sendable {
+    let value: CMSampleBuffer
+    init(_ value: CMSampleBuffer) { self.value = value }
   }
 
   // MARK: - Microphone

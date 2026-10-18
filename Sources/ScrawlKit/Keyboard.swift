@@ -125,8 +125,8 @@
     private struct Style {
       let background: UIColor
       let separator: UIColor
-      let label: NSAttributedString
-      let glyph: UIImage?
+      let badge: UIImage
+      let badgeSize: CGSize
     }
 
     private static var styles: [Bool: Style] = [:]
@@ -139,16 +139,15 @@
       style.separator.setFill()
       UIRectFill(CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: 0.5))
 
-      let labelSize = style.label.size()
-      let glyphSize = style.glyph?.size ?? .zero
-      let spacing: CGFloat = glyphSize == .zero ? 0 : 6
-      let width = glyphSize.width + spacing + labelSize.width
+      let size = style.badgeSize
+      guard size.width > 0, rect.height > size.height + 4 else { return }
       // Centred in the keys area, or in whatever part is on screen while it slides.
-      let centerY = rect.midY
-      let originX = rect.midX - width / 2
-      guard rect.height > max(labelSize.height, glyphSize.height) + 4 else { return }
-      style.glyph?.draw(in: CGRect(x: originX, y: centerY - glyphSize.height / 2, width: glyphSize.width, height: glyphSize.height))
-      style.label.draw(at: CGPoint(x: originX + glyphSize.width + spacing, y: centerY - labelSize.height / 2))
+      style.badge.draw(in: CGRect(
+        x: rect.midX - size.width / 2,
+        y: rect.midY - size.height / 2,
+        width: size.width,
+        height: size.height
+      ))
     }
 
     private static func style(dark: Bool) -> Style {
@@ -161,7 +160,28 @@
       let label = NSAttributedString(string: "Keyboard", attributes: [.font: font, .foregroundColor: ink])
       let glyph = UIImage(systemName: "keyboard", withConfiguration: UIImage.SymbolConfiguration(font: font))?
         .withTintColor(ink, renderingMode: .alwaysOriginal)
-      let style = Style(background: background, separator: separator, label: label, glyph: glyph)
+      let labelSize = label.size()
+      let glyphSize = glyph?.size ?? .zero
+      let spacing: CGFloat = glyphSize == .zero ? 0 : 6
+      let badgeSize = CGSize(
+        width: (glyphSize.width + spacing + labelSize.width).rounded(.up),
+        height: max(labelSize.height, glyphSize.height).rounded(.up)
+      )
+      let format = UIGraphicsImageRendererFormat.default()
+      format.opaque = false
+      let badge = UIGraphicsImageRenderer(size: badgeSize, format: format).image { _ in
+        glyph?.draw(in: CGRect(
+          x: 0,
+          y: (badgeSize.height - glyphSize.height) / 2,
+          width: glyphSize.width,
+          height: glyphSize.height
+        ))
+        label.draw(at: CGPoint(
+          x: glyphSize.width + spacing,
+          y: (badgeSize.height - labelSize.height) / 2
+        ))
+      }
+      let style = Style(background: background, separator: separator, badge: badge, badgeSize: badgeSize)
       styles[dark] = style
       return style
     }
