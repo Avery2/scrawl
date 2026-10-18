@@ -70,6 +70,8 @@ cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
   <string>Scrawl mirrors and records a cabled iPhone's screen.</string>
   <key>NSSpeechRecognitionUsageDescription</key>
   <string>Scrawl transcribes your narration on this Mac.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Scrawl reads the address of the browser tab you captured, to send a capture of a dev site to its project's session.</string>
   <key>SUEnableAutomaticChecks</key>
   <false/>
   <key>SUAutomaticallyUpdate</key>

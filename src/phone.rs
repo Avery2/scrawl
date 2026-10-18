@@ -1285,6 +1285,7 @@ fn serve_http(port: u16, config: IngestConfig) -> Result<()> {
     let listener = std::net::TcpListener::bind(&addr)
         .with_context(|| format!("port {port} already in use"))?;
     scrawl_log(format!("ingest server listening on {addr}"));
+    crate::web::set_serving();
     // Only the process that owns the port retries deliveries, so two never race over a bundle.
     if config.route_opencode {
         crate::delivery::spawn_retries(config.captures_dir(), config.hooks.forward, mark_sent);
@@ -1498,31 +1499,9 @@ fn build_ingested(
         let _ = crate::handoff::copy_bundle_to_clipboard(&dir);
     }
     let delivery = match session {
-        Some(session) if config.route_opencode => match (config.hooks.forward)(&dir, session) {
-            Ok(()) => Delivery::Sent {
-                title: title.to_owned(),
-            },
-            Err(err) => {
-                let error = format!("{err:#}");
-                scrawl_log(format!(
-                    "ingest: OpenCode send to {title} failed ({error}); retrying from the Mac"
-                ));
-                let pending = crate::delivery::Pending::new(
-                    session,
-                    title,
-                    Some(key),
-                    &error,
-                    crate::now_epoch_ms(),
-                );
-                if let Err(err) = pending.write(&dir) {
-                    scrawl_log(format!("ingest: {err:#}"));
-                }
-                Delivery::Queued {
-                    title: title.to_owned(),
-                    error,
-                }
-            }
-        },
+        Some(session) if config.route_opencode => {
+            crate::delivery::deliver(&dir, session, title, Some(key), config.hooks.forward)
+        }
         _ => Delivery::Saved,
     };
     let status = delivery.status(if config.copy_clipboard {
@@ -1592,6 +1571,10 @@ fn handle_ingest_connection_with_token(
         return Ok(());
     }
     let header = String::from_utf8_lossy(&header);
+    // The dev-page SDK's routes check their own access (loopback pages, or the token).
+    if crate::web::handle(&mut stream, &header, expected_token)? {
+        return Ok(());
+    }
     let authorized = bearer_token(&header)
         .is_some_and(|provided| constant_time_eq(provided, expected_token));
     if !authorized {

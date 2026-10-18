@@ -103,6 +103,27 @@ pub struct ScrawlBundle {
     /// the full frames are kept beside them).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autocrop: Option<AutocropInfo>,
+    /// The OpenCode session a Mac capture of a dev site was sent to (`routing`), so `scrawl send`
+    /// recovers to the same place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<Destination>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Destination {
+    pub session: String,
+    #[serde(default)]
+    pub title: String,
+    /// `"sdk"` (the page registered through `/sdk.js`) or `"localhost"` (matched by the port's
+    /// process directory).
+    pub via: String,
+    /// The browser tab the capture was of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The project directory the session was chosen by, when it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory: Option<String>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {

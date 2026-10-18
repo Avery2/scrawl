@@ -1406,6 +1406,7 @@ mod tests {
             windows: Vec::new(),
             cursor: Vec::new(),
             autocrop: None,
+            destination: None,
         }
     }
 

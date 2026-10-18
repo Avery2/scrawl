@@ -139,6 +139,36 @@ pub fn backoff_ms(attempts: u32) -> u64 {
 
 pub type Forward = fn(&Path, &str) -> Result<()>;
 
+/// Queues the bundle at `dir` into `session` through `forward`. If that fails, leaves a `PENDING`
+/// marker so the port owner retries it, and says so.
+pub fn deliver(
+    dir: &Path,
+    session: &str,
+    title: &str,
+    key: Option<&str>,
+    forward: Forward,
+) -> Delivery {
+    match forward(dir, session) {
+        Ok(()) => Delivery::Sent {
+            title: title.to_owned(),
+        },
+        Err(err) => {
+            let error = format!("{err:#}");
+            scrawl_log(format!(
+                "deliver: OpenCode send to {title} failed ({error}); retrying from the Mac"
+            ));
+            let pending = Pending::new(session, title, key, &error, crate::now_epoch_ms());
+            if let Err(err) = pending.write(dir) {
+                scrawl_log(format!("deliver: {err:#}"));
+            }
+            Delivery::Queued {
+                title: title.to_owned(),
+                error,
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Report {
     /// Bundles that went through, with their markers.

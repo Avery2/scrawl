@@ -206,6 +206,40 @@ pub struct OpenCodeSession {
     pub parent_id: Option<String>,
     #[serde(default)]
     pub time: OpenCodeSessionTime,
+    /// V2 puts the session's working directory here; V1 used a top-level `directory`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<OpenCodeSessionLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory: Option<String>,
+}
+
+impl OpenCodeSession {
+    pub fn directory(&self) -> Option<&str> {
+        self.location
+            .as_ref()
+            .and_then(|l| l.directory.as_deref())
+            .or(self.directory.as_deref())
+            .filter(|d| !d.is_empty())
+    }
+
+    pub fn is_open_root(&self) -> bool {
+        self.parent_id.is_none() && self.time.archived.is_none()
+    }
+
+    /// The title, or the ID when it has none.
+    pub fn label(&self) -> &str {
+        if self.title.is_empty() {
+            &self.id
+        } else {
+            &self.title
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct OpenCodeSessionLocation {
+    #[serde(default)]
+    pub directory: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -276,6 +310,10 @@ pub struct Config {
     /// `false` turns Screen-capture auto-crop off; an object overrides its settings.
     #[serde(default)]
     pub autocrop: Option<serde_json::Value>,
+    /// `false` keeps Mac captures of a dev site on the clipboard instead of sending them to the
+    /// site's OpenCode session (`routing`).
+    #[serde(default)]
+    pub auto_send: Option<bool>,
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -374,6 +412,41 @@ pub fn ensure_ingest_token_in(path: &Path) -> Result<String> {
 
 pub fn ensure_ingest_token() -> Result<String> {
     ensure_ingest_token_in(&default_config_path())
+}
+
+/// Whether Mac captures of a dev site go straight to its session (`autoSend`, default on).
+pub fn auto_send() -> bool {
+    config().auto_send.unwrap_or(true)
+}
+
+/// Sets one top-level key in `path`, keeping the rest (and its `0600` mode, since it holds the
+/// ingest token).
+pub fn set_config_value_in(path: &Path, key: &str, value: serde_json::Value) -> Result<()> {
+    let mut config = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    config[key] = value;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let mut body = serde_json::to_vec_pretty(&config)?;
+    body.push(b'\n');
+    fs::write(&tmp, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    }
+    fs::rename(&tmp, path).with_context(|| format!("Could not write {}", path.display()))
+}
+
+pub fn set_config_value(key: &str, value: serde_json::Value) -> Result<()> {
+    set_config_value_in(&default_config_path(), key, value)
 }
 
 /// Bundle IDs whose `Documents/Scrawl` (and legacy `Documents/Tether`) container the USB watcher
@@ -588,8 +661,17 @@ pub(crate) fn query_escape(value: &str) -> String {
 }
 
 pub fn list_opencode_sessions() -> Result<Vec<OpenCodeSession>> {
+    list_sessions_from("/api/session")
+}
+
+/// Root sessions only (the server filters them), newest first.
+pub fn list_root_sessions() -> Result<Vec<OpenCodeSession>> {
+    list_sessions_from("/api/session?parentID=null&limit=100")
+}
+
+fn list_sessions_from(first: &str) -> Result<Vec<OpenCodeSession>> {
     let mut sessions = Vec::new();
-    let mut path = "/api/session".to_owned();
+    let mut path = first.to_owned();
     let mut cursors = std::collections::HashSet::new();
     loop {
         let response: serde_json::Value =
@@ -641,17 +723,23 @@ pub fn send_to_opencode(
     Ok(id)
 }
 
-/// The session a ScrawlKit recording was addressed to: `timeline.json`'s top-level `session`.
+/// The session a recording was addressed to: a ScrawlKit `timeline.json`'s top-level `session`,
+/// else the `destination` a Mac capture of a dev site was routed to (`scrawl.json`).
 /// `context.session` only names the session that was on screen, and never chooses a destination.
 pub fn recorded_destination(bundle_dir: &Path) -> Option<String> {
-    let timeline: serde_json::Value =
-        serde_json::from_slice(&fs::read(bundle_dir.join("timeline.json")).ok()?).ok()?;
-    timeline
-        .get("session")?
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
+    let read = |name: &str| -> Option<serde_json::Value> {
+        serde_json::from_slice(&fs::read(bundle_dir.join(name)).ok()?).ok()
+    };
+    let session = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    read("timeline.json")
+        .and_then(|timeline| session(timeline.get("session")))
+        .or_else(|| read("scrawl.json").and_then(|b| session(b.pointer("/destination/session"))))
 }
 
 fn choose_destination<'a>(
@@ -1123,6 +1211,40 @@ mod tests {
             let mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn auto_send_defaults_on_and_the_toggle_keeps_other_keys() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("config.json");
+        fs::write(&path, br#"{"ingestToken":"abc","retention":{"mediaDays":7}}"#).unwrap();
+        assert_eq!(load_config_from(&path).auto_send, None);
+        set_config_value_in(&path, "autoSend", serde_json::Value::Bool(false)).unwrap();
+        let config = load_config_from(&path);
+        assert_eq!(config.auto_send, Some(false));
+        assert_eq!(config.ingest_token.as_deref(), Some("abc"));
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["retention"]["mediaDays"], 7);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn sessions_read_their_directory_from_v2_location_or_v1_field() {
+        let v2: OpenCodeSession = serde_json::from_str(
+            r#"{"id":"ses_a","title":"A","time":{"updated":1},"location":{"directory":"/p/a"}}"#,
+        )
+        .unwrap();
+        assert_eq!(v2.directory(), Some("/p/a"));
+        assert!(v2.is_open_root());
+        let v1: OpenCodeSession =
+            serde_json::from_str(r#"{"id":"ses_b","parentID":"ses_a","directory":"/p/b"}"#).unwrap();
+        assert_eq!(v1.directory(), Some("/p/b"));
+        assert!(!v1.is_open_root());
+        assert_eq!(v1.label(), "ses_b");
     }
 
     #[test]

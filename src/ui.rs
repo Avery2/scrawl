@@ -193,12 +193,35 @@ fn completed_meta(_duration_ms: u64, frame_count: usize) -> String {
     )
 }
 
-/// Lead text of the Completed island: local captures were copied; iPhone ones count the inbox.
-fn completed_label(inbox_count: usize) -> String {
+/// Lead text of the Completed island: local captures were copied (or sent, as `note` says);
+/// iPhone ones count the inbox.
+fn completed_label(inbox_count: usize, note: Option<&str>) -> String {
     match inbox_count {
-        0 => "Copied".to_owned(),
+        0 => note.unwrap_or("Copied").to_owned(),
         1 => "From iPhone".to_owned(),
         n => format!("{n} from iPhone"),
+    }
+}
+
+/// A session title short enough for the island.
+fn island_title(title: &str) -> String {
+    const MAX: usize = 24;
+    if title.chars().count() > MAX {
+        format!(
+            "{}…",
+            title.chars().take(MAX - 1).collect::<String>().trim_end()
+        )
+    } else {
+        title.to_owned()
+    }
+}
+
+/// The Completed island's lead once a local capture's send is done.
+fn completed_delivery_note(delivery: &crate::delivery::Delivery, title: &str) -> String {
+    match delivery {
+        crate::delivery::Delivery::Sent { .. } => format!("Sent to {title}"),
+        crate::delivery::Delivery::Queued { .. } => format!("Copied · couldn't reach {title}"),
+        crate::delivery::Delivery::Saved => "Copied".to_owned(),
     }
 }
 
@@ -282,6 +305,7 @@ fn island_content_width(
     iphone: bool,
     hold: bool,
     chips: bool,
+    completed_note: Option<&str>,
 ) -> f32 {
     let divider = 1.0 + 2.0 * DIVIDER_MX;
     let inner = match phase {
@@ -319,7 +343,7 @@ fn island_content_width(
                 + 8.0
                 + measure_text(
                     window,
-                    &completed_label(inbox_count),
+                    &completed_label(inbox_count, completed_note),
                     HUD_TEXT,
                     FontWeight::SEMIBOLD,
                 )
@@ -345,6 +369,7 @@ enum MenuAction {
     RunDemo,
     Welcome,
     KeepRecordings(crate::retention::Preset),
+    ToggleAutoSend,
     ShowCaptures,
     CheckForUpdates,
     Quit,
@@ -404,6 +429,11 @@ objc2::define_class!(
             }
         }
 
+        #[unsafe(method(toggleAutoSend:))]
+        fn toggle_auto_send(&self, _sender: &AnyObject) {
+            let _ = self.ivars().sender.try_send(MenuAction::ToggleAutoSend);
+        }
+
         #[unsafe(method(showCaptures:))]
         fn show_captures(&self, _sender: &AnyObject) {
             let _ = self.ivars().sender.try_send(MenuAction::ShowCaptures);
@@ -436,6 +466,9 @@ objc2::define_class!(
         fn menu_needs_update(&self, menu: &NSMenu) {
             rebuild_inbox_menu_items(menu, self);
             refresh_keep_menu(menu);
+            if let Some(item) = menu.itemWithTag(AUTO_SEND_MENU_TAG) {
+                item.setState(if crate::handoff::auto_send() { 1 } else { 0 });
+            }
         }
     }
 );
@@ -444,6 +477,8 @@ objc2::define_class!(
 const INBOX_MENU_TAG: isize = 0x5c4a;
 /// Tag on the Keep Recordings item; its choices are tagged one past it, in `Preset::ALL` order.
 const KEEP_MENU_TAG: isize = 0x5c50;
+/// Tag on the toggle for sending dev-site captures to their session (`crate::routing`).
+const AUTO_SEND_MENU_TAG: isize = 0x5c4f;
 
 /// Ticks the current Keep Recordings choice and shows how much the captures take up.
 fn refresh_keep_menu(menu: &NSMenu) {
@@ -637,6 +672,10 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
     keep_item.setTag(KEEP_MENU_TAG);
     keep_item.setSubmenu(Some(&keep));
     menu.addItem(&keep_item);
+    add("Send Dev Site Captures to OpenCode", sel!(toggleAutoSend:));
+    if let Some(item) = menu.itemAtIndex(menu.numberOfItems() - 1) {
+        item.setTag(AUTO_SEND_MENU_TAG);
+    }
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     add("Welcome to Scrawl…", sel!(welcome:));
     add("Check for Updates…", sel!(checkForUpdates:));
@@ -1177,6 +1216,9 @@ pub struct ScrawlCoordinator {
     iphone: Option<PhoneDevice>,
     /// The bundle the Completed island is showing.
     completed_dir: Option<PathBuf>,
+    /// The Completed island's lead text for a local capture sent to a session ("Sent to …"),
+    /// instead of "Copied".
+    completed_note: Option<String>,
     /// When this Mac last finished a capture, so ⌥⇧V prefers it over older inbox items.
     last_local_capture_ms: u64,
     inbox: crate::inbox::Inbox,
@@ -1246,6 +1288,7 @@ impl ScrawlCoordinator {
             selected_keyframe: 0,
             iphone: None,
             completed_dir: None,
+            completed_note: None,
             last_local_capture_ms: 0,
             inbox: crate::inbox::Inbox::load_default(),
             last_mode: SelectionMode::load_last_used(),
@@ -2046,6 +2089,54 @@ impl ScrawlCoordinator {
         });
     }
 
+    /// Sends a finished local capture to the session it was routed to, and says how that went
+    /// on the Completed island and in the review window.
+    fn send_completed(
+        &mut self,
+        dir: PathBuf,
+        dest: crate::model::Destination,
+        cx: &mut Context<Self>,
+    ) {
+        let title = island_title(&dest.title);
+        self.completed_note = Some(format!("Sending to {title}…"));
+        let (sender, receiver) = flume::bounded(1);
+        let send_dir = dir.clone();
+        let spawned = std::thread::Builder::new()
+            .name("scrawl-send".into())
+            .spawn(move || {
+                let _ = sender.send(crate::delivery::deliver(
+                    &send_dir,
+                    &dest.session,
+                    &dest.title,
+                    None,
+                    crate::handoff::send_bundle_to_session,
+                ));
+            });
+        if spawned.is_err() {
+            self.completed_note = None;
+            return;
+        }
+        cx.spawn(async move |entity, cx| {
+            let Ok(delivery) = receiver.recv_async().await else {
+                return;
+            };
+            let _ = entity.update(cx, |coord, cx| {
+                if coord.completed_dir.as_deref() == Some(dir.as_path()) {
+                    coord.completed_note = Some(completed_delivery_note(&delivery, &title));
+                }
+                if coord
+                    .review_bundle
+                    .as_ref()
+                    .is_some_and(|(shown, _)| *shown == dir)
+                {
+                    coord.review_status = Some(delivery.status("Copied to clipboard"));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub fn step_island(&mut self, dt_sec: f32, cx: &mut Context<Self>) {
         let dt = dt_sec.clamp(0.001, 0.05);
         if let IslandPhase::Completed { finished_at, .. } = self.island_phase
@@ -2570,7 +2661,22 @@ impl ScrawlCoordinator {
         // media teardown, transcription, and PNG encoding run on a background worker.
         drop(rec._metal_overlay);
         self.set_island_phase(IslandPhase::Processing);
+        self.completed_note = None;
         cx.notify();
+
+        // A capture that ends on a dev site goes to its project's session; work that out (reading
+        // the browser tab, the port's process, the sessions) while the bundle is built.
+        let route = matches!(source, CaptureSource::Screen { .. }).then(|| {
+            // A window capture is of that window's app, whatever is in front at the end.
+            let front = (target.mode != CaptureMode::Window)
+                .then(crate::capture::frontmost_app_info)
+                .flatten()
+                .and_then(|(_, _, id)| id);
+            let captured = target.bundle_id.clone();
+            std::thread::spawn(move || {
+                crate::routing::route_capture(front.as_deref(), captured.as_deref())
+            })
+        });
 
         cx.spawn(async move |entity, cx| {
             let result = cx
@@ -2618,7 +2724,7 @@ impl ScrawlCoordinator {
                     activity.stop_started = Some(stop_started);
                     activity.stop_ms = Some(stop_started.elapsed().as_millis() as u64);
                     let duration_ms = recording.duration_ms;
-                    let finalized = crate::finalize_capture_bundle(
+                    let mut finalized = crate::finalize_capture_bundle(
                         &bundle_dir,
                         target,
                         recording,
@@ -2628,6 +2734,12 @@ impl ScrawlCoordinator {
                         None,
                         activity,
                     );
+                    if let Ok((dir, bundle, _)) = &mut finalized
+                        && let Some(Ok(Some(dest))) = route.map(std::thread::JoinHandle::join)
+                        && let Err(err) = crate::routing::record_destination(dir, bundle, dest)
+                    {
+                        scrawl_log(format!("routing: couldn't record the destination: {err:#}"));
+                    }
                     (finalized, duration_ms)
                 })
                 .await;
@@ -2641,7 +2753,10 @@ impl ScrawlCoordinator {
                     let _ = crate::handoff::copy_bundle_to_clipboard(&dir);
                     coord.completed_dir = Some(dir.clone());
                     coord.last_local_capture_ms = crate::now_epoch_ms();
-                    coord.set_review_bundle((dir, bundle), None);
+                    if let Some(dest) = bundle.destination.clone() {
+                        coord.send_completed(dir.clone(), dest, cx);
+                    }
+                    coord.set_review_bundle((dir, bundle), coord.completed_note.clone());
                 }
                 coord.set_island_phase(IslandPhase::Completed {
                     finished_at: Instant::now(),
@@ -2695,6 +2810,7 @@ impl Render for HudPillWindow {
 
         let clock = format_clock(elapsed_ms);
         let has_iphone = coord.iphone.is_some();
+        let completed_note = coord.completed_note.clone();
         let hold = coord.hold_picker;
         // The Recording capsule's trailing group: switch chips or controls, and the swap between.
         let chips = if matches!(phase, IslandPhase::Recording) {
@@ -2713,8 +2829,15 @@ impl Render for HudPillWindow {
             .then_some(coord.reveal_outgoing)
             .flatten()
             .filter(|_| swap_age < enter_s.max(exit_s));
-        let target_width =
-            island_content_width(window, target_phase, &clock, has_iphone, hold, chips);
+        let target_width = island_content_width(
+            window,
+            target_phase,
+            &clock,
+            has_iphone,
+            hold,
+            chips,
+            completed_note.as_deref(),
+        );
         let snap_initial_width =
             phase_age < 0.025 && matches!(phase, IslandPhase::Selecting { .. }) && opacity < 0.35;
         self.coordinator.update(cx, |coord, _| {
@@ -2855,7 +2978,7 @@ impl Render for HudPillWindow {
                                 .ml(px(8.0))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(TEXT_COLOR))
-                                .child(completed_label(inbox_count)),
+                                .child(completed_label(inbox_count, completed_note.as_deref())),
                         ),
                 )
                 .child(island_divider())
@@ -4842,6 +4965,15 @@ pub fn run_app(
                                     }
                                     crate::retention::nudge();
                                 }
+                                MenuAction::ToggleAutoSend => {
+                                    let on = !crate::handoff::auto_send();
+                                    if let Err(error) = crate::handoff::set_config_value(
+                                        "autoSend",
+                                        serde_json::Value::Bool(on),
+                                    ) {
+                                        scrawl_log(format!("Saving autoSend failed: {error:#}"));
+                                    }
+                                }
                                 MenuAction::ShowCaptures => {
                                     let dir = crate::handoff::default_captures_dir();
                                     let _ = std::fs::create_dir_all(&dir);
@@ -5266,9 +5398,27 @@ mod tests {
     fn clock_template_is_width_stable() {
         assert_eq!(clock_template("12:34"), "00:00");
         assert_eq!(completed_meta(8_000, 1), "· 1 frame · ⌥⇧V");
-        assert_eq!(completed_label(0), "Copied");
-        assert_eq!(completed_label(1), "From iPhone");
-        assert_eq!(completed_label(3), "3 from iPhone");
+        assert_eq!(completed_label(0, None), "Copied");
+        assert_eq!(completed_label(0, Some("Sent to SCRAWL")), "Sent to SCRAWL");
+        assert_eq!(completed_label(1, Some("Sent to SCRAWL")), "From iPhone");
+        assert_eq!(completed_label(3, None), "3 from iPhone");
+        assert_eq!(island_title("SCRAWL"), "SCRAWL");
+        assert_eq!(
+            island_title("Make Mac captures route to the site session"),
+            "Make Mac captures route…"
+        );
+        let queued = crate::delivery::Delivery::Queued {
+            title: "SCRAWL".into(),
+            error: "offline".into(),
+        };
+        assert_eq!(
+            completed_delivery_note(&queued, "SCRAWL"),
+            "Copied · couldn't reach SCRAWL"
+        );
+        let sent = crate::delivery::Delivery::Sent {
+            title: "SCRAWL".into(),
+        };
+        assert_eq!(completed_delivery_note(&sent, "SCRAWL"), "Sent to SCRAWL");
     }
 
     #[test]

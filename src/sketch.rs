@@ -466,6 +466,18 @@ pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> 
         format_clock(bundle.duration_ms),
         bundle_dir.display()
     );
+    if let Some(dest) = &bundle.destination {
+        let title = if dest.title.is_empty() {
+            &dest.session
+        } else {
+            &dest.title
+        };
+        out.push_str(&format!("For session: {title} ({})", dest.session));
+        if let Some(url) = &dest.url {
+            out.push_str(&format!(" · page {url}"));
+        }
+        out.push('\n');
+    }
     // The screen at the start and the app's own values, on one line.
     let start_screen = bundle.screen_at(0);
     let context: Vec<String> = start_screen
@@ -1345,6 +1357,7 @@ mod tests {
             windows: Vec::new(),
             cursor: Vec::new(),
             autocrop: None,
+            destination: None,
         };
         let tl = timeline(&bundle).join("\n");
         assert!(tl.find("0:03 “").unwrap() < tl.find("0:04 · pressed").unwrap());

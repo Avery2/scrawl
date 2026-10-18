@@ -15,10 +15,12 @@ mod onboarding;
 mod phone;
 mod render;
 mod retention;
+mod routing;
 mod sketch;
 mod sparkle;
 mod transcribe;
 mod ui;
+mod web;
 mod windows;
 mod zoom;
 
@@ -257,7 +259,8 @@ enum Command {
         #[arg(default_value = "latest")]
         bundle: PathBuf,
         /// Target OpenCode session ID (`ses_...`). If omitted, an iPhone recording goes to the
-        /// session it was addressed to, anything else to the most recent active session.
+        /// session it was addressed to, a Mac capture of a dev site to the session it was routed
+        /// to, anything else to the most recent active session.
         #[arg(long)]
         session: Option<String>,
         /// Send an iPhone recording to `--session` even though it was addressed to another.
@@ -266,6 +269,16 @@ enum Command {
         /// Copy to the macOS clipboard instead of posting to OpenCode.
         #[arg(long)]
         clipboard: bool,
+    },
+    /// Print which OpenCode session a capture of a browser tab would be sent to, without
+    /// sending: a page registered through `/sdk.js`, else the project serving a localhost port.
+    Route {
+        /// The tab's URL.
+        #[arg(long, conflicts_with = "browser")]
+        url: Option<String>,
+        /// Read the front tab of this browser instead (bundle ID, e.g. `com.brave.Browser`).
+        #[arg(long)]
+        browser: Option<String>,
     },
     /// Open a `.scrawl` bundle in the native GPUI review window.
     Preview {
@@ -755,6 +768,7 @@ pub fn build_bundle_from_parts(
             windows: extras.activity.windows,
             cursor: extras.activity.cursor,
             autocrop: prep.autocrop,
+            destination: None,
         };
         let summary = summary_markdown(&bundle, bundle_dir);
         std::fs::create_dir_all(bundle_dir.join("frames"))
@@ -905,6 +919,7 @@ pub fn build_bundle_from_parts(
         windows: extras.activity.windows,
         cursor: extras.activity.cursor,
         autocrop: cropped.as_ref().map(|(info, _)| info.clone()),
+        destination: None,
     };
 
     let (full_sheet, contact_sheet) = std::thread::scope(|scope| {
@@ -1758,6 +1773,19 @@ fn main() -> Result<()> {
                     "Sent {} to OpenCode session {target_session}",
                     dir.display()
                 );
+            }
+            Ok(())
+        }
+        Command::Route { url, browser } => {
+            let url = match (url, browser) {
+                (Some(url), _) => url,
+                (None, Some(browser)) => routing::browser_tab_url(&browser)
+                    .with_context(|| format!("Couldn't read the front tab of {browser}"))?,
+                (None, None) => anyhow::bail!("Pass --url or --browser"),
+            };
+            match routing::route(&url, &routing::Hooks::default()) {
+                Ok(dest) => println!("{}", serde_json::to_string_pretty(&dest)?),
+                Err(reason) => println!("{url}: clipboard only ({reason})"),
             }
             Ok(())
         }

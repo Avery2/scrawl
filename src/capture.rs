@@ -1478,7 +1478,7 @@ pub fn frontmost_external_pid() -> Option<i32> {
     (fallback > 0 && fallback != our_pid).then_some(fallback)
 }
 
-fn frontmost_app_info() -> Option<(i32, String, Option<String>)> {
+pub fn frontmost_app_info() -> Option<(i32, String, Option<String>)> {
     use objc2_app_kit::{NSRunningApplication, NSWorkspace};
     let our_pid = std::process::id() as i32;
     let workspace = NSWorkspace::sharedWorkspace();
