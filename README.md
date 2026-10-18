@@ -581,6 +581,32 @@ word was spoken. The word timings drive two things:
   "there" count only when they coincide with a change, because they are usually filler. Speech
   pauses never cut keyframes.
 
+### Apple or Hex
+
+Apple's SpeechAnalyzer is the default and needs nothing. If you use Hex
+(2.2 or later, running), Scrawl can transcribe with it instead and with whichever model Hex has
+ready: menu → **Transcription** → **Hex**, then pick a model under **Hex model**. Or in
+`~/.config/scrawl/config.json`:
+
+```json
+{ "transcriber": "hex", "hexModel": "parakeet_v3" }
+```
+
+`"transcriber"` is `"apple"` (default) or `"hex"`; `hexModel` defaults to the first ready one of
+`parakeet_unified_en`, `parakeet_v3`, `parakeet_v2`, `whisper_large_v3_turbo`. Scrawl never
+downloads or prepares a model: install it in Hex first.
+
+- Hex is optional. When it isn't running, **Hex** is greyed out as "Hex (not running)" and Scrawl
+  uses Apple, whatever the saved preference. If Hex fails on a recording, that recording falls back
+  to Apple Speech (see `~/Library/Logs/Scrawl`).
+- Hex returns text without word times, so Scrawl sends each stretch of speech separately and
+  spreads its words across it by length. The transcript says `"source": "hex:<model>"` and
+  `"estimated": true`; because those times are approximate, spoken cues ("now", "here") don't cut
+  keyframes from a Hex transcript. Marks, clicks, laser and scene changes still do.
+- `scrawl hex status` shows whether Hex is connected, its ready models and what the next recording
+  will use. `scrawl reprocess <bundle> --out … --transcriber hex|apple` (also `scrawl import`) picks
+  an engine for one run.
+
 ## Helper
 
 `scrawl-helper` is a small Swift executable built by `build.rs` from `helper/` and shipped inside

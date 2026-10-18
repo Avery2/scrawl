@@ -200,6 +200,75 @@ pub fn recorded_audio_from_wav(wav_bytes: Vec<u8>) -> Result<RecordedAudio> {
     })
 }
 
+/// Decodes a 16 kHz mono 16-bit WAV (this module's own format) into samples.
+pub fn decode_wav_16k(wav_bytes: &[u8]) -> Result<Vec<f32>> {
+    let reader = hound::WavReader::new(Cursor::new(wav_bytes))?;
+    let spec = reader.spec();
+    ensure!(
+        spec.sample_rate == SAMPLE_RATE
+            && spec.channels == 1
+            && spec.bits_per_sample == 16
+            && spec.sample_format == hound::SampleFormat::Int,
+        "Expected 16 kHz mono 16-bit audio"
+    );
+    reader
+        .into_samples::<i16>()
+        .map(|sample| Ok(f32::from(sample?) / 32_768.0))
+        .collect()
+}
+
+const ISLAND_WINDOW_MS: u64 = 50;
+const ISLAND_MERGE_SILENCE_MS: u64 = 350;
+
+/// Energy-based speech spans in milliseconds, quantized to 50 ms. These are not recognizer
+/// timestamps. The speech threshold follows the recording's own noise floor (10th percentile of
+/// window energy) so a quiet microphone and a noisy room both find their speech.
+pub fn speech_islands(samples_16k: &[f32]) -> Vec<(u64, u64)> {
+    let window = (u64::from(SAMPLE_RATE) * ISLAND_WINDOW_MS / 1_000) as usize;
+    let rms: Vec<f64> = samples_16k
+        .chunks(window)
+        .map(|chunk| {
+            (chunk
+                .iter()
+                .map(|&x| {
+                    if x.is_finite() {
+                        f64::from(x).powi(2)
+                    } else {
+                        0.0
+                    }
+                })
+                .sum::<f64>()
+                / chunk.len() as f64)
+                .sqrt()
+        })
+        .collect();
+    if rms.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted = rms.clone();
+    sorted.sort_by(f64::total_cmp);
+    let floor = sorted[sorted.len() / 10];
+    let threshold = (floor * 3.0).clamp(0.005, 0.02);
+    let mut islands: Vec<(u64, u64)> = Vec::new();
+    for (index, &level) in rms.iter().enumerate() {
+        if level <= threshold {
+            continue;
+        }
+        let start = index as u64 * ISLAND_WINDOW_MS;
+        let end = start + ISLAND_WINDOW_MS;
+        match islands.last_mut() {
+            Some(last) if start.saturating_sub(last.1) < ISLAND_MERGE_SILENCE_MS => last.1 = end,
+            _ => islands.push((start, end)),
+        }
+    }
+    let duration = samples_16k.len() as u64 * 1_000 / u64::from(SAMPLE_RATE);
+    for island in &mut islands {
+        island.1 = island.1.min(duration);
+    }
+    islands.retain(|&(a, b)| b > a);
+    islands
+}
+
 pub fn encode_wav_16k(samples_16k: &[f32]) -> Result<Vec<u8>> {
     let mut bytes = Cursor::new(Vec::with_capacity(44 + samples_16k.len() * 2));
     {
@@ -278,6 +347,35 @@ mod tests {
                 .to_string()
                 .contains("device unavailable")
         );
+    }
+
+    #[test]
+    fn speech_islands_merge_only_short_silences() {
+        let mut samples = vec![0.0; 32_000];
+        samples[1_600..4_800].fill(0.2); // 100..300
+        samples[8_800..12_800].fill(0.2); // 550..800: merge 250 ms gap
+        samples[18_400..20_800].fill(0.2); // 1150..1300: keep 350 ms gap
+        assert_eq!(speech_islands(&samples), vec![(100, 800), (1_150, 1_300)]);
+        assert!(speech_islands(&[0.001; 800]).is_empty());
+        assert!(speech_islands(&[]).is_empty());
+    }
+
+    #[test]
+    fn speech_islands_adapt_to_a_noisy_floor() {
+        let mut samples: Vec<f32> = (0..32_000)
+            .map(|i| if i % 2 == 0 { 0.006 } else { -0.006 })
+            .collect();
+        samples[8_000..16_000]
+            .iter_mut()
+            .for_each(|s| *s = if *s > 0.0 { 0.15 } else { -0.15 });
+        assert_eq!(speech_islands(&samples), vec![(500, 1_000)]);
+    }
+
+    #[test]
+    fn decoded_wav_round_trips() {
+        let wav = encode_wav_16k(&[0.0, 0.5, -0.5]).unwrap();
+        assert_eq!(decode_wav_16k(&wav).unwrap(), vec![0.0, 0.5, -0.5]);
+        assert!(decode_wav_16k(b"nope").is_err());
     }
 
     #[test]

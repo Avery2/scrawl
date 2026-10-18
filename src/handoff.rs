@@ -317,6 +317,13 @@ pub struct Config {
     /// Feature flag: shows **Export Last Capture as Video…** in the menu (default off).
     #[serde(default)]
     pub video_export: Option<bool>,
+    /// `"apple"` (default) or `"hex"`: which engine transcribes recordings (`transcribe`).
+    #[serde(default)]
+    pub transcriber: Option<String>,
+    /// The Hex model to use when `transcriber` is `"hex"` (default: the first ready one of
+    /// `hex::PREFERRED_MODELS`).
+    #[serde(default)]
+    pub hex_model: Option<String>,
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -426,6 +433,19 @@ pub fn auto_send() -> bool {
 /// either way.
 pub fn video_export() -> bool {
     config().video_export.unwrap_or(false)
+}
+
+/// The configured transcriber name (`transcriber`) as written, unvalidated.
+pub fn transcriber() -> Option<String> {
+    config().transcriber
+}
+
+/// The configured Hex model id (`hexModel`), if any.
+pub fn hex_model() -> Option<String> {
+    config()
+        .hex_model
+        .map(|model| model.trim().to_owned())
+        .filter(|model| !model.is_empty())
 }
 
 /// Sets one top-level key in `path`, keeping the rest (and its `0600` mode, since it holds the
@@ -1219,6 +1239,28 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn transcriber_preference_round_trips_and_keeps_other_keys() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("config.json");
+        fs::write(&path, br#"{"ingestToken":"abc","autoSend":false}"#).unwrap();
+        let config = load_config_from(&path);
+        assert_eq!((config.transcriber, config.hex_model), (None, None));
+        set_config_value_in(&path, "transcriber", "hex".into()).unwrap();
+        set_config_value_in(&path, "hexModel", "parakeet_v3".into()).unwrap();
+        let config = load_config_from(&path);
+        assert_eq!(config.transcriber.as_deref(), Some("hex"));
+        assert_eq!(config.hex_model.as_deref(), Some("parakeet_v3"));
+        assert_eq!(config.ingest_token.as_deref(), Some("abc"));
+        assert_eq!(config.auto_send, Some(false));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
         }
     }
 

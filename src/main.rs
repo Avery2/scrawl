@@ -6,6 +6,7 @@ mod delivery;
 mod export;
 mod handoff;
 mod helper;
+mod hex;
 mod hold;
 mod icons;
 mod inbox;
@@ -51,6 +52,57 @@ use crate::sketch::{marks_of, summary_markdown};
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+fn parse_engine(name: &str) -> Result<crate::transcribe::Engine, String> {
+    crate::transcribe::Engine::parse(name).ok_or_else(|| "expected `apple` or `hex`".to_owned())
+}
+
+/// `scrawl hex status`: connection, models and what the next recording would use.
+fn hex_status() {
+    let preferred = transcribe::Engine::configured();
+    println!("Preferred transcriber: {}", preferred.name());
+    let configured = handoff::hex_model();
+    println!(
+        "Hex model setting: {}",
+        configured.as_deref().unwrap_or("(automatic)")
+    );
+    println!("Discovery file: {}", hex::discovery_path().display());
+    let status = match hex::status() {
+        Ok(status) => status,
+        Err(error) => {
+            println!("Hex: not connected ({error:#})");
+            println!("Next recording uses: Apple Speech");
+            return;
+        }
+    };
+    println!("Hex: connected, version {}", status.version);
+    for model in &status.models {
+        let state = match (model.installed, model.verified) {
+            (true, true) => "ready",
+            (true, false) => "installed, not verified",
+            _ => "not installed",
+        };
+        println!("  {}\t{state}", model.id);
+    }
+    let chosen = hex::pick_model(&status.models, configured.as_deref());
+    println!(
+        "Hex model in use: {}",
+        chosen.as_deref().unwrap_or("none ready")
+    );
+    println!(
+        "Next recording uses: {}",
+        match (preferred, chosen) {
+            (transcribe::Engine::Hex, Some(model)) => format!("Hex ({model})"),
+            _ => "Apple Speech".to_owned(),
+        }
+    );
+}
+
+#[derive(Subcommand)]
+enum HexCommand {
+    /// Whether Hex is connected, its version, ready models and the transcriber Scrawl will use.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -107,6 +159,9 @@ enum Command {
         /// Copy the summary to the clipboard.
         #[arg(long)]
         clipboard: bool,
+        /// Transcribe with `apple` or `hex` instead of the configured transcriber.
+        #[arg(long, value_parser = parse_engine)]
+        transcriber: Option<crate::transcribe::Engine>,
     },
     /// List cabled iPhones and iPads that can be captured.
     Devices,
@@ -122,6 +177,14 @@ enum Command {
         /// captures) to benchmark finish-to-done wall clock.
         #[arg(long, hide = true)]
         bench: Option<u32>,
+        /// Transcribe with `apple` or `hex` instead of the configured transcriber.
+        #[arg(long, value_parser = parse_engine)]
+        transcriber: Option<crate::transcribe::Engine>,
+    },
+    /// Check the Hex transcriber: is it running, which models are ready, which one Scrawl uses.
+    Hex {
+        #[command(subcommand)]
+        command: HexCommand,
     },
     /// Print the agent-ready summary or JSON manifest for a `.scrawl` bundle (or `latest`).
     Inspect {
@@ -1326,7 +1389,11 @@ fn main() -> Result<()> {
             note,
             out,
             clipboard,
+            transcriber,
         } => {
+            if let Some(engine) = transcriber {
+                transcribe::set_override(engine);
+            }
             let (movie, timeline) =
                 phone::resolve_import(recording.as_deref(), timeline.as_deref())?;
             let bundle_dir = out.unwrap_or_else(|| {
@@ -1340,7 +1407,15 @@ fn main() -> Result<()> {
             print!("{summary}");
             Ok(())
         }
-        Command::Reprocess { bundle, out, bench } => {
+        Command::Reprocess {
+            bundle,
+            out,
+            bench,
+            transcriber,
+        } => {
+            if let Some(engine) = transcriber {
+                transcribe::set_override(engine);
+            }
             let (dir, old) = handoff::load_bundle(&bundle)?;
             let video = old
                 .video
@@ -1576,6 +1651,12 @@ fn main() -> Result<()> {
                 .2
             };
             print!("{summary}");
+            Ok(())
+        }
+        Command::Hex {
+            command: HexCommand::Status,
+        } => {
+            hex_status();
             Ok(())
         }
         Command::Devices => {

@@ -370,6 +370,8 @@ enum MenuAction {
     Welcome,
     KeepRecordings(crate::retention::Preset),
     ToggleAutoSend,
+    SetTranscriber(crate::transcribe::Engine),
+    SetHexModel(String),
     ExportVideo,
     ShowCaptures,
     CheckForUpdates,
@@ -435,6 +437,33 @@ objc2::define_class!(
             let _ = self.ivars().sender.try_send(MenuAction::ToggleAutoSend);
         }
 
+        #[unsafe(method(useAppleSpeech:))]
+        fn use_apple_speech(&self, _sender: &AnyObject) {
+            let _ = self
+                .ivars()
+                .sender
+                .try_send(MenuAction::SetTranscriber(crate::transcribe::Engine::Apple));
+        }
+
+        #[unsafe(method(useHex:))]
+        fn use_hex(&self, _sender: &AnyObject) {
+            let _ = self
+                .ivars()
+                .sender
+                .try_send(MenuAction::SetTranscriber(crate::transcribe::Engine::Hex));
+        }
+
+        #[unsafe(method(pickHexModel:))]
+        fn pick_hex_model(&self, sender: &NSMenuItem) {
+            let model = sender
+                .representedObject()
+                .and_then(|object| object.downcast::<NSString>().ok())
+                .map(|model| model.to_string());
+            if let Some(model) = model {
+                let _ = self.ivars().sender.try_send(MenuAction::SetHexModel(model));
+            }
+        }
+
         #[unsafe(method(exportVideo:))]
         fn export_video(&self, _sender: &AnyObject) {
             let _ = self.ivars().sender.try_send(MenuAction::ExportVideo);
@@ -472,6 +501,7 @@ objc2::define_class!(
         fn menu_needs_update(&self, menu: &NSMenu) {
             rebuild_inbox_menu_items(menu, self);
             refresh_keep_menu(menu);
+            refresh_transcription_menu(menu, self);
             if let Some(item) = menu.itemWithTag(AUTO_SEND_MENU_TAG) {
                 item.setState(if crate::handoff::auto_send() { 1 } else { 0 });
             }
@@ -488,6 +518,10 @@ const INBOX_MENU_TAG: isize = 0x5c4a;
 const KEEP_MENU_TAG: isize = 0x5c50;
 /// Tag on **Export Last Capture as Video…**, shown only with `"videoExport": true`.
 const EXPORT_VIDEO_MENU_TAG: isize = 0x5c4e;
+/// Tag on the Transcription item; Apple is one past it, Hex two past, and the Hex model rows
+/// (header, separator and one per ready model) sit from `TRANSCRIBE_MODELS_TAG` up.
+const TRANSCRIBE_MENU_TAG: isize = 0x5c60;
+const TRANSCRIBE_MODELS_TAG: isize = TRANSCRIBE_MENU_TAG + 10;
 /// Tag on the toggle for sending dev-site captures to their session (`crate::routing`).
 const AUTO_SEND_MENU_TAG: isize = 0x5c4f;
 
@@ -511,6 +545,77 @@ fn refresh_keep_menu(menu: &NSMenu) {
             "Captures use {}",
             crate::retention::format_bytes(size)
         )));
+    }
+}
+
+/// Ticks the engine recordings would use now, greys out Hex while it isn't connected (from the
+/// last background check, so opening the menu never waits on it) and lists Hex's ready models.
+fn refresh_transcription_menu(menu: &NSMenu, target: &ScrawlMenuTarget) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Some(submenu) = menu
+        .itemWithTag(TRANSCRIBE_MENU_TAG)
+        .and_then(|item| item.submenu())
+    else {
+        return;
+    };
+    let status = crate::hex::cached_status();
+    crate::hex::refresh_in_background();
+    let state = crate::transcribe::menu_state(
+        crate::transcribe::Engine::configured(),
+        status.as_ref(),
+        crate::handoff::hex_model().as_deref(),
+    );
+    if let Some(item) = submenu.itemWithTag(TRANSCRIBE_MENU_TAG + 1) {
+        item.setState(isize::from(state.apple_checked));
+    }
+    if let Some(item) = submenu.itemWithTag(TRANSCRIBE_MENU_TAG + 2) {
+        item.setTitle(&NSString::from_str(state.hex_title));
+        item.setEnabled(state.hex_enabled);
+        item.setState(isize::from(state.hex_checked));
+    }
+    for index in (0..submenu.numberOfItems()).rev() {
+        if submenu
+            .itemAtIndex(index)
+            .is_some_and(|item| item.tag() >= TRANSCRIBE_MODELS_TAG)
+        {
+            submenu.removeItemAtIndex(index);
+        }
+    }
+    if state.models.is_empty() {
+        return;
+    }
+    let separator = NSMenuItem::separatorItem(mtm);
+    separator.setTag(TRANSCRIBE_MODELS_TAG);
+    submenu.addItem(&separator);
+    let header = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Hex model"),
+            None,
+            &NSString::new(),
+        )
+    };
+    header.setEnabled(false);
+    header.setTag(TRANSCRIBE_MODELS_TAG + 1);
+    submenu.addItem(&header);
+    for (index, (id, title, chosen)) in state.models.iter().enumerate() {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                Some(sel!(pickHexModel:)),
+                &NSString::new(),
+            )
+        };
+        unsafe {
+            item.setTarget(Some(target));
+            item.setRepresentedObject(Some(&NSString::from_str(id)));
+        }
+        item.setTag(TRANSCRIBE_MODELS_TAG + 2 + index as isize);
+        item.setState(isize::from(*chosen));
+        submenu.addItem(&item);
     }
 }
 
@@ -757,6 +862,35 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
     keep_item.setTag(KEEP_MENU_TAG);
     keep_item.setSubmenu(Some(&keep));
     menu.addItem(&keep_item);
+    let transcription =
+        NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Transcription"));
+    for (offset, title, action) in [
+        (1, "Apple Speech", sel!(useAppleSpeech:)),
+        (2, "Hex", sel!(useHex:)),
+    ] {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                Some(action),
+                &NSString::new(),
+            )
+        };
+        unsafe { item.setTarget(Some(&target)) };
+        item.setTag(TRANSCRIBE_MENU_TAG + offset);
+        transcription.addItem(&item);
+    }
+    let transcription_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Transcription"),
+            None,
+            &NSString::new(),
+        )
+    };
+    transcription_item.setTag(TRANSCRIBE_MENU_TAG);
+    transcription_item.setSubmenu(Some(&transcription));
+    menu.addItem(&transcription_item);
     add("Send Dev Site Captures to OpenCode", sel!(toggleAutoSend:));
     if let Some(item) = menu.itemAtIndex(menu.numberOfItems() - 1) {
         item.setTag(AUTO_SEND_MENU_TAG);
@@ -4897,6 +5031,7 @@ pub fn run_app(
         start_global_input_tap(Arc::clone(&telemetry));
         crate::sparkle::start();
         crate::retention::start();
+        crate::hex::watch();
         let menu_rx = install_status_bar();
 
         // Onboarding opens on first launch, or for a permission that went away.
@@ -5066,6 +5201,26 @@ pub fn run_app(
                                         serde_json::Value::Bool(on),
                                     ) {
                                         scrawl_log(format!("Saving autoSend failed: {error:#}"));
+                                    }
+                                }
+                                MenuAction::SetTranscriber(engine) => {
+                                    if let Err(error) = crate::handoff::set_config_value(
+                                        "transcriber",
+                                        engine.name().into(),
+                                    ) {
+                                        scrawl_log(format!("Saving transcriber failed: {error:#}"));
+                                    }
+                                }
+                                MenuAction::SetHexModel(model) => {
+                                    // Picking a Hex model is choosing Hex.
+                                    for (key, value) in
+                                        [("hexModel", model.as_str()), ("transcriber", "hex")]
+                                    {
+                                        if let Err(error) =
+                                            crate::handoff::set_config_value(key, value.into())
+                                        {
+                                            scrawl_log(format!("Saving {key} failed: {error:#}"));
+                                        }
                                     }
                                 }
                                 MenuAction::ExportVideo => start_video_export(),
