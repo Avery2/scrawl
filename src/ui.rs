@@ -370,6 +370,7 @@ enum MenuAction {
     Welcome,
     KeepRecordings(crate::retention::Preset),
     ToggleAutoSend,
+    ExportVideo,
     ShowCaptures,
     CheckForUpdates,
     Quit,
@@ -434,6 +435,11 @@ objc2::define_class!(
             let _ = self.ivars().sender.try_send(MenuAction::ToggleAutoSend);
         }
 
+        #[unsafe(method(exportVideo:))]
+        fn export_video(&self, _sender: &AnyObject) {
+            let _ = self.ivars().sender.try_send(MenuAction::ExportVideo);
+        }
+
         #[unsafe(method(showCaptures:))]
         fn show_captures(&self, _sender: &AnyObject) {
             let _ = self.ivars().sender.try_send(MenuAction::ShowCaptures);
@@ -469,6 +475,9 @@ objc2::define_class!(
             if let Some(item) = menu.itemWithTag(AUTO_SEND_MENU_TAG) {
                 item.setState(if crate::handoff::auto_send() { 1 } else { 0 });
             }
+            if let Some(item) = menu.itemWithTag(EXPORT_VIDEO_MENU_TAG) {
+                item.setHidden(!crate::handoff::video_export());
+            }
         }
     }
 );
@@ -477,6 +486,8 @@ objc2::define_class!(
 const INBOX_MENU_TAG: isize = 0x5c4a;
 /// Tag on the Keep Recordings item; its choices are tagged one past it, in `Preset::ALL` order.
 const KEEP_MENU_TAG: isize = 0x5c50;
+/// Tag on **Export Last Capture as Video…**, shown only with `"videoExport": true`.
+const EXPORT_VIDEO_MENU_TAG: isize = 0x5c4e;
 /// Tag on the toggle for sending dev-site captures to their session (`crate::routing`).
 const AUTO_SEND_MENU_TAG: isize = 0x5c4f;
 
@@ -568,6 +579,75 @@ fn rebuild_inbox_menu_items(menu: &NSMenu, target: &ScrawlMenuTarget) {
     }
 }
 
+/// Text beside the menu bar icon while a video export runs (`None` goes back to the inbox count).
+static EXPORT_STATUS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static EXPORTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn set_status_text(text: &str) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    STATUS_BAR.with(|slot| {
+        let slot = slot.borrow();
+        let Some(button) = slot.as_ref().and_then(|bar| bar._item.button(mtm)) else {
+            return;
+        };
+        button.setImagePosition(NSCellImagePosition::ImageLeft);
+        button.setTitle(&NSString::from_str(text));
+    });
+}
+
+/// Exports the newest bundle to `~/Movies/Scrawl/<name>.mp4` off the main thread, reporting
+/// through `EXPORT_STATUS`, then reveals the file in Finder.
+fn start_video_export() {
+    use std::sync::atomic::Ordering;
+    if EXPORTING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let say = |text: Option<String>| {
+        if let Ok(mut status) = EXPORT_STATUS.lock() {
+            *status = text;
+        }
+    };
+    say(Some("Exporting…".into()));
+    let spawned = std::thread::Builder::new()
+        .name("scrawl-export".into())
+        .spawn(move || {
+            let result = crate::handoff::load_bundle(std::path::Path::new("latest")).and_then(
+                |(dir, bundle)| {
+                    let options = crate::export::Options {
+                        background: true,
+                        ..Default::default()
+                    };
+                    crate::export::export(&dir, &bundle, &options, &mut |fraction| {
+                        say(Some(format!("Exporting {}%", (fraction * 100.0) as u32)));
+                    })
+                },
+            );
+            match result {
+                Ok(exported) => {
+                    scrawl_log(format!("Exported {}", crate::export::describe(&exported)));
+                    say(Some("Exported".into()));
+                    let _ = std::process::Command::new("/usr/bin/open")
+                        .arg("-R")
+                        .arg(&exported.path)
+                        .spawn();
+                }
+                Err(error) => {
+                    scrawl_log(format!("Video export failed: {error:#}"));
+                    say(Some("Export failed".into()));
+                }
+            }
+            std::thread::sleep(Duration::from_secs(4));
+            say(None);
+            EXPORTING.store(false, Ordering::SeqCst);
+        });
+    if spawned.is_err() {
+        say(None);
+        EXPORTING.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Shows the unhandled iPhone capture count beside the menu bar icon.
 fn set_status_inbox_count(count: usize) {
     let Some(mtm) = MainThreadMarker::new() else {
@@ -634,6 +714,11 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
     add("Open Latest Bundle", sel!(openLatest:));
     add("Generate Demo Bundle", sel!(runDemo:));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add("Export Last Capture as Video…", sel!(exportVideo:));
+    if let Some(item) = menu.itemAtIndex(menu.numberOfItems() - 1) {
+        item.setTag(EXPORT_VIDEO_MENU_TAG);
+        item.setHidden(!crate::handoff::video_export());
+    }
     add("Show Captures in Finder", sel!(showCaptures:));
     let keep = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Keep Recordings"));
     for (index, preset) in crate::retention::Preset::ALL.into_iter().enumerate() {
@@ -4877,6 +4962,7 @@ pub fn run_app(
         let loop_coord = coordinator.clone();
         cx.spawn(async move |cx| {
             let mut last_frame = Instant::now();
+            let mut shown_status: Option<String> = None;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(8))
@@ -4885,6 +4971,14 @@ pub fn run_app(
                 last_frame = Instant::now();
                 let mut should_quit = false;
                 let _ = cx.update(|cx| {
+                    let status = EXPORT_STATUS.lock().ok().and_then(|s| s.clone());
+                    if status != shown_status {
+                        match &status {
+                            Some(text) => set_status_text(text),
+                            None => set_status_inbox_count(loop_coord.read(cx).inbox.len()),
+                        }
+                        shown_status = status;
+                    }
                     if let Some(ref rx) = menu_rx {
                         while let Ok(action) = rx.try_recv() {
                             match action {
@@ -4974,6 +5068,7 @@ pub fn run_app(
                                         scrawl_log(format!("Saving autoSend failed: {error:#}"));
                                     }
                                 }
+                                MenuAction::ExportVideo => start_video_export(),
                                 MenuAction::ShowCaptures => {
                                     let dir = crate::handoff::default_captures_dir();
                                     let _ = std::fs::create_dir_all(&dir);

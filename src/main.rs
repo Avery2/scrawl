@@ -3,6 +3,7 @@ mod autocrop;
 mod autocrop_lab;
 mod capture;
 mod delivery;
+mod export;
 mod handoff;
 mod helper;
 mod hold;
@@ -163,6 +164,40 @@ enum Command {
         /// Show the whole screen even when the bundle's keyframes are auto-cropped.
         #[arg(long)]
         full: bool,
+    },
+    /// Export a bundle's recording as one shareable .mp4: H.264 video cropped to the activity
+    /// with the ink and click ripples burned in, AAC audio in sync, and optionally Screen
+    /// Studio-style auto-zoom (`--zoom`). Encoding runs in the helper with AVFoundation.
+    Export {
+        /// Path to `.scrawl` bundle directory or `latest`.
+        #[arg(default_value = "latest")]
+        bundle: PathBuf,
+        /// Output file (defaults to ~/Movies/Scrawl/<bundle>.mp4).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// `full`, `auto` (the activity region), or `x,y,w,h` as fractions of the capture (all
+        /// ≤ 1) or pixels of the recording.
+        #[arg(long, default_value = "auto")]
+        crop: export::crop::CropArg,
+        /// Longest side of the output in pixels; it is never scaled up.
+        #[arg(long, default_value_t = export::crop::DEFAULT_LONG_EDGE)]
+        size: u32,
+        /// Ease in toward clicks, drags, marks and laser points, hold while activity stays
+        /// nearby, and ease back out.
+        #[arg(long)]
+        zoom: bool,
+        /// Leave out the red ink, pins and laser.
+        #[arg(long)]
+        no_ink: bool,
+        /// Leave out click ripples and touch trails.
+        #[arg(long)]
+        no_clicks: bool,
+        /// Encode HEVC instead of H.264.
+        #[arg(long)]
+        hevc: bool,
+        /// Output frame rate (default 60 for a 60 fps recording, else 30).
+        #[arg(long)]
+        fps: Option<u32>,
     },
     /// Clean up old captures now, as the app does daily: video and audio past the Keep
     /// Recordings setting go to the Trash, then whole bundles; native iPhone video is shrunk.
@@ -1608,6 +1643,43 @@ fn main() -> Result<()> {
             for path in extracted {
                 println!("{}", path.display());
             }
+            Ok(())
+        }
+        Command::Export {
+            bundle,
+            out,
+            crop,
+            size,
+            zoom,
+            no_ink,
+            no_clicks,
+            hevc,
+            fps,
+        } => {
+            let (dir, loaded) = handoff::load_bundle(&bundle)?;
+            let options = export::Options {
+                out,
+                crop,
+                size,
+                zoom,
+                ink: !no_ink,
+                clicks: !no_clicks,
+                hevc,
+                fps,
+                background: false,
+            };
+            let mut last = -1;
+            let exported = export::export(&dir, &loaded, &options, &mut |fraction| {
+                let percent = (fraction * 100.0) as i32;
+                if percent != last && std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                    last = percent;
+                    eprint!("\rExporting {percent}%");
+                }
+            });
+            if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                eprintln!();
+            }
+            println!("{}", export::describe(&exported?));
             Ok(())
         }
         Command::Zoom {

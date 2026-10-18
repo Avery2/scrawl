@@ -143,6 +143,9 @@ pub struct Probe {
     pub height: u32,
     #[serde(default)]
     pub audio_tracks: u32,
+    /// The video track's nominal frame rate (0 when unknown).
+    #[serde(default)]
+    pub fps: f64,
 }
 
 pub fn probe(movie: &Path) -> Result<Probe> {

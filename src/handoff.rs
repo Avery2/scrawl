@@ -314,6 +314,9 @@ pub struct Config {
     /// site's OpenCode session (`routing`).
     #[serde(default)]
     pub auto_send: Option<bool>,
+    /// Feature flag: shows **Export Last Capture as Video…** in the menu (default off).
+    #[serde(default)]
+    pub video_export: Option<bool>,
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -417,6 +420,12 @@ pub fn ensure_ingest_token() -> Result<String> {
 /// Whether Mac captures of a dev site go straight to its session (`autoSend`, default on).
 pub fn auto_send() -> bool {
     config().auto_send.unwrap_or(true)
+}
+
+/// Whether the menu offers video export (`videoExport`, default off). `scrawl export` works
+/// either way.
+pub fn video_export() -> bool {
+    config().video_export.unwrap_or(false)
 }
 
 /// Sets one top-level key in `path`, keeping the rest (and its `0600` mode, since it holds the
@@ -1230,6 +1239,16 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn video_export_flag_defaults_off() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("config.json");
+        fs::write(&path, br#"{"autoSend":false}"#).unwrap();
+        assert_eq!(load_config_from(&path).video_export, None);
+        fs::write(&path, br#"{"videoExport":true}"#).unwrap();
+        assert_eq!(load_config_from(&path).video_export, Some(true));
     }
 
     #[test]

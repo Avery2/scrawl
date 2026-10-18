@@ -7,6 +7,7 @@
 //   scrawl-helper audio MOVIE OUT.wav                   16 kHz mono PCM of every audio track, mixed
 //   scrawl-helper probe MOVIE                           duration and video size
 //   scrawl-helper shrink MOVIE --out FILE.mov [--max-edge PX] [--bitrate BPS]   HEVC copy, same timeline
+//   scrawl-helper export PLAN.json                      shareable .mp4: crop/camera, burned-in ink, audio (Export.swift)
 //   scrawl-helper permissions                           what Scrawl has been granted, as JSON
 //   scrawl-helper onboarding [--shortcut L] [--render DIR]   the welcome window (Onboarding.swift)
 //
@@ -129,6 +130,9 @@ case "shrink":
   runAsync {
     emit(try await Media.shrink(movie: URL(filePath: arguments[1]), out: URL(filePath: out), maxEdge: maxEdge, bitRate: bitRate))
   }
+case "export":
+  guard arguments.count >= 2 else { fail("export needs PLAN.json") }
+  runAsync { try await Exporter.run(plan: URL(filePath: arguments[1])) }
 case "probe":
   guard arguments.count >= 2 else { fail("probe needs MOVIE") }
   runAsync { emit(try await Media.probe(URL(filePath: arguments[1]))) }
@@ -145,5 +149,5 @@ case "qr":
   }
   emit(["qr": qr])
 default:
-  fail("usage: scrawl-helper devices|mirror|transcribe|frames|audio|probe|shrink|guide|permissions|onboarding|qr …")
+  fail("usage: scrawl-helper devices|mirror|transcribe|frames|audio|probe|export|shrink|guide|permissions|onboarding|qr …")
 }

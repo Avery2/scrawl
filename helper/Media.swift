@@ -170,6 +170,7 @@ enum Media {
       let shown = size.applying(transform)
       result["width"] = Int(abs(shown.width).rounded())
       result["height"] = Int(abs(shown.height).rounded())
+      result["fps"] = Double(try await track.load(.nominalFrameRate))
     }
     result["audioTracks"] = try await asset.loadTracks(withMediaType: .audio).count
     return result
