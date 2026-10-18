@@ -441,44 +441,109 @@ pub fn annotate_keyframe_in_place(
             draw_click_ripple(frame, [cx * w, cy * h], k);
         }
     }
-    let label = keyframe.index.to_string();
-    let font_size = 12.0_f32 * k;
-    let badge_h = 22.0_f32 * k;
-    let badge_r = badge_h * 0.5;
-    let text_w = text_width(&label, font_size, true);
-    let badge_w = (text_w + 13.0 * k).max(badge_h);
-    let focus_top_right = keyframe
-        .cursor
-        .or(click)
-        .is_some_and(|[cx, cy]| cx > 0.72 && cy < 0.25);
-    let margin = 6.0 * k;
-    let bx = if focus_top_right {
-        margin
+    let badge_k = (h / 480.0).min(w / 280.0).max(0.45);
+    let num_label = format!("#{}", keyframe.index);
+    let time_label = (!keyframe.file.is_empty() || !keyframe.event.is_empty())
+        .then(|| format_clock(keyframe.t));
+    let num_size = 15.5 * badge_k;
+    let time_size = 12.5 * badge_k;
+    let badge_h = 28.0 * badge_k;
+    let outer_r = 8.5 * badge_k;
+    let inset = 2.5 * badge_k;
+    let cap_h = badge_h - inset * 2.0;
+    let cap_r = (outer_r - inset).max(2.0);
+    let num_w = text_width(&num_label, num_size, true);
+    let cap_w = (num_w + 12.0 * badge_k).max(cap_h);
+    let time_w = time_label
+        .as_deref()
+        .map_or(0.0, |clock| text_width(clock, time_size, true));
+    let badge_w = if time_label.is_some() {
+        inset + cap_w + 7.0 * badge_k + time_w + 9.0 * badge_k
     } else {
+        cap_w + inset * 2.0
+    };
+
+    let in_top_left = |[x, y]: [f32; 2]| x < 0.30 && y < 0.18;
+    let in_top_right = |[x, y]: [f32; 2]| x > 0.70 && y < 0.18;
+    let focus_pt = keyframe.cursor.or(click);
+    let stroke_in_tl = strokes.iter().enumerate().any(|(idx, s)| {
+        !s.laser
+            && (shown.iter().any(|m| m.strokes.contains(&idx))
+                || (shown.is_empty()
+                    && s.t0 <= keyframe.t
+                    && keyframe.t.saturating_sub(s.t1) <= MARK_GAP_MS))
+            && s.timed_points()
+                .into_iter()
+                .any(|(x, y, t)| t <= keyframe.t && in_top_left([x, y]))
+    });
+    let busy_top_left = focus_pt.is_some_and(in_top_left) || stroke_in_tl;
+    let busy_top_right = focus_pt.is_some_and(in_top_right);
+    let margin = 7.0 * badge_k;
+    let bx = if busy_top_left && !busy_top_right {
         (w - badge_w - margin).max(margin)
+    } else {
+        margin
     };
     let by = margin;
+
+    rounded(
+        frame,
+        [
+            bx - 1.0 * badge_k,
+            by - 1.0 * badge_k,
+            badge_w + 2.0 * badge_k,
+            badge_h + 2.0 * badge_k,
+        ],
+        outer_r + 1.0 * badge_k,
+        [0, 0, 0, 96],
+    );
     rounded(
         frame,
         [bx, by, badge_w, badge_h],
-        badge_r,
-        [255, 255, 255, 42],
+        outer_r,
+        [255, 255, 255, 78],
     );
+    let border = (1.2 * badge_k).max(1.0);
     rounded(
         frame,
-        [bx + 1.0, by + 1.0, badge_w - 2.0, badge_h - 2.0],
-        badge_r - 1.0,
-        [18, 18, 20, 218],
+        [
+            bx + border,
+            by + border,
+            (badge_w - border * 2.0).max(0.0),
+            (badge_h - border * 2.0).max(0.0),
+        ],
+        (outer_r - border).max(0.0),
+        [14, 15, 18, 240],
     );
+    let cap_x = bx + inset;
+    let cap_y = by + inset;
+    rounded(
+        frame,
+        [cap_x, cap_y, cap_w, cap_h],
+        cap_r,
+        [248, 249, 252, 255],
+    );
+    // CoreText draws digits with optical cap-center at ~0.595 * font_size from top of mask.
     draw_text(
         frame,
-        &label,
-        bx + (badge_w - text_w) * 0.5,
-        by + 5.0 * k,
-        font_size,
-        WHITE,
+        &num_label,
+        cap_x + (cap_w - num_w) * 0.5,
+        cap_y + cap_h * 0.5 - num_size * 0.59,
+        num_size,
+        [14, 15, 18, 255],
         true,
     );
+    if let Some(clock) = time_label {
+        draw_text(
+            frame,
+            &clock,
+            cap_x + cap_w + 7.0 * badge_k,
+            by + badge_h * 0.5 - time_size * 0.59,
+            time_size,
+            [236, 238, 244, 255],
+            true,
+        );
+    }
 }
 
 fn draw_pin(frame: &mut RgbaFrame, point: [f32; 2], number: u32, scale: f32, alpha: f32) {
@@ -597,74 +662,249 @@ pub fn render_contact_sheet(
     render_contact_sheet_for_duration(bundle.duration_ms, annotated_frames)
 }
 
+const SHEET_PAD: u32 = 6;
+const SHEET_GAP: u32 = 6;
+const SHEET_BG: Color = [28, 29, 34, 255];
+const SHEET_MAX_EDGE: f32 = 1600.0;
+const SHEET_MAX_PIXELS: f32 = 1_560_000.0;
+
+/// Partition `aspects` (in chronological order) into justified rows of 1..=6 frames so that
+/// row heights are uniform and the overall sheet aspect ratio sits near the vision-model sweet spot.
+fn plan_contact_sheet_rows(aspects: &[f32]) -> Vec<std::ops::Range<usize>> {
+    let n = aspects.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![0..1];
+    }
+    if n == 2 {
+        return if aspects[0] + aspects[1] > 3.6 {
+            vec![0..1, 1..2]
+        } else {
+            vec![0..2]
+        };
+    }
+
+    let avg_a = aspects.iter().sum::<f32>() / n as f32;
+    let total_a = aspects.iter().sum::<f32>();
+    let target_sheet = if avg_a < 0.7 { 1.05 } else { 1.25 };
+    let target_row_a = (total_a * target_sheet).sqrt().max(avg_a);
+    let max_cols = 6usize;
+
+    let mut best_rows = Vec::new();
+    let mut best_cost = f32::INFINITY;
+    let mut current = Vec::with_capacity(n);
+
+    fn search(
+        idx: usize,
+        n: usize,
+        max_cols: usize,
+        aspects: &[f32],
+        avg_a: f32,
+        target_sheet: f32,
+        target_row_a: f32,
+        current: &mut Vec<std::ops::Range<usize>>,
+        best_cost: &mut f32,
+        best_rows: &mut Vec<std::ops::Range<usize>>,
+    ) {
+        if idx == n {
+            let r_count = current.len() as f32;
+            let mut row_aspects = [0.0f32; MAX_KEYFRAMES];
+            let mut inv_sum = 0.0f32;
+            let mut log_sum = 0.0f32;
+            for (r_idx, row) in current.iter().enumerate() {
+                let a: f32 = aspects[row.clone()].iter().sum();
+                row_aspects[r_idx] = a;
+                inv_sum += 1.0 / a;
+                log_sum += a.ln();
+            }
+            let sheet_aspect = 1.0 / inv_sum;
+            let sheet_pen = (sheet_aspect / target_sheet).ln().powi(2) * 2.5;
+            let mean_log_a = log_sum / r_count;
+            let mut row_var = 0.0f32;
+            let mut row_pen = 0.0f32;
+            let mut cramp_pen = 0.0f32;
+            let mut tie = 0.0f32;
+
+            for (r_idx, row) in current.iter().enumerate() {
+                let a_r = row_aspects[r_idx];
+                let dl = a_r.ln() - mean_log_a;
+                row_var += dl * dl;
+                let dt = (a_r / target_row_a).ln();
+                row_pen += dt * dt;
+
+                for &a_i in &aspects[row.clone()] {
+                    let w_frac = (a_i / a_r) * sheet_aspect.min(1.0);
+                    if w_frac < 0.16 {
+                        cramp_pen += ((0.16 - w_frac) / 0.16).powi(2) * 8.0;
+                    }
+                }
+                let cols = row.len();
+                if cols > 4 && avg_a > 0.75 {
+                    cramp_pen += (cols - 4) as f32 * 2.0;
+                }
+                if cols > 3 && avg_a > 1.15 {
+                    cramp_pen += (cols - 3) as f32 * 2.0;
+                }
+                tie += r_idx as f32 * 1e-4 * cols as f32;
+            }
+            let cost = sheet_pen + row_var * 2.5 + row_pen * 0.4 + cramp_pen + tie;
+            if cost < *best_cost {
+                *best_cost = cost;
+                *best_rows = current.clone();
+            }
+            return;
+        }
+
+        let limit = max_cols.min(n - idx);
+        for k in 1..=limit {
+            if k == 1 && n >= 4 && aspects[idx] < 1.85 {
+                continue;
+            }
+            current.push(idx..idx + k);
+            search(
+                idx + k,
+                n,
+                max_cols,
+                aspects,
+                avg_a,
+                target_sheet,
+                target_row_a,
+                current,
+                best_cost,
+                best_rows,
+            );
+            current.pop();
+        }
+    }
+
+    search(
+        0,
+        n,
+        max_cols,
+        aspects,
+        avg_a,
+        target_sheet,
+        target_row_a,
+        &mut current,
+        &mut best_cost,
+        &mut best_rows,
+    );
+    best_rows
+}
+
 pub fn render_contact_sheet_for_duration(
     duration_ms: u64,
     annotated_frames: &[(Keyframe, RgbaFrame)],
 ) -> RgbaFrame {
-    const CELL: f32 = 640.0;
-    const PAD: f32 = 16.0;
-    const GAP: f32 = 14.0;
     let frames = &annotated_frames[..annotated_frames.len().min(MAX_KEYFRAMES)];
     if frames.is_empty() {
-        let mut sheet = solid(640, 360, [20, 20, 20, 255]);
+        let mut sheet = solid(640, 360, SHEET_BG);
         sheet.t_ms = duration_ms;
         return sheet;
     }
-    // Phone frames are portrait: three narrower cells to a row keep the sheet compact, and past
-    // six, two rows. Screen frames go two to a row, three past six.
-    let portrait = frames.iter().all(|(_, f)| f.height > f.width);
-    let cell = if portrait { 440.0 } else { CELL };
-    let columns = match frames.len() {
-        1 => 1,
-        n @ ..=6 if portrait => n.min(3),
-        n if portrait => n.div_ceil(2),
-        ..=6 => 2,
-        _ => 3,
-    };
-    let width = (PAD * 2.0 + cell * columns as f32 + GAP * (columns - 1) as f32) as u32;
-    let card_sizes: Vec<[f32; 2]> = frames
+
+    let aspects: Vec<f32> = frames
         .iter()
-        .map(|(_, image)| {
-            let scale = (cell / image.width.max(1) as f32).min(960.0 / image.height.max(1) as f32);
-            [image.width as f32 * scale, image.height as f32 * scale]
+        .map(|(_, f)| (f.width.max(1) as f32 / f.height.max(1) as f32).clamp(0.25, 4.5))
+        .collect();
+    let rows = plan_contact_sheet_rows(&aspects);
+    let row_aspects: Vec<f32> = rows
+        .iter()
+        .map(|r| aspects[r.clone()].iter().sum::<f32>().max(0.1))
+        .collect();
+    let inv_sum: f32 = row_aspects.iter().map(|a| 1.0 / a).sum();
+    let sheet_aspect = 1.0 / inv_sum.max(0.01);
+
+    let pad = SHEET_PAD as f32;
+    let gap = SHEET_GAP as f32;
+    let native_row_w = rows
+        .iter()
+        .map(|r| {
+            let sum_w: u32 = frames[r.clone()].iter().map(|(_, f)| f.width).sum();
+            sum_w as f32 + gap * r.len().saturating_sub(1) as f32
+        })
+        .fold(0.0f32, f32::max);
+    let min_inner_w = if frames.len() == 1 { 640.0 } else { 960.0 };
+    let desired_inner_w = native_row_w.max(min_inner_w);
+
+    let mut w_inner = if sheet_aspect >= 1.0 {
+        (SHEET_MAX_EDGE - 2.0 * pad).min(desired_inner_w)
+    } else {
+        ((SHEET_MAX_EDGE - 2.0 * pad) * sheet_aspect).min(desired_inner_w)
+    };
+
+    let calc_h_inner = |wi: f32| -> f32 {
+        rows.iter()
+            .zip(&row_aspects)
+            .map(|(r, &a)| {
+                let avail = (wi - gap * r.len().saturating_sub(1) as f32).max(32.0);
+                avail / a
+            })
+            .sum::<f32>()
+            + gap * rows.len().saturating_sub(1) as f32
+    };
+
+    let h_inner = calc_h_inner(w_inner);
+    let mut total_w = w_inner + 2.0 * pad;
+    let total_h = h_inner + 2.0 * pad;
+
+    let mut scale = 1.0f32;
+    if total_w.max(total_h) > SHEET_MAX_EDGE {
+        scale = scale.min(SHEET_MAX_EDGE / total_w.max(total_h));
+    }
+    if total_w * total_h > SHEET_MAX_PIXELS {
+        scale = scale.min((SHEET_MAX_PIXELS / (total_w * total_h)).sqrt());
+    }
+    if scale < 1.0 {
+        w_inner = ((total_w * scale) - 2.0 * pad).max(64.0);
+        total_w = w_inner + 2.0 * pad;
+    }
+
+    let inner_w_px = total_w.round().max(64.0) as u32 - 2 * SHEET_PAD;
+    let row_heights_px: Vec<u32> = rows
+        .iter()
+        .zip(&row_aspects)
+        .map(|(r, &a)| {
+            let total_gap = SHEET_GAP * r.len().saturating_sub(1) as u32;
+            let avail_w = inner_w_px.saturating_sub(total_gap).max(1);
+            (avail_w as f32 / a).round().max(1.0) as u32
         })
         .collect();
-    let row_heights: Vec<f32> = card_sizes
-        .chunks(columns)
-        .map(|row| row.iter().map(|s| s[1]).fold(0.0, f32::max))
-        .collect();
-    let height = (PAD * 2.0
-        + row_heights.iter().sum::<f32>()
-        + GAP * row_heights.len().saturating_sub(1) as f32)
-        .ceil() as u32;
-    let mut sheet = solid(width, height, [20, 20, 20, 255]);
+
+    let width = inner_w_px + 2 * SHEET_PAD;
+    let height = 2 * SHEET_PAD
+        + row_heights_px.iter().sum::<u32>()
+        + SHEET_GAP * rows.len().saturating_sub(1) as u32;
+
+    let mut sheet = solid(width, height, SHEET_BG);
     sheet.t_ms = duration_ms;
-    let mut row_y = PAD;
-    for (row, row_height) in row_heights.iter().enumerate() {
-        for col in 0..columns {
-            let i = row * columns + col;
-            let Some(&image_size) = card_sizes.get(i) else {
-                continue;
+
+    let mut row_y = SHEET_PAD;
+    for (r_idx, row) in rows.iter().enumerate() {
+        let row_h = row_heights_px[r_idx];
+        let k = row.len();
+        let total_gap = SHEET_GAP * k.saturating_sub(1) as u32;
+        let avail_w = inner_w_px.saturating_sub(total_gap);
+        let a_row = row_aspects[r_idx];
+        let mut cum_a = 0.0f32;
+
+        for (j, i) in row.clone().enumerate() {
+            let x0 = (avail_w as f32 * (cum_a / a_row)).round() as u32;
+            cum_a += aspects[i];
+            let x1 = if j + 1 == k {
+                avail_w
+            } else {
+                (avail_w as f32 * (cum_a / a_row)).round() as u32
             };
+            let cell_w = x1.saturating_sub(x0).max(1);
+            let cell_x = SHEET_PAD + x0 + j as u32 * SHEET_GAP;
             let (_, image) = &frames[i];
-            let x = PAD + col as f32 * (cell + GAP);
-            let card_x = x + (cell - image_size[0]) * 0.5;
-            let card_y = row_y + (*row_height - image_size[1]) * 0.5;
-            rounded(
-                &mut sheet,
-                [card_x, card_y, image_size[0], image_size[1]],
-                10.0,
-                [46, 46, 48, 255],
-            );
-            let image_rect = [
-                card_x + 1.0,
-                card_y + 1.0,
-                (image_size[0] - 2.0).max(0.0),
-                (image_size[1] - 2.0).max(0.0),
-            ];
-            blit_scaled(&mut sheet, image, image_rect, 9.0);
+            let rect = [cell_x as f32, row_y as f32, cell_w as f32, row_h as f32];
+            blit_scaled(&mut sheet, image, rect, 0.0);
         }
-        row_y += row_height + GAP;
+        row_y += row_h + SHEET_GAP;
     }
     sheet
 }
@@ -753,6 +993,56 @@ pub fn render_zoom_sheet(frames: &[RgbaFrame]) -> RgbaFrame {
     sheet
 }
 
+fn sample_bilinear(
+    src: &RgbaFrame,
+    row0: usize,
+    row1: usize,
+    fy: f32,
+    x0: usize,
+    x1: usize,
+    fx: f32,
+) -> [f32; 4] {
+    let w_y0 = 1.0 - fy;
+    let w00 = (1.0 - fx) * w_y0;
+    let w10 = fx * w_y0;
+    let w01 = (1.0 - fx) * fy;
+    let w11 = fx * fy;
+    let i00 = row0 + x0 * 4;
+    let i10 = row0 + x1 * 4;
+    let i01 = row1 + x0 * 4;
+    let i11 = row1 + x1 * 4;
+    let p00 = &src.rgba[i00..i00 + 4];
+    let p10 = &src.rgba[i10..i10 + 4];
+    let p01 = &src.rgba[i01..i01 + 4];
+    let p11 = &src.rgba[i11..i11 + 4];
+    if (p00[3] & p10[3] & p01[3] & p11[3]) == 255 {
+        return [
+            p00[0] as f32 * w00 + p10[0] as f32 * w10 + p01[0] as f32 * w01 + p11[0] as f32 * w11,
+            p00[1] as f32 * w00 + p10[1] as f32 * w10 + p01[1] as f32 * w01 + p11[1] as f32 * w11,
+            p00[2] as f32 * w00 + p10[2] as f32 * w10 + p01[2] as f32 * w01 + p11[2] as f32 * w11,
+            255.0,
+        ];
+    }
+    let mut accum = [0.0f32; 4];
+    for (p, weight) in [(p00, w00), (p10, w10), (p01, w01), (p11, w11)] {
+        let a = p[3] as f32 / 255.0;
+        for c in 0..3 {
+            accum[c] += p[c] as f32 * a * weight;
+        }
+        accum[3] += a * weight;
+    }
+    if accum[3] > 0.0 {
+        [
+            accum[0] / accum[3],
+            accum[1] / accum[3],
+            accum[2] / accum[3],
+            accum[3] * 255.0,
+        ]
+    } else {
+        [0.0; 4]
+    }
+}
+
 fn blit_scaled(dst: &mut RgbaFrame, src: &RgbaFrame, rect: [f32; 4], radius: f32) {
     let [x, y, w, h] = rect;
     if src.width == 0 || src.height == 0 || w <= 0.0 || h <= 0.0 {
@@ -760,29 +1050,64 @@ fn blit_scaled(dst: &mut RgbaFrame, src: &RgbaFrame, rect: [f32; 4], radius: f32
     }
     let r = radius.max(0.0).min(w * 0.5).min(h * 0.5);
     let src_w = src.width as usize;
+    let src_h = src.height as usize;
     let dst_w = dst.width as usize;
     let px_start = (x.floor() as i32).max(0);
     let px_end = ((x + w).ceil() as i32).min(dst.width as i32);
+    if px_start >= px_end {
+        return;
+    }
     let inv_w = src.width as f32 / w;
     let inv_h = src.height as f32 / h;
     let max_sx = src.width.saturating_sub(1) as f32;
     let max_sy = src.height.saturating_sub(1) as f32;
+    let supersample = inv_w > 1.35 || inv_h > 1.35;
+
+    let x_tap = |sample_x: f32| -> (usize, usize, f32) {
+        let sx = sample_x.clamp(0.0, max_sx);
+        let x0 = sx.floor() as usize;
+        let x1 = (x0 + 1).min(src_w - 1);
+        (x0, x1, sx - x0 as f32)
+    };
+    let y_tap = |sample_y: f32| -> (usize, usize, f32) {
+        let sy = sample_y.clamp(0.0, max_sy);
+        let y0 = sy.floor() as usize;
+        let y1 = (y0 + 1).min(src_h - 1);
+        (y0 * src_w * 4, y1 * src_w * 4, sy - y0 as f32)
+    };
+
+    // Precompute X sample taps across the horizontal span once.
+    let span = (px_end - px_start) as usize;
+    let mut x_taps = Vec::with_capacity(span);
+    for px in px_start..px_end {
+        let cx = px as f32 + 0.5;
+        if supersample {
+            let sx_a = (cx - 0.25 - x) * inv_w - 0.5;
+            let sx_b = (cx + 0.25 - x) * inv_w - 0.5;
+            x_taps.push((cx, x_tap(sx_a), x_tap(sx_b)));
+        } else {
+            let t = x_tap((cx - x) * inv_w - 0.5);
+            x_taps.push((cx, t, t));
+        }
+    }
 
     for py in (y.floor() as i32).max(0)..((y + h).ceil() as i32).min(dst.height as i32) {
         let cy = py as f32 + 0.5;
-        let sy = ((cy - y) * inv_h - 0.5).clamp(0.0, max_sy);
-        let y0 = sy.floor() as usize;
-        let y1 = (y0 + 1).min(src.height as usize - 1);
-        let fy = sy - y0 as f32;
-        let w_y0 = 1.0 - fy;
-        let row0 = y0 * src_w * 4;
-        let row1 = y1 * src_w * 4;
+        let (ya, yb) = if supersample {
+            (
+                y_tap((cy - 0.25 - y) * inv_h - 0.5),
+                y_tap((cy + 0.25 - y) * inv_h - 0.5),
+            )
+        } else {
+            let t = y_tap((cy - y) * inv_h - 0.5);
+            (t, t)
+        };
         let dst_row = py as usize * dst_w * 4;
         let y_inside_band = cy >= y + r + 0.5 && cy <= y + h - r - 0.5;
         let y_inside_box = cy >= y + 0.5 && cy <= y + h - 0.5;
 
-        for px in px_start..px_end {
-            let cx = px as f32 + 0.5;
+        for (idx, &(cx, xa, xb)) in x_taps.iter().enumerate() {
+            let px = px_start + idx as i32;
             let full_cov = (y_inside_band && cx >= x + 0.5 && cx <= x + w - 0.5)
                 || (y_inside_box && cx >= x + r + 0.5 && cx <= x + w - r - 0.5);
             let coverage = if full_cov {
@@ -794,66 +1119,33 @@ fn blit_scaled(dst: &mut RgbaFrame, src: &RgbaFrame, rect: [f32; 4], radius: f32
                 }
                 c
             };
-            let sx = ((cx - x) * inv_w - 0.5).clamp(0.0, max_sx);
-            let x0 = sx.floor() as usize;
-            let x1 = (x0 + 1).min(src_w - 1);
-            let fx = sx - x0 as f32;
-            let w00 = (1.0 - fx) * w_y0;
-            let w10 = fx * w_y0;
-            let w01 = (1.0 - fx) * fy;
-            let w11 = fx * fy;
 
-            let i00 = row0 + x0 * 4;
-            let i10 = row0 + x1 * 4;
-            let i01 = row1 + x0 * 4;
-            let i11 = row1 + x1 * 4;
-            let p00 = &src.rgba[i00..i00 + 4];
-            let p10 = &src.rgba[i10..i10 + 4];
-            let p01 = &src.rgba[i01..i01 + 4];
-            let p11 = &src.rgba[i11..i11 + 4];
+            let rgba = if supersample {
+                let s00 = sample_bilinear(src, ya.0, ya.1, ya.2, xa.0, xa.1, xa.2);
+                let s10 = sample_bilinear(src, ya.0, ya.1, ya.2, xb.0, xb.1, xb.2);
+                let s01 = sample_bilinear(src, yb.0, yb.1, yb.2, xa.0, xa.1, xa.2);
+                let s11 = sample_bilinear(src, yb.0, yb.1, yb.2, xb.0, xb.1, xb.2);
+                [
+                    ((s00[0] + s10[0] + s01[0] + s11[0]) * 0.25).round() as u8,
+                    ((s00[1] + s10[1] + s01[1] + s11[1]) * 0.25).round() as u8,
+                    ((s00[2] + s10[2] + s01[2] + s11[2]) * 0.25).round() as u8,
+                    ((s00[3] + s10[3] + s01[3] + s11[3]) * 0.25).round() as u8,
+                ]
+            } else {
+                let s = sample_bilinear(src, ya.0, ya.1, ya.2, xa.0, xa.1, xa.2);
+                [
+                    s[0].round() as u8,
+                    s[1].round() as u8,
+                    s[2].round() as u8,
+                    s[3].round() as u8,
+                ]
+            };
 
-            if full_cov && (p00[3] & p10[3] & p01[3] & p11[3]) == 255 {
+            if full_cov && rgba[3] == 255 {
                 let out_i = dst_row + px as usize * 4;
-                dst.rgba[out_i] = (p00[0] as f32 * w00
-                    + p10[0] as f32 * w10
-                    + p01[0] as f32 * w01
-                    + p11[0] as f32 * w11)
-                    .round() as u8;
-                dst.rgba[out_i + 1] = (p00[1] as f32 * w00
-                    + p10[1] as f32 * w10
-                    + p01[1] as f32 * w01
-                    + p11[1] as f32 * w11)
-                    .round() as u8;
-                dst.rgba[out_i + 2] = (p00[2] as f32 * w00
-                    + p10[2] as f32 * w10
-                    + p01[2] as f32 * w01
-                    + p11[2] as f32 * w11)
-                    .round() as u8;
-                dst.rgba[out_i + 3] = 255;
-                continue;
-            }
-
-            let mut accum = [0.0f32; 4];
-            for (p, weight) in [(p00, w00), (p10, w10), (p01, w01), (p11, w11)] {
-                let a = p[3] as f32 / 255.0;
-                for c in 0..3 {
-                    accum[c] += p[c] as f32 * a * weight;
-                }
-                accum[3] += a * weight;
-            }
-            if accum[3] > 0.0 {
-                blend(
-                    dst,
-                    px,
-                    py,
-                    [
-                        (accum[0] / accum[3]).round() as u8,
-                        (accum[1] / accum[3]).round() as u8,
-                        (accum[2] / accum[3]).round() as u8,
-                        (accum[3] * 255.0).round() as u8,
-                    ],
-                    coverage,
-                );
+                dst.rgba[out_i..out_i + 4].copy_from_slice(&rgba);
+            } else if rgba[3] > 0 {
+                blend(dst, px, py, rgba, coverage);
             }
         }
     }
@@ -1576,8 +1868,8 @@ mod tests {
 
     #[test]
     fn contact_sheets_lay_out_up_to_twelve_frames() {
-        for (count, landscape, portrait) in [(7, 3, 4), (9, 3, 5), (12, 3, 6)] {
-            for (size, columns) in [((320, 200), landscape), ((200, 430), portrait)] {
+        for count in [1, 2, 3, 4, 7, 9, 12] {
+            for size in [(1280, 800), (736, 1600), (930, 975)] {
                 let frames: Vec<_> = (1..=count)
                     .map(|i| {
                         (
@@ -1587,18 +1879,42 @@ mod tests {
                     })
                     .collect();
                 let sheet = render_contact_sheet(&bundle(), &frames);
-                let cell = if size.1 > size.0 { 440 } else { 640 };
-                assert_eq!(
-                    sheet.width as usize,
-                    32 + cell * columns + 14 * (columns - 1)
+                assert!(
+                    sheet.width <= SHEET_MAX_EDGE as u32 && sheet.height <= SHEET_MAX_EDGE as u32,
+                    "Sheet {}x{} exceeded max edge for count={count} size={size:?}",
+                    sheet.width,
+                    sheet.height
                 );
+                assert!(
+                    (sheet.width as f32 * sheet.height as f32) <= SHEET_MAX_PIXELS * 1.03,
+                    "Sheet {}x{} exceeded pixel budget for count={count} size={size:?}",
+                    sheet.width,
+                    sheet.height
+                );
+                let mut centroids = Vec::with_capacity(count);
                 for i in 1..=count {
+                    let color = [40 + i as u8 * 10, 60, 80, 255];
+                    let mut sum_x = 0usize;
+                    let mut sum_y = 0usize;
+                    let mut n_px = 0usize;
+                    for (idx, p) in sheet.rgba.chunks_exact(4).enumerate() {
+                        if p == color {
+                            sum_x += idx % sheet.width as usize;
+                            sum_y += idx / sheet.width as usize;
+                            n_px += 1;
+                        }
+                    }
+                    assert!(n_px > 500, "Missing card {i} of {count}");
+                    centroids.push((sum_x as f32 / n_px as f32, sum_y as f32 / n_px as f32));
+                }
+                // Reading order: every frame is either to the right on the same row, or on a lower row.
+                for pair in centroids.windows(2) {
+                    let (x0, y0) = pair[0];
+                    let (x1, y1) = pair[1];
+                    let same_row = (y1 - y0).abs() < 20.0;
                     assert!(
-                        sheet
-                            .rgba
-                            .chunks_exact(4)
-                            .any(|p| p == [40 + i as u8 * 10, 60, 80, 255]),
-                        "Missing card {i} of {count}"
+                        (same_row && x1 > x0) || (!same_row && y1 > y0),
+                        "Reading order violated for count={count} size={size:?}: {centroids:?}"
                     );
                 }
             }
@@ -1606,29 +1922,56 @@ mod tests {
     }
 
     #[test]
-    fn contact_sheets_support_one_three_and_four_frames() {
-        for count in [1, 3, 4] {
-            let frames: Vec<_> = (1..=count)
-                .map(|i| (key(i), solid(320, 200, [40 + i as u8 * 10, 60, 80, 255])))
-                .collect();
-            let sheet = render_contact_sheet(&bundle(), &frames);
-            assert_eq!(sheet.width, if count == 1 { 672 } else { 1326 });
-            assert!(sheet.height >= if count == 1 { 400 } else { 800 });
-            assert_eq!(
-                sheet.rgba.len(),
-                sheet.width as usize * sheet.height as usize * 4
-            );
-            for i in 1..=count {
+    fn contact_sheets_pack_mixed_aspects_and_fill_width_without_letterboxing() {
+        // Mixed aspect ratios like an auto-cropped screen capture: wide strip, landscape, square, tall portrait.
+        let dims = [
+            (1054, 327),
+            (1183, 837),
+            (1183, 837),
+            (685, 648),
+            (694, 1416),
+            (898, 1416),
+            (898, 1416),
+        ];
+        let frames: Vec<_> = dims
+            .iter()
+            .enumerate()
+            .map(|(idx, &(w, h))| {
+                let i = idx + 1;
+                (key(i), solid(w, h, [50 + i as u8 * 15, 90, 130, 255]))
+            })
+            .collect();
+        let sheet = render_contact_sheet(&bundle(), &frames);
+        let w = sheet.width as usize;
+        let h = sheet.height as usize;
+        let pad = SHEET_PAD as usize;
+        assert_eq!(sheet.rgba.len(), w * h * 4);
+        assert!(sheet.rgba.chunks_exact(4).all(|p| p[3] == 255));
+
+        // Every non-gutter scanline inside [pad..h-pad] must start with a frame pixel at x=pad
+        // and end with a frame pixel at x=w-pad-1 (every row fills the inner width completely).
+        let is_card = |p: &[u8]| p != SHEET_BG;
+        let mut content_rows = 0usize;
+        for y in pad..h - pad {
+            let left = &sheet.rgba[(y * w + pad) * 4..(y * w + pad + 1) * 4];
+            let right = &sheet.rgba[(y * w + w - pad - 1) * 4..(y * w + w - pad) * 4];
+            if is_card(left) || is_card(right) {
                 assert!(
-                    sheet
-                        .rgba
-                        .chunks_exact(4)
-                        .any(|p| p == [40 + i as u8 * 10, 60, 80, 255]),
-                    "Missing card {i}"
+                    is_card(left) && is_card(right),
+                    "Row y={y} did not fill full inner width"
+                );
+                content_rows += 1;
+                // Count non-gutter pixels in this scanline: only thin horizontal gutters may be SHEET_BG.
+                let bg_px = (pad..w - pad)
+                    .filter(|&x| !is_card(&sheet.rgba[(y * w + x) * 4..(y * w + x + 1) * 4]))
+                    .count();
+                assert!(
+                    bg_px <= 5 * SHEET_GAP as usize,
+                    "Unexpected blank space ({bg_px} px) on scanline y={y}"
                 );
             }
-            assert!(sheet.rgba.chunks_exact(4).all(|p| p[3] == 255));
         }
+        assert!(content_rows > h * 4 / 5, "Too many empty scanlines");
     }
 
     #[test]
