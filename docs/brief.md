@@ -24,7 +24,7 @@ Handoff: copy to the clipboard as images plus text, or send straight to an OpenC
 ## Prior art to study first
 
 - **opencode-ios session-review tool:** `~/code/open-source/opencode-ios/tools/session-review/`. It has an annotation feature that records video, tracks the mouse, and aligns drawings with a recorded transcript. Reuse its ideas and code where possible. Ask Kit which session built it if it isn't obvious.
-- **Hex:** Kit's local voice-to-text. There's a published SDK, `@kitlangton/hex` (0.3.0); see `~/code/open-source/hex-sdk-lab` for usage, and `~/code/open-source/hex-worktrees` for the source. Prefer Hex for transcription, as an SDK, binary or shared core. If Scrawl needs things Hex lacks (word timings, streaming, file input), that's a reason to improve Hex rather than add another model. A Hex-native "Scrawl mode" is also an option to weigh.
+- **Hex:** Kit's local voice-to-text. There's a published SDK, `@kitlangton/hex` (0.3.0); see `~/code/open-source/hex-sdk-lab` for usage, and `~/code/open-source/hex-worktrees` for the source. Prefer Hex for transcription, as an SDK, binary or shared core. If Scrawl needs things Hex lacks (word timings, streaming, file input), that's a reason to improve Hex rather than add another model. A Hex-native "Scrawl mode" is also an option to weigh. (Superseded October 2026: Scrawl transcribes with Apple's SpeechAnalyzer only; the Hex fallback was removed.)
 
 ## Open questions
 

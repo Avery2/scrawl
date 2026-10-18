@@ -409,8 +409,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.kitlangton.scrawl.se
 ## Transcription
 
 Narration is transcribed on device by Apple's SpeechAnalyzer (macOS 26), which reports when every
-word was spoken. Hex's local API is the fallback when SpeechAnalyzer is unavailable (set
-`SCRAWL_TRANSCRIBER=hex` to force it). The word timings drive two things:
+word was spoken. The word timings drive two things:
 
 - **Text per keyframe.** Each keyframe's text runs from the start of the clause in progress when
   its moment began (the action, the transition, or the spoken cue) until the next keyframe, so the

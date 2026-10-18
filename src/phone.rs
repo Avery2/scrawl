@@ -528,7 +528,7 @@ pub fn build_movie_bundle(
             });
             let audio_started = Instant::now();
             let exported = helper::export_audio(&capture.movie, &wav)
-                .and_then(|()| crate::hex::recorded_audio_from_wav(std::fs::read(&wav)?));
+                .and_then(|()| crate::audio::recorded_audio_from_wav(std::fs::read(&wav)?));
             let audio_ms = audio_started.elapsed().as_millis() as u64;
             let (audio, audio_err) = match exported {
                 Ok(a) => (Some(a), None),

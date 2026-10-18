@@ -30,7 +30,7 @@ use crate::capture::{
     update_global_shortcut,
 };
 use crate::helper::PhoneDevice;
-use crate::hex::AudioRecorder;
+use crate::audio::AudioRecorder;
 use crate::laser_overlay::MetalLaserOverlay;
 use crate::model::{CaptureMode, ScrawlBundle, TargetFrame, TargetInfo, format_clock};
 use crate::phone::PhoneSession;

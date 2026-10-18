@@ -1,9 +1,9 @@
+mod audio;
 mod autocrop;
 mod autocrop_lab;
 mod capture;
 mod handoff;
 mod helper;
-mod hex;
 mod hold;
 mod icons;
 mod inbox;
@@ -27,7 +27,7 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 
 use crate::capture::{ScreenCaptureSession, discover_target, write_bundle_artifacts};
-use crate::hex::{AudioRecorder, RecordedAudio};
+use crate::audio::{AudioRecorder, RecordedAudio};
 use crate::keyframes::select_keyframes;
 use crate::model::{
     CaptureMode, DeviceInfo, InteractionEvent, MAX_KEYFRAMES, Mark, RgbaFrame, SCALE, ScrawlBundle,
@@ -1074,8 +1074,8 @@ pub fn generate_demo_bundle(out: Option<PathBuf>) -> Result<(PathBuf, ScrawlBund
     ];
 
     let transcript = TranscriptData {
-        source: "hex".into(),
-        model: Some("parakeet_unified_en".into()),
+        source: "speech-analyzer".into(),
+        model: Some("SpeechTranscriber en_US".into()),
         text: "When I click Used 12 tools this band header jumps down by four pixels, and the row spacing under the card feels too tight.".into(),
         segments: vec![
             TranscriptSegment {
@@ -1356,7 +1356,7 @@ fn main() -> Result<()> {
                         let iter_wav = wav_bytes.clone();
                         let t0 = std::time::Instant::now();
                         let recorded = iter_wav
-                            .map(hex::recorded_audio_from_wav)
+                            .map(audio::recorded_audio_from_wav)
                             .transpose()?;
                         iter_activity.stop_started = Some(t0);
                         iter_activity.stop_ms = Some(t0.elapsed().as_millis() as u64);
@@ -1427,7 +1427,7 @@ fn main() -> Result<()> {
                 let recorded = match &audio {
                     Some(path) => {
                         std::fs::copy(path, out.join("audio.wav"))?;
-                        Some(hex::recorded_audio_from_wav(std::fs::read(path)?)?)
+                        Some(audio::recorded_audio_from_wav(std::fs::read(path)?)?)
                     }
                     None => None,
                 };
