@@ -196,9 +196,21 @@ mod tests {
         let b = bundle();
         let fractions = resolve(CropArg::Rect([0.25, 0.25, 0.5, 0.5]), &b, (2560, 1440)).unwrap();
         assert_eq!(fractions, [0.25, 0.25, 0.75, 0.75]);
-        let pixels = resolve(CropArg::Rect([640.0, 360.0, 1280.0, 720.0]), &b, (2560, 1440)).unwrap();
+        let pixels = resolve(
+            CropArg::Rect([640.0, 360.0, 1280.0, 720.0]),
+            &b,
+            (2560, 1440),
+        )
+        .unwrap();
         assert_eq!(pixels, [0.25, 0.25, 0.75, 0.75]);
-        assert!(resolve(CropArg::Rect([2000.0, 0.0, 1280.0, 720.0]), &b, (2560, 1440)).is_err());
+        assert!(
+            resolve(
+                CropArg::Rect([2000.0, 0.0, 1280.0, 720.0]),
+                &b,
+                (2560, 1440)
+            )
+            .is_err()
+        );
         assert!(resolve(CropArg::Rect([0.0, 0.0, 0.001, 0.5]), &b, (2560, 1440)).is_err());
         assert_eq!(resolve(CropArg::Full, &b, (2560, 1440)).unwrap(), FULL);
     }
@@ -216,7 +228,11 @@ mod tests {
         assert_eq!(output_size((2560.0, 1440.0), 1920).unwrap(), (1920, 1080));
         assert_eq!(output_size((2023.0, 1059.0), 1920).unwrap(), (1920, 1006));
         let (w, h) = output_size((733.0, 309.0), 1920).unwrap();
-        assert_eq!((w, h), (734, 310), "small crops stay at native size, rounded to even");
+        assert_eq!(
+            (w, h),
+            (734, 310),
+            "small crops stay at native size, rounded to even"
+        );
         let (w, h) = output_size((1320.0, 2868.0), 1920).unwrap();
         assert_eq!(h, 1920);
         assert_eq!(w % 2, 0);

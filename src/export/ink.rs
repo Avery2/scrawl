@@ -7,9 +7,7 @@
 
 use serde::Serialize;
 
-use crate::model::{
-    InteractionEvent, LASER_MS, ScrawlBundle, Stroke,
-};
+use crate::model::{InteractionEvent, LASER_MS, ScrawlBundle, Stroke};
 use crate::sketch::{FreehandOptions, freehand_outline, slice_laser_window, smooth_laser_points};
 
 /// Ink stays on screen this long after its mark's last stroke, then fades.
@@ -213,14 +211,20 @@ pub fn plan(bundle: &ScrawlBundle, video_px: (u32, u32), layers: Layers) -> InkP
                     path,
                     button,
                     label,
-                } if button.as_deref() == Some("touch") && !is_long_press(label) && *t >= offset => {
+                } if button.as_deref() == Some("touch")
+                    && !is_long_press(label)
+                    && *t >= offset =>
+                {
                     let pts: Vec<[f32; 2]> = if path.len() >= 2 {
                         path.clone()
                     } else {
                         vec![[*x0, *y0], [*x1, *y1]]
                     };
                     plan.trails.push(Trail {
-                        pts: pts.iter().flat_map(|p| [round(p[0]), round(p[1])]).collect(),
+                        pts: pts
+                            .iter()
+                            .flat_map(|p| [round(p[0]), round(p[1])])
+                            .collect(),
                         t: vt(*t),
                         t1: vt(*t1),
                     });
@@ -377,17 +381,30 @@ mod tests {
         let plan = plan(&b, (2560, 1440), layers);
         assert_eq!(plan.strokes.len(), 2);
         let first = &plan.strokes[0];
-        assert_eq!(first.snaps.first().unwrap().t, 2_000 - 100, "bundle clock to video clock");
+        assert_eq!(
+            first.snaps.first().unwrap().t,
+            2_000 - 100,
+            "bundle clock to video clock"
+        );
         assert!(first.snaps.windows(2).all(|p| p[0].t < p[1].t));
         assert!(
-            first.snaps.windows(2).all(|p| p[0].poly.len() <= p[1].poly.len() + 8),
+            first
+                .snaps
+                .windows(2)
+                .all(|p| p[0].poly.len() <= p[1].poly.len() + 8),
             "the outline grows as the stroke does"
         );
         // Both strokes of the mark fade after the later one ends (580 ms into the second).
         let end = 3_000 + 29 * 20;
         assert_eq!(first.fade_at, end + HOLD_MS - 100);
         assert_eq!(plan.strokes[1].fade_at, first.fade_at);
-        assert!(first.snaps.iter().flat_map(|s| &s.poly).all(|v| (-0.1..=1.1).contains(v)));
+        assert!(
+            first
+                .snaps
+                .iter()
+                .flat_map(|s| &s.poly)
+                .all(|v| (-0.1..=1.1).contains(v))
+        );
         assert!(plan.ripples.is_empty());
     }
 
@@ -403,10 +420,27 @@ mod tests {
             label: None,
             role: None,
         }];
-        let off = Layers { ink: false, clicks: false };
+        let off = Layers {
+            ink: false,
+            clicks: false,
+        };
         assert!(plan(&b, (2560, 1440), off).is_empty());
-        let clicks = plan(&b, (2560, 1440), Layers { ink: false, clicks: true });
-        assert_eq!(clicks.ripples, vec![Ripple { x: 0.3, y: 0.4, t: 4_900 }]);
+        let clicks = plan(
+            &b,
+            (2560, 1440),
+            Layers {
+                ink: false,
+                clicks: true,
+            },
+        );
+        assert_eq!(
+            clicks.ripples,
+            vec![Ripple {
+                x: 0.3,
+                y: 0.4,
+                t: 4_900
+            }]
+        );
         assert!(clicks.strokes.is_empty());
     }
 
@@ -415,7 +449,10 @@ mod tests {
         let mut b = bundle();
         let mut pin = stroke(4_000, &[(2_000, 3_000, 0)]);
         pin.pin = Some(2);
-        let mut beam = stroke(6_000, &[(1_000, 1_000, 0), (3_000, 2_000, 100), (5_000, 3_000, 200)]);
+        let mut beam = stroke(
+            6_000,
+            &[(1_000, 1_000, 0), (3_000, 2_000, 100), (5_000, 3_000, 200)],
+        );
         beam.laser = true;
         b.strokes = vec![pin, beam];
         b.events = vec![InteractionEvent::Drag {
@@ -429,7 +466,14 @@ mod tests {
             button: Some("touch".into()),
             path: Vec::new(),
         }];
-        let plan = plan(&b, (1320, 2868), Layers { ink: true, clicks: true });
+        let plan = plan(
+            &b,
+            (1320, 2868),
+            Layers {
+                ink: true,
+                clicks: true,
+            },
+        );
         assert_eq!(plan.pins.len(), 1);
         assert_eq!((plan.pins[0].n, plan.pins[0].t), (2, 3_900));
         assert_eq!(plan.lasers.len(), 1);
@@ -443,10 +487,18 @@ mod tests {
 
     #[test]
     fn long_strokes_are_thinned_to_a_snapshot_budget() {
-        let long: Vec<(i32, i32, i32)> = (0..600).map(|i| (1_000 + i * 10, 5_000, i * 10)).collect();
+        let long: Vec<(i32, i32, i32)> =
+            (0..600).map(|i| (1_000 + i * 10, 5_000, i * 10)).collect();
         let mut b = bundle();
         b.strokes = vec![stroke(1_000, &long)];
-        let plan = plan(&b, (2560, 1440), Layers { ink: true, clicks: false });
+        let plan = plan(
+            &b,
+            (2560, 1440),
+            Layers {
+                ink: true,
+                clicks: false,
+            },
+        );
         let snaps = &plan.strokes[0].snaps;
         assert!(snaps.len() <= MAX_SNAPSHOTS);
         assert_eq!(snaps.last().unwrap().t, 1_000 + 5_990 - 100);

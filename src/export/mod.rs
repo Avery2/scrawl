@@ -129,7 +129,12 @@ pub fn focuses(bundle: &ScrawlBundle) -> Vec<Focus> {
     let bbox = |points: &mut dyn Iterator<Item = [f32; 2]>| -> Option<Rect> {
         points.fold(None, |acc: Option<Rect>, p| {
             Some(acc.map_or([p[0], p[1], p[0], p[1]], |r| {
-                [r[0].min(p[0]), r[1].min(p[1]), r[2].max(p[0]), r[3].max(p[1])]
+                [
+                    r[0].min(p[0]),
+                    r[1].min(p[1]),
+                    r[2].max(p[0]),
+                    r[3].max(p[1]),
+                ]
             }))
         })
     };
@@ -232,20 +237,23 @@ pub fn export(
     // The audio: an iPhone movie's own track (full quality, on the movie's clock), else
     // `audio.wav`, which Scrawl records from the bundle's start, `video_offset_ms` before the
     // video's.
-    let wav = bundle.audio.as_ref().map(|name| dir.join(name)).filter(|p| p.is_file());
-    let (audio, audio_start, audio_length) = if bundle.source.as_deref() == Some("iphone")
-        && probe.audio_tracks > 0
-    {
-        (Some(video.clone()), 0, probe.duration_ms)
-    } else if let Some(wav) = wav {
-        let wav_ms = wav_duration_ms(&wav)?;
-        match crop::audio_window(bundle.video_offset_ms, probe.duration_ms, wav_ms) {
-            Some((start, length)) => (Some(wav), start, length),
-            None => (None, 0, 0),
-        }
-    } else {
-        (None, 0, 0)
-    };
+    let wav = bundle
+        .audio
+        .as_ref()
+        .map(|name| dir.join(name))
+        .filter(|p| p.is_file());
+    let (audio, audio_start, audio_length) =
+        if bundle.source.as_deref() == Some("iphone") && probe.audio_tracks > 0 {
+            (Some(video.clone()), 0, probe.duration_ms)
+        } else if let Some(wav) = wav {
+            let wav_ms = wav_duration_ms(&wav)?;
+            match crop::audio_window(bundle.video_offset_ms, probe.duration_ms, wav_ms) {
+                Some((start, length)) => (Some(wav), start, length),
+                None => (None, 0, 0),
+            }
+        } else {
+            (None, 0, 0)
+        };
 
     let camera = options
         .zoom
@@ -290,7 +298,8 @@ pub fn export(
         }),
         ink: &ink,
     };
-    let plan_path = std::env::temp_dir().join(format!("scrawl-export-{}.json", crate::make_bundle_id()));
+    let plan_path =
+        std::env::temp_dir().join(format!("scrawl-export-{}.json", crate::make_bundle_id()));
     std::fs::write(&plan_path, serde_json::to_vec(&plan)?)?;
     let result = run_helper(&plan_path, options.background, progress);
     let _ = std::fs::remove_file(&plan_path);
@@ -321,7 +330,10 @@ fn wav_duration_ms(path: &Path) -> Result<u64> {
     let reader = hound::WavReader::open(path)
         .with_context(|| format!("Could not read {}", path.display()))?;
     let spec = reader.spec();
-    ensure!(spec.sample_rate > 0 && spec.channels > 0, "Invalid audio file");
+    ensure!(
+        spec.sample_rate > 0 && spec.channels > 0,
+        "Invalid audio file"
+    );
     Ok(u64::from(reader.duration()) * 1_000 / u64::from(spec.sample_rate))
 }
 
@@ -381,8 +393,16 @@ pub fn describe(exported: &Exported) -> String {
         exported.fps,
         crate::model::format_clock(exported.duration_ms),
         exported.bytes as f64 / 1_048_576.0,
-        if exported.audio { " · audio" } else { " · no audio" },
-        if exported.camera_moves { " · auto-zoom" } else { "" },
+        if exported.audio {
+            " · audio"
+        } else {
+            " · no audio"
+        },
+        if exported.camera_moves {
+            " · auto-zoom"
+        } else {
+            ""
+        },
     )
 }
 
@@ -413,7 +433,11 @@ mod tests {
     #[test]
     fn camera_focuses_are_on_the_video_clock_and_skip_what_came_before_it() {
         let f = focuses(&bundle());
-        assert_eq!(f.len(), 3, "click, drag, stroke; the early click and scroll don't count");
+        assert_eq!(
+            f.len(),
+            3,
+            "click, drag, stroke; the early click and scroll don't count"
+        );
         assert_eq!((f[0].t0, f[0].rect), (2_000, [0.5, 0.5, 0.5, 0.5]));
         assert_eq!((f[1].t0, f[1].t1), (7_900, 8_400));
         assert_eq!(f[1].rect, [0.7, 0.6, 0.75, 0.65]);
@@ -432,6 +456,10 @@ mod tests {
     #[test]
     fn default_output_lands_in_movies_scrawl() {
         let path = default_output(Path::new("/x/scrawl-17-9.scrawl"));
-        assert!(path.ends_with("Movies/Scrawl/scrawl-17-9.mp4"), "{}", path.display());
+        assert!(
+            path.ends_with("Movies/Scrawl/scrawl-17-9.mp4"),
+            "{}",
+            path.display()
+        );
     }
 }

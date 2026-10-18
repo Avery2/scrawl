@@ -103,7 +103,12 @@ fn span(r: Rect) -> f32 {
 }
 
 fn union(a: Rect, b: Rect) -> Rect {
-    [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+    [
+        a[0].min(b[0]),
+        a[1].min(b[1]),
+        a[2].max(b[2]),
+        a[3].max(b[3]),
+    ]
 }
 
 /// Where the cursor moves fast, as `[from, to]` ms ranges.
@@ -282,11 +287,7 @@ fn dense(input: &Input) -> Vec<CameraKey> {
         let (lo_x, lo_y) = (1.0 - s, 1.0 - s);
         ox = ox.clamp(lo_x, 0.0);
         oy = oy.clamp(lo_y, 0.0);
-        if target_scale == 1.0
-            && (s - 1.0).abs() < 0.002
-            && ox.abs() < 0.002
-            && oy.abs() < 0.002
-        {
+        if target_scale == 1.0 && (s - 1.0).abs() < 0.002 && ox.abs() < 0.002 && oy.abs() < 0.002 {
             (s, vs, ox, vox, oy, voy) = (1.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         }
         let (cx, cy, cw, ch) = (
@@ -385,28 +386,50 @@ mod tests {
         let focuses = [click(5_000, 0.7, 0.3)];
         let keys = plan(&input(14_000, FULL, &focuses, &[]));
         assert!((scale_at(&keys, 0.0) - 1.0).abs() < 1e-4);
-        assert!((scale_at(&keys, 4_000.0) - 1.0).abs() < 0.02, "no zoom early");
+        assert!(
+            (scale_at(&keys, 4_000.0) - 1.0).abs() < 0.02,
+            "no zoom early"
+        );
         let mid = scale_at(&keys, 5_000.0);
-        assert!(mid > 1.2 && mid < ZOOM_SCALE, "zoom is under way at the click: {mid}");
+        assert!(
+            mid > 1.2 && mid < ZOOM_SCALE,
+            "zoom is under way at the click: {mid}"
+        );
         assert!(scale_at(&keys, 6_500.0) > ZOOM_SCALE - 0.02, "arrived");
         let at_hold = scale_at(&keys, 7_400.0);
-        assert!(at_hold > ZOOM_SCALE - 0.02, "held until the hold ends: {at_hold}");
+        assert!(
+            at_hold > ZOOM_SCALE - 0.02,
+            "held until the hold ends: {at_hold}"
+        );
         let c = centre_at(&keys, 6_500.0);
-        assert!((c[0] - 0.7).abs() < 0.03 && (c[1] - 0.3).abs() < 0.05, "centred on the click: {c:?}");
+        assert!(
+            (c[0] - 0.7).abs() < 0.03 && (c[1] - 0.3).abs() < 0.05,
+            "centred on the click: {c:?}"
+        );
         assert!(scale_at(&keys, 8_500.0) < ZOOM_SCALE - 0.1, "easing out");
-        assert!((scale_at(&keys, 13_000.0) - 1.0).abs() < 1e-3, "back to the full crop");
+        assert!(
+            (scale_at(&keys, 13_000.0) - 1.0).abs() < 1e-3,
+            "back to the full crop"
+        );
         assert_eq!(rect_at(&keys, 13_900.0), FULL);
     }
 
     #[test]
     fn nearby_activity_shares_one_zoom_until_after_the_last() {
-        let focuses = [click(5_000, 0.50, 0.50), click(6_800, 0.55, 0.52), click(8_500, 0.52, 0.48)];
+        let focuses = [
+            click(5_000, 0.50, 0.50),
+            click(6_800, 0.55, 0.52),
+            click(8_500, 0.52, 0.48),
+        ];
         let keys = plan(&input(16_000, FULL, &focuses, &[]));
         let floor = (6_000..11_000)
             .step_by(100)
             .map(|t| scale_at(&keys, t as f64))
             .fold(f32::MAX, f32::min);
-        assert!(floor > ZOOM_SCALE - 0.02, "never eases out between clicks: {floor}");
+        assert!(
+            floor > ZOOM_SCALE - 0.02,
+            "never eases out between clicks: {floor}"
+        );
         assert!(scale_at(&keys, 13_500.0) < 1.15, "eases out after the last");
     }
 
@@ -418,7 +441,10 @@ mod tests {
             .step_by(50)
             .map(|t| scale_at(&keys, t as f64))
             .fold(f32::MAX, f32::min);
-        assert!(floor > MIN_ZOOM_SCALE, "stays zoomed while panning across: {floor}");
+        assert!(
+            floor > MIN_ZOOM_SCALE,
+            "stays zoomed while panning across: {floor}"
+        );
         let c = centre_at(&keys, 9_000.0);
         assert!(c[0] > 0.65, "ends on the second click: {c:?}");
     }
@@ -446,7 +472,10 @@ mod tests {
         ];
         let keys = plan(&input(12_000, FULL, &focuses, &[]));
         assert!(scale_at(&keys, 3_900.0) > 1.6);
-        assert!(scale_at(&keys, 6_500.0) < 1.05, "wide again for the wide activity");
+        assert!(
+            scale_at(&keys, 6_500.0) < 1.05,
+            "wide again for the wide activity"
+        );
     }
 
     #[test]
@@ -464,7 +493,10 @@ mod tests {
                 scale_at(&keys, t as f64)
             );
         }
-        assert!(scale_at(&keys, 4_800.0) > ZOOM_SCALE - 0.05, "zooms once there");
+        assert!(
+            scale_at(&keys, 4_800.0) > ZOOM_SCALE - 0.05,
+            "zooms once there"
+        );
 
         // The same click with a slow approach zooms ahead of it.
         let slow: Vec<(u64, f32, f32)> = (0..=12)
@@ -482,7 +514,10 @@ mod tests {
             .collect();
         let keys = plan(&input(8_000, FULL, &focuses, &fidget));
         let c = centre_at(&keys, 4_000.0);
-        assert!((c[0] - 0.5).abs() < 0.01, "small movement doesn't pan: {c:?}");
+        assert!(
+            (c[0] - 0.5).abs() < 0.01,
+            "small movement doesn't pan: {c:?}"
+        );
 
         // Drifting right slowly (0.25 crop widths per second) pulls the view along.
         let drift: Vec<(u64, f32, f32)> = (0..=24)
@@ -490,7 +525,10 @@ mod tests {
             .collect();
         let keys = plan(&input(8_000, FULL, &focuses, &drift));
         let c = centre_at(&keys, 4_500.0);
-        assert!(c[0] > 0.55, "follows a cursor that leaves the safe zone: {c:?}");
+        assert!(
+            c[0] > 0.55,
+            "follows a cursor that leaves the safe zone: {c:?}"
+        );
         let r = rect_at(&keys, 4_500.0);
         assert!(r[2] <= 1.0 + 1e-5 && r[0] >= -1e-5);
     }
@@ -539,7 +577,11 @@ mod tests {
             let r = rect_at(&keys, t);
             let delta: [f32; 4] = std::array::from_fn(|i| r[i] - previous[i]);
             biggest = biggest.max(delta.iter().fold(0.0, |m, d| m.max(d.abs())));
-            jerk = jerk.max((0..4).map(|i| (delta[i] - last_step[i]).abs()).fold(0.0, f32::max));
+            jerk = jerk.max(
+                (0..4)
+                    .map(|i| (delta[i] - last_step[i]).abs())
+                    .fold(0.0, f32::max),
+            );
             last_step = delta;
             assert!(1.0 / (r[2] - r[0]) <= ZOOM_SCALE + 1e-3, "overshoot at {t}");
             previous = r;
@@ -555,11 +597,20 @@ mod tests {
         let i = input(12_000, FULL, &focuses, &[]);
         let all = dense(&i);
         let keys = plan(&i);
-        assert!(keys.len() < all.len(), "idle runs collapse: {} of {}", keys.len(), all.len());
+        assert!(
+            keys.len() < all.len(),
+            "idle runs collapse: {} of {}",
+            keys.len(),
+            all.len()
+        );
         assert_eq!(keys.first().unwrap().t_ms, 0.0);
         for key in &all {
             let r = rect_at(&keys, key.t_ms);
-            assert!((0..4).all(|j| (r[j] - key.rect[j]).abs() < 1e-4), "at {}", key.t_ms);
+            assert!(
+                (0..4).all(|j| (r[j] - key.rect[j]).abs() < 1e-4),
+                "at {}",
+                key.t_ms
+            );
         }
     }
 }
