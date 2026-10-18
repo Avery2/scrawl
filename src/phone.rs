@@ -471,8 +471,9 @@ pub fn build_movie_bundle(
                 let every = (probe.duration_ms / MAX_CANDIDATES).max(250);
                 let t0 = Instant::now();
                 let budget = crate::model::keyframe_budget(probe.duration_ms);
-                let direct_marks = mark_times.len() >= budget;
-                if direct_marks {
+                // With a mark for every slot, only the frames under the marks are needed, unless
+                // marks on one screen share a keyframe and leave slots for other moments.
+                if mark_times.len() >= budget {
                     let direct = helper::frames(
                         movie_ref,
                         FrameTimes::At(&mark_times),
@@ -507,18 +508,24 @@ pub fn build_movie_bundle(
                             &crate::model::TranscriptData::default(),
                             budget,
                         );
-                        let prep = crate::prepare_visuals(
-                            preview,
-                            raw_frames.first(),
-                            None,
-                            &target,
-                            probe.duration_ms,
-                            strokes_ref,
-                            &preview_marks,
-                            events_ref,
-                            &crate::windows::ActivityLog::default(),
-                        );
-                        return Ok((probe, raw_frames, decode_ms, true, prep));
+                        if preview.len() == budget
+                            && preview
+                                .iter()
+                                .all(|(k, _)| k.reason == crate::model::KeyframeReason::Mark)
+                        {
+                            let prep = crate::prepare_visuals(
+                                preview,
+                                raw_frames.first(),
+                                None,
+                                &target,
+                                probe.duration_ms,
+                                strokes_ref,
+                                &preview_marks,
+                                events_ref,
+                                &crate::windows::ActivityLog::default(),
+                            );
+                            return Ok((probe, raw_frames, decode_ms, true, prep));
+                        }
                     }
                 }
                 let res = helper::frames(movie_ref, FrameTimes::Every(every), CANDIDATE_EDGE)?;

@@ -505,29 +505,38 @@ impl Input {
         }
     }
 
-    /// Adds the ink of every mark grouped into a keyframe to that keyframe's crop.
-    pub fn pin_ink(
+    /// Gives the ink of every mark grouped into a keyframe to that keyframe's crop alone, however
+    /// long before it was drawn. `strokes` are the ones passed to `new`.
+    pub fn pin_ink<'a>(
         &mut self,
-        selected: &[(Keyframe, RgbaFrame)],
+        keyframes: impl IntoIterator<Item = &'a Keyframe>,
         strokes: &[Stroke],
         marks: &[Mark],
     ) {
-        for (k, (keyframe, _)) in selected.iter().enumerate() {
+        // `new` adds an item for each stroke with points, first and in order.
+        let item_of: Vec<Option<usize>> = strokes
+            .iter()
+            .scan(0, |next, s| {
+                Some((s.pts.len() >= 3).then(|| {
+                    *next += 1;
+                    *next - 1
+                }))
+            })
+            .collect();
+        for (k, keyframe) in keyframes.into_iter().enumerate() {
             let grouped = marks
                 .iter()
                 .filter(|m| m.frame.as_ref() == Some(&keyframe.file))
                 .flat_map(|m| &m.strokes);
-            for stroke in grouped.filter_map(|&i| strokes.get(i)) {
-                let pts = stroke.timed_points();
-                if !pts.is_empty() {
-                    self.items.push(Item {
-                        kind: Kind::Stroke,
-                        t0: stroke.t0,
-                        t1: stroke.t1,
-                        pts: subsample(&pts, 48),
-                        dwell: 0.0,
-                        keyframe: Some(k),
-                    });
+            for &i in grouped {
+                if let Some(item) = item_of
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .map(|i| &mut self.items[i])
+                    && item.kind == Kind::Stroke
+                {
+                    item.keyframe = Some(k);
                 }
             }
         }
@@ -1022,8 +1031,8 @@ impl Ctx<'_> {
         for (i, item) in self.input.items.iter().enumerate() {
             let in_slice = item.t1 >= slice[0] && item.t0 <= slice[1];
             match (item.kind, item.keyframe) {
-                // A grouped mark's ink drawn before this keyframe's slice still belongs to it.
-                (Kind::Stroke, Some(_)) if item.keyframe != k || in_slice => continue,
+                // A grouped mark's ink belongs to its keyframe alone, whenever it was drawn.
+                (Kind::Stroke, Some(_)) if k.is_some() && item.keyframe != k => continue,
                 (Kind::Stroke, Some(_)) => {}
                 (Kind::Change, Some(_)) if k.is_some() && item.keyframe != k => continue,
                 _ if !in_slice => continue,
@@ -1770,7 +1779,7 @@ pub fn annotate_and_crop(
                 cursor,
                 &changes,
             );
-            input.pin_ink(&selected, strokes, marks);
+            input.pin_ink(selected.iter().map(|(k, _)| k), strokes, marks);
             let screen = input.screen;
             input.content = std::thread::scope(|scope| {
                 let workers: Vec<_> = selected
@@ -1923,6 +1932,47 @@ mod tests {
             mark_id: None,
             cursor: Some([0.5, 0.5]),
         }
+    }
+
+    #[test]
+    fn grouped_ink_belongs_to_its_keyframe_alone() {
+        let stroke = |t0: u64, x: i32| Stroke {
+            t0,
+            t1: t0 + 100,
+            fw: 1000,
+            fh: 800,
+            on: None,
+            pin: None,
+            laser: false,
+            pts: vec![x, 5000, 0, x + 500, 5000, 100],
+        };
+        let strokes = [stroke(1_000, 1000), stroke(9_000, 8000)];
+        let mark = |id: &str, stroke: usize| Mark {
+            id: id.into(),
+            strokes: vec![stroke],
+            t0: strokes[stroke].t0,
+            t1: strokes[stroke].t1,
+            box_norm: [0.0, 0.0, 1.0, 1.0],
+            shape: crate::model::Shape::Line,
+            from: None,
+            to: None,
+            pin: None,
+            on: None,
+            description: String::new(),
+            frame: Some("frames/frame-02.png".into()),
+        };
+        let keyframes = [keyframe(1, 500), keyframe(2, 9_100)];
+        let mut input = Input::new(FRAME, 10_000, &[500, 9_100], &strokes, &[], &[], &[], &[]);
+        let before = input.items.len();
+        input.pin_ink(&keyframes, &strokes, &[mark("m1", 0), mark("m2", 1)]);
+        assert_eq!(input.items.len(), before);
+        let ink: Vec<_> = input
+            .items
+            .iter()
+            .filter(|item| item.kind == Kind::Stroke)
+            .map(|item| item.keyframe)
+            .collect();
+        assert_eq!(ink, [Some(1), Some(1)]);
     }
 
     fn window(id: u32, app: &str, bounds: [i32; 4], frontmost: bool) -> WindowEntry {

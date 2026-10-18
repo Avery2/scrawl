@@ -116,6 +116,7 @@ pub fn input_for_bundle(dir: &Path, bundle: &ScrawlBundle) -> Input {
         &bundle.cursor,
         &changes,
     );
+    input.pin_ink(&bundle.keyframes, &bundle.strokes, &bundle.marks);
     // The full frames carry Scrawl's ink, which reads as content too; close enough for tuning.
     let full = bundle
         .autocrop

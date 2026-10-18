@@ -521,6 +521,7 @@ function renderStrip() {
 
 // Scrawl's contact sheet layout (render_contact_sheet): 16 px padding, 14 px gaps, 640 px cells
 // two to a row (440 px, three to a row, when every frame is portrait), cards at most 960 px tall.
+// Past six frames: three landscape to a row, or portrait in two rows.
 function sheetCell() { return sheetRects().every(r => r[3] > r[2]) ? 440 : 640; }
 function sheetRects() {
   const original = document.getElementById('sheetOriginal').checked;
@@ -532,7 +533,8 @@ function renderSheet() {
   if (!rects.length) return;
   const portrait = rects.every(r => r[3] > r[2]);
   const cell = portrait ? 440 : 640;
-  const cols = rects.length === 1 ? 1 : portrait ? Math.min(rects.length, 3) : 2;
+  const n = rects.length;
+  const cols = n === 1 ? 1 : portrait ? (n <= 6 ? Math.min(n, 3) : Math.ceil(n / 2)) : n <= 6 ? 2 : 3;
   const sizes = rects.map(r => { const s = Math.min(cell / r[2], 960 / r[3]); return [r[2] * s, r[3] * s, s]; });
   const rowH = [];
   for (let i = 0; i < sizes.length; i += cols) rowH.push(Math.max(...sizes.slice(i, i + cols).map(s => s[1])));

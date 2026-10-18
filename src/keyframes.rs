@@ -164,17 +164,24 @@ const CUE_NOVELTY: f32 = 0.03;
 const SAME_SCREEN: f32 = 0.05;
 const INK_CONTEXT: f32 = 0.08;
 const CELL_CHANGE: f32 = 0.04;
-/// Marks drawn further apart than this start a new group even on an unchanged screen, so one
-/// frame never carries half a minute of ink and talk.
-const GROUP_MS: u64 = 30_000;
+/// A group of marks on one screen closes past this span or this much ink, so one frame stays
+/// legible and its words stay near its ink.
+const GROUP_MS: u64 = 20_000;
+const GROUP_STROKES: usize = 12;
 /// A keyframe owns too much when its stretch holds more words or time than this; a frame from
 /// inside the stretch is added if the screen changed there.
-const COVERAGE_WORDS: f32 = 120.0;
-const COVERAGE_MS: f32 = 40_000.0;
+const COVERAGE_WORDS: f32 = 100.0;
+const COVERAGE_MS: f32 = 35_000.0;
 
-/// Marks in drawing order, grouped while they were drawn on the same screen; then the most alike
-/// neighbouring groups merge until they fit `budget`. Flags carry no ink and stay on their own.
-fn group_marks(frames: &[&RgbaFrame], marks: &[Mark], budget: usize) -> Vec<Vec<usize>> {
+/// Marks in drawing order, grouped while they were drawn on the same screen with no click or drag
+/// (`actions`, sorted times) between them; then neighbouring groups merge until they fit `budget`,
+/// same-screen pairs with the least ink first, else the most alike. Flags stay on their own.
+fn group_marks(
+    frames: &[&RgbaFrame],
+    marks: &[Mark],
+    actions: &[u64],
+    budget: usize,
+) -> Vec<Vec<usize>> {
     let at: Vec<usize> = marks.iter().map(|m| nearest_frame(frames, m.t1)).collect();
     let mut drawn: Vec<usize> = (0..marks.len())
         .filter(|&i| marks[i].shape != Shape::Flag)
@@ -202,7 +209,8 @@ fn group_marks(frames: &[&RgbaFrame], marks: &[Mark], budget: usize) -> Vec<Vec<
             .find(|(f, _)| *f == at[i])
             .map(|(_, grid)| grid)
     };
-    let ink = |group: &[usize]| marks[group[0]].shape != Shape::Flag;
+    let drawn = |group: &[usize]| marks[group[0]].shape != Shape::Flag;
+    let ink = |group: &[usize]| group.iter().map(|&i| marks[i].strokes.len()).sum::<usize>();
     // How far the screen around the marks' ink was, as each was drawn, from the screen at
     // `last`, where the keyframe will be.
     let spread = |group: &[usize], last: usize| {
@@ -237,11 +245,17 @@ fn group_marks(frames: &[&RgbaFrame], marks: &[Mark], budget: usize) -> Vec<Vec<
     order.sort_by_key(|&i| marks[i].t1);
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for i in order {
+        let acted = |j: usize| {
+            actions.partition_point(|&t| t <= marks[j].t1)
+                < actions.partition_point(|&t| t < marks[i].t0)
+        };
         match groups.last_mut() {
             Some(group)
                 if marks[i].shape != Shape::Flag
-                    && ink(group)
+                    && drawn(group)
                     && marks[i].t1.saturating_sub(marks[group[0]].t0) <= GROUP_MS
+                    && ink(group) + marks[i].strokes.len() <= GROUP_STROKES
+                    && !acted(*group.last().unwrap())
                     && spread(group, i) < SAME_SCREEN =>
             {
                 group.push(i);
@@ -249,21 +263,27 @@ fn group_marks(frames: &[&RgbaFrame], marks: &[Mark], budget: usize) -> Vec<Vec<
             _ => groups.push(vec![i]),
         }
     }
-    // `costs[k]` is what merging group `k` into `k - 1` would spread; flags never merge.
+    // `costs[k]` ranks merging group `k` into `k - 1`: on one screen by the ink they'd carry
+    // together, so same-screen merges stay balanced, else by how far the screens differ. Flags
+    // never merge.
     let cost = |groups: &[Vec<usize>], k: usize| {
-        if k == 0 || !ink(&groups[k - 1]) || !ink(&groups[k]) {
-            return f32::INFINITY;
+        if k == 0 || !drawn(&groups[k - 1]) || !drawn(&groups[k]) {
+            return None;
         }
-        spread(
-            &[&groups[k - 1][..], &groups[k]].concat(),
-            *groups[k].last().unwrap(),
-        )
+        let merged = [&groups[k - 1][..], &groups[k]].concat();
+        let spread = spread(&merged, *groups[k].last().unwrap());
+        Some(if spread < SAME_SCREEN {
+            (false, ink(&merged) as f32)
+        } else {
+            (true, spread)
+        })
     };
-    let mut costs: Vec<f32> = (0..groups.len()).map(|k| cost(&groups, k)).collect();
+    let mut costs: Vec<Option<(bool, f32)>> = (0..groups.len()).map(|k| cost(&groups, k)).collect();
     while groups.len() > budget {
         let Some(k) = (1..groups.len())
-            .filter(|&k| costs[k].is_finite())
-            .min_by(|&a, &b| costs[a].total_cmp(&costs[b]))
+            .filter_map(|k| costs[k].map(|cost| (k, cost)))
+            .min_by(|(_, a), (_, b)| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)))
+            .map(|(k, _)| k)
         else {
             break;
         };
@@ -445,7 +465,15 @@ pub fn select_keyframes(
     } else {
         frames.iter().map(|frame| luma_thumbnail(frame)).collect()
     };
-    let mut candidates: Vec<Candidate> = group_marks(&frames, marks, max_keyframes)
+    let settled = settled_events(events);
+    let actions: Vec<u64> = settled
+        .iter()
+        .filter_map(|event| match event {
+            InteractionEvent::Click { t, .. } | InteractionEvent::Drag { t, .. } => Some(*t),
+            _ => None,
+        })
+        .collect();
+    let mut candidates: Vec<Candidate> = group_marks(&frames, marks, &actions, max_keyframes)
         .into_iter()
         .map(|group| {
             let (first, last) = (&marks[group[0]], &marks[*group.last().unwrap()]);
@@ -468,7 +496,7 @@ pub fn select_keyframes(
         .windows(2)
         .map(|pair| scene_transition_diff(&pair[0], &pair[1]))
         .collect();
-    for event in settled_events(events) {
+    for event in settled {
         match &event {
             InteractionEvent::Click { t, x, y, .. }
             | InteractionEvent::Drag {
@@ -627,11 +655,12 @@ pub fn select_keyframes(
         if !candidate.marks.is_empty() {
             return true;
         }
+        // Too close to a chosen frame, or among the marks drawn into one, whose screen it repeats.
         let t = frames[candidate.frame].t_ms;
-        if selected
-            .iter()
-            .any(|other| frames[other.frame].t_ms.abs_diff(t) < FRAME_GAP_MS)
-        {
+        if selected.iter().any(|other| {
+            frames[other.frame].t_ms.abs_diff(t) < FRAME_GAP_MS
+                || (other.marks.len() > 1 && other.span.0 <= t && t <= other.span.1)
+        }) {
             return false;
         }
         !matches!(
@@ -723,7 +752,8 @@ pub fn select_keyframes(
 /// Splits stretches a keyframe owns that hold more than `COVERAGE_WORDS` or `COVERAGE_MS`, with a
 /// frame from inside them when the screen changed there: the best-ranked candidate that leaves no
 /// part above three quarters of the stretch, else the most even split. Like the transcript, the
-/// first keyframe's stretch starts at the beginning.
+/// first keyframe's stretch starts at the beginning; but a frame added before it must also split
+/// that lead-in evenly, so it lands mid-gap rather than beside the first keyframe.
 fn cover_long_stretches(
     selected: &mut Vec<Candidate>,
     pending: &mut [Option<Candidate>],
@@ -763,15 +793,24 @@ fn cover_long_stretches(
             - counted[words.partition_point(|w| w.0 < a)];
         (said as f32 / COVERAGE_WORDS).max((b - a) as f32 / COVERAGE_MS)
     };
-    let stretches = |anchors: &[u64]| -> Vec<(u64, u64)> {
+    // What each keyframe owns, or (`seen`) what each frame shows until the next, with the lead-in
+    // apart.
+    let stretches = |anchors: &[u64], seen: bool| -> Vec<(u64, u64)> {
         let bounds: Vec<u64> = std::iter::once(0)
-            .chain(anchors.iter().skip(1).copied())
+            .chain(anchors.iter().skip(usize::from(!seen)).copied())
             .chain([end])
             .collect();
         bounds.windows(2).map(|pair| (pair[0], pair[1])).collect()
     };
+    let worst_within = |pieces: Vec<(u64, u64)>, (a, b): (u64, u64)| {
+        pieces
+            .into_iter()
+            .filter(|&(s, e)| s >= a && e <= b)
+            .map(size)
+            .fold(0.0, f32::max)
+    };
     let anchor = |c: &Candidate| c.span.0.min(frames[c.frame].t_ms);
-    // A lone keyframe owns everything however it's placed, so the first is the best-ranked one.
+    // The best-ranked frame goes first, as it would without coverage.
     if selected.is_empty()
         && let Some(slot) = pending
             .iter_mut()
@@ -783,7 +822,7 @@ fn cover_long_stretches(
     while selected.len() < max_keyframes {
         let mut anchors: Vec<u64> = selected.iter().map(anchor).collect();
         anchors.sort_unstable();
-        let mut long: Vec<(f32, (u64, u64))> = stretches(&anchors)
+        let mut long: Vec<(f32, (u64, u64))> = stretches(&anchors, false)
             .into_iter()
             .map(|stretch| (size(stretch), stretch))
             .filter(|(size, _)| *size > 1.0)
@@ -791,8 +830,8 @@ fn cover_long_stretches(
         long.sort_by(|x, y| y.0.total_cmp(&x.0));
         let mut pick = None;
         'stretches: for (whole, (a, b)) in long {
-            // (uneven, worst part, rank)
-            let mut options: Vec<(bool, f32, usize)> = Vec::new();
+            // (uneven, worst part, worst part of what was seen, rank)
+            let mut options: Vec<(bool, f32, f32, usize)> = Vec::new();
             for (i, slot) in pending.iter().enumerate() {
                 let Some(candidate) = slot.as_ref().filter(|_| !rejected[i]) else {
                     continue;
@@ -806,25 +845,27 @@ fn cover_long_stretches(
                 }
                 let mut with = anchors.clone();
                 with.insert(at, x);
-                let worst = stretches(&with)
+                let worst = worst_within(stretches(&with, false), (a, b));
+                let gap = stretches(&anchors, true)
                     .into_iter()
-                    .filter(|&(s, e)| s >= a && e <= b)
-                    .map(size)
-                    .fold(0.0, f32::max);
+                    .find(|&(s, e)| s <= x && x < e)
+                    .unwrap_or((a, b));
+                let seen = worst_within(stretches(&with, true), gap);
                 if worst < whole {
-                    options.push((worst > 0.75 * whole, worst, i));
+                    let uneven = worst > 0.75 * whole || seen > 0.75 * size(gap);
+                    options.push((uneven, worst, seen, i));
                 }
             }
             options.sort_by(|p, q| {
                 p.0.cmp(&q.0).then_with(|| {
                     if p.0 {
-                        p.1.total_cmp(&q.1)
+                        p.1.total_cmp(&q.1).then(p.2.total_cmp(&q.2))
                     } else {
-                        p.2.cmp(&q.2)
+                        p.3.cmp(&q.3)
                     }
                 })
             });
-            for (_, _, i) in options {
+            for (_, _, _, i) in options {
                 if pending[i].as_ref().is_some_and(|c| admissible(c, selected)) {
                     pick = Some(i);
                     break 'stretches;
@@ -1336,11 +1377,12 @@ mod tests {
         let at: Vec<_> = selected.iter().map(|(k, _)| k.t).collect();
         assert_eq!(at.len(), 4, "{at:?}");
         assert!(at[0] <= 30_000 && at[1] <= 60_000, "{at:?}");
+        // The first keyframe owns the lead-in too: a minute here, not a minute and a half.
         let most = selected
             .iter()
             .map(|(k, _)| word_count(k.said.as_deref().unwrap_or("")))
             .max();
-        assert!(most <= Some(COVERAGE_WORDS as usize), "{most:?}");
+        assert!(most <= Some(120), "{most:?}");
 
         // The same talk over an unchanged screen stays one frame.
         let still: Vec<_> = (0..=240).map(|i| frame(i * 500, 90)).collect();
@@ -1348,6 +1390,100 @@ mod tests {
             select_keyframes(&still, &[], &mut [], &[], &transcript, MAX_KEYFRAMES).len(),
             1
         );
+    }
+
+    #[test]
+    fn a_long_lead_in_is_split_near_its_middle() {
+        // One strong late change ranks first; of the small earlier ones, coverage takes the one
+        // nearest the middle of the lead-in, not the one beside the late frame.
+        let gray = |t: u64| match t {
+            ..30_000 => 20,
+            ..70_000 => 50,
+            ..130_000 => 80,
+            ..138_000 => 110,
+            _ => 210,
+        };
+        let frames: Vec<_> = (0..=300).map(|i| frame(i * 500, gray(i * 500))).collect();
+        let selected = select_keyframes(&frames, &[], &mut [], &[], &TranscriptData::default(), 2);
+        let at: Vec<_> = selected.iter().map(|(k, _)| k.t).collect();
+        assert_eq!(at, [70_000, 138_000]);
+    }
+
+    #[test]
+    fn groups_close_at_a_click_or_too_much_ink() {
+        let frames: Vec<_> = (0..=40).map(|i| frame(i * 250, 128)).collect();
+        let mut marks = vec![mark("m1", 2_000), mark("m2", 4_000)];
+        select_keyframes(
+            &frames,
+            &[],
+            &mut marks,
+            &[click(3_000)],
+            &TranscriptData::default(),
+            MAX_KEYFRAMES,
+        );
+        assert_ne!(marks[0].frame, marks[1].frame);
+
+        let heavy = |id: &str, t: u64| Mark {
+            strokes: (0..5).collect(),
+            ..mark(id, t)
+        };
+        let mut marks = vec![heavy("m1", 2_000), heavy("m2", 4_000), heavy("m3", 6_000)];
+        select_keyframes(
+            &frames,
+            &[],
+            &mut marks,
+            &[],
+            &TranscriptData::default(),
+            MAX_KEYFRAMES,
+        );
+        assert_eq!(marks[0].frame, marks[1].frame);
+        assert_ne!(marks[1].frame, marks[2].frame);
+    }
+
+    #[test]
+    fn same_screen_merges_stay_balanced() {
+        // Six marks on one screen, kept apart by clicks, merged to fit three slots.
+        let frames: Vec<_> = (0..=60).map(|i| frame(i * 250, 128)).collect();
+        let mut marks: Vec<_> = (0..6)
+            .map(|i| mark(&format!("m{}", i + 1), 1_000 + i * 2_000))
+            .collect();
+        let clicks: Vec<_> = (0..5).map(|i| click(2_000 + i * 2_000)).collect();
+        select_keyframes(
+            &frames,
+            &[],
+            &mut marks,
+            &clicks,
+            &TranscriptData::default(),
+            3,
+        );
+        let frames_of: Vec<_> = marks.iter().map(|m| m.frame.clone().unwrap()).collect();
+        assert_eq!(frames_of[0], frames_of[1]);
+        assert_eq!(frames_of[2], frames_of[3]);
+        assert_eq!(frames_of[4], frames_of[5]);
+        assert_ne!(frames_of[1], frames_of[2]);
+        assert_ne!(frames_of[3], frames_of[4]);
+    }
+
+    #[test]
+    fn nothing_cuts_into_a_drawing_session() {
+        let frames: Vec<_> = (0..=40).map(|i| frame(i * 250, 128)).collect();
+        let mut marks = vec![mark("m1", 2_000), mark("m2", 6_000)];
+        let point = InteractionEvent::Point {
+            t: 4_000,
+            x: 0.5,
+            y: 0.5,
+            label: None,
+        };
+        let selected = select_keyframes(
+            &frames,
+            &[],
+            &mut marks,
+            &[point],
+            &TranscriptData::default(),
+            MAX_KEYFRAMES,
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].0.reason, KeyframeReason::Mark);
     }
 
     #[test]
