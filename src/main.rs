@@ -30,9 +30,9 @@ use crate::capture::{ScreenCaptureSession, discover_target, write_bundle_artifac
 use crate::audio::{AudioRecorder, RecordedAudio};
 use crate::keyframes::select_keyframes;
 use crate::model::{
-    CaptureMode, DeviceInfo, InteractionEvent, MAX_KEYFRAMES, Mark, RgbaFrame, SCALE, ScrawlBundle,
-    Shape, Stroke, TargetFrame, TargetInfo, TranscriptData, TranscriptSegment, WordTiming,
-    parse_clock_ms,
+    CaptureMode, DeviceInfo, InteractionEvent, Mark, RgbaFrame, SCALE, ScrawlBundle, Shape,
+    Stroke, TargetFrame, TargetInfo, TranscriptData, TranscriptSegment, WordTiming,
+    keyframe_budget, parse_clock_ms,
 };
 use crate::render::{render_contact_sheet, render_synthetic_demo_frame};
 use crate::sketch::{marks_of, summary_markdown};
@@ -556,15 +556,20 @@ pub fn finalize_capture_bundle(
             && !frames.is_empty()
         {
             let mut preview_marks = marks_of(&strokes);
-            let marks_fill = preview_marks.len() >= MAX_KEYFRAMES;
+            let budget = keyframe_budget(duration_ms);
             let preview = select_keyframes(
                 &frames,
                 &strokes,
                 &mut preview_marks,
                 &events,
                 &TranscriptData::default(),
-                MAX_KEYFRAMES,
+                budget,
             );
+            // Marks alone filled the budget, so speech can't change the selection.
+            let marks_fill = preview.len() == budget
+                && preview
+                    .iter()
+                    .all(|(k, _)| k.reason == model::KeyframeReason::Mark);
             let times: Vec<u64> = preview.iter().map(|(k, _)| k.t).collect();
             let decoded = movie_frames_at(movie, &times, video_offset_ms, 0).unwrap_or_default();
             if duration_ms >= 20_000 {
@@ -665,7 +670,7 @@ pub fn build_bundle_from_parts(
         &mut marks,
         &events,
         &transcript,
-        MAX_KEYFRAMES,
+        keyframe_budget(duration_ms),
     );
     let select_only_at = std::time::Instant::now();
     let matches_prepared = extras.prepared.as_ref().is_some_and(|prep| {

@@ -16,8 +16,17 @@ pub const MAX_MARK_STROKES: usize = 6;
 /// How long a laser trail remains visible on screen (ms).
 pub const LASER_MS: u64 = 420;
 
+/// Keyframes any capture may fill from ordinary events.
+pub const BASE_KEYFRAMES: usize = 6;
+
 /// Maximum keyframes selected for a contact sheet.
-pub const MAX_KEYFRAMES: usize = 6;
+pub const MAX_KEYFRAMES: usize = 12;
+
+/// Keyframes a capture of this length may use: `BASE_KEYFRAMES` up to 40 s, then one more per
+/// 20 s, up to `MAX_KEYFRAMES` at 2:20. Each image costs a reading model ~1–1.5k tokens.
+pub fn keyframe_budget(duration_ms: u64) -> usize {
+    (BASE_KEYFRAMES + duration_ms.saturating_sub(20_000) as usize / 20_000).min(MAX_KEYFRAMES)
+}
 
 /// Formats milliseconds as `M:SS` (e.g. `0:04`, `1:23`).
 pub fn format_clock(ms: u64) -> String {

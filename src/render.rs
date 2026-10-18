@@ -325,19 +325,23 @@ pub fn annotate_keyframe_in_place(
     // Sizes are tuned for ~1280×800 screen frames; phone frames are taller and denser.
     let k = (w.min(h) / 800.0).max(w.max(h) / 1280.0).clamp(1.0, 2.0);
     let size = (w.min(h) * 0.0065).clamp(4.2, 6.0) * k;
-    // Flags carry no ink, so a flagged keyframe still shows the strokes of its moment.
-    let active_mark = keyframe
-        .mark_id
-        .as_ref()
-        .and_then(|id| marks.iter().find(|m| &m.id == id))
-        .filter(|m| !m.strokes.is_empty());
+    // A mark keyframe shows every mark drawn on its screen. Flags carry no ink, so a flagged
+    // keyframe still shows the strokes of its moment.
+    let shown: Vec<&Mark> = marks
+        .iter()
+        .filter(|m| {
+            !m.strokes.is_empty()
+                && (keyframe.mark_id.as_ref() == Some(&m.id)
+                    || (!keyframe.file.is_empty() && m.frame.as_ref() == Some(&keyframe.file)))
+        })
+        .collect();
     for (index, stroke) in strokes.iter().enumerate() {
         if stroke.laser {
             continue;
         }
-        let belongs = active_mark.is_some_and(|m| m.strokes.contains(&index));
+        let belongs = shown.iter().any(|m| m.strokes.contains(&index));
         let active = belongs
-            || (active_mark.is_none()
+            || (shown.is_empty()
                 && stroke.t0 <= keyframe.t
                 && keyframe.t.saturating_sub(stroke.t1) <= MARK_GAP_MS);
         if !active {
@@ -606,13 +610,16 @@ pub fn render_contact_sheet_for_duration(
         sheet.t_ms = duration_ms;
         return sheet;
     }
-    // Phone frames are portrait: three narrower cells to a row keep the sheet compact.
+    // Phone frames are portrait: three narrower cells to a row keep the sheet compact, and past
+    // six, two rows. Screen frames go two to a row, three past six.
     let portrait = frames.iter().all(|(_, f)| f.height > f.width);
     let cell = if portrait { 440.0 } else { CELL };
     let columns = match frames.len() {
         1 => 1,
-        n if portrait => n.min(3),
-        _ => 2,
+        n @ ..=6 if portrait => n.min(3),
+        n if portrait => n.div_ceil(2),
+        ..=6 => 2,
+        _ => 3,
     };
     let width = (PAD * 2.0 + cell * columns as f32 + GAP * (columns - 1) as f32) as u32;
     let card_sizes: Vec<[f32; 2]> = frames
@@ -1515,6 +1522,86 @@ mod tests {
         let result = render_annotated_keyframe(&base, &key(1), &[future], &[], &[]);
         assert_eq!(&result.rgba[100 * 320 * 4..], &base.rgba[100 * 320 * 4..]);
         assert!(base.rgba.chunks_exact(4).all(|p| p == [20, 20, 20, 255]));
+    }
+
+    #[test]
+    fn a_grouped_keyframe_shows_every_mark_drawn_on_its_screen() {
+        let base = solid(320, 200, [20, 20, 20, 255]);
+        // Three strokes across the lower half, drawn long before the keyframe.
+        let stroke = |y: i32| Stroke {
+            t0: 100,
+            t1: 300,
+            fw: 320,
+            fh: 200,
+            on: None,
+            pin: None,
+            laser: false,
+            pts: vec![1500, y, 0, 5000, y, 100, 8500, y, 200],
+        };
+        let strokes = [stroke(6000), stroke(7500), stroke(9000)];
+        let mark = |id: &str, stroke: usize, frame: &str| Mark {
+            id: id.into(),
+            strokes: vec![stroke],
+            t0: 100,
+            t1: 300,
+            box_norm: [0.15, 0.6, 0.85, 0.9],
+            shape: Shape::Underline,
+            from: None,
+            to: None,
+            pin: None,
+            on: None,
+            description: String::new(),
+            frame: Some(frame.into()),
+        };
+        let mut keyframe = key(1);
+        keyframe.mark_id = Some("m1".into());
+        let marks = [
+            mark("m1", 0, &keyframe.file),
+            mark("m2", 1, &keyframe.file),
+            mark("m3", 2, "frames/2.png"),
+        ];
+        let result = render_annotated_keyframe(&base, &keyframe, &strokes, &marks, &[]);
+        let red_rows = |rows: std::ops::Range<usize>| {
+            rows.filter(|y| {
+                result.rgba[y * 320 * 4..(y + 1) * 320 * 4]
+                    .chunks_exact(4)
+                    .any(|p| p[0] == 255 && p[1] < 80)
+            })
+            .count()
+        };
+        assert!(red_rows(115..125) > 0 && red_rows(145..155) > 0);
+        assert_eq!(red_rows(175..185), 0, "another keyframe's mark");
+    }
+
+    #[test]
+    fn contact_sheets_lay_out_up_to_twelve_frames() {
+        for (count, landscape, portrait) in [(7, 3, 4), (9, 3, 5), (12, 3, 6)] {
+            for (size, columns) in [((320, 200), landscape), ((200, 430), portrait)] {
+                let frames: Vec<_> = (1..=count)
+                    .map(|i| {
+                        (
+                            key(i),
+                            solid(size.0, size.1, [40 + i as u8 * 10, 60, 80, 255]),
+                        )
+                    })
+                    .collect();
+                let sheet = render_contact_sheet(&bundle(), &frames);
+                let cell = if size.1 > size.0 { 440 } else { 640 };
+                assert_eq!(
+                    sheet.width as usize,
+                    32 + cell * columns + 14 * (columns - 1)
+                );
+                for i in 1..=count {
+                    assert!(
+                        sheet
+                            .rgba
+                            .chunks_exact(4)
+                            .any(|p| p == [40 + i as u8 * 10, 60, 80, 255]),
+                        "Missing card {i} of {count}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

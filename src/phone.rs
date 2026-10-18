@@ -453,10 +453,6 @@ pub fn build_movie_bundle(
         .collect();
     mark_times.sort_unstable();
     mark_times.dedup();
-    let direct_marks = mark_times.len() >= crate::MAX_KEYFRAMES;
-    if direct_marks {
-        mark_times.truncate(crate::MAX_KEYFRAMES);
-    }
     let ((transcript, audio_ms, transcribe_ms, audio_err), joined) =
         std::thread::scope(|scope| {
             let base_target = capture.target.clone();
@@ -474,6 +470,8 @@ pub fn build_movie_bundle(
                 }
                 let every = (probe.duration_ms / MAX_CANDIDATES).max(250);
                 let t0 = Instant::now();
+                let budget = crate::model::keyframe_budget(probe.duration_ms);
+                let direct_marks = mark_times.len() >= budget;
                 if direct_marks {
                     let direct = helper::frames(
                         movie_ref,
@@ -507,7 +505,7 @@ pub fn build_movie_bundle(
                             &mut preview_marks,
                             events_ref,
                             &crate::model::TranscriptData::default(),
-                            crate::MAX_KEYFRAMES,
+                            budget,
                         );
                         let prep = crate::prepare_visuals(
                             preview,

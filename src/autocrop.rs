@@ -265,7 +265,7 @@ pub struct Item {
     pub pts: Vec<(f32, f32, u64)>,
     /// Seconds the cursor rested here.
     pub dwell: f32,
-    /// Change regions belong to one keyframe.
+    /// Change regions, and grouped ink from `pin_ink`, belong to one keyframe.
     pub keyframe: Option<usize>,
 }
 
@@ -502,6 +502,34 @@ impl Input {
             items,
             snapshots,
             content: Vec::new(),
+        }
+    }
+
+    /// Adds the ink of every mark grouped into a keyframe to that keyframe's crop.
+    pub fn pin_ink(
+        &mut self,
+        selected: &[(Keyframe, RgbaFrame)],
+        strokes: &[Stroke],
+        marks: &[Mark],
+    ) {
+        for (k, (keyframe, _)) in selected.iter().enumerate() {
+            let grouped = marks
+                .iter()
+                .filter(|m| m.frame.as_ref() == Some(&keyframe.file))
+                .flat_map(|m| &m.strokes);
+            for stroke in grouped.filter_map(|&i| strokes.get(i)) {
+                let pts = stroke.timed_points();
+                if !pts.is_empty() {
+                    self.items.push(Item {
+                        kind: Kind::Stroke,
+                        t0: stroke.t0,
+                        t1: stroke.t1,
+                        pts: subsample(&pts, 48),
+                        dwell: 0.0,
+                        keyframe: Some(k),
+                    });
+                }
+            }
         }
     }
 
@@ -992,11 +1020,14 @@ impl Ctx<'_> {
         let t_kf = k.map_or(self.input.duration / 2, |k| self.input.keyframes[k]);
         let mut pts: Vec<Pt> = Vec::new();
         for (i, item) in self.input.items.iter().enumerate() {
-            if item.t1 < slice[0] || item.t0 > slice[1] {
-                continue;
-            }
-            if item.kind == Kind::Change && k.is_some() && item.keyframe != k {
-                continue;
+            let in_slice = item.t1 >= slice[0] && item.t0 <= slice[1];
+            match (item.kind, item.keyframe) {
+                // A grouped mark's ink drawn before this keyframe's slice still belongs to it.
+                (Kind::Stroke, Some(_)) if item.keyframe != k || in_slice => continue,
+                (Kind::Stroke, Some(_)) => {}
+                (Kind::Change, Some(_)) if k.is_some() && item.keyframe != k => continue,
+                _ if !in_slice => continue,
+                _ => {}
             }
             let w = weight(item, s);
             if w <= 0.0 || item.pts.is_empty() {
@@ -1739,6 +1770,7 @@ pub fn annotate_and_crop(
                 cursor,
                 &changes,
             );
+            input.pin_ink(&selected, strokes, marks);
             let screen = input.screen;
             input.content = std::thread::scope(|scope| {
                 let workers: Vec<_> = selected

@@ -64,6 +64,67 @@ fn scene_transition_diff(a: &[f32; THUMB_PIXELS], b: &[f32; THUMB_PIXELS]) -> f3
     global.max((top[3] * 1.4).clamp(0.0, 1.0))
 }
 
+const GRID: usize = 128;
+
+/// Mean luma over a grid of up to `GRID`×`GRID` cells, so a thin line that appears changes its
+/// cell.
+struct LumaGrid {
+    columns: usize,
+    rows: usize,
+    cells: Vec<f32>,
+}
+
+fn luma_grid(frame: &RgbaFrame) -> LumaGrid {
+    let (width, height) = (frame.width as usize, frame.height as usize);
+    let (columns, rows) = (width.min(GRID), height.min(GRID));
+    // Large frames are sampled at up to four pixels per cell side.
+    let step = (width.max(height) / (GRID * 4)).max(1);
+    let cell_x: Vec<usize> = (0..width)
+        .step_by(step)
+        .map(|x| x * columns / width)
+        .collect();
+    let mut sums = vec![0_u32; columns * rows];
+    let mut counts = vec![0_u32; columns * rows];
+    let lines = frame.rgba.chunks_exact(width.max(1) * 4).take(height);
+    for (y, line) in lines.enumerate().step_by(step) {
+        let row = y * rows / height * columns;
+        for (p, &x) in line.chunks_exact(4).step_by(step).zip(&cell_x) {
+            // Rec. 709 luma in 1/256ths.
+            sums[row + x] += (54 * p[0] as u32 + 183 * p[1] as u32 + 19 * p[2] as u32) >> 8;
+            counts[row + x] += 1;
+        }
+    }
+    let cells = sums
+        .iter()
+        .zip(&counts)
+        .map(|(&sum, &n)| sum as f32 / 255.0 / n.max(1) as f32)
+        .collect();
+    LumaGrid {
+        columns,
+        rows,
+        cells,
+    }
+}
+
+/// The share of cells inside `rect` (normalized `[x0, y0, x1, y1]`) whose luma changed.
+fn region_diff(a: &LumaGrid, b: &LumaGrid, rect: [f32; 4]) -> f32 {
+    if (a.columns, a.rows) != (b.columns, b.rows) || a.cells.is_empty() {
+        return 1.0;
+    }
+    let span = |lo: f32, hi: f32, n: usize| {
+        let lo = ((lo * n as f32) as usize).min(n - 1);
+        lo..((hi * n as f32).ceil() as usize).clamp(lo + 1, n)
+    };
+    let rows = span(rect[1], rect[3], a.rows);
+    let columns = span(rect[0], rect[2], a.columns);
+    let total = rows.len() * columns.len();
+    let changed = rows
+        .flat_map(|y| columns.clone().map(move |x| y * a.columns + x))
+        .filter(|&i| (a.cells[i] - b.cells[i]).abs() > CELL_CHANGE)
+        .count();
+    changed as f32 / total as f32
+}
+
 #[cfg(test)]
 pub fn luma_diff(a: &RgbaFrame, b: &RgbaFrame) -> f32 {
     thumbnail_diff(&luma_thumbnail(a), &luma_thumbnail(b))
@@ -74,7 +135,7 @@ struct Candidate {
     span: (u64, u64),
     score: f32,
     reason: KeyframeReason,
-    mark: Option<usize>,
+    marks: Vec<usize>,
     event: String,
     cursor: Option<[f32; 2]>,
 }
@@ -98,6 +159,124 @@ fn nearest_frame(frames: &[&RgbaFrame], t: u64) -> usize {
 const CLAUSE_GAP_MS: u64 = 1_500;
 /// A spoken cue only cuts a keyframe if its image differs from every keyframe already chosen.
 const CUE_NOVELTY: f32 = 0.03;
+/// Marks share a keyframe while the screen around their ink (`INK_CONTEXT` beyond it, as a
+/// fraction of the frame) differs from the latest one's by less than this.
+const SAME_SCREEN: f32 = 0.05;
+const INK_CONTEXT: f32 = 0.08;
+const CELL_CHANGE: f32 = 0.04;
+/// Marks drawn further apart than this start a new group even on an unchanged screen, so one
+/// frame never carries half a minute of ink and talk.
+const GROUP_MS: u64 = 30_000;
+/// A keyframe owns too much when its stretch holds more words or time than this; a frame from
+/// inside the stretch is added if the screen changed there.
+const COVERAGE_WORDS: f32 = 120.0;
+const COVERAGE_MS: f32 = 40_000.0;
+
+/// Marks in drawing order, grouped while they were drawn on the same screen; then the most alike
+/// neighbouring groups merge until they fit `budget`. Flags carry no ink and stay on their own.
+fn group_marks(frames: &[&RgbaFrame], marks: &[Mark], budget: usize) -> Vec<Vec<usize>> {
+    let at: Vec<usize> = marks.iter().map(|m| nearest_frame(frames, m.t1)).collect();
+    let mut drawn: Vec<usize> = (0..marks.len())
+        .filter(|&i| marks[i].shape != Shape::Flag)
+        .map(|i| at[i])
+        .collect();
+    drawn.sort_unstable();
+    drawn.dedup();
+    let grids: Vec<(usize, LumaGrid)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = drawn
+            .chunks(drawn.len().div_ceil(6).max(1))
+            .map(|chunk| {
+                scope.spawn(move || -> Vec<_> {
+                    chunk.iter().map(|&f| (f, luma_grid(frames[f]))).collect()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect()
+    });
+    let grid = |i: usize| {
+        grids
+            .iter()
+            .find(|(f, _)| *f == at[i])
+            .map(|(_, grid)| grid)
+    };
+    let ink = |group: &[usize]| marks[group[0]].shape != Shape::Flag;
+    // How far the screen around the marks' ink was, as each was drawn, from the screen at
+    // `last`, where the keyframe will be.
+    let spread = |group: &[usize], last: usize| {
+        let [x0, y0, x1, y1] =
+            group
+                .iter()
+                .chain([&last])
+                .fold([1.0_f32, 1.0, 0.0, 0.0], |r, &j| {
+                    let b = marks[j].box_norm;
+                    [
+                        r[0].min(b[0]),
+                        r[1].min(b[1]),
+                        r[2].max(b[2]),
+                        r[3].max(b[3]),
+                    ]
+                });
+        let around = [
+            (x0 - INK_CONTEXT).max(0.0),
+            (y0 - INK_CONTEXT).max(0.0),
+            (x1 + INK_CONTEXT).min(1.0),
+            (y1 + INK_CONTEXT).min(1.0),
+        ];
+        group
+            .iter()
+            .map(|&j| match (grid(j), grid(last)) {
+                (Some(a), Some(b)) => region_diff(a, b, around),
+                _ => 1.0,
+            })
+            .fold(0.0, f32::max)
+    };
+    let mut order: Vec<usize> = (0..marks.len()).collect();
+    order.sort_by_key(|&i| marks[i].t1);
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for i in order {
+        match groups.last_mut() {
+            Some(group)
+                if marks[i].shape != Shape::Flag
+                    && ink(group)
+                    && marks[i].t1.saturating_sub(marks[group[0]].t0) <= GROUP_MS
+                    && spread(group, i) < SAME_SCREEN =>
+            {
+                group.push(i);
+            }
+            _ => groups.push(vec![i]),
+        }
+    }
+    // `costs[k]` is what merging group `k` into `k - 1` would spread; flags never merge.
+    let cost = |groups: &[Vec<usize>], k: usize| {
+        if k == 0 || !ink(&groups[k - 1]) || !ink(&groups[k]) {
+            return f32::INFINITY;
+        }
+        spread(
+            &[&groups[k - 1][..], &groups[k]].concat(),
+            *groups[k].last().unwrap(),
+        )
+    };
+    let mut costs: Vec<f32> = (0..groups.len()).map(|k| cost(&groups, k)).collect();
+    while groups.len() > budget {
+        let Some(k) = (1..groups.len())
+            .filter(|&k| costs[k].is_finite())
+            .min_by(|&a, &b| costs[a].total_cmp(&costs[b]))
+        else {
+            break;
+        };
+        let later = groups.remove(k);
+        groups[k - 1].extend(later);
+        costs.remove(k);
+        costs[k - 1] = cost(&groups, k - 1);
+        if k < groups.len() {
+            costs[k] = cost(&groups, k);
+        }
+    }
+    groups
+}
 
 /// Words that point at the screen. The strong ones are deliberate cues ("now", "look");
 /// the rest are just as often filler ("I see why", "here and there", "that's weird"), so they
@@ -228,7 +407,7 @@ fn align_transcript(
     }
 }
 
-/// Select representative captured frames. Callers use `MAX_KEYFRAMES` for the
+/// Select representative captured frames. Callers use `keyframe_budget` for the
 /// default limit; an explicit zero requests no keyframes.
 pub fn select_keyframes(
     frames: &[RgbaFrame],
@@ -246,167 +425,177 @@ pub fn select_keyframes(
     }
     let mut frames: Vec<_> = frames.iter().collect();
     frames.sort_by_key(|frame| frame.t_ms);
-    let mut candidates = Vec::new();
-    for (i, mark) in marks.iter().enumerate() {
-        candidates.push(Candidate {
-            frame: nearest_frame(&frames, mark.t1),
-            span: (mark.t0, mark.t1),
-            score: 100.0,
-            reason: KeyframeReason::Mark,
-            mark: Some(i),
-            event: describe_mark(mark),
-            cursor: None,
-        });
-    }
-    let thumbnails: Vec<_> = if marks.len() < max_keyframes {
-        if frames.len() >= 128 {
-            let chunk_size = frames.len().div_ceil(6).max(1);
-            std::thread::scope(|scope| {
-                let workers: Vec<_> = frames
-                    .chunks(chunk_size)
-                    .map(|chunk| {
-                        scope.spawn(move || -> Vec<[f32; THUMB_PIXELS]> {
-                            chunk.iter().map(|frame| luma_thumbnail(frame)).collect()
-                        })
+    let thumbnails: Vec<_> = if frames.len() >= 128 {
+        let chunk_size = frames.len().div_ceil(6).max(1);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = frames
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    scope.spawn(move || -> Vec<[f32; THUMB_PIXELS]> {
+                        chunk.iter().map(|frame| luma_thumbnail(frame)).collect()
                     })
-                    .collect();
-                let mut out = Vec::with_capacity(frames.len());
-                for worker in workers {
-                    out.extend(worker.join().unwrap());
-                }
-                out
-            })
-        } else {
-            frames.iter().map(|frame| luma_thumbnail(frame)).collect()
-        }
+                })
+                .collect();
+            let mut out = Vec::with_capacity(frames.len());
+            for worker in workers {
+                out.extend(worker.join().unwrap());
+            }
+            out
+        })
     } else {
-        Vec::new()
+        frames.iter().map(|frame| luma_thumbnail(frame)).collect()
     };
-    if marks.len() < max_keyframes {
-        let deltas: Vec<_> = thumbnails
-            .windows(2)
-            .map(|pair| scene_transition_diff(&pair[0], &pair[1]))
-            .collect();
-        for event in settled_events(events) {
-            match &event {
-                InteractionEvent::Click { t, x, y, .. }
-                | InteractionEvent::Drag {
-                    t, x1: x, y1: y, ..
-                } => {
-                    let end = match &event {
-                        InteractionEvent::Drag { t1, .. } => *t1,
-                        _ => *t,
-                    };
-                    let before = frames
-                        .partition_point(|frame| frame.t_ms < *t)
-                        .saturating_sub(1);
-                    // A short delay captures the result of the action rather than the
-                    // mouse-down state. Prefer an actual post-action frame when present.
-                    let first_after = frames.partition_point(|frame| frame.t_ms < end);
-                    let after = nearest_frame(&frames, end.saturating_add(250))
-                        .max(first_after.min(frames.len() - 1));
-                    let delta = thumbnail_diff(&thumbnails[before], &thumbnails[after]);
-                    candidates.push(Candidate {
-                        frame: after,
-                        span: (*t, end),
-                        score: 60.0 + 30.0 * delta,
-                        reason: KeyframeReason::Click,
-                        mark: None,
-                        event: describe_event(&event),
-                        cursor: Some([*x, *y]),
-                    });
-                }
-                InteractionEvent::Point { t, x, y, .. } => candidates.push(Candidate {
-                    frame: nearest_frame(&frames, *t),
-                    span: (*t, *t),
-                    score: 55.0,
-                    reason: KeyframeReason::Laser,
-                    mark: None,
+    let mut candidates: Vec<Candidate> = group_marks(&frames, marks, max_keyframes)
+        .into_iter()
+        .map(|group| {
+            let (first, last) = (&marks[group[0]], &marks[*group.last().unwrap()]);
+            Candidate {
+                frame: nearest_frame(&frames, last.t1),
+                span: (first.t0, last.t1),
+                score: 100.0,
+                reason: KeyframeReason::Mark,
+                event: group
+                    .iter()
+                    .map(|&i| describe_mark(&marks[i]))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                marks: group,
+                cursor: None,
+            }
+        })
+        .collect();
+    let deltas: Vec<_> = thumbnails
+        .windows(2)
+        .map(|pair| scene_transition_diff(&pair[0], &pair[1]))
+        .collect();
+    for event in settled_events(events) {
+        match &event {
+            InteractionEvent::Click { t, x, y, .. }
+            | InteractionEvent::Drag {
+                t, x1: x, y1: y, ..
+            } => {
+                let end = match &event {
+                    InteractionEvent::Drag { t1, .. } => *t1,
+                    _ => *t,
+                };
+                let before = frames
+                    .partition_point(|frame| frame.t_ms < *t)
+                    .saturating_sub(1);
+                // A short delay captures the result of the action rather than the
+                // mouse-down state. Prefer an actual post-action frame when present.
+                let first_after = frames.partition_point(|frame| frame.t_ms < end);
+                let after = nearest_frame(&frames, end.saturating_add(250))
+                    .max(first_after.min(frames.len() - 1));
+                let delta = thumbnail_diff(&thumbnails[before], &thumbnails[after]);
+                candidates.push(Candidate {
+                    frame: after,
+                    span: (*t, end),
+                    score: 60.0 + 30.0 * delta,
+                    reason: KeyframeReason::Click,
+                    marks: Vec::new(),
                     event: describe_event(&event),
                     cursor: Some([*x, *y]),
-                }),
-                _ => {}
-            }
-        }
-        for stroke in strokes.iter().filter(|s| s.laser) {
-            let cursor = stroke.normalized_points().last().copied();
-            let label = stroke
-                .on
-                .as_ref()
-                .map(|on| format!(" “{on}”"))
-                .unwrap_or_default();
-            let position = cursor
-                .map(|[x, y]| format!(" (x {x:.2}, y {y:.2})"))
-                .unwrap_or_default();
-            candidates.push(Candidate {
-                frame: nearest_frame(&frames, stroke.t1),
-                span: (stroke.t0, stroke.t1),
-                score: 55.0,
-                reason: KeyframeReason::Laser,
-                mark: None,
-                event: format!("pointed at{label}{position}"),
-                cursor,
-            });
-        }
-        // A run of changing frames is one transition. Its last changed frame is
-        // the settled view, avoiding several near-identical animation keyframes.
-        let mut transitions: Vec<(usize, (u64, u64), f32)> = Vec::new();
-        let mut transition: Option<(usize, u64, f32)> = None;
-        for (i, &delta) in deltas.iter().enumerate() {
-            if delta > 0.08 {
-                let start_t = transition.map_or(frames[i].t_ms, |(_, t0, _)| t0);
-                transition = Some((
-                    i + 1,
-                    start_t,
-                    transition.map_or(delta, |(_, _, max)| max.max(delta)),
-                ));
-            } else if let Some((frame, start_t, diff)) = transition.take() {
-                transitions.push((frame, (start_t, frames[frame].t_ms), diff));
-            }
-        }
-        if let Some((frame, start_t, diff)) = transition {
-            transitions.push((frame, (start_t, frames[frame].t_ms), diff));
-        }
-        for &(frame, span, diff) in &transitions {
-            candidates.push(scene_candidate(frame, span, diff));
-        }
-        // A pointing word is a deliberate cue ("if I say now, find the right image"). It looks for
-        // a transition that starts around the word; otherwise it takes what was on screen as it
-        // was said. Speech alone never cuts a keyframe over an unchanged screen: cues must show
-        // something new (checked during selection), and pauses never cut at all.
-        if !transcript.estimated {
-            for word in &transcript.words {
-                let Some((cue, score, strong)) = spoken_cue(&word.text) else {
-                    continue;
-                };
-                let snapped = transitions
-                    .iter()
-                    .filter(|(_, (start, _), _)| {
-                        start.saturating_add(300) >= word.t0 && *start <= word.t0 + 1_200
-                    })
-                    .min_by_key(|(_, (start, _), _)| start.abs_diff(word.t0));
-                let (frame, score, event) = match snapped {
-                    Some(&(frame, _, diff)) => (
-                        frame,
-                        score.max(40.0 + 40.0 * diff) + if strong { 6.0 } else { 1.0 },
-                        format!("said “{cue}” as the screen changed"),
-                    ),
-                    None => (
-                        nearest_frame(&frames, word.t0 + 150),
-                        score,
-                        format!("said “{cue}”"),
-                    ),
-                };
-                candidates.push(Candidate {
-                    frame,
-                    span: (word.t0, word.t0),
-                    score,
-                    reason: KeyframeReason::Speech,
-                    mark: None,
-                    event,
-                    cursor: None,
                 });
             }
+            InteractionEvent::Point { t, x, y, .. } => candidates.push(Candidate {
+                frame: nearest_frame(&frames, *t),
+                span: (*t, *t),
+                score: 55.0,
+                reason: KeyframeReason::Laser,
+                marks: Vec::new(),
+                event: describe_event(&event),
+                cursor: Some([*x, *y]),
+            }),
+            _ => {}
+        }
+    }
+    for stroke in strokes.iter().filter(|s| s.laser) {
+        let cursor = stroke.normalized_points().last().copied();
+        let label = stroke
+            .on
+            .as_ref()
+            .map(|on| format!(" “{on}”"))
+            .unwrap_or_default();
+        let position = cursor
+            .map(|[x, y]| format!(" (x {x:.2}, y {y:.2})"))
+            .unwrap_or_default();
+        candidates.push(Candidate {
+            frame: nearest_frame(&frames, stroke.t1),
+            span: (stroke.t0, stroke.t1),
+            score: 55.0,
+            reason: KeyframeReason::Laser,
+            marks: Vec::new(),
+            event: format!("pointed at{label}{position}"),
+            cursor,
+        });
+    }
+    // A run of changing frames is one transition. Its last changed frame is
+    // the settled view, avoiding several near-identical animation keyframes.
+    let mut transitions: Vec<(usize, (u64, u64), f32)> = Vec::new();
+    let mut transition: Option<(usize, u64, f32)> = None;
+    for (i, &delta) in deltas.iter().enumerate() {
+        if delta > 0.08 {
+            let start_t = transition.map_or(frames[i].t_ms, |(_, t0, _)| t0);
+            transition = Some((
+                i + 1,
+                start_t,
+                transition.map_or(delta, |(_, _, max)| max.max(delta)),
+            ));
+        } else if let Some((frame, start_t, diff)) = transition.take() {
+            transitions.push((frame, (start_t, frames[frame].t_ms), diff));
+        }
+    }
+    if let Some((frame, start_t, diff)) = transition {
+        transitions.push((frame, (start_t, frames[frame].t_ms), diff));
+    }
+    // A mark group's keyframe already shows the screen its marks were drawn on.
+    let drawing: Vec<(u64, u64)> = candidates
+        .iter()
+        .filter(|c| !c.marks.is_empty())
+        .map(|c| c.span)
+        .collect();
+    for &(frame, span, diff) in &transitions {
+        let t = frames[frame].t_ms;
+        if !drawing.iter().any(|&(t0, t1)| t0 <= t && t <= t1) {
+            candidates.push(scene_candidate(frame, span, diff));
+        }
+    }
+    // A pointing word is a deliberate cue ("if I say now, find the right image"). It looks for
+    // a transition that starts around the word; otherwise it takes what was on screen as it
+    // was said. Speech alone never cuts a keyframe over an unchanged screen: cues must show
+    // something new (checked during selection), and pauses never cut at all.
+    if !transcript.estimated {
+        for word in &transcript.words {
+            let Some((cue, score, strong)) = spoken_cue(&word.text) else {
+                continue;
+            };
+            let snapped = transitions
+                .iter()
+                .filter(|(_, (start, _), _)| {
+                    start.saturating_add(300) >= word.t0 && *start <= word.t0 + 1_200
+                })
+                .min_by_key(|(_, (start, _), _)| start.abs_diff(word.t0));
+            let (frame, score, event) = match snapped {
+                Some(&(frame, _, diff)) => (
+                    frame,
+                    score.max(40.0 + 40.0 * diff) + if strong { 6.0 } else { 1.0 },
+                    format!("said “{cue}” as the screen changed"),
+                ),
+                None => (
+                    nearest_frame(&frames, word.t0 + 150),
+                    score,
+                    format!("said “{cue}”"),
+                ),
+            };
+            candidates.push(Candidate {
+                frame,
+                span: (word.t0, word.t0),
+                score,
+                reason: KeyframeReason::Speech,
+                marks: Vec::new(),
+                event,
+                cursor: None,
+            });
         }
     }
     if candidates.is_empty() {
@@ -417,7 +606,7 @@ pub fn select_keyframes(
             span: (t, t),
             score: 0.0,
             reason: KeyframeReason::Initial,
-            mark: None,
+            marks: Vec::new(),
             event: "initial view".into(),
             cursor: None,
         });
@@ -427,38 +616,56 @@ pub fn select_keyframes(
             a.reason == KeyframeReason::Speech && !a.event.ends_with("as the screen changed");
         let b_unsnapped_speech =
             b.reason == KeyframeReason::Speech && !b.event.ends_with("as the screen changed");
-        b.mark
-            .is_some()
-            .cmp(&a.mark.is_some())
+        a.marks
+            .is_empty()
+            .cmp(&b.marks.is_empty())
             .then_with(|| a_unsnapped_speech.cmp(&b_unsnapped_speech))
             .then_with(|| b.score.total_cmp(&a.score))
             .then_with(|| frames[a.frame].t_ms.cmp(&frames[b.frame].t_ms))
     });
-    let mut selected: Vec<Candidate> = Vec::new();
-    for candidate in candidates {
-        if selected.len() == max_keyframes {
-            break;
+    let admissible = |candidate: &Candidate, selected: &[Candidate]| {
+        if !candidate.marks.is_empty() {
+            return true;
         }
-        if candidate.mark.is_none()
-            && selected.iter().any(|other| {
-                frames[other.frame]
-                    .t_ms
-                    .abs_diff(frames[candidate.frame].t_ms)
-                    < FRAME_GAP_MS
-            })
+        let t = frames[candidate.frame].t_ms;
+        if selected
+            .iter()
+            .any(|other| frames[other.frame].t_ms.abs_diff(t) < FRAME_GAP_MS)
         {
-            continue;
+            return false;
         }
-        if matches!(
+        !matches!(
             candidate.reason,
             KeyframeReason::Speech | KeyframeReason::SceneChange
-        ) && selected.iter().any(|other| {
+        ) || selected.iter().all(|other| {
             scene_transition_diff(&thumbnails[other.frame], &thumbnails[candidate.frame])
-                < CUE_NOVELTY
-        }) {
-            continue;
+                >= CUE_NOVELTY
+        })
+    };
+    let mut pending: Vec<Option<Candidate>> = candidates.into_iter().map(Some).collect();
+    let mut selected: Vec<Candidate> = Vec::new();
+    for slot in pending.iter_mut() {
+        if selected.len() == max_keyframes || slot.as_ref().is_none_or(|c| c.marks.is_empty()) {
+            break;
         }
-        selected.push(candidate);
+        selected.extend(slot.take());
+    }
+    cover_long_stretches(
+        &mut selected,
+        &mut pending,
+        max_keyframes,
+        &frames,
+        transcript,
+        &admissible,
+    );
+    // Past the base, keyframes are only for marks and coverage.
+    for slot in pending.iter_mut() {
+        if selected.len() >= max_keyframes.min(BASE_KEYFRAMES) {
+            break;
+        }
+        if let Some(candidate) = slot.take_if(|c| admissible(c, &selected)) {
+            selected.push(candidate);
+        }
     }
     // Order-independent novelty pass: if a speech cue duplicates the screen of any visual/input
     // keyframe selected after it, drop the redundant speech cue (keeping at least one frame).
@@ -489,10 +696,10 @@ pub fn select_keyframes(
         .map(|(i, candidate)| {
             let index = i + 1;
             let file = format!("frames/frame-{index:02}.png");
-            let mark_id = candidate.mark.map(|j| {
+            for &j in &candidate.marks {
                 marks[j].frame = Some(file.clone());
-                marks[j].id.clone()
-            });
+            }
+            let mark_id = candidate.marks.first().map(|&j| marks[j].id.clone());
             let frame = frames[candidate.frame];
             (
                 Keyframe {
@@ -513,13 +720,130 @@ pub fn select_keyframes(
     out
 }
 
+/// Splits stretches a keyframe owns that hold more than `COVERAGE_WORDS` or `COVERAGE_MS`, with a
+/// frame from inside them when the screen changed there: the best-ranked candidate that leaves no
+/// part above three quarters of the stretch, else the most even split. Like the transcript, the
+/// first keyframe's stretch starts at the beginning.
+fn cover_long_stretches(
+    selected: &mut Vec<Candidate>,
+    pending: &mut [Option<Candidate>],
+    max_keyframes: usize,
+    frames: &[&RgbaFrame],
+    transcript: &TranscriptData,
+    admissible: &dyn Fn(&Candidate, &[Candidate]) -> bool,
+) {
+    let mut words: Vec<(u64, usize)> = if transcript.words.is_empty() {
+        transcript
+            .segments
+            .iter()
+            .map(|s| (s.t0, word_count(&s.text)))
+            .collect()
+    } else {
+        transcript
+            .words
+            .iter()
+            .filter(|w| w.text.chars().any(char::is_alphanumeric))
+            .map(|w| (w.t0, 1))
+            .collect()
+    };
+    words.sort_unstable();
+    let counted: Vec<usize> = std::iter::once(0)
+        .chain(words.iter().scan(0, |sum, &(_, n)| {
+            *sum += n;
+            Some(*sum)
+        }))
+        .collect();
+    let end = frames
+        .last()
+        .map_or(0, |f| f.t_ms)
+        .max(words.last().map_or(0, |w| w.0))
+        + 1;
+    let size = |(a, b): (u64, u64)| {
+        let said = counted[words.partition_point(|w| w.0 < b)]
+            - counted[words.partition_point(|w| w.0 < a)];
+        (said as f32 / COVERAGE_WORDS).max((b - a) as f32 / COVERAGE_MS)
+    };
+    let stretches = |anchors: &[u64]| -> Vec<(u64, u64)> {
+        let bounds: Vec<u64> = std::iter::once(0)
+            .chain(anchors.iter().skip(1).copied())
+            .chain([end])
+            .collect();
+        bounds.windows(2).map(|pair| (pair[0], pair[1])).collect()
+    };
+    let anchor = |c: &Candidate| c.span.0.min(frames[c.frame].t_ms);
+    // A lone keyframe owns everything however it's placed, so the first is the best-ranked one.
+    if selected.is_empty()
+        && let Some(slot) = pending
+            .iter_mut()
+            .find(|slot| slot.as_ref().is_some_and(|c| admissible(c, selected)))
+    {
+        selected.extend(slot.take());
+    }
+    let mut rejected = vec![false; pending.len()];
+    while selected.len() < max_keyframes {
+        let mut anchors: Vec<u64> = selected.iter().map(anchor).collect();
+        anchors.sort_unstable();
+        let mut long: Vec<(f32, (u64, u64))> = stretches(&anchors)
+            .into_iter()
+            .map(|stretch| (size(stretch), stretch))
+            .filter(|(size, _)| *size > 1.0)
+            .collect();
+        long.sort_by(|x, y| y.0.total_cmp(&x.0));
+        let mut pick = None;
+        'stretches: for (whole, (a, b)) in long {
+            // (uneven, worst part, rank)
+            let mut options: Vec<(bool, f32, usize)> = Vec::new();
+            for (i, slot) in pending.iter().enumerate() {
+                let Some(candidate) = slot.as_ref().filter(|_| !rejected[i]) else {
+                    continue;
+                };
+                let x = anchor(candidate);
+                let Err(at) = anchors.binary_search(&x) else {
+                    continue;
+                };
+                if x < a || x >= b {
+                    continue;
+                }
+                let mut with = anchors.clone();
+                with.insert(at, x);
+                let worst = stretches(&with)
+                    .into_iter()
+                    .filter(|&(s, e)| s >= a && e <= b)
+                    .map(size)
+                    .fold(0.0, f32::max);
+                if worst < whole {
+                    options.push((worst > 0.75 * whole, worst, i));
+                }
+            }
+            options.sort_by(|p, q| {
+                p.0.cmp(&q.0).then_with(|| {
+                    if p.0 {
+                        p.1.total_cmp(&q.1)
+                    } else {
+                        p.2.cmp(&q.2)
+                    }
+                })
+            });
+            for (_, _, i) in options {
+                if pending[i].as_ref().is_some_and(|c| admissible(c, selected)) {
+                    pick = Some(i);
+                    break 'stretches;
+                }
+                rejected[i] = true;
+            }
+        }
+        let Some(i) = pick else { break };
+        selected.extend(pending[i].take());
+    }
+}
+
 fn scene_candidate(frame: usize, span: (u64, u64), diff: f32) -> Candidate {
     Candidate {
         frame,
         span,
         score: 40.0 + 40.0 * diff,
         reason: KeyframeReason::SceneChange,
-        mark: None,
+        marks: Vec::new(),
         event: "scene changed".into(),
         cursor: None,
     }
@@ -571,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn marks_take_priority_even_when_close_together() {
+    fn marks_on_one_screen_share_a_keyframe() {
         let frames = vec![
             frame(0, 0),
             frame(1000, 255),
@@ -588,16 +912,55 @@ mod tests {
             2,
         );
         assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].0.reason, KeyframeReason::Click);
+        let grouped = &selected[1].0;
+        assert_eq!(grouped.reason, KeyframeReason::Mark);
+        assert_eq!((grouped.t, grouped.mark_id.as_deref()), (2200, Some("m1")));
         assert!(
-            selected
+            marks
                 .iter()
-                .all(|(k, _)| k.reason == KeyframeReason::Mark)
+                .all(|m| m.frame.as_deref() == Some("frames/frame-02.png"))
         );
-        assert_eq!(selected[0].0.mark_id.as_deref(), Some("m1"));
-        assert_eq!(selected[1].0.mark_id.as_deref(), Some("m2"));
-        assert_eq!(marks[0].frame.as_deref(), Some("frames/frame-01.png"));
-        assert_eq!(marks[1].frame.as_deref(), Some("frames/frame-02.png"));
-        assert_eq!(marks[2].frame, None);
+    }
+
+    #[test]
+    fn every_mark_gets_a_keyframe_within_the_budget() {
+        // Eight marks on eight different screens, two of them nearly alike.
+        let grays = [0, 40, 80, 120, 160, 164, 210, 250];
+        let frames: Vec<_> = grays
+            .iter()
+            .enumerate()
+            .map(|(i, &g)| frame(i as u64 * 2_000 + 1_000, g))
+            .collect();
+        let mut marks: Vec<_> = (0..8)
+            .map(|i| mark(&format!("m{}", i + 1), i * 2_000 + 1_000))
+            .collect();
+        let selected =
+            select_keyframes(&frames, &[], &mut marks, &[], &TranscriptData::default(), 7);
+        assert_eq!(selected.len(), 7);
+        assert!(marks.iter().all(|m| m.frame.is_some()));
+        // The two alike screens were merged, onto the later one.
+        assert_eq!(marks[4].frame, marks[5].frame);
+        assert_eq!(selected[4].0.t, 11_000);
+
+        // On one unchanged screen, marks group until they span more than `GROUP_MS`.
+        let frames: Vec<_> = (0..=50).map(|i| frame(i * 1_000, 128)).collect();
+        let mut marks: Vec<_> = [2_000, 9_000, 20_000, 33_000, 40_000]
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| mark(&format!("m{}", i + 1), t))
+            .collect();
+        let selected = select_keyframes(
+            &frames,
+            &[],
+            &mut marks,
+            &[],
+            &TranscriptData::default(),
+            MAX_KEYFRAMES,
+        );
+        let at: Vec<_> = selected.iter().map(|(k, _)| k.t).collect();
+        assert_eq!(at, [20_000, 40_000]);
+        assert!(marks.iter().all(|m| m.frame.is_some()));
     }
 
     #[test]
@@ -643,7 +1006,7 @@ mod tests {
 
     #[test]
     fn transcript_words_partition_without_duplicates_or_gaps() {
-        let frames = vec![frame(1000, 0), frame(4000, 0)];
+        let frames = vec![frame(1000, 0), frame(4000, 255)];
         let mut marks = vec![mark("m1", 1000), mark("m2", 4000)];
         let transcript = TranscriptData {
             text: "Make this smaller, and move that.".into(),
@@ -718,7 +1081,7 @@ mod tests {
                 ..mark("m2", 5000)
             },
         ];
-        let span_frames = vec![frame(600, 0), frame(5000, 0)];
+        let span_frames = vec![frame(600, 0), frame(5000, 255)];
         let span_transcript = TranscriptData {
             words: [
                 (400, "First."),
@@ -948,6 +1311,51 @@ mod tests {
         );
         assert_eq!(selected[0].0.mark_id.as_deref(), Some("f1"));
         assert_eq!(selected[0].0.t, 1_500);
+    }
+
+    #[test]
+    fn long_talk_over_a_changing_screen_gets_more_than_one_frame() {
+        // Two minutes of steady talk. Small changes at 0:30 and 1:00, then bigger ones at the end
+        // that outrank them: ranked alone, the first keyframe would own a minute and a half.
+        let gray = |t: u64| match t {
+            ..30_000 => 20,
+            ..60_000 => 50,
+            ..90_000 => 80,
+            ..100_000 => 180,
+            ..110_000 => 250,
+            ..115_000 => 140,
+            _ => 220,
+        };
+        let frames: Vec<_> = (0..=240).map(|i| frame(i * 500, gray(i * 500))).collect();
+        let talk: Vec<(u64, &str)> = (0..240).map(|i| (i * 500, "word")).collect();
+        let transcript = TranscriptData {
+            words: words(&talk),
+            ..Default::default()
+        };
+        let selected = select_keyframes(&frames, &[], &mut [], &[], &transcript, 4);
+        let at: Vec<_> = selected.iter().map(|(k, _)| k.t).collect();
+        assert_eq!(at.len(), 4, "{at:?}");
+        assert!(at[0] <= 30_000 && at[1] <= 60_000, "{at:?}");
+        let most = selected
+            .iter()
+            .map(|(k, _)| word_count(k.said.as_deref().unwrap_or("")))
+            .max();
+        assert!(most <= Some(COVERAGE_WORDS as usize), "{most:?}");
+
+        // The same talk over an unchanged screen stays one frame.
+        let still: Vec<_> = (0..=240).map(|i| frame(i * 500, 90)).collect();
+        assert_eq!(
+            select_keyframes(&still, &[], &mut [], &[], &transcript, MAX_KEYFRAMES).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_budget_grows_with_duration() {
+        let budget: Vec<_> = [8_000, 39_999, 40_000, 67_600, 140_000, 268_000]
+            .map(keyframe_budget)
+            .into();
+        assert_eq!(budget, [6, 6, 7, 8, 12, 12]);
     }
 
     #[test]
