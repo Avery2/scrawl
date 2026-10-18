@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
 use crate::capture::{LiveOverlayEvent, SharedCaptureTelemetry, scrawl_log};
+use crate::delivery::{Delivery, Outcome};
 use crate::helper::{self, FrameTimes, PhoneDevice};
 use crate::model::{
     CaptureMode, ContextChange, DeviceInfo, InteractionEvent, RgbaFrame, ScrawlBundle, ScreenSpan,
@@ -1051,7 +1052,50 @@ pub struct IngestConfig {
     pub copy_clipboard: bool,
     pub route_opencode: bool,
     pub on_bundle: Option<IngestCallback>,
+    /// Where bundles are built and pending deliveries retried; the default captures folder if
+    /// unset.
+    captures: Option<PathBuf>,
+    hooks: IngestHooks,
 }
+
+impl IngestConfig {
+    fn captures_dir(&self) -> PathBuf {
+        self.captures
+            .clone()
+            .unwrap_or_else(crate::handoff::default_captures_dir)
+    }
+}
+
+/// The steps of an ingest that reach outside the process, swappable in tests so they never
+/// build real movies or post to a real OpenCode session.
+#[derive(Clone, Copy)]
+struct IngestHooks {
+    resolve: fn(Option<&str>, Option<&str>) -> Result<(String, String)>,
+    /// Movie, timeline, bundle directory → the built bundle.
+    build: fn(&Path, &Path, &Path) -> Result<(PathBuf, Option<ScrawlBundle>)>,
+    forward: crate::delivery::Forward,
+}
+
+impl Default for IngestHooks {
+    fn default() -> Self {
+        Self {
+            resolve: crate::handoff::resolve_opencode_session,
+            build: |movie, timeline, bundle_dir| {
+                let (dir, bundle, _) = import(movie, Some(timeline), bundle_dir, None)?;
+                Ok((dir, Some(bundle)))
+            },
+            forward: crate::handoff::send_bundle_to_session,
+        }
+    }
+}
+
+/// How long an upload waits for its bundle to be built and sent before the Mac answers
+/// "processing". The phone can ask for less with `X-Scrawl-Wait` (seconds); without it the Mac
+/// stays under the 30 s idle timeout of ScrawlKit builds from before the header.
+const REPLY_WAIT_MAX: Duration = Duration::from_secs(45);
+const REPLY_WAIT_DEFAULT: Duration = Duration::from_secs(25);
+/// Over USB the phone gives up 30 s after it stopped, and the copy takes some of that.
+const USB_REPLY_WAIT: Duration = Duration::from_secs(15);
 
 /// Constant-time comparison for bearer tokens so timing does not leak token bytes.
 pub fn constant_time_eq(provided: &str, expected: &str) -> bool {
@@ -1206,6 +1250,7 @@ pub fn start_ingest_server(ui_sender: flume::Sender<LiveOverlayEvent>) {
                 status,
             });
         })),
+        ..IngestConfig::default()
     };
     let http_cfg = config.clone();
     let _ = std::thread::Builder::new()
@@ -1227,6 +1272,7 @@ pub fn run_ingest_server(port: u16, usb: bool, no_opencode: bool) -> Result<()> 
         copy_clipboard: false,
         route_opencode,
         on_bundle: None,
+        ..IngestConfig::default()
     };
     if usb {
         spawn_usb_poller(config.clone());
@@ -1239,6 +1285,10 @@ fn serve_http(port: u16, config: IngestConfig) -> Result<()> {
     let listener = std::net::TcpListener::bind(&addr)
         .with_context(|| format!("port {port} already in use"))?;
     scrawl_log(format!("ingest server listening on {addr}"));
+    // Only the process that owns the port retries deliveries, so two never race over a bundle.
+    if config.route_opencode {
+        crate::delivery::spawn_retries(config.captures_dir(), config.hooks.forward, mark_sent);
+    }
     for stream in listener.incoming().flatten() {
         let cfg = config.clone();
         std::thread::spawn(move || {
@@ -1271,31 +1321,156 @@ fn spawn_usb_poller(config: IngestConfig) {
         });
 }
 
-/// Recordings already taken in, by `recordedAt`, so one that arrives over both HTTP and USB is
-/// built once.
-static INGESTED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+/// Where a recording is in its ingest.
+#[derive(Clone, Debug)]
+enum IngestState {
+    Processing,
+    Done(Delivery),
+}
 
-/// Claims a recording for ingest; `false` if it was already claimed.
-fn claim_recording(timeline: &Timeline) -> bool {
-    let key = timeline
-        .recorded_at
-        .clone()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(crate::make_bundle_id);
+/// Recordings taken in, by `recordedAt`, so one that arrives over both HTTP and USB (or twice
+/// over HTTP, to the LAN and Tailscale addresses) is built once and every copy hears how it
+/// went. A recording whose bundle failed to build is forgotten so it can be sent again.
+static INGESTED: Mutex<BTreeMap<String, IngestState>> = Mutex::new(BTreeMap::new());
+static INGEST_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+
+fn ingested() -> std::sync::MutexGuard<'static, BTreeMap<String, IngestState>> {
     INGESTED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get_or_insert_with(Default::default)
-        .insert(key)
+}
+
+fn ingest_key(timeline: &Timeline) -> String {
+    timeline
+        .recorded_at
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(crate::make_bundle_id)
+}
+
+/// A retried delivery went through: later copies of that recording hear it was sent.
+fn mark_sent(_: &Path, pending: &crate::delivery::Pending) {
+    if let Some(key) = &pending.key {
+        ingested().insert(
+            key.clone(),
+            IngestState::Done(Delivery::Sent {
+                title: pending.title.clone(),
+            }),
+        );
+        INGEST_CHANGED.notify_all();
+    }
+}
+
+/// Waits up to `wait` for the recording `key` to finish.
+fn wait_for_ingest(key: &str, wait: Duration) -> Outcome {
+    let deadline = Instant::now() + wait;
+    let mut map = ingested();
+    loop {
+        match map.get(key) {
+            Some(IngestState::Done(delivery)) => return Outcome::Done(delivery.clone()),
+            None => return Outcome::Failed("The Mac couldn't build this recording".into()),
+            Some(IngestState::Processing) => {}
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Outcome::Processing;
+        }
+        map = INGEST_CHANGED
+            .wait_timeout(map, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+}
+
+/// Takes in a received recording whose files are in `staging` (removed when done): builds its
+/// bundle and sends it to its session on a thread, and waits up to `wait` to say how that went.
+/// A copy of a recording already being taken in waits for that one instead.
+fn ingest_recording(
+    staging: PathBuf,
+    movie: PathBuf,
+    timeline_path: PathBuf,
+    timeline: &Timeline,
+    config: &IngestConfig,
+    wait: Duration,
+) -> (Outcome, String) {
+    let key = ingest_key(timeline);
+    let (session, title) = ingest_target(timeline, config);
+    let fresh = {
+        let mut map = ingested();
+        if map.contains_key(&key) {
+            false
+        } else {
+            map.insert(key.clone(), IngestState::Processing);
+            true
+        }
+    };
+    if !fresh {
+        let _ = std::fs::remove_dir_all(&staging);
+        scrawl_log(format!(
+            "ingest: {key} arrived again; waiting for the first copy"
+        ));
+        return (wait_for_ingest(&key, wait), title);
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let spawned = {
+        let (key, title, config) = (key.clone(), title.clone(), config.clone());
+        std::thread::Builder::new()
+            .name("scrawl-ingest-build".into())
+            .spawn(move || {
+                let built = build_ingested(
+                    &movie,
+                    &timeline_path,
+                    session.as_deref(),
+                    &title,
+                    &key,
+                    &config,
+                );
+                let _ = std::fs::remove_dir_all(&staging);
+                match &built {
+                    Ok(delivery) => {
+                        ingested().insert(key, IngestState::Done(delivery.clone()));
+                    }
+                    Err(err) => {
+                        scrawl_log(format!("ingest: {key} failed to build ({err:#})"));
+                        ingested().remove(&key);
+                    }
+                }
+                INGEST_CHANGED.notify_all();
+                let _ = sender.send(built.map_err(|err| format!("{err:#}")));
+            })
+    };
+    if let Err(err) = spawned {
+        ingested().remove(&key);
+        INGEST_CHANGED.notify_all();
+        return (
+            Outcome::Failed(format!("Could not start the build: {err}")),
+            title,
+        );
+    }
+    let outcome = match receiver.recv_timeout(wait) {
+        Ok(Ok(delivery)) => Outcome::Done(delivery),
+        Ok(Err(err)) => Outcome::Failed(err),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            scrawl_log(format!(
+                "ingest: {key} still building after {} s; answering \"processing\"",
+                wait.as_secs()
+            ));
+            Outcome::Processing
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Outcome::Failed("The build stopped".into())
+        }
+    };
+    (outcome, title)
 }
 
 /// The OpenCode session a recording goes to (if one resolves) and the name the phone shows.
-fn ingest_target(timeline: &Timeline, route_opencode: bool) -> (Option<String>, String) {
-    if !route_opencode {
+fn ingest_target(timeline: &Timeline, config: &IngestConfig) -> (Option<String>, String) {
+    if !config.route_opencode {
         return (None, "Mac".to_owned());
     }
     let app = timeline.app.as_deref().or(timeline.bundle_id.as_deref());
-    match crate::handoff::resolve_opencode_session(timeline.session.as_deref(), app) {
+    match (config.hooks.resolve)(timeline.session.as_deref(), app) {
         Ok((id, title)) => (Some(id), title),
         Err(err) => {
             scrawl_log(format!("ingest: no OpenCode session ({err:#})"));
@@ -1305,42 +1480,61 @@ fn ingest_target(timeline: &Timeline, route_opencode: bool) -> (Option<String>, 
 }
 
 /// Builds the bundle for a received recording, optionally copies it to the clipboard, queues it
-/// into `session`, and notifies the GUI HUD if running inside the app.
+/// into `session` (leaving a pending delivery to retry if that fails), and notifies the GUI HUD
+/// if running inside the app.
 fn build_ingested(
     movie: &Path,
     timeline_path: &Path,
     session: Option<&str>,
     title: &str,
+    key: &str,
     config: &IngestConfig,
-) -> Result<()> {
-    let bundle_dir =
-        crate::handoff::default_captures_dir().join(format!("{}.scrawl", crate::make_bundle_id()));
-    let (dir, bundle, _) = import(movie, Some(timeline_path), &bundle_dir, None)?;
+) -> Result<Delivery> {
+    let bundle_dir = config
+        .captures_dir()
+        .join(format!("{}.scrawl", crate::make_bundle_id()));
+    let (dir, bundle) = (config.hooks.build)(movie, timeline_path, &bundle_dir)?;
     if config.copy_clipboard {
         let _ = crate::handoff::copy_bundle_to_clipboard(&dir);
     }
-    let fallback_status = if config.copy_clipboard {
+    let delivery = match session {
+        Some(session) if config.route_opencode => match (config.hooks.forward)(&dir, session) {
+            Ok(()) => Delivery::Sent {
+                title: title.to_owned(),
+            },
+            Err(err) => {
+                let error = format!("{err:#}");
+                scrawl_log(format!(
+                    "ingest: OpenCode send to {title} failed ({error}); retrying from the Mac"
+                ));
+                let pending = crate::delivery::Pending::new(
+                    session,
+                    title,
+                    Some(key),
+                    &error,
+                    crate::now_epoch_ms(),
+                );
+                if let Err(err) = pending.write(&dir) {
+                    scrawl_log(format!("ingest: {err:#}"));
+                }
+                Delivery::Queued {
+                    title: title.to_owned(),
+                    error,
+                }
+            }
+        },
+        _ => Delivery::Saved,
+    };
+    let status = delivery.status(if config.copy_clipboard {
         "Copied to clipboard"
     } else {
         "Saved bundle"
-    };
-    let status = match session {
-        Some(session) if config.route_opencode => {
-            match crate::handoff::send_bundle_to_session(&dir, session) {
-                Ok(()) => format!("Sent to {title}"),
-                Err(err) => {
-                    scrawl_log(format!("ingest: OpenCode send failed ({err:#})"));
-                    fallback_status.to_owned()
-                }
-            }
-        }
-        _ => fallback_status.to_owned(),
-    };
+    });
     scrawl_log(format!("ingest: {} ({status})", dir.display()));
-    if let Some(ref on_bundle) = config.on_bundle {
+    if let (Some(on_bundle), Some(bundle)) = (&config.on_bundle, bundle) {
         on_bundle(dir, bundle, Some(status));
     }
-    Ok(())
+    Ok(delivery)
 }
 
 fn http_json(stream: &mut std::net::TcpStream, status: &str, body: &serde_json::Value) {
@@ -1435,7 +1629,6 @@ fn handle_ingest_connection_with_token(
     ensure!(4 + json_len < payload.len(), "Invalid framed payload");
     let json_bytes = &payload[4..4 + json_len];
     let timeline: Timeline = serde_json::from_slice(json_bytes).unwrap_or_default();
-    let (session, title) = ingest_target(&timeline, config.route_opencode);
     let staging = std::env::temp_dir().join(format!("scrawl-ingest-{}", crate::make_bundle_id()));
     std::fs::create_dir_all(&staging)?;
     let timeline_path = staging.join("timeline.json");
@@ -1443,33 +1636,45 @@ fn handle_ingest_connection_with_token(
     std::fs::write(&timeline_path, json_bytes)?;
     std::fs::write(&movie_path, &payload[4 + json_len..])?;
     drop(payload);
-    if !claim_recording(&timeline) {
-        let _ = std::fs::remove_dir_all(&staging);
-        http_json(
-            &mut stream,
-            "200 OK",
-            &serde_json::json!({ "ok": true, "sessionTitle": title }),
-        );
-        return Ok(());
-    }
 
-    // The phone only needs to know the files arrived; building the bundle takes a while.
-    http_json(
-        &mut stream,
-        "202 Accepted",
-        &serde_json::json!({ "ok": true, "sessionTitle": title }),
-    );
-    let _ = stream.shutdown(std::net::Shutdown::Both);
-
-    let built = build_ingested(
-        &movie_path,
-        &timeline_path,
-        session.as_deref(),
-        &title,
+    // Answer once the bundle is built and sent (or the wait runs out), so the phone says what
+    // actually happened.
+    let (outcome, title) = ingest_recording(
+        staging,
+        movie_path,
+        timeline_path,
+        &timeline,
         config,
+        reply_wait(&header),
     );
-    let _ = std::fs::remove_dir_all(&staging);
-    built
+    let body = crate::delivery::reply_json(&outcome, &title);
+    scrawl_log(format!("ingest http: replied {body}"));
+    let status = if matches!(outcome, Outcome::Failed(_)) {
+        "500 Internal Server Error"
+    } else {
+        "200 OK"
+    };
+    http_json(&mut stream, status, &body);
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    Ok(())
+}
+
+/// How long the phone will wait for the answer: `X-Scrawl-Wait` seconds, at most
+/// `REPLY_WAIT_MAX`.
+fn reply_wait(header: &str) -> Duration {
+    header
+        .lines()
+        .skip(1)
+        .find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("x-scrawl-wait")
+                .then(|| v.trim().parse::<u64>().ok())
+                .flatten()
+        })
+        .map_or(REPLY_WAIT_DEFAULT, |secs| {
+            Duration::from_secs(secs).min(REPLY_WAIT_MAX)
+        })
 }
 
 fn devicectl_copy(
@@ -1500,9 +1705,32 @@ fn devicectl_copy(
         .is_ok_and(|o| o.status.success())
 }
 
+/// Cabled recordings whose bundle failed to build: how many times, and when to try again.
+static USB_FAILURES: Mutex<BTreeMap<String, (u32, Instant)>> = Mutex::new(BTreeMap::new());
+
+fn usb_backing_off(key: &str) -> bool {
+    USB_FAILURES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+        .is_some_and(|&(_, next)| Instant::now() < next)
+}
+
+/// Notes a failed build and returns how long until the next try (1 min doubling to 30 min).
+fn usb_failed(key: &str) -> Duration {
+    let mut failures = USB_FAILURES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let count = failures.get(key).map_or(1, |&(n, _)| n + 1);
+    let wait = Duration::from_secs((60_u64 << (count - 1).min(5)).min(30 * 60));
+    failures.insert(key.to_owned(), (count, Instant::now() + wait));
+    wait
+}
+
 /// Takes in recordings the phone marked `.ready` but has no `.sent` for (in `Documents/Scrawl` or
-/// the legacy `Documents/Tether` directory), and writes `.sent` (the session's name) back as soon
-/// as the files are on the Mac.
+/// the legacy `Documents/Tether` directory). Once the bundle is built and sent (or 15 s pass),
+/// writes back `.delivery` (the same JSON an HTTP upload gets) and then `.sent` (the session's
+/// name, all that ScrawlKit builds before `.delivery` read).
 fn poll_usb_app_containers(apps: &[String], config: &IngestConfig) -> Result<()> {
     if apps.is_empty() {
         return Ok(());
@@ -1558,12 +1786,15 @@ fn poll_usb_app_containers(apps: &[String], config: &IngestConfig) -> Result<()>
                 if names.contains(&format!("{stem}.sent").as_str()) {
                     continue;
                 }
+                let retry_key = format!("{bundle_id}/{subdir}/{stem}");
+                if usb_backing_off(&retry_key) {
+                    continue;
+                }
                 let staging =
                     std::env::temp_dir().join(format!("scrawl-usb-{}", crate::make_bundle_id()));
                 std::fs::create_dir_all(&staging)?;
                 let local_json = staging.join(format!("{stem}.json"));
                 let local_mp4 = staging.join(format!("{stem}.mp4"));
-                let sent = staging.join(format!("{stem}.sent"));
                 let remote = |ext: &str| format!("{subdir}/{stem}.{ext}");
                 if !devicectl_copy(
                     &udid,
@@ -1589,10 +1820,46 @@ fn poll_usb_app_containers(apps: &[String], config: &IngestConfig) -> Result<()>
                     let _ = std::fs::remove_dir_all(&staging);
                     continue;
                 }
-                let (session, title) = ingest_target(&timeline, config.route_opencode);
-                let fresh = claim_recording(&timeline);
-                // Answer the phone first: it is waiting, and the bundle takes a while to build.
+                let (outcome, title) = ingest_recording(
+                    staging,
+                    local_mp4,
+                    local_json,
+                    &timeline,
+                    config,
+                    USB_REPLY_WAIT,
+                );
+                if let Outcome::Failed(err) = &outcome {
+                    // No `.sent`: the phone keeps `.ready`, and this is tried again later.
+                    let wait = usb_failed(&retry_key);
+                    scrawl_log(format!(
+                        "ingest usb {stem}: {err}; trying again in {} s",
+                        wait.as_secs()
+                    ));
+                    continue;
+                }
+                USB_FAILURES
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&retry_key);
+                // `.delivery` (the HTTP reply) goes first: ScrawlKit reads it once `.sent`
+                // appears. Builds from before it only read `.sent`, the session's name.
+                let replies =
+                    std::env::temp_dir().join(format!("scrawl-usb-{}", crate::make_bundle_id()));
+                std::fs::create_dir_all(&replies)?;
+                let delivery = replies.join(format!("{stem}.delivery"));
+                let sent = replies.join(format!("{stem}.sent"));
+                std::fs::write(
+                    &delivery,
+                    crate::delivery::reply_json(&outcome, &title).to_string(),
+                )?;
                 std::fs::write(&sent, title.as_bytes())?;
+                devicectl_copy(
+                    &udid,
+                    bundle_id,
+                    "to",
+                    &delivery.to_string_lossy(),
+                    &remote("delivery"),
+                );
                 devicectl_copy(
                     &udid,
                     bundle_id,
@@ -1600,18 +1867,8 @@ fn poll_usb_app_containers(apps: &[String], config: &IngestConfig) -> Result<()>
                     &sent.to_string_lossy(),
                     &remote("sent"),
                 );
-                if fresh {
-                    if let Err(err) = build_ingested(
-                        &local_mp4,
-                        &local_json,
-                        session.as_deref(),
-                        &title,
-                        config,
-                    ) {
-                        scrawl_log(format!("ingest usb {stem}: {err:#}"));
-                    }
-                }
-                let _ = std::fs::remove_dir_all(&staging);
+                scrawl_log(format!("ingest usb {stem}: replied {outcome:?}"));
+                let _ = std::fs::remove_dir_all(&replies);
             }
         }
     }
@@ -1893,5 +2150,216 @@ mod tests {
         );
         assert!(valid_health.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(valid_health.contains(r#"{"ok":true}"#));
+    }
+
+    const SECRET: &str = "feedface0123456789abcdef0123456789abcdef0123456789abcdef01234567";
+
+    /// Builds nothing real: the movie's bytes say how the build goes.
+    fn fake_build(
+        movie: &Path,
+        _timeline: &Path,
+        bundle_dir: &Path,
+    ) -> Result<(PathBuf, Option<ScrawlBundle>)> {
+        let bytes = std::fs::read(movie)?;
+        if bytes == b"slow" {
+            std::thread::sleep(Duration::from_millis(800));
+        }
+        ensure!(bytes != b"bad", "no video track");
+        std::fs::create_dir_all(bundle_dir)?;
+        Ok((bundle_dir.to_owned(), None))
+    }
+
+    /// Never reaches OpenCode: `ses_down` fails like an unreachable server.
+    fn fake_forward(_: &Path, session: &str) -> Result<()> {
+        ensure!(
+            session != "ses_down",
+            "OpenCode API failed: connection refused"
+        );
+        Ok(())
+    }
+
+    fn fake_resolve(session: Option<&str>, _app: Option<&str>) -> Result<(String, String)> {
+        Ok((session.unwrap_or("ses_up").to_owned(), "UP DOWN".to_owned()))
+    }
+
+    fn test_config(captures: &Path, route_opencode: bool) -> IngestConfig {
+        IngestConfig {
+            route_opencode,
+            captures: Some(captures.to_owned()),
+            hooks: IngestHooks {
+                resolve: fake_resolve,
+                build: fake_build,
+                forward: fake_forward,
+            },
+            ..IngestConfig::default()
+        }
+    }
+
+    /// Uploads one framed recording; returns the status line and the JSON body.
+    fn post_ingest(
+        config: &IngestConfig,
+        timeline: serde_json::Value,
+        movie: &[u8],
+        wait: Option<u64>,
+    ) -> (String, serde_json::Value) {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = config.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_ingest_connection_with_token(stream, SECRET, &cfg).unwrap();
+        });
+        let json = timeline.to_string();
+        let mut payload = (json.len() as u32).to_be_bytes().to_vec();
+        payload.extend_from_slice(json.as_bytes());
+        payload.extend_from_slice(movie);
+        let wait = wait.map_or(String::new(), |s| format!("X-Scrawl-Wait: {s}\r\n"));
+        let mut request = format!(
+            "POST /ingest HTTP/1.1\r\nAuthorization: Bearer {SECRET}\r\n{wait}Content-Length: {}\r\n\r\n",
+            payload.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(&payload);
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client.write_all(&request).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        server.join().unwrap();
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        (
+            head.lines().next().unwrap().to_owned(),
+            serde_json::from_str(body).unwrap(),
+        )
+    }
+
+    fn temp_captures() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("scrawl-ingest-test-{}", crate::make_bundle_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn bundles(captures: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(captures)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect()
+    }
+
+    #[test]
+    fn ingest_answers_saved_when_routing_is_off() {
+        let captures = temp_captures();
+        let (status, body) = post_ingest(
+            &test_config(&captures, false),
+            serde_json::json!({"recordedAt": "2026-10-18T10:00:00Z-saved"}),
+            b"movie",
+            None,
+        );
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(
+            body,
+            serde_json::json!({"ok": true, "delivered": false, "state": "saved", "sessionTitle": "Mac"})
+        );
+        assert_eq!(bundles(&captures).len(), 1);
+        std::fs::remove_dir_all(captures).unwrap();
+    }
+
+    #[test]
+    fn ingest_answers_sent_only_after_opencode_took_it() {
+        let captures = temp_captures();
+        let (status, body) = post_ingest(
+            &test_config(&captures, true),
+            serde_json::json!({"recordedAt": "2026-10-18T10:00:00Z-sent", "session": "ses_up"}),
+            b"movie",
+            None,
+        );
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(
+            body,
+            serde_json::json!({"ok": true, "delivered": true, "state": "sent", "sessionTitle": "UP DOWN"})
+        );
+        std::fs::remove_dir_all(captures).unwrap();
+    }
+
+    #[test]
+    fn a_failed_forward_is_queued_on_the_mac_and_retried() {
+        let captures = temp_captures();
+        let config = test_config(&captures, true);
+        let timeline =
+            serde_json::json!({"recordedAt": "2026-10-18T10:00:00Z-queued", "session": "ses_down"});
+        let (status, body) = post_ingest(&config, timeline.clone(), b"movie", None);
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(body["delivered"], false);
+        assert_eq!(body["state"], "queued");
+        assert_eq!(body["sessionTitle"], "UP DOWN");
+        assert_eq!(body["error"], "OpenCode API failed: connection refused");
+        let bundle = bundles(&captures).pop().unwrap();
+        let pending: crate::delivery::Pending =
+            serde_json::from_slice(&std::fs::read(bundle.join(crate::delivery::PENDING)).unwrap())
+                .unwrap();
+        assert_eq!(pending.session, "ses_down");
+        assert_eq!(pending.attempts, 1);
+
+        // OpenCode is back (the session answers now): the Mac's retry goes through.
+        let report = crate::delivery::retry_due(&captures, u64::MAX / 2, |dir, _| {
+            fake_forward(dir, "ses_up")
+        });
+        assert_eq!(report.sent.len(), 1);
+        assert!(!bundle.join(crate::delivery::PENDING).exists());
+        for (dir, pending) in &report.sent {
+            mark_sent(dir, pending);
+        }
+        // The phone sending it again (a lost reply) hears it was sent, and nothing is rebuilt.
+        let (_, again) = post_ingest(&config, timeline, b"movie", None);
+        assert_eq!(again["state"], "sent");
+        assert_eq!(bundles(&captures).len(), 1);
+        std::fs::remove_dir_all(captures).unwrap();
+    }
+
+    #[test]
+    fn a_failed_build_answers_500_and_the_upload_can_be_sent_again() {
+        let captures = temp_captures();
+        let config = test_config(&captures, true);
+        let timeline = serde_json::json!({"recordedAt": "2026-10-18T10:00:00Z-bad"});
+        let (status, body) = post_ingest(&config, timeline.clone(), b"bad", None);
+        assert_eq!(status, "HTTP/1.1 500 Internal Server Error");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"], "no video track");
+        let (status, body) = post_ingest(&config, timeline, b"movie", None);
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(body["state"], "sent");
+        std::fs::remove_dir_all(captures).unwrap();
+    }
+
+    #[test]
+    fn a_slow_build_answers_processing_and_a_copy_waits_for_the_real_outcome() {
+        let captures = temp_captures();
+        let config = test_config(&captures, true);
+        let timeline = serde_json::json!({"recordedAt": "2026-10-18T10:00:00Z-slow"});
+        let (status, body) = post_ingest(&config, timeline.clone(), b"slow", Some(0));
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(
+            body,
+            serde_json::json!({"ok": true, "delivered": false, "state": "processing", "sessionTitle": "UP DOWN"})
+        );
+        // The same recording over the other address waits for the first build.
+        let (_, body) = post_ingest(&config, timeline, b"slow", Some(10));
+        assert_eq!(body["state"], "sent");
+        assert_eq!(bundles(&captures).len(), 1);
+        std::fs::remove_dir_all(captures).unwrap();
+    }
+
+    #[test]
+    fn reply_wait_reads_the_phones_header_and_caps_it() {
+        assert_eq!(reply_wait("POST /ingest HTTP/1.1\r\n"), REPLY_WAIT_DEFAULT);
+        assert_eq!(
+            reply_wait("POST /ingest HTTP/1.1\r\nx-scrawl-wait: 10\r\n"),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            reply_wait("POST /ingest HTTP/1.1\r\nX-Scrawl-Wait: 600\r\n"),
+            REPLY_WAIT_MAX
+        );
     }
 }

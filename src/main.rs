@@ -2,6 +2,7 @@ mod audio;
 mod autocrop;
 mod autocrop_lab;
 mod capture;
+mod delivery;
 mod handoff;
 mod helper;
 mod hold;

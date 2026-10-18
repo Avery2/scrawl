@@ -5,8 +5,8 @@
 //! media goes to the Trash and the prompt stays; after `bundleDays` the whole bundle goes. Both
 //! live under `"retention"` in `~/.config/scrawl/config.json` (`null` keeps forever). A bundle
 //! younger than a day or changed within the last day, one whose media is still copying
-//! (`.media-pending`, `.media-sending`), one Scrawl is working on, and a pinned one (`.pinned`)
-//! are never touched.
+//! (`.media-pending`, `.media-sending`), one Scrawl is working on, a pinned one (`.pinned`), and
+//! one still waiting to reach OpenCode (`.deliver.json`) are never touched.
 //!
 //! Cabled-iPhone videos are also re-encoded to HEVC at the size keyframes use (`shrink`), which
 //! makes them about ten times smaller.
@@ -279,6 +279,7 @@ pub fn plan(captures: &Path, policy: &Policy, now: SystemTime) -> Vec<Action> {
     let mut actions = Vec::new();
     for dir in bundles {
         if dir.join(PINNED).exists()
+            || dir.join(crate::delivery::PENDING).exists()
             || is_claimed(&dir)
             || live_marker(&dir, crate::handoff::MEDIA_PENDING, now)
             || live_marker(&dir, MEDIA_SENDING, now)
@@ -463,6 +464,7 @@ pub fn apply(actions: &[Action], policy: &Policy, trasher: Trasher, shrink: bool
         if live_marker(bundle, crate::handoff::MEDIA_PENDING, now)
             || live_marker(bundle, MEDIA_SENDING, now)
             || bundle.join(PINNED).exists()
+            || bundle.join(crate::delivery::PENDING).exists()
         {
             continue;
         }
@@ -934,6 +936,13 @@ mod tests {
         );
         let sending = bundle(&tmp.0, "scrawl-sending", 40.0, false);
         marker(&sending, MEDIA_SENDING, later() - Duration::from_secs(3600));
+        // A bundle still waiting to reach OpenCode, however old its marker.
+        let undelivered = bundle(&tmp.0, "scrawl-undelivered", 40.0, false);
+        marker(
+            &undelivered,
+            crate::delivery::PENDING,
+            later() - Duration::from_secs(40 * 24 * 3600),
+        );
         let busy = bundle(&tmp.0, "scrawl-busy", 40.0, false);
         let held = claim(&busy).unwrap();
         assert!(claim(&busy).is_none(), "one claim at a time");
