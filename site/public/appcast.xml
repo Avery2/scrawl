@@ -3,13 +3,13 @@
     <channel>
         <title>Scrawl</title>
         <item>
-            <title>0.2.0</title>
-            <pubDate>Wed, 14 Oct 2026 15:24:04 -0700</pubDate>
-            <sparkle:version>2</sparkle:version>
-            <sparkle:shortVersionString>0.2.0</sparkle:shortVersionString>
+            <title>0.3.0</title>
+            <pubDate>Sun, 18 Oct 2026 16:03:03 -0700</pubDate>
+            <sparkle:version>3</sparkle:version>
+            <sparkle:shortVersionString>0.3.0</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl-0.2.0-arm64.zip" length="7596644" type="application/octet-stream" sparkle:edSignature="oxY7Y3ILDcK0YK0WcT08kzxNOXv7OJ5orrIDiLMU7IeVICL6NOHliAxv8CF2e69QeXIvj0ZtBSa6aD7dTnr9Dw=="/>
+            <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl-0.3.0-arm64.zip" length="8235657" type="application/octet-stream" sparkle:edSignature="D7AeZIfzN++KzDjUgQ6+ru1+ci6CtfwPdlx0XKn3Ieoi56W+AV1XhTpFklZVuXvI3s8cMVjmBfkQrr1fNJMKDw=="/>
         </item>
     </channel>
 </rss>
