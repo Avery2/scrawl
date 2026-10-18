@@ -306,6 +306,19 @@ You can also AirDrop the `.mp4` and `.json` pair to the Mac and run `scrawl impo
 - App events (`Scrawl.event("Done tapped")`) appear in `summary.md` under the keyframe that was on
   screen when they happened (`  · 0:12 app: Done tapped`).
 
+#### Destination and recovery
+
+The original `timeline.json` stores the paired destination in its top-level `session` field.
+`context.session`, when the app supplies it, describes the session being viewed and does not choose
+the recipient. For example, recording OpenCode Settings while viewing another project's session
+can still send to the paired OpenCode iOS coordinator. Automatic Mac ingest resolves the top-level
+destination first; without one, it uses the app/session fallback in `resolve_opencode_session`.
+
+When recovering a failed delivery, read that original top-level field and check whether the capture
+already arrived before sending again. `scrawl send --session` explicitly overrides the recipient;
+do not fill it from `context.session`. If there is no recorded destination and ownership is unclear,
+ask before forwarding. Keep private-project endpoints and recipients unchanged.
+
 #### Sending to an HTTPS endpoint
 
 A setup link can point at a hosted endpoint instead of a Mac, for phones that aren't on your LAN or
