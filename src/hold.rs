@@ -1,6 +1,8 @@
 //! The capture shortcut as a ⌘Tab-style switcher. Tap ⌥⇧S to record the screen at once. Keep
 //! holding ⌥⇧ and the switcher appears on Screen: each further S steps Screen → Window → iPhone,
-//! a mouse drag selects an area, Esc cancels, and releasing ⌥⇧ records the selection.
+//! a mouse drag selects an area, Esc cancels, and releasing ⌥⇧ records the selection. A tap's
+//! recording shows the same modes as chips in its capsule for a few seconds (`Reveal`), so the
+//! target can still change and nobody has to know about holding.
 
 use crate::ui::SelectionMode;
 
@@ -144,6 +146,71 @@ impl Switcher {
     }
 }
 
+/// How long a tap-started recording shows its switch chips when nothing else happens.
+pub const REVEAL_MS: u64 = 3_500;
+/// The chips stay at least this long even if work starts at once, so they are seen.
+pub const REVEAL_MIN_MS: u64 = 900;
+/// After the pointer leaves the capsule the chips stay this much longer.
+pub const REVEAL_LINGER_MS: u64 = 1_200;
+
+/// The switch chips a tap-started recording shows in its capsule (Area · Window · Screen ·
+/// iPhone), so a tap teaches that the target can change. They fold back into the recording pill
+/// after `REVEAL_MS`, or once the user starts working (a click, scroll or stroke), but not while
+/// the pointer is on the capsule.
+#[derive(Debug, Default)]
+pub struct Reveal {
+    open: Option<RevealOpen>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RevealOpen {
+    since_ms: u64,
+    /// Activity count when the chips appeared; more than this means the user got to work.
+    baseline: usize,
+    hovered_at_ms: Option<u64>,
+}
+
+impl Reveal {
+    pub fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
+    pub fn show(&mut self, now_ms: u64, activity: usize) {
+        self.open = Some(RevealOpen {
+            since_ms: now_ms,
+            baseline: activity,
+            hovered_at_ms: None,
+        });
+    }
+
+    pub fn close(&mut self) {
+        self.open = None;
+    }
+
+    /// Polled every frame; returns true on the frame the chips fold away.
+    pub fn tick(&mut self, now_ms: u64, hovered: bool, activity: usize) -> bool {
+        let Some(open) = self.open.as_mut() else {
+            return false;
+        };
+        if hovered {
+            open.hovered_at_ms = Some(now_ms);
+            return false;
+        }
+        let age = now_ms.saturating_sub(open.since_ms);
+        if age < REVEAL_MIN_MS {
+            return false;
+        }
+        let linger_until = open.hovered_at_ms.map_or(0, |at| at + REVEAL_LINGER_MS);
+        let deadline = (open.since_ms + REVEAL_MS).max(linger_until);
+        let working = activity > open.baseline && now_ms >= linger_until;
+        if now_ms >= deadline || working {
+            self.open = None;
+            return true;
+        }
+        false
+    }
+}
+
 /// The next mode for another S press. An area goes back to the start of the cycle.
 fn next(mode: SelectionMode) -> SelectionMode {
     match mode {
@@ -252,6 +319,48 @@ mod tests {
         assert_eq!(s.tick(100, false), Action::None);
         assert_eq!(s.press(0, Activity::Processing), Action::None);
         assert!(!s.is_held());
+    }
+
+    #[test]
+    fn reveal_folds_away_after_its_time_when_ignored() {
+        let mut r = Reveal::default();
+        assert!(!r.tick(0, false, 0));
+        r.show(1_000, 0);
+        assert!(r.is_open());
+        assert!(!r.tick(1_000 + REVEAL_MS - 1, false, 0));
+        assert!(r.tick(1_000 + REVEAL_MS, false, 0));
+        assert!(!r.is_open());
+        assert!(!r.tick(1_000 + REVEAL_MS + 8, false, 0));
+    }
+
+    #[test]
+    fn reveal_folds_away_once_work_starts_but_is_seen_first() {
+        let mut r = Reveal::default();
+        r.show(0, 3);
+        // A click right away: the chips stay for their minimum.
+        assert!(!r.tick(100, false, 4));
+        assert!(!r.tick(REVEAL_MIN_MS - 1, false, 4));
+        assert!(r.tick(REVEAL_MIN_MS, false, 4));
+        // No new activity: only the timeout folds it.
+        r.show(10_000, 7);
+        assert!(!r.tick(10_000 + REVEAL_MIN_MS + 500, false, 7));
+        assert!(r.tick(10_000 + REVEAL_MIN_MS + 600, false, 8));
+    }
+
+    #[test]
+    fn reveal_stays_while_hovered_and_lingers_after() {
+        let mut r = Reveal::default();
+        r.show(0, 0);
+        assert!(!r.tick(3_000, true, 0));
+        // Hovered past the timeout: still open.
+        assert!(!r.tick(6_000, true, 5));
+        // Left at 6 s: lingers, even with activity, then folds.
+        assert!(!r.tick(6_000 + REVEAL_LINGER_MS - 1, false, 5));
+        assert!(r.tick(6_000 + REVEAL_LINGER_MS, false, 5));
+        // Choosing a chip closes it outright.
+        r.show(20_000, 0);
+        r.close();
+        assert!(!r.is_open());
     }
 
     #[test]

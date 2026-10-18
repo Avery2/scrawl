@@ -79,7 +79,11 @@ Preview every step without the app: `target/debug/scrawl-helper onboarding --ren
 - **Tap `⌥⇧S`** (release within 0.25 s): record the display under the pointer straight away,
   auto-cropped (see below). Tap it again to finish; a tap within 0.4 s of the start is ignored, so a
   double press doesn't leave an empty capture. `⌃⌥⇧S` also works, as does your own shortcut if you
-  set one in the review window.
+  set one in the review window. As it starts, the island opens onto the modes (Area · Window ·
+  **Screen** · iPhone when one is cabled) for about 3.5 s, or until you click, scroll or draw;
+  hovering keeps them. Click Window or Area to retarget (the first seconds are dropped and the
+  picker takes over: click a window or drag an area), iPhone to record the phone instead, or just
+  carry on.
 - **Hold `⌥⇧` after `S`**, like `⌘Tab`: after 0.25 s the switcher appears on **Screen**. Each
   further `S` steps Screen → Window → iPhone → Screen; Window highlights the window under the
   pointer. Dragging with the mouse selects an area instead. Release `⌥⇧` to record what's
