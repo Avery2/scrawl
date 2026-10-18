@@ -148,7 +148,7 @@ function Prompt({
           </div>
           </AutoHeight>
           <div className="tp-meta">
-            <span className="tx-build">Build</span> <span className="tx-mute">·</span> Claude Opus 4.6 <span className="tx-mute">anthropic</span>
+            <span className="tx-build">Build</span> <span className="tx-mute">·</span> Claude Opus 5.5 <span className="tx-mute">anthropic</span>
           </div>
         </div>
       </div>
@@ -391,7 +391,7 @@ function Session({
           {done && (
             <div className="ta-foot enter">
               <span className="tx-build">Build</span>
-              <span className="tx-mute"> · Claude Opus 4.6 · 4.1s</span>
+              <span className="tx-mute"> · Claude Opus 5.5 · 4.1s</span>
             </div>
           )}
         </div>

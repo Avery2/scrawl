@@ -59,11 +59,6 @@ function MirrorVisual() {
           <i />
           REC
         </span>
-        <span className="ip-flag">⚑ M</span>
-      </div>
-      <div className="ip-meta">
-        <code>recording.mov</code>
-        <code>1320×2868</code>
       </div>
     </div>
   )
@@ -91,24 +86,6 @@ function ScrawlKitVisual() {
           </svg>
         </Screen>
       </div>
-      <div className="ip-timeline">
-        <span>
-          <i className="tap" />
-          tap
-        </span>
-        <span>
-          <i className="swipe" />
-          swipe
-        </span>
-        <span>
-          <i className="long" />
-          long-press
-        </span>
-        <span>
-          <i className="event" />
-          app: Done tapped
-        </span>
-      </div>
     </div>
   )
 }
@@ -117,29 +94,19 @@ export function IPhoneSection() {
   return (
     <section id="iphone" className="iphone-section">
       <h2>iPhone</h2>
-      <div className="ip-cards">
-        <article className="ip-card-outer">
+      <div className="feature-cards">
+        <article className="feature-card">
           <MirrorVisual />
-          <div className="ip-copy">
-            <h3>
-              Live USB mirror <code>scrawl-helper mirror</code>
-            </h3>
-            <p>
-              Plug in an iPhone, click <b>iPhone</b> in the pill to preview the phone in a floating mirror, then <b>Record</b>. Draw strokes and drop pins
-              right on the mirror. Keyframes are decoded from the phone's native 1320×2868 video. Press <kbd>M</kbd> to flag a moment.
-            </p>
+          <div className="feature-copy">
+            <h3>Plug it into your Mac</h3>
+            <p>Your iPhone’s screen appears in a window on the Mac, and you talk and draw over it as it records.</p>
           </div>
         </article>
-        <article className="ip-card-outer">
+        <article className="feature-card">
           <ScrawlKitVisual />
-          <div className="ip-copy">
-            <h3>
-              ScrawlKit recording <code>scrawl import</code>
-            </h3>
-            <p>
-              Record inside your own iOS app with ScrawlKit. Scrawl imports the <code>.mp4</code> and its touch timeline, and turns taps, long-presses,
-              swipes, and <code>Scrawl.event(…)</code> logs into keyframes with touch ripples and swipe trails.
-            </p>
+          <div className="feature-copy">
+            <h3>Record inside your own app</h3>
+            <p>Add ScrawlKit to your iOS app to record on the phone itself, with every tap and swipe drawn on the frames.</p>
           </div>
         </article>
       </div>

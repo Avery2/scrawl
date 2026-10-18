@@ -1,8 +1,8 @@
 import { lazy, Suspense } from "react"
-import { BundleExplorer } from "./Bundle"
 import { BrushFallback } from "./brush-paths"
 import { Copy } from "./Copy"
 import { Demo } from "./demo/Demo"
+import { HowItWorks } from "./HowItWorks"
 import { IPhoneSection } from "./IPhone"
 
 const Brush3D = lazy(() => import("./Brush3D").then((m) => ({ default: m.Brush3D })))
@@ -35,9 +35,6 @@ function Download() {
         </svg>
         Download for macOS
       </a>
-      <span className="download-meta">
-        Apple Silicon · macOS 26+ · <a href={ZIP}>.zip</a>
-      </span>
     </div>
   )
 }
@@ -52,7 +49,7 @@ export function App() {
         </a>
         <nav>
           <a href="#iphone">iPhone</a>
-          <a href="#bundle">Bundle</a>
+          <a href="#how">How it works</a>
           <a href="#install">Install</a>
           <a href={REPO}>GitHub</a>
           <a className="nav-dl" href={DMG}>
@@ -81,12 +78,7 @@ export function App() {
 
         <IPhoneSection />
 
-        <section id="bundle" className="bundle-section">
-          <h2>
-            <code>.scrawl</code> bundle
-          </h2>
-          <BundleExplorer />
-        </section>
+        <HowItWorks />
 
         <section className="split">
           <div>
