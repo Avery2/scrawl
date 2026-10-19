@@ -399,6 +399,41 @@ pub struct Config {
     /// Visual style of the native recording pill: `"black"` (default) or `"glass"` (`NSGlassEffectView`).
     #[serde(default)]
     pub pill_style: Option<String>,
+    /// Behaviour Kit tries locally before it ships (`{"agentContext": true}`); see `experiment`.
+    #[serde(default)]
+    pub experiments: std::collections::BTreeMap<String, bool>,
+}
+
+/// More of what Scrawl already knows in the summary and on the frames: marks, shortcuts, drags
+/// and windows inline at their time, numbered marks on shared frames, where a screen changed.
+pub const AGENT_CONTEXT: &str = "agentContext";
+
+/// Transcribe Mac recordings while they record, so finishing only waits for the last words
+/// (`live_transcribe`).
+pub const LIVE_TRANSCRIBE: &str = "liveTranscribe";
+
+static EXPERIMENT_OVERRIDES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Turns an experiment on for this process (`scrawl reprocess --experiment <name>`).
+pub fn enable_experiment(name: &str) {
+    EXPERIMENT_OVERRIDES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(name.to_owned());
+}
+
+/// Whether an experiment is on: `"experiments": {"<name>": true}` in `config.json`, or
+/// `enable_experiment` in this process. Off by default; tests see only `enable_experiment`.
+pub fn experiment(name: &str) -> bool {
+    let overridden = EXPERIMENT_OVERRIDES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|n| n == name);
+    if overridden || cfg!(test) {
+        return overridden;
+    }
+    config().experiments.get(name).copied().unwrap_or(false)
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -1486,6 +1521,25 @@ mod tests {
         let cfg_after = load_config_from(&missing);
         assert_eq!(cfg_after.ingest_token.as_deref(), Some(token.as_str()));
         assert!(cfg_after.usb_apps.is_empty());
+    }
+
+    #[test]
+    fn experiments_are_read_from_config_and_off_by_default() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("config.json");
+        fs::write(
+            &path,
+            r#"{"experiments": {"agentContext": true, "other": false}}"#,
+        )
+        .unwrap();
+        let cfg = load_config_from(&path);
+        assert_eq!(cfg.experiments.get(AGENT_CONTEXT), Some(&true));
+        assert_eq!(cfg.experiments.get("other"), Some(&false));
+        assert!(Config::default().experiments.is_empty());
+        // Tests never read Kit's config, only what this process turned on.
+        assert!(!experiment("neverEnabled"));
+        enable_experiment("enabledForThisTest");
+        assert!(experiment("enabledForThisTest"));
     }
 }
 

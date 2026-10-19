@@ -209,9 +209,33 @@ pub fn describe_mark(mark: &Mark) -> String {
         Shape::Flag => "flagged this moment".into(),
     };
     if let Some(on) = &mark.on {
-        text.push_str(&format!(" over “{on}”"));
+        text.push_str(&format!(" over {}", quote_label(on)));
     }
     text
+}
+
+/// A label in curly quotes, unless it already quotes its own parts (`button “Area” #area` from
+/// `crate::ax`, `<div.capsule> in Pill (src/Pill.tsx:42)` from `crate::page`).
+fn quote_label(label: &str) -> String {
+    if label.contains('“') || label.starts_with('<') {
+        label.to_owned()
+    } else {
+        format!("“{label}”")
+    }
+}
+
+/// The inked marks a keyframe draws (every mark of its screen's group), in drawing order.
+pub fn marks_on<'a>(keyframe: &Keyframe, marks: &'a [Mark]) -> Vec<&'a Mark> {
+    let mut shown: Vec<&Mark> = marks
+        .iter()
+        .filter(|m| {
+            !m.strokes.is_empty()
+                && (keyframe.mark_id.as_ref() == Some(&m.id)
+                    || (!keyframe.file.is_empty() && m.frame.as_ref() == Some(&keyframe.file)))
+        })
+        .collect();
+    shown.sort_by_key(|m| m.t0);
+    shown
 }
 
 /// Coalesce each label independently, even when other events occur during a burst.
@@ -307,6 +331,7 @@ pub fn describe_event(event: &InteractionEvent) -> String {
             y,
             label,
             button,
+            role,
             ..
         } => {
             let verb = if button.as_deref() == Some("touch") {
@@ -314,9 +339,16 @@ pub fn describe_event(event: &InteractionEvent) -> String {
             } else {
                 "clicked"
             };
+            let role = role
+                .as_deref()
+                .filter(|r| !r.is_empty())
+                .map(|r| format!(" {r}"))
+                .unwrap_or_default();
             match label.as_deref() {
-                Some(l) if !l.is_empty() => format!("{verb} “{l}” ({})", at([*x, *y])),
-                _ => format!("{verb} ({})", at([*x, *y])),
+                Some(l) if !l.is_empty() => {
+                    format!("{verb}{role} {} ({})", quote_label(l), at([*x, *y]))
+                }
+                _ => format!("{verb}{role} ({})", at([*x, *y])),
             }
         }
         InteractionEvent::Drag {
@@ -348,7 +380,7 @@ pub fn describe_event(event: &InteractionEvent) -> String {
                     label
                         .as_ref()
                         .filter(|s| !s.is_empty())
-                        .map(|s| format!(" “{s}”"))
+                        .map(|s| format!(" {}", quote_label(s)))
                         .unwrap_or_default(),
                     direction(x1 - x0, y1 - y0, 0.04),
                     at([*x0, *y0]),
@@ -431,6 +463,16 @@ fn context_value(raw: &str) -> String {
 }
 
 pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> String {
+    let agent_context = crate::handoff::experiment(crate::handoff::AGENT_CONTEXT);
+    summary_markdown_with(bundle, bundle_dir, agent_context)
+}
+
+/// `agent_context` is the `agentContext` experiment (`agent_context::keyframe_texts`).
+pub fn summary_markdown_with(
+    bundle: &ScrawlBundle,
+    bundle_dir: &std::path::Path,
+    agent_context: bool,
+) -> String {
     let mut target = bundle
         .target
         .app
@@ -523,7 +565,37 @@ pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> 
         (change.t, text)
     }));
     app_events.sort_by_key(|(t, _)| *t);
-    if !bundle.keyframes.is_empty() {
+    if agent_context && !bundle.keyframes.is_empty() {
+        let texts = crate::agent_context::keyframe_texts(bundle);
+        let mut shown_screen = start_screen;
+        for (frame, text) in bundle.keyframes.iter().zip(texts) {
+            let screen = bundle.screen_at(frame.t);
+            let screen_marker = match screen {
+                Some(name) if screen != shown_screen => format!(" ⟨{}⟩", context_value(name)),
+                _ => String::new(),
+            };
+            shown_screen = screen;
+            let flag = frame
+                .mark_id
+                .as_ref()
+                .and_then(|id| bundle.marks.iter().find(|m| &m.id == id))
+                .is_some_and(|m| m.shape == Shape::Flag);
+            let flag_marker = if flag { " ⚑" } else { "" };
+            let head = if text.head.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", text.head)
+            };
+            out.push_str(&format!(
+                "- #{} ({}){screen_marker}{flag_marker}{head}\n",
+                frame.index,
+                format_clock(frame.t)
+            ));
+            for line in text.lines {
+                out.push_str(&format!("  {line}\n"));
+            }
+        }
+    } else if !bundle.keyframes.is_empty() {
         let first_t = bundle.keyframes[0].t;
         for (t, label) in &app_events {
             if *t < first_t {

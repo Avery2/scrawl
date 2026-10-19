@@ -1,5 +1,8 @@
+mod agent_context;
 mod audio;
 mod autocrop;
+#[cfg_attr(not(target_os = "macos"), path = "ax_other.rs")]
+mod ax;
 mod autocrop_lab;
 mod capture;
 mod command_line;
@@ -15,10 +18,12 @@ mod inbox;
 mod keyframes;
 #[cfg(target_os = "macos")]
 mod laser_overlay;
+mod live_transcribe;
 mod model;
 mod native;
 mod onboarding;
 mod onboarding_window;
+mod page;
 mod phone;
 mod render;
 mod retention;
@@ -232,9 +237,17 @@ enum Command {
         /// captures) to benchmark finish-to-done wall clock.
         #[arg(long, hide = true)]
         bench: Option<u32>,
+        /// With `--bench` on a Screen capture: play the audio into a live transcription at this
+        /// many times real time first, as if recording, so the finish only transcribes the tail.
+        #[arg(long, hide = true, requires = "bench")]
+        live_speed: Option<f64>,
         /// Transcribe with `apple` or `hex` instead of the configured transcriber.
         #[arg(long, value_parser = parse_engine)]
         transcriber: Option<crate::transcribe::Engine>,
+        /// Turn an experiment on for this run, as `"experiments"` in `config.json` would
+        /// (e.g. `agentContext`). Repeatable.
+        #[arg(long = "experiment", value_name = "NAME")]
+        experiments: Vec<String>,
     },
     /// Motion lab: replay the capsule's states on a fixed timeline with nothing captured, for
     /// traces (`--trace`, motion-lint's format), screen recordings and tuning.
@@ -263,6 +276,9 @@ enum Command {
         /// Emit raw `scrawl.json` instead of `summary.md`.
         #[arg(long)]
         json: bool,
+        /// Turn an experiment on for this summary (e.g. `agentContext`). Repeatable.
+        #[arg(long = "experiment", value_name = "NAME")]
+        experiments: Vec<String>,
     },
     /// Extract a dense burst of frames from a `.scrawl` bundle's time range (`M:SS` or seconds).
     Frames {
@@ -439,6 +455,10 @@ enum Command {
     },
     /// Print which OpenCode session a capture of a browser tab would be sent to, without
     /// sending: a page registered through `/sdk.js`, else the project serving a localhost port.
+    ///
+    /// With `--explain <bundle>`, prints the evidence smart routing sees for that capture, the
+    /// sessions it weighed and their scores, and its decision (read-only). `--url` stands in for
+    /// the tab when the bundle didn't save one.
     Route {
         /// The tab's URL.
         #[arg(long, conflicts_with = "browser")]
@@ -446,6 +466,9 @@ enum Command {
         /// Read the front tab of this browser instead (bundle ID, e.g. `com.brave.Browser`).
         #[arg(long)]
         browser: Option<String>,
+        /// A `.scrawl` bundle (or `latest`) to explain.
+        #[arg(long, value_name = "BUNDLE")]
+        explain: Option<PathBuf>,
     },
     /// Open a `.scrawl` bundle in the native GPUI review window.
     Preview {
@@ -1293,7 +1316,7 @@ pub fn generate_demo_bundle(out: Option<PathBuf>) -> Result<(PathBuf, ScrawlBund
             y: 0.36,
             button: Some("left".into()),
             label: Some("Used 12 tools".into()),
-            role: Some("AXButton".into()),
+            role: Some("button".into()),
         },
         InteractionEvent::Scroll {
             t: 4_800,
@@ -1504,10 +1527,15 @@ fn main() -> Result<()> {
             bundle,
             out,
             bench,
+            live_speed,
             transcriber,
+            experiments,
         } => {
             if let Some(engine) = transcriber {
                 transcribe::set_override(engine);
+            }
+            for name in &experiments {
+                handoff::enable_experiment(name);
             }
             let (dir, old) = handoff::load_bundle(&bundle)?;
             let video = old
@@ -1615,8 +1643,20 @@ fn main() -> Result<()> {
                             ..Default::default()
                         };
                         let iter_wav = wav_bytes.clone();
+                        let live = match (live_speed, &iter_wav) {
+                            (Some(speed), Some(wav)) => {
+                                Some(live_transcribe::simulate(wav, speed)?)
+                            }
+                            _ => None,
+                        };
                         let t0 = std::time::Instant::now();
-                        let recorded = iter_wav.map(audio::recorded_audio_from_wav).transpose()?;
+                        let recorded = iter_wav
+                            .map(audio::recorded_audio_from_wav)
+                            .transpose()?
+                            .map(|mut recorded| {
+                                recorded.live = live_transcribe::Slot::new(live);
+                                recorded
+                            });
                         iter_activity.stop_started = Some(t0);
                         iter_activity.stop_ms = Some(t0.elapsed().as_millis() as u64);
                         finalize_capture_bundle(
@@ -1816,7 +1856,14 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Inspect { bundle, json } => {
+        Command::Inspect {
+            bundle,
+            json,
+            experiments,
+        } => {
+            for name in &experiments {
+                handoff::enable_experiment(name);
+            }
             let (dir, loaded) = handoff::load_bundle(&bundle)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&loaded)?);
@@ -2087,7 +2134,26 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Route { url, browser } => {
+        Command::Route {
+            url,
+            browser,
+            explain: Some(bundle),
+        } => {
+            let url = match browser {
+                Some(browser) => Some(
+                    routing::browser_tab_url(&browser)
+                        .with_context(|| format!("Couldn't read the front tab of {browser}"))?,
+                ),
+                None => url,
+            };
+            print!("{}", routing::explain_bundle(&bundle, url.as_deref())?);
+            Ok(())
+        }
+        Command::Route {
+            url,
+            browser,
+            explain: None,
+        } => {
             let url = match (url, browser) {
                 (Some(url), _) => url,
                 (None, Some(browser)) => routing::browser_tab_url(&browser)

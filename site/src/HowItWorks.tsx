@@ -6,6 +6,7 @@ import { smoother, springAt } from "./demo/motion"
 import { type Anchors, AREA, buildScript, lerp, NARRATION, progress, type Rect, type Script, STAGE, strokeAt, T } from "./demo/script"
 import { FrameBadge, KeyframeScene, MenuBar } from "./demo/stage-parts"
 import { Terminal } from "./demo/terminal"
+import { useHydrated } from "./idle"
 
 // Each diagram is drawn in a 480 × 288 box and scaled to its card. A diagram plays on a loop only
 // while it is on screen; reduced motion shows its settled pose and never moves.
@@ -44,7 +45,7 @@ const subscribeReduced = (cb: () => void) => {
   reduceQuery?.addEventListener("change", cb)
   return () => reduceQuery?.removeEventListener("change", cb)
 }
-const useReducedMotion = () => useSyncExternalStore(subscribeReduced, () => !!reduceQuery?.matches)
+const useReducedMotion = () => useSyncExternalStore(subscribeReduced, () => !!reduceQuery?.matches, () => false)
 
 function useLoop(length: number, settled: number) {
   const ref = useRef<HTMLDivElement>(null)
@@ -95,10 +96,11 @@ function useLoop(length: number, settled: number) {
 
 function Visual({ loop, settled, label, children }: { loop: number; settled: number; label: string; children: (t: number) => ReactNode }) {
   const { ref, t, scale } = useLoop(loop, settled)
+  const live = useHydrated()
   return (
     <div ref={ref} className="how-visual" role="img" aria-label={label}>
-      <div className="how-box" style={{ width: W, height: H, transform: `scale(${scale})` }}>
-        {children(t)}
+      <div className="how-box" style={{ width: W, height: H, transform: `scale(${scale})` }} aria-hidden inert>
+        {live && children(t)}
       </div>
     </div>
   )
@@ -110,6 +112,7 @@ function useMacScript() {
   const actionsRef = useRef<HTMLDivElement>(null)
   const titleRef = useRef<HTMLHeadingElement>(null)
   const [anchors, setAnchors] = useState<Anchors | null>(null)
+  const live = useHydrated()
 
   useLayoutEffect(() => {
     const measure = () => {
@@ -118,11 +121,11 @@ function useMacScript() {
     }
     measure()
     document.fonts?.ready.then(measure)
-  }, [])
+  }, [live])
 
   const script = useMemo(() => (anchors ? buildScript("mac", anchors) : null), [anchors])
-  const probe = (
-    <div className="how-probe" aria-hidden>
+  const probe = !live ? null : (
+    <div className="how-probe" aria-hidden inert>
       <div ref={stageRef} style={{ width: STAGE.w, height: STAGE.h }}>
         <MacWindow fix={BROKEN} refs={{ badge: badgeRef, actions: actionsRef, title: titleRef }} />
       </div>

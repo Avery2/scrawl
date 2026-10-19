@@ -702,6 +702,9 @@ pub struct SharedCaptureTelemetry {
     mouse_live: AtomicBool,
     last_shortcut_ms: AtomicU64,
     drag_start: Mutex<Option<(u64, f32, f32, Option<String>, TargetFrame)>>,
+    /// The `agentContext` experiment was on when this capture started: clicks and strokes are
+    /// looked up in the Accessibility tree (`crate::ax`, macOS only).
+    agent_context: AtomicBool,
 }
 
 impl SharedCaptureTelemetry {
@@ -745,6 +748,7 @@ impl SharedCaptureTelemetry {
             mouse_live: AtomicBool::new(false),
             last_shortcut_ms: AtomicU64::new(0),
             drag_start: Mutex::new(None),
+            agent_context: AtomicBool::new(false),
         })
     }
 
@@ -888,6 +892,11 @@ impl SharedCaptureTelemetry {
             .clear();
         self.shift_held.store(false, Ordering::Release);
         self.window_log_request.store(false, Ordering::Release);
+        let agent_context = crate::handoff::experiment(crate::handoff::AGENT_CONTEXT);
+        self.agent_context.store(agent_context, Ordering::Release);
+        if agent_context {
+            crate::ax::Prober::shared().begin();
+        }
         self.active.store(true, Ordering::Release);
         let clicks = if self.mouse_live.load(Ordering::Acquire) {
             platform::MOUSE_SOURCE
@@ -929,6 +938,14 @@ impl SharedCaptureTelemetry {
             && screen_y <= frame.y + frame.height
     }
 
+    /// Whether to look up what clicks and strokes land on: `agentContext` is on, the target is
+    /// this Mac's screen (not the iPhone mirror) and Accessibility is granted.
+    fn probing(&self) -> bool {
+        self.agent_context.load(Ordering::Acquire)
+            && self.capture_mode.load(Ordering::Acquire) != 3
+            && accessibility_granted()
+    }
+
     /// A mouse button went down at a global point.
     fn pointer_down(&self, t_ms: u64, screen_x: f64, screen_y: f64) {
         if !self.contains_screen_point(screen_x, screen_y) {
@@ -945,6 +962,9 @@ impl SharedCaptureTelemetry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((t_ms, nx, ny, None, start_frame));
+        if self.probing() {
+            crate::ax::Prober::shared().probe(crate::ax::Target::Pointer(t_ms), screen_x, screen_y);
+        }
     }
 
     /// A mouse button came up: records the click or drag that `pointer_down` began.
@@ -1071,18 +1091,28 @@ impl SharedCaptureTelemetry {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(ink);
         }
-        let events = std::mem::take(
+        let mut events = std::mem::take(
             &mut *self
                 .events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        let strokes = std::mem::take(
+        let mut strokes = std::mem::take(
             &mut *self
                 .strokes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        if self.agent_context.swap(false, Ordering::AcqRel) {
+            let hits = crate::ax::Prober::shared().finish();
+            crate::ax::apply(&hits, &mut events, &mut strokes);
+            if self.capture_mode.load(Ordering::Acquire) != 3 {
+                let end = crate::now_epoch_ms();
+                let start = end.saturating_sub(self.elapsed_ms());
+                let page = crate::page::between(start, end);
+                crate::page::apply(&page, start, &mut events, &mut strokes);
+            }
+        }
         (events, strokes)
     }
 }
@@ -1181,6 +1211,15 @@ fn track_shift_ink(
                 .fold(0.0_f32, f32::max);
             // Ignore stationary Shift taps (e.g. typing a capital letter without moving the mouse).
             if max_span_px >= 6.0 {
+                if telemetry.probing() {
+                    let frame = *telemetry
+                        .target_frame
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some((x, y)) = crate::ax::stroke_probe_point(&stroke, frame) {
+                        crate::ax::Prober::shared().probe(crate::ax::Target::Stroke(stroke.t0), x, y);
+                    }
+                }
                 telemetry
                     .strokes
                     .lock()

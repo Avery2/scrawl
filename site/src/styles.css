@@ -237,6 +237,251 @@ kbd {
   margin-top: -2px;
 }
 
+.btn-primary .icon-windows {
+  width: 14px;
+  height: 14px;
+  margin-top: 0;
+}
+
+.btn-primary .icon-share {
+  width: 14px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.btn-primary.btn-unavailable {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--muted);
+  box-shadow: none;
+  cursor: default;
+  transform: none;
+}
+
+/* Every state is one pill, one line of meta and the toggle, so the page
+   doesn't move when platform detection settles. */
+.download-meta {
+  margin: 0;
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  text-wrap: balance;
+}
+
+.download-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  margin: -6px -10px 0;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 13px;
+  color: var(--muted);
+  transition: color 0.15s ease;
+}
+
+.download-more .chevron {
+  width: 9px;
+  height: 6px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.download-more[aria-expanded="true"] {
+  color: var(--fg);
+}
+
+.download-more[aria-expanded="true"] .chevron {
+  transform: rotate(180deg);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .download-more:hover {
+    color: var(--fg);
+  }
+}
+
+/* The card itself grows (rows 0fr → 1fr); its contents slide with it and stay sharp. */
+.platforms {
+  display: grid;
+  grid-template-rows: 0fr;
+  width: min(440px, 100%);
+  margin-top: -12px;
+  border-radius: 14px;
+  background: #111113;
+  box-shadow: inset 0 0 0 1px var(--line);
+  opacity: 0;
+}
+
+/* Transitions start with the first click: WebKit would otherwise animate
+   the closed card's margin in from 0 on load. */
+.platforms[data-touched="true"] {
+  transition:
+    grid-template-rows 0.3s cubic-bezier(0.2, 0.8, 0.2, 1),
+    margin-top 0.3s cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 0.2s ease;
+}
+
+.platforms[data-open="true"] {
+  grid-template-rows: 1fr;
+  margin-top: 0;
+  opacity: 1;
+}
+
+.platforms[data-touched="true"][data-open="true"] {
+  transition:
+    grid-template-rows 0.4s cubic-bezier(0.2, 0.8, 0.2, 1),
+    margin-top 0.4s cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 0.25s ease;
+}
+
+.platforms-clip {
+  min-height: 0;
+  overflow: hidden;
+  container-type: inline-size;
+}
+
+.platform-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 16px;
+  text-align: left;
+  transform: translateY(-8px);
+}
+
+.platforms[data-touched="true"] .platform-list {
+  transition: transform 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.platforms[data-open="true"] .platform-list {
+  transform: none;
+  transition-duration: 0.4s;
+}
+
+.platform-list li + li {
+  border-top: 1px solid var(--line);
+}
+
+.platform-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  grid-template-areas: "name detail action";
+  align-items: center;
+  column-gap: 10px;
+  min-height: 48px;
+  font-size: 14px;
+}
+
+.platform-name {
+  grid-area: name;
+  font-weight: 500;
+}
+
+.platform-detail {
+  grid-area: detail;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.platform-row > :last-child {
+  grid-area: action;
+}
+
+/* In the Install column the detail drops under the name. */
+@container (max-width: 360px) {
+  .platform-row {
+    grid-template-columns: 1fr auto;
+    grid-template-areas: "name action" "detail action";
+    padding: 9px 0;
+  }
+  .platform-detail {
+    font-size: 12px;
+    line-height: 16px;
+  }
+  .platform-row:not(:has(.platform-detail)) .platform-name {
+    grid-row: 1 / -1;
+  }
+}
+
+.platform-action,
+.soon {
+  display: inline-grid;
+  place-items: center;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.platform-action {
+  background: rgba(255, 255, 255, 0.1);
+  transition: background 0.15s ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .platform-action:hover {
+    background: rgba(255, 255, 255, 0.16);
+  }
+}
+
+.soon {
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.platform-brew {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: -2px -9px 12px;
+  padding: 3px 3px 3px 9px;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.platform-brew code {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+  scrollbar-width: none;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 26px;
+  color: #d1d1d6;
+  mask-image: linear-gradient(to right, #000 calc(100% - 16px), transparent);
+}
+
+.platform-brew code::-webkit-scrollbar {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .platforms[data-touched="true"],
+  .platforms[data-touched="true"][data-open="true"] {
+    transition: opacity 0.15s ease;
+  }
+  .platform-list,
+  .platforms[data-touched="true"] .platform-list {
+    transform: none;
+    transition: none;
+  }
+}
+
 .demo-section {
   max-width: 1240px;
   margin: 0 auto;
@@ -263,6 +508,10 @@ kbd {
 .split h2 code {
   font-family: var(--mono);
   font-size: 0.92em;
+}
+
+.hero .download {
+  align-self: stretch;
 }
 
 .split .download {
@@ -294,6 +543,12 @@ kbd {
   font-size: 13px;
 }
 
+.code-blocks {
+  display: grid;
+  gap: 16px;
+  align-self: start;
+}
+
 .code-block {
   border-radius: 14px;
   background: #111113;
@@ -321,6 +576,21 @@ kbd {
   line-height: 1.75;
   white-space: pre-wrap;
   word-break: break-word;
+  color: #d1d1d6;
+}
+
+.code-note {
+  margin: -4px 0 0;
+  padding: 0 16px 16px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--muted);
+  max-width: 66ch;
+}
+
+.code-note code {
+  font-family: var(--mono);
+  font-size: 12px;
   color: #d1d1d6;
 }
 
@@ -420,6 +690,7 @@ kbd {
 .stage-wrap {
   position: relative;
   width: 100%;
+  aspect-ratio: 5 / 3;
   border-radius: 16px;
   overflow: hidden;
   outline: none;

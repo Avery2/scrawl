@@ -1,16 +1,17 @@
-import { lazy, Suspense } from "react"
+import { lazy, Suspense, useEffect, useState } from "react"
 import { BrushFallback } from "./brush-paths"
 import { Copy } from "./Copy"
 import { Demo } from "./demo/Demo"
+import { Download, useDownloadHref } from "./Download"
 import { HowItWorks } from "./HowItWorks"
+import { afterLoad } from "./idle"
 import { IPhoneSection } from "./IPhone"
+import { BREW, MAC_ZIP, SKILL } from "./release"
 
 const Brush3D = lazy(() => import("./Brush3D").then((m) => ({ default: m.Brush3D })))
 
 const REPO = "https://github.com/kitlangton/scrawl"
-const BASE = "https://scrawl.kitlangton.com"
-const DMG = `/releases/Scrawl-latest-arm64.dmg`
-const ZIP = `${BASE}/releases/Scrawl-latest-arm64.zip`
+const ZIP = `https://scrawl.kitlangton.com${MAC_ZIP}`
 
 const INSTALL = `curl -LO ${ZIP}
 unzip Scrawl-latest-arm64.zip -d ~/Applications
@@ -26,25 +27,15 @@ const CONTROLS: [string[], string][] = [
   [["M"], "Flag a moment on iPhone"],
 ]
 
-function Download() {
-  return (
-    <div className="download">
-      <a className="btn-primary" href={DMG}>
-        <svg viewBox="0 0 17 21" aria-hidden>
-          <path d="M11.2 4.3c.6-.8 1-1.8.9-2.8-.9 0-2 .6-2.6 1.4-.6.7-1.1 1.7-.9 2.7 1 .1 2-.5 2.6-1.3zM12.1 5.8c-1.4-.1-2.7.8-3.3.8-.7 0-1.7-.8-2.9-.8C4.4 5.9 3 6.8 2.2 8.1c-1.6 2.7-.4 6.8 1.1 9 .8 1.1 1.7 2.3 2.8 2.3 1.1 0 1.6-.7 2.9-.7 1.4 0 1.8.7 2.9.7 1.2 0 2-1.1 2.7-2.2.9-1.3 1.2-2.5 1.2-2.6 0 0-2.4-.9-2.4-3.6 0-2.2 1.8-3.3 1.9-3.4-1-1.5-2.6-1.7-3.2-1.7z" />
-        </svg>
-        Download for macOS
-      </a>
-    </div>
-  )
-}
-
 export function App() {
+  const downloadHref = useDownloadHref()
+  const [brush, setBrush] = useState(false)
+  useEffect(() => afterLoad(() => setBrush(true)), [])
   return (
     <>
       <header className="nav">
         <a className="brand" href="#">
-          <img src="/app-icon.png" width={26} height={26} decoding="async" alt="" />
+          <img src="/app-icon-64.png" width={26} height={26} decoding="async" alt="" />
           Scrawl
         </a>
         <nav>
@@ -52,7 +43,7 @@ export function App() {
           <a href="#how">How it works</a>
           <a href="#install">Install</a>
           <a href={REPO}>GitHub</a>
-          <a className="nav-dl" href={DMG}>
+          <a className="nav-dl" href={downloadHref}>
             Download
           </a>
         </nav>
@@ -60,9 +51,13 @@ export function App() {
 
       <main>
         <section className="hero">
-          <Suspense fallback={<BrushFallback />}>
-            <Brush3D />
-          </Suspense>
+          {brush ? (
+            <Suspense fallback={<BrushFallback />}>
+              <Brush3D />
+            </Suspense>
+          ) : (
+            <BrushFallback />
+          )}
           <h1>Show an agent the problem.</h1>
           <p className="lede">
             Press <kbd>⌥</kbd>
@@ -101,27 +96,57 @@ export function App() {
         <section id="install" className="split">
           <div>
             <h2>Install</h2>
-            <Download />
+            <Download brew={false} />
           </div>
-          <div className="code-block">
-            <div className="code-head">
-              <span>Terminal</span>
-              <Copy text={INSTALL} />
-            </div>
-            <pre>
-              {INSTALL.split("\n").map((l) => (
-                <div key={l}>
+          <div className="code-blocks">
+            <div className="code-block">
+              <div className="code-head">
+                <span>Homebrew</span>
+                <Copy text={BREW} />
+              </div>
+              <pre>
+                <div>
                   <span className="dim">$ </span>
-                  {l}
+                  {BREW}
                 </div>
-              ))}
-            </pre>
+              </pre>
+            </div>
+            <div className="code-block">
+              <div className="code-head">
+                <span>Terminal</span>
+                <Copy text={INSTALL} />
+              </div>
+              <pre>
+                {INSTALL.split("\n").map((l) => (
+                  <div key={l}>
+                    <span className="dim">$ </span>
+                    {l}
+                  </div>
+                ))}
+              </pre>
+            </div>
+            <div className="code-block">
+              <div className="code-head">
+                <span>For agents</span>
+                <Copy text={SKILL} />
+              </div>
+              <pre>
+                <div>
+                  <span className="dim">$ </span>
+                  {SKILL}
+                </div>
+              </pre>
+              <p className="code-note">
+                With the skill, an agent that gets a Scrawl paste reads the contact sheet and transcript, opens the
+                keyframes the narration points at, and uses the <code>scrawl</code> command to look closer.
+              </p>
+            </div>
           </div>
         </section>
       </main>
 
       <footer className="foot">
-        <img src="/app-icon.png" width={20} height={20} decoding="async" alt="" />
+        <img src="/app-icon-64.png" width={20} height={20} decoding="async" alt="" />
         <span>Scrawl</span>
         <a href={REPO}>GitHub</a>
       </footer>

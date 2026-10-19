@@ -338,14 +338,7 @@ pub fn annotate_keyframe_marks_in_place(
     let size = (w.min(h) * 0.0065).clamp(4.2, 6.0) * k;
     // A mark keyframe shows every mark drawn on its screen. Flags carry no ink, so a flagged
     // keyframe still shows the strokes of its moment.
-    let shown: Vec<&Mark> = marks
-        .iter()
-        .filter(|m| {
-            !m.strokes.is_empty()
-                && (keyframe.mark_id.as_ref() == Some(&m.id)
-                    || (!keyframe.file.is_empty() && m.frame.as_ref() == Some(&keyframe.file)))
-        })
-        .collect();
+    let shown = crate::sketch::marks_on(keyframe, marks);
     for (index, stroke) in strokes.iter().enumerate() {
         if stroke.laser {
             continue;
@@ -384,6 +377,9 @@ pub fn annotate_keyframe_marks_in_place(
             );
             polygon(frame, &outline, RED);
         }
+    }
+    if shown.len() >= 2 && crate::handoff::experiment(crate::handoff::AGENT_CONTEXT) {
+        draw_mark_numbers(frame, &shown, strokes, k);
     }
     for stroke in strokes.iter().filter(|s| s.laser) {
         draw_laser(frame, stroke, keyframe.t);
@@ -585,6 +581,58 @@ fn draw_keyframe_badge(
             by + badge_h * 0.5 - time_size * 0.59,
             time_size,
             [236, 238, 244, 255],
+            true,
+        );
+    }
+}
+
+/// Small numbered discs where each mark of a shared keyframe began, in drawing order, so the
+/// summary's ①②③ point at their ink. Dark with a white ring, unlike red pins.
+fn draw_mark_numbers(frame: &mut RgbaFrame, marks: &[&Mark], strokes: &[Stroke], k: f32) {
+    let (w, h) = (frame.width as f32, frame.height as f32);
+    let radius = 11.0 * k;
+    let mut placed: Vec<[f32; 2]> = Vec::new();
+    for (n, mark) in marks.iter().enumerate() {
+        let start = mark
+            .strokes
+            .iter()
+            .filter_map(|&i| strokes.get(i))
+            .min_by_key(|s| s.t0)
+            .and_then(|s| s.normalized_points().first().copied());
+        let Some([x, y]) = start else {
+            continue;
+        };
+        let lift = radius * 1.1;
+        let clamp_x = |v: f32| v.clamp(radius + 2.0, (w - radius - 2.0).max(radius + 2.0));
+        let clamp_y = |v: f32| v.clamp(radius + 2.0, (h - radius - 2.0).max(radius + 2.0));
+        let mut center = [clamp_x(x * w - lift), clamp_y(y * h - lift)];
+        // Marks that start in one place would hide each other's numbers; step along instead.
+        for _ in 0..marks.len() {
+            let crowded = placed
+                .iter()
+                .any(|p: &[f32; 2]| (p[0] - center[0]).hypot(p[1] - center[1]) < radius * 2.3);
+            if !crowded {
+                break;
+            }
+            center = [clamp_x(center[0] + radius * 2.5), center[1]];
+        }
+        placed.push(center);
+        circle(frame, center, radius + 1.6 * k, WHITE);
+        circle(frame, center, radius, [14, 15, 18, 255]);
+        let label = (n + 1).to_string();
+        let mut size = 14.0 * k;
+        let width = text_width(&label, size, true);
+        if width > radius * 1.6 {
+            size *= radius * 1.6 / width;
+        }
+        let width = text_width(&label, size, true);
+        draw_text(
+            frame,
+            &label,
+            center[0] - width * 0.5,
+            center[1] - size * 0.58,
+            size,
+            WHITE,
             true,
         );
     }
@@ -2045,6 +2093,23 @@ mod tests {
         };
         assert!(red_rows(115..125) > 0 && red_rows(145..155) > 0);
         assert_eq!(red_rows(175..185), 0, "another keyframe's mark");
+
+        // agentContext numbers the shared marks with dark, white-ringed discs up and left of
+        // where each began.
+        let mut numbered = result.clone();
+        let shown: Vec<&Mark> = marks[..2].iter().collect();
+        draw_mark_numbers(&mut numbered, &shown, &strokes, 1.0);
+        let changed = |x0: usize, y0: usize| {
+            (y0..y0 + 14).any(|y| {
+                (x0..x0 + 14).any(|x| {
+                    let i = (y * 320 + x) * 4;
+                    numbered.rgba[i..i + 4] != result.rgba[i..i + 4]
+                })
+            })
+        };
+        // Starts at (48, 120) and (48, 150); discs sit about 12 px up and left.
+        assert!(changed(30, 102) && changed(30, 132));
+        assert!(!changed(200, 20), "nothing else is touched");
     }
 
     #[test]
