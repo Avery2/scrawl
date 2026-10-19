@@ -191,7 +191,6 @@ fn completed_delivery_note(delivery: &crate::delivery::Delivery, title: &str) ->
     }
 }
 
-
 fn segment_width(window: &Window, mode: SelectionMode) -> f32 {
     measure_text(window, mode.label(), HUD_TEXT, FontWeight::MEDIUM)
         + 2.0 * SEG_PX
@@ -199,16 +198,11 @@ fn segment_width(window: &Window, mode: SelectionMode) -> f32 {
         + SEG_ICON_GAP
 }
 
-
-
-
-
 /// The switch chips' clock: the animation clock, so they stay open as long in slow motion
 /// (`motion::time_scale`). The held switcher keeps the real clock: it times key presses.
 fn reveal_clock_ms() -> u64 {
     (motion::now() * 1000.0) as u64
 }
-
 
 /// Whether macOS asks for reduced motion (Accessibility ▸ Display ▸ Reduce motion).
 fn reduce_motion() -> bool {
@@ -832,8 +826,12 @@ fn apply_pill_layer_effect(
         layer.setShadowRadius(14.0);
         layer.setShadowOffset(NSSize::new(0.0, -5.0));
         unsafe {
-            let bg_ns =
-                NSColor::colorWithSRGBRed_green_blue_alpha(20.0 / 255.0, 20.0 / 255.0, 22.0 / 255.0, 0.96);
+            let bg_ns = NSColor::colorWithSRGBRed_green_blue_alpha(
+                20.0 / 255.0,
+                20.0 / 255.0,
+                22.0 / 255.0,
+                0.96,
+            );
             let bg_cg: *const OpaqueCGColor = msg_send![&*bg_ns, CGColor];
             let _: () = msg_send![layer, setBackgroundColor: bg_cg];
             let border_ns = if is_completed {
@@ -905,7 +903,12 @@ fn trace_capsule(ns_window: &NSWindow, frame: &island::Frame) -> motion::Xf {
     let win = top_left_frame(ns_window);
     let (cx, cy) = (win[2] * 0.5, win[3] * 0.5);
     let sh = frame.shape;
-    let shell = [win[0] + cx + sh.l, win[1] + cy + sh.t, sh.width(), sh.height()];
+    let shell = [
+        win[0] + cx + sh.l,
+        win[1] + cy + sh.t,
+        sh.width(),
+        sh.height(),
+    ];
     motion::trace_element("window", win, 0.0, 0.0, None, None);
     motion::trace_element("shell", shell, frame.shell_alpha, sh.radius, None, None);
     motion::trace_channel("content.blur", "level", frame.content_blur);
@@ -1108,6 +1111,8 @@ pub struct ScrawlCoordinator {
     island_phase_since: f64,
     /// The capsule's outline and content motion (`island`): one shape retargeted per state.
     island: island::Island,
+    /// The phase before this one: items leaving the capsule keep drawing as they looked in it.
+    island_prev_phase: IslandPhase,
     /// Switch chips on a tap-started recording (`crate::hold::Reveal`).
     reveal: crate::hold::Reveal,
     /// macOS Reduce motion, read when the island changes state.
@@ -1193,6 +1198,7 @@ impl ScrawlCoordinator {
             island_phase: IslandPhase::Hidden,
             island_phase_since: motion::now(),
             island: island::Island::new(),
+            island_prev_phase: IslandPhase::Hidden,
             reveal: crate::hold::Reveal::default(),
             reduced_motion: false,
             close_hover: None,
@@ -2121,6 +2127,7 @@ impl ScrawlCoordinator {
                 _ => self.island.open(),
             }
             self.island_phase_since = motion::now();
+            self.island_prev_phase = self.island_phase;
             motion::trace_event(format!("phase:{}", phase.trace_name()));
         }
         self.island_phase = phase;
@@ -2922,13 +2929,22 @@ fn capsule_specs(
     let close = [divider_spec("divider.close"), Spec::chip("close", CHIP_H)];
     match phase {
         IslandPhase::Recording => {
-            let clock_w = measure_text(window, &clock_template(clock), HUD_TEXT, FontWeight::SEMIBOLD);
+            let clock_w = measure_text(
+                window,
+                &clock_template(clock),
+                HUD_TEXT,
+                FontWeight::SEMIBOLD,
+            );
             let mut specs = vec![
                 Spec::new("lead", CHIP_H + clock_w + LEAD_TRAIL, LEAD_INK),
                 divider_spec("divider.lead"),
             ];
             if chips {
-                specs.extend(SelectionMode::available(iphone).iter().map(|&m| mode_chip(m)));
+                specs.extend(
+                    SelectionMode::available(iphone)
+                        .iter()
+                        .map(|&m| mode_chip(m)),
+                );
             } else {
                 specs.push(chip("undo", "Undo", FontWeight::MEDIUM));
                 specs.push(chip("finish", "Finish", FontWeight::SEMIBOLD));
@@ -2949,7 +2965,10 @@ fn capsule_specs(
         }
         IslandPhase::Processing => vec![Spec::new(
             "processing",
-            CHIP_H + 6.0 + measure_text(window, "Processing…", HUD_TEXT, FontWeight::SEMIBOLD) + CHIP_PX,
+            CHIP_H
+                + 6.0
+                + measure_text(window, "Processing…", HUD_TEXT, FontWeight::SEMIBOLD)
+                + CHIP_PX,
             island::Ink {
                 left: 6.0,
                 right: CHIP_PX,
@@ -3066,9 +3085,14 @@ impl Render for HudPillWindow {
             .filter(|s| !s.laser)
             .count();
         let close_hover = coord.close_hover;
-        let ctx = ItemContext {
+        let context = |phase: IslandPhase, current: bool| ItemContext {
             phase,
-            clock_w: measure_text(window, &clock_template(&clock), HUD_TEXT, FontWeight::SEMIBOLD),
+            clock_w: measure_text(
+                window,
+                &clock_template(&clock),
+                HUD_TEXT,
+                FontWeight::SEMIBOLD,
+            ),
             clock: clock.clone(),
             phase_age,
             stroke_count,
@@ -3076,7 +3100,7 @@ impl Render for HudPillWindow {
                 IslandPhase::Selecting { mode } => Some(mode),
                 _ => None,
             },
-            highlight_prev: coord.highlight_prev,
+            highlight_prev: coord.highlight_prev.filter(|_| current),
             highlight_p: ease_out_cubic(motion::age(coord.highlight_since) / HIGHLIGHT_FADE_S),
             completed: match phase {
                 IslandPhase::Completed { inbox_count, .. } => {
@@ -3085,6 +3109,10 @@ impl Render for HudPillWindow {
                 _ => String::new(),
             },
         };
+        let ctx = context(phase, true);
+        // What leaves draws as it looked in the phase it belonged to (a dismissed picker keeps
+        // its highlight, a dismissed "Done" its label).
+        let leaving_ctx = context(coord.island_prev_phase, false);
         let is_completed = matches!(phase, IslandPhase::Completed { .. });
         let specs = capsule_specs(
             window,
@@ -3139,7 +3167,11 @@ impl Render for HudPillWindow {
                     .flex()
                     .items_center()
                     .opacity(f.alpha)
-                    .child(self.item_element(&f.key, &ctx, f.live))
+                    .child(self.item_element(
+                        &f.key,
+                        if f.leaving { &leaving_ctx } else { &ctx },
+                        f.live,
+                    ))
                     .into_any_element()
             })
             .collect();
@@ -3164,9 +3196,9 @@ impl Render for HudPillWindow {
                 div()
                     .absolute()
                     .left(px(cx0 + close.x + close.w * 0.5 - 15.0))
-                    .top(px(cy0 + ISLAND_H * 0.5 + 4.0))
+                    .top(px(cy0 + ISLAND_H * 0.5 + 3.0))
                     .w(px(30.0))
-                    .h(px(16.0))
+                    .h(px(15.0))
                     .rounded(px(4.0))
                     .bg(rgba(0x141416e6))
                     .border_1()
@@ -3309,29 +3341,36 @@ impl HudPillWindow {
             "close" => {
                 let completed = matches!(phase, IslandPhase::Completed { .. });
                 let c_hover = self.coordinator.clone();
-                icon_circle_chip(if completed { "hud-dismiss" } else { "hud-cancel" }, "✕")
-                    .when(live, |d| {
-                        d.on_click(move |_, _, cx| {
-                            coordinator.update(cx, |coord, cx| {
-                                if completed {
-                                    coord.dismiss_completed_bundle(cx);
-                                } else {
-                                    // Discards the recording, as Esc does.
-                                    coord.cancel_recording(cx);
-                                }
-                            });
-                        })
+                icon_circle_chip(
+                    if completed {
+                        "hud-dismiss"
+                    } else {
+                        "hud-cancel"
+                    },
+                    "✕",
+                )
+                .when(live, |d| {
+                    d.on_click(move |_, _, cx| {
+                        coordinator.update(cx, |coord, cx| {
+                            if completed {
+                                coord.dismiss_completed_bundle(cx);
+                            } else {
+                                // Discards the recording, as Esc does.
+                                coord.cancel_recording(cx);
+                            }
+                        });
                     })
-                    .when(live && !completed, |d| {
-                        d.on_hover(move |hovered, _, cx| {
-                            let hovered = *hovered;
-                            c_hover.update(cx, |coord, cx| {
-                                coord.close_hover = hovered.then(motion::now);
-                                cx.notify();
-                            });
-                        })
+                })
+                .when(live && !completed, |d| {
+                    d.on_hover(move |hovered, _, cx| {
+                        let hovered = *hovered;
+                        c_hover.update(cx, |coord, cx| {
+                            coord.close_hover = hovered.then(motion::now);
+                            cx.notify();
+                        });
                     })
-                    .into_any_element()
+                })
+                .into_any_element()
             }
             "processing" => {
                 // 120Hz 8-dot orbiting progress ring inside the leading 32px slot.
@@ -3410,20 +3449,23 @@ impl HudPillWindow {
                                 coord.paste_completed_bundle(None, cx);
                             });
                         })
-                        .on_mouse_up_out(MouseButton::Left, move |_, _, cx| {
-                            let end = current_mouse_screen();
-                            c_out.update(cx, |coord, cx| {
-                                if let (Some(start), Some(drop_pt)) =
-                                    (coord.paste_drag_start.take(), end)
-                                {
-                                    let dist =
-                                        (drop_pt[0] - start[0]).hypot(drop_pt[1] - start[1]);
-                                    if dist >= 24.0 {
-                                        coord.paste_completed_bundle(Some(drop_pt), cx);
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            move |_, _, cx| {
+                                let end = current_mouse_screen();
+                                c_out.update(cx, |coord, cx| {
+                                    if let (Some(start), Some(drop_pt)) =
+                                        (coord.paste_drag_start.take(), end)
+                                    {
+                                        let dist =
+                                            (drop_pt[0] - start[0]).hypot(drop_pt[1] - start[1]);
+                                        if dist >= 24.0 {
+                                            coord.paste_completed_bundle(Some(drop_pt), cx);
+                                        }
                                     }
-                                }
-                            });
-                        })
+                                });
+                            },
+                        )
                     })
                     .into_any_element()
             }
@@ -3515,7 +3557,6 @@ fn icon_circle_chip(id: &'static str, icon: &'static str) -> gpui::Stateful<Div>
         .hover(|s| s.bg(rgba(0xffffff14)).text_color(rgb(TEXT_COLOR)))
         .child(icon)
 }
-
 
 fn mix_rgb(from: u32, to: u32, t: f32) -> gpui::Rgba {
     let t = t.clamp(0.0, 1.0);
@@ -5384,7 +5425,10 @@ mod tests {
     fn the_widest_layouts_fit_the_pill_window() {
         // Generous label estimates: segment ≈ label + padding + icon.
         let seg = |label: f32| label + 2.0 * SEG_PX + SEG_ICON + SEG_ICON_GAP;
-        let close = [divider_spec("divider.close"), island::Spec::chip("close", CHIP_H)];
+        let close = [
+            divider_spec("divider.close"),
+            island::Spec::chip("close", CHIP_H),
+        ];
         let mut picker: Vec<island::Spec> = [34.0, 56.0, 50.0, 46.0]
             .iter()
             .enumerate()

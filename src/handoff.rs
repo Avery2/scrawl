@@ -573,7 +573,9 @@ pub fn sync_bundle_to(host: &str, bundle_dir: &Path) -> Result<()> {
         format!(" && touch {bundle_q}/{MEDIA_PENDING}")
     };
     let output = ssh(host)
-        .arg(format!("mkdir -p {parent_q} && tar -C {parent_q} -xf -{mark_pending}"))
+        .arg(format!(
+            "mkdir -p {parent_q} && tar -C {parent_q} -xf -{mark_pending}"
+        ))
         .stdin(tar.stdout.take().context("No tar output")?)
         .output()
         .context("Could not start ssh")?;
@@ -1181,14 +1183,23 @@ mod tests {
         let addressed = recorded_destination(&dir);
         assert_eq!(addressed.as_deref(), Some("ses_ios"));
         let addressed = addressed.as_deref();
-        assert_eq!(choose_destination(None, addressed, false).unwrap(), Some("ses_ios"));
+        assert_eq!(
+            choose_destination(None, addressed, false).unwrap(),
+            Some("ses_ios")
+        );
         assert!(choose_destination(Some("ses_motion"), addressed, false).is_err());
         assert_eq!(
             choose_destination(Some("ses_motion"), addressed, true).unwrap(),
             Some("ses_motion")
         );
-        assert_eq!(choose_destination(Some("ses_ios"), addressed, false).unwrap(), Some("ses_ios"));
-        assert_eq!(choose_destination(Some("ses_x"), None, false).unwrap(), Some("ses_x"));
+        assert_eq!(
+            choose_destination(Some("ses_ios"), addressed, false).unwrap(),
+            Some("ses_ios")
+        );
+        assert_eq!(
+            choose_destination(Some("ses_x"), None, false).unwrap(),
+            Some("ses_x")
+        );
         fs::remove_dir_all(&dir).unwrap();
         assert_eq!(recorded_destination(&dir), None);
     }
@@ -1264,7 +1275,11 @@ mod tests {
     fn auto_send_defaults_on_and_the_toggle_keeps_other_keys() {
         let fixture = Fixture::new();
         let path = fixture.0.join("config.json");
-        fs::write(&path, br#"{"ingestToken":"abc","retention":{"mediaDays":7}}"#).unwrap();
+        fs::write(
+            &path,
+            br#"{"ingestToken":"abc","retention":{"mediaDays":7}}"#,
+        )
+        .unwrap();
         assert_eq!(load_config_from(&path).auto_send, None);
         set_config_value_in(&path, "autoSend", serde_json::Value::Bool(false)).unwrap();
         let config = load_config_from(&path);
@@ -1275,7 +1290,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
     }
 
@@ -1298,7 +1316,8 @@ mod tests {
         assert_eq!(v2.directory(), Some("/p/a"));
         assert!(v2.is_open_root());
         let v1: OpenCodeSession =
-            serde_json::from_str(r#"{"id":"ses_b","parentID":"ses_a","directory":"/p/b"}"#).unwrap();
+            serde_json::from_str(r#"{"id":"ses_b","parentID":"ses_a","directory":"/p/b"}"#)
+                .unwrap();
         assert_eq!(v1.directory(), Some("/p/b"));
         assert!(!v1.is_open_root());
         assert_eq!(v1.label(), "ses_b");
@@ -1327,7 +1346,8 @@ mod sync_live_check {
     #[test]
     #[ignore]
     fn sync_to_pro() {
-        let base = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join("Library/Caches/scrawl-sync-live");
+        let base = std::path::PathBuf::from(std::env::var("HOME").unwrap())
+            .join("Library/Caches/scrawl-sync-live");
         let _ = std::fs::remove_dir_all(&base);
         let bundle = base.join("scrawl-synctest.scrawl");
         std::fs::create_dir_all(bundle.join("frames-full")).unwrap();
@@ -1346,7 +1366,17 @@ mod sync_live_check {
                 break;
             }
         }
-        let _ = super::ssh("pro").arg(format!("rm -rf {}", super::shell_quote(&base.to_string_lossy()))).status();
-        assert!(out.contains("8000000") && out.contains("frame-01.png") && !out.contains(super::MEDIA_PENDING), "{out}");
+        let _ = super::ssh("pro")
+            .arg(format!(
+                "rm -rf {}",
+                super::shell_quote(&base.to_string_lossy())
+            ))
+            .status();
+        assert!(
+            out.contains("8000000")
+                && out.contains("frame-01.png")
+                && !out.contains(super::MEDIA_PENDING),
+            "{out}"
+        );
     }
 }

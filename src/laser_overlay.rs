@@ -560,6 +560,9 @@ mod tests {
             .next()
             .and_then(|v| v.parse().ok())
             .expect("target has a major version");
-        assert!(major <= 26, "laser shader targets macOS {major}, newer than 26.0");
+        assert!(
+            major <= 26,
+            "laser shader targets macOS {major}, newer than 26.0"
+        );
     }
 }

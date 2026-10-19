@@ -26,9 +26,10 @@
 use super::motion::Tune;
 use super::{CHIP_GAP, CHIP_H, ISLAND_H, ISLAND_INSET, Spring};
 
-/// The outline a capsule opens from and lands into: a small lozenge under the menu bar.
+/// The outline a capsule opens from and lands into: a small lozenge under the menu bar. Its
+/// height is most of the pill's, so a row as tall as the pill gets room early in the growth.
 pub const LAND_W: f32 = 64.0;
-pub const LAND_H: f32 = 20.0;
+pub const LAND_H: f32 = 28.0;
 /// The shell fades in over this much width above `LAND_W` (and out over it, landing).
 const LAND_FADE_W: f32 = 40.0;
 /// The largest corner radius; above `ISLAND_H / 2` by more than the blend, so the pill is an
@@ -219,8 +220,8 @@ pub fn clearance(shape: &Shape, x: f32, w: f32, ink: Ink) -> f32 {
 
 /// Layout widths: the outer width of a row of items, inset on both sides.
 pub fn row_width(specs: &[Spec]) -> f32 {
-    let inner: f32 = specs.iter().map(|s| s.w).sum::<f32>()
-        + specs.len().saturating_sub(1) as f32 * CHIP_GAP;
+    let inner: f32 =
+        specs.iter().map(|s| s.w).sum::<f32>() + specs.len().saturating_sub(1) as f32 * CHIP_GAP;
     inner + 2.0 * ISLAND_INSET
 }
 
@@ -334,6 +335,10 @@ pub struct Island {
     ghost: Option<Shape>,
     dis: f32,
     pub life: Life,
+    /// How much of the whole-content blur and scale applies (springs between 0 and 1).
+    whole: S1,
+    /// The current layout's keys, to notice a new one.
+    keys: Vec<String>,
 }
 
 /// Everything a frame draws.
@@ -359,6 +364,8 @@ pub struct ItemFrame {
     pub alpha: f32,
     /// In the layout and shown enough to take clicks.
     pub live: bool,
+    /// Not in the current layout: on its way out.
+    pub leaving: bool,
 }
 
 impl Default for Island {
@@ -387,6 +394,8 @@ impl Island {
             ghost: None,
             dis: 1.0,
             life: Life::Hidden,
+            whole: S1::at(1.0, spring(0.12, 0.0)),
+            keys: Vec::new(),
         }
     }
 
@@ -425,6 +434,8 @@ impl Island {
             self.ghost = None;
             self.dis = 1.0;
             self.fade.snap(0.0);
+            self.whole.snap(1.0);
+            self.keys.clear();
         }
         self.life = Life::Open;
     }
@@ -483,8 +494,18 @@ impl Island {
         let lefts = row_lefts(specs);
         let width = row_width(specs);
         let keys: Vec<&str> = specs.iter().map(|s| s.key.as_str()).collect();
+        let new_layout =
+            self.keys.len() != keys.len() || self.keys.iter().zip(&keys).any(|(a, b)| a != b);
         for item in &mut self.items {
             item.in_target = keys.contains(&item.spec.key.as_str());
+            // What is showing and stays through a new layout is kept: the change isn't a whole
+            // new content, so it gets no whole-content blur.
+            if new_layout {
+                item.kept = item.in_target && (item.settled || item.travelling);
+            }
+        }
+        if new_layout {
+            self.keys = keys.iter().map(|k| (*k).to_owned()).collect();
         }
         for (spec, &left) in specs.iter().zip(&lefts) {
             match self.items.iter_mut().find(|i| i.spec.key == spec.key) {
@@ -502,7 +523,11 @@ impl Island {
         order.sort_by(|a, b| a.1.total_cmp(&b.1));
         let last = specs.len().saturating_sub(1);
         for (rank, (i, _)) in order.iter().enumerate() {
-            if let Some(item) = self.items.iter_mut().find(|it| it.spec.key == specs[*i].key) {
+            if let Some(item) = self
+                .items
+                .iter_mut()
+                .find(|it| it.spec.key == specs[*i].key)
+            {
                 item.rank = rank;
                 item.last = last;
             }
@@ -526,7 +551,9 @@ impl Island {
         }
         for item in &mut self.items {
             item.in_target = false;
+            item.kept = false;
         }
+        self.keys.clear();
         self.life = Life::Landing;
         if self.reduced {
             self.fade.to(0.0, spring(tune.reduced_fade, 0.0));
@@ -547,8 +574,7 @@ impl Island {
         (a.w - b.w).abs() < 0.01
             && (a.h - b.h).abs() < 0.01
             && a.lefts.len() == b.lefts.len()
-            && a
-                .lefts
+            && a.lefts
                 .iter()
                 .zip(&b.lefts)
                 .all(|(x, y)| x.0 == y.0 && (x.1 - y.1).abs() < 0.01)
@@ -615,9 +641,6 @@ impl Island {
         self.w.to(geometry.w, spring(w_duration, bounce));
         self.h.to(geometry.h, spring(base.response, 0.0));
         self.grow_from = (w0, h0);
-        for item in &mut self.items {
-            item.kept = item.in_target && (item.settled || item.travelling);
-        }
         for (key, left) in &geometry.lefts {
             let Some(item) = self.items.iter_mut().find(|i| &i.spec.key == key) else {
                 continue;
@@ -846,6 +869,14 @@ impl Island {
         }
         self.items
             .retain(|i| i.in_target || i.a.x > 1e-3 || i.a.target > 0.0);
+        let (_, changing, _, _) = self.raw_frame(tune);
+        if reduced {
+            self.whole.snap(0.0);
+        } else {
+            self.whole
+                .to(f32::from(u8::from(changing)), spring(0.12, 0.0));
+            self.whole.step(dt);
+        }
     }
 
     /// Keeps an item whole inside the outline's sides with full room: pushes it toward the
@@ -877,6 +908,17 @@ impl Island {
     }
 
     pub fn frame(&self, tune: &Tune) -> Frame {
+        let (mut frame, _, blur, scale) = self.raw_frame(tune);
+        // The whole-content blur and scale fade in and out with `whole` rather than switching.
+        let g = self.whole.x.clamp(0.0, 1.0);
+        frame.content_blur = blur * g;
+        frame.content_scale = mix(1.0, scale, g);
+        frame
+    }
+
+    /// The frame with its whole-content effect at full strength, whether the whole content is
+    /// coming or going together (or nothing shows), and that effect's blur and scale.
+    fn raw_frame(&self, tune: &Tune) -> (Frame, bool, f32, f32) {
         let reduced = self.reduced;
         let shape = self.shape(tune);
         let ghost = (reduced && self.dis < 1.0)
@@ -927,25 +969,30 @@ impl Island {
                 w: item.spec.w,
                 alpha,
                 live: item.in_target && alpha > 0.3,
+                leaving: !item.in_target,
             });
         }
-        let changing = whole && unsettled && alpha_sum > 0.0 && !reduced;
-        Frame {
+        // Nothing showing counts as all of it gone: blurred and small, so whatever comes next
+        // starts from there.
+        let visible = alpha_sum > 0.0;
+        let changing = !reduced && (!visible || whole && unsettled);
+        let (blur, scale) = if visible {
+            (
+                tune.content_blur * blur_sum / alpha_sum,
+                mix(tune.content_scale, 1.0, max_a),
+            )
+        } else {
+            (tune.content_blur, tune.content_scale)
+        };
+        let frame = Frame {
             shape,
             shell_alpha: self.shell_alpha(),
             ghost,
             items,
-            content_blur: if changing {
-                tune.content_blur * blur_sum / alpha_sum
-            } else {
-                0.0
-            },
-            content_scale: if changing {
-                mix(tune.content_scale, 1.0, max_a)
-            } else {
-                1.0
-            },
-        }
+            content_blur: 0.0,
+            content_scale: 1.0,
+        };
+        (frame, changing, blur, scale)
     }
 }
 
@@ -1081,7 +1128,12 @@ mod tests {
             if island.reduced {
                 continue;
             }
-            assert!(d >= 0.0, "{what}: {} sliced (d {d:.2}, alpha {:.2})", f.key, f.alpha);
+            assert!(
+                d >= 0.0,
+                "{what}: {} sliced (d {d:.2}, alpha {:.2})",
+                f.key,
+                f.alpha
+            );
             if item.settled || item.travelling {
                 continue; // contained instead: the sides push it along
             }
@@ -1132,7 +1184,10 @@ mod tests {
             let r = radius_of(h, MAX_RADIUS, blend);
             let slope = (r - prev) / 0.25;
             assert!(r >= prev - 1e-5, "monotone at {h}");
-            assert!((slope - prev_slope).abs() < 0.02, "no kink at {h}: {prev_slope} → {slope}");
+            assert!(
+                (slope - prev_slope).abs() < 0.02,
+                "no kink at {h}: {prev_slope} → {slope}"
+            );
             prev = r;
             prev_slope = slope;
             h += 0.25;
@@ -1143,12 +1198,26 @@ mod tests {
     #[test]
     fn layouts_fit_and_rest_with_full_room() {
         for (name, tune) in presets() {
-            for specs in [recording(true), recording(false), picker(true), processing(), done()] {
+            for specs in [
+                recording(true),
+                recording(false),
+                picker(true),
+                processing(),
+                done(),
+            ] {
                 let island = opened(&tune, &specs);
                 let frame = island.frame(&tune);
-                assert!((frame.shape.width() - row_width(&specs)).abs() < 0.05, "{name}");
+                assert!(
+                    (frame.shape.width() - row_width(&specs)).abs() < 0.05,
+                    "{name}"
+                );
                 for f in &frame.items {
-                    assert!((f.alpha - 1.0).abs() < 1e-3, "{name}: {} rests at {}", f.key, f.alpha);
+                    assert!(
+                        (f.alpha - 1.0).abs() < 1e-3,
+                        "{name}: {} rests at {}",
+                        f.key,
+                        f.alpha
+                    );
                 }
                 assert_eq!(frame.content_blur, 0.0);
                 assert_eq!(frame.content_scale, 1.0);
@@ -1186,7 +1255,13 @@ mod tests {
 
     #[test]
     fn every_change_fired_mid_flight_of_every_other() {
-        let layouts = [recording(true), recording(false), picker(false), processing(), done()];
+        let layouts = [
+            recording(true),
+            recording(false),
+            picker(false),
+            processing(),
+            done(),
+        ];
         for (name, tune) in presets() {
             for a in 0..layouts.len() {
                 for b in 0..layouts.len() {
@@ -1227,7 +1302,13 @@ mod tests {
     fn shared_items_travel_and_newcomers_wait_for_room() {
         let tune = Tune::DEFAULT;
         let mut island = opened(&tune, &recording(true));
-        let start = island.items.iter().find(|i| i.spec.key == "chip:Area").unwrap().x.x;
+        let start = island
+            .items
+            .iter()
+            .find(|i| i.spec.key == "chip:Area")
+            .unwrap()
+            .x
+            .x;
         island.present(&picker(false), &tune);
         let mut xs = Vec::new();
         let mut lead_gone_at = None;
@@ -1240,7 +1321,10 @@ mod tests {
             assert!(area.alpha > 0.99, "the chip stays: it is the same element");
             xs.push(area.x);
             if lead_gone_at.is_none()
-                && f.items.iter().find(|f| f.key == "lead").is_none_or(|l| l.alpha < 0.05)
+                && f.items
+                    .iter()
+                    .find(|f| f.key == "lead")
+                    .is_none_or(|l| l.alpha < 0.05)
             {
                 lead_gone_at = Some(t);
             }
@@ -1257,7 +1341,10 @@ mod tests {
         assert!((xs.last().unwrap() - row_lefts(&picker(false))[0]).abs() < 0.05);
         // Apple's collapse: the lead is mostly gone before the outline moves.
         let (gone, moved) = (lead_gone_at.unwrap(), width_moved_at.unwrap());
-        assert!(moved >= tune.collapse_wait - 1e-3, "the outline waits ({moved})");
+        assert!(
+            moved >= tune.collapse_wait - 1e-3,
+            "the outline waits ({moved})"
+        );
         assert!(gone <= moved + 0.1, "content first ({gone} vs {moved})");
     }
 
@@ -1276,14 +1363,21 @@ mod tests {
             for item in &f.items {
                 if item.alpha > 0.02 && !first.iter().any(|(k, _)| k == &item.key) {
                     let grown = (i.w.x - LAND_W) / (target - LAND_W);
-                    assert!(grown >= tune.content_delay - 0.02, "{} at {grown}", item.key);
+                    assert!(
+                        grown >= tune.content_delay - 0.02,
+                        "{} at {grown}",
+                        item.key
+                    );
                     first.push((item.key.clone(), t));
                 }
             }
         });
         assert_eq!(first.len(), specs.len());
         let at = |k: &str| first.iter().find(|(key, _)| key == k).unwrap().1;
-        assert!(at("chip:Window") <= at("close"), "the inner chip comes before the end");
+        assert!(
+            at("chip:Window") <= at("close"),
+            "the inner chip comes before the end"
+        );
     }
 
     #[test]
@@ -1304,8 +1398,50 @@ mod tests {
             }
         });
         assert!(over > 0.5, "the width does bounce");
-        assert!(h_over < 1e-3, "the height doesn't: no overshoot up into the menu bar");
+        assert!(
+            h_over < 1e-3,
+            "the height doesn't: no overshoot up into the menu bar"
+        );
         assert!(alpha <= 1.0);
+    }
+
+    #[test]
+    fn the_whole_content_blur_and_scale_never_step() {
+        let layouts = [
+            recording(true),
+            recording(false),
+            picker(false),
+            processing(),
+            done(),
+        ];
+        for (name, tune) in presets() {
+            for a in 0..layouts.len() {
+                for b in 0..layouts.len() {
+                    let mut island = Island::new();
+                    island.open();
+                    let mut last: Option<(f32, f32)> = None;
+                    let mut check = |_: &Island, f: &Frame| {
+                        if let Some((blur, scale)) = last {
+                            assert!(
+                                (f.content_blur - blur).abs() < 2.0,
+                                "{name} {a}→{b}: blur {blur} → {}",
+                                f.content_blur
+                            );
+                            assert!(
+                                (f.content_scale - scale).abs() < 0.04,
+                                "{name} {a}→{b}: scale {scale} → {}",
+                                f.content_scale
+                            );
+                        }
+                        last = Some((f.content_blur, f.content_scale));
+                    };
+                    run(&mut island, &tune, Some(&layouts[a]), 0.9, &mut check);
+                    run(&mut island, &tune, Some(&layouts[b]), 1.2, &mut check);
+                    island.dismiss(&tune);
+                    run(&mut island, &tune, None, 1.2, &mut check);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1336,8 +1472,15 @@ mod tests {
         island.present(&picker(false), &tune);
         island.step(FRAME, &tune);
         let f = island.frame(&tune);
-        assert_eq!(f.shape.width(), row_width(&picker(false)), "no width travel");
-        assert!(f.ghost.is_some_and(|(g, a)| (g.width() - w0).abs() < 1e-3 && a > 0.9));
+        assert_eq!(
+            f.shape.width(),
+            row_width(&picker(false)),
+            "no width travel"
+        );
+        assert!(
+            f.ghost
+                .is_some_and(|(g, a)| (g.width() - w0).abs() < 1e-3 && a > 0.9)
+        );
         assert_eq!(f.content_blur, 0.0);
         run(&mut island, &tune, Some(&picker(false)), 0.5, |_, f| {
             for item in &f.items {

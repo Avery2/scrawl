@@ -198,32 +198,100 @@ type Field = fn(&mut Tune) -> &mut f32;
 
 /// `tune.json` keys, in the order `scrawl tune list` prints them.
 pub(super) const KEYS: &[(&str, &str, Field)] = &[
-    ("open.duration", "Outline grows (s)", |t| &mut t.open.response),
-    ("open.bounce", "Outline grows: bounce (width only)", |t| &mut t.open.bounce),
-    ("close.duration", "Outline shrinks (s)", |t| &mut t.close.response),
-    ("close.bounce", "Outline shrinks: bounce (width only)", |t| &mut t.close.bounce),
-    ("widthLead", "Width leads the growth by (s)", |t| &mut t.width_lead),
-    ("heightLead", "Height leads the collapse by (s)", |t| &mut t.height_lead),
-    ("radius.blend", "Radius eases into its cap over (pt)", |t| &mut t.radius_blend),
-    ("tap.duration", "Squish spring (s)", |t| &mut t.squish.response),
+    ("open.duration", "Outline grows (s)", |t| {
+        &mut t.open.response
+    }),
+    ("open.bounce", "Outline grows: bounce (width only)", |t| {
+        &mut t.open.bounce
+    }),
+    ("close.duration", "Outline shrinks (s)", |t| {
+        &mut t.close.response
+    }),
+    (
+        "close.bounce",
+        "Outline shrinks: bounce (width only)",
+        |t| &mut t.close.bounce,
+    ),
+    ("widthLead", "Width leads the growth by (s)", |t| {
+        &mut t.width_lead
+    }),
+    ("heightLead", "Height leads the collapse by (s)", |t| {
+        &mut t.height_lead
+    }),
+    ("radius.blend", "Radius eases into its cap over (pt)", |t| {
+        &mut t.radius_blend
+    }),
+    ("tap.duration", "Squish spring (s)", |t| {
+        &mut t.squish.response
+    }),
     ("tap.bounce", "Squish bounce", |t| &mut t.squish.bounce),
-    ("tap.squish", "Squish amount (× width)", |t| &mut t.squish_amount),
-    ("collapse.wait", "Outline waits for leaving content (s)", |t| &mut t.collapse_wait),
-    ("content.delay", "Content waits for this share of the growth", |t| &mut t.content_delay),
+    ("tap.squish", "Squish amount (× width)", |t| {
+        &mut t.squish_amount
+    }),
+    (
+        "collapse.wait",
+        "Outline waits for leaving content (s)",
+        |t| &mut t.collapse_wait,
+    ),
+    (
+        "content.delay",
+        "Content waits for this share of the growth",
+        |t| &mut t.content_delay,
+    ),
     ("content.in", "Content fades in (s)", |t| &mut t.content_in),
-    ("content.out", "Content fades out (s)", |t| &mut t.content_out),
-    ("content.blur", "Whole-content blur coming and going (pt)", |t| &mut t.content_blur),
-    ("content.scale", "Whole-content scale coming and going", |t| &mut t.content_scale),
-    ("content.blurLead", "Blur settles within (× fade)", |t| &mut t.blur_lead),
-    ("content.stagger", "Items follow each other outward by (s)", |t| &mut t.stagger),
-    ("content.push", "Items arrive travelling outward by (pt)", |t| &mut t.content_push),
-    ("content.exitLead", "Content clears the edge ahead by (s)", |t| &mut t.exit_lead),
-    ("content.clear", "Nothing within this of the edge (pt)", |t| &mut t.clear),
+    ("content.out", "Content fades out (s)", |t| {
+        &mut t.content_out
+    }),
+    (
+        "content.blur",
+        "Whole-content blur coming and going (pt)",
+        |t| &mut t.content_blur,
+    ),
+    (
+        "content.scale",
+        "Whole-content scale coming and going",
+        |t| &mut t.content_scale,
+    ),
+    ("content.blurLead", "Blur settles within (× fade)", |t| {
+        &mut t.blur_lead
+    }),
+    (
+        "content.stagger",
+        "Items follow each other outward by (s)",
+        |t| &mut t.stagger,
+    ),
+    (
+        "content.push",
+        "Items arrive travelling outward by (pt)",
+        |t| &mut t.content_push,
+    ),
+    (
+        "content.exitLead",
+        "Content clears the edge ahead by (s)",
+        |t| &mut t.exit_lead,
+    ),
+    (
+        "content.clear",
+        "Nothing within this of the edge (pt)",
+        |t| &mut t.clear,
+    ),
     ("content.band", "Then fades in over (pt)", |t| &mut t.band),
-    ("shared.duration", "Shared items travel (s)", |t| &mut t.shared.response),
-    ("shared.travel", "Shared items travel (1) or swap (0)", |t| &mut t.shared_travel),
-    ("reduced.fade", "Reduce Motion dissolve (s)", |t| &mut t.reduced_fade),
-    ("timeScale", "Animation time scale (0.25 = slow motion)", |t| &mut t.time_scale),
+    ("shared.duration", "Shared items travel (s)", |t| {
+        &mut t.shared.response
+    }),
+    (
+        "shared.travel",
+        "Shared items travel (1) or swap (0)",
+        |t| &mut t.shared_travel,
+    ),
+    ("reduced.fade", "Reduce Motion dissolve (s)", |t| {
+        &mut t.reduced_fade
+    }),
+    (
+        "timeScale",
+        "Animation time scale (0.25 = slow motion)",
+        |t| &mut t.time_scale,
+    ),
 ];
 
 /// Numbered presets, each a full set of values. `DEFAULT` is Kit Motion.

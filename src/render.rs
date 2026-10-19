@@ -501,8 +501,8 @@ fn draw_keyframe_badge(
     }
     let badge_k = badge_k.max(0.45);
     let num_label = format!("#{}", keyframe.index);
-    let time_label = (!keyframe.file.is_empty() || !keyframe.event.is_empty())
-        .then(|| format_clock(keyframe.t));
+    let time_label =
+        (!keyframe.file.is_empty() || !keyframe.event.is_empty()).then(|| format_clock(keyframe.t));
     let num_size = 15.5 * badge_k;
     let time_size = 12.5 * badge_k;
     let badge_h = 28.0 * badge_k;
@@ -522,8 +522,7 @@ fn draw_keyframe_badge(
     };
 
     let margin = 7.0 * badge_k;
-    let dodge =
-        dodge_top_right || keyframe.cursor.is_some_and(|[x, y]| x < 0.30 && y < 0.18);
+    let dodge = dodge_top_right || keyframe.cursor.is_some_and(|[x, y]| x < 0.30 && y < 0.18);
     let bx = if dodge {
         (rx + rw - badge_w - margin).max(rx + margin)
     } else {
@@ -792,8 +791,7 @@ fn plan_contact_sheet_rows(aspects: &[f32]) -> Vec<std::ops::Range<usize>> {
 
             let mut sorted_areas = areas;
             sorted_areas[..n].sort_by(f32::total_cmp);
-            let median_area =
-                (sorted_areas[(n - 1) / 2] + sorted_areas[n / 2]).max(1e-6) * 0.5;
+            let median_area = (sorted_areas[(n - 1) / 2] + sorted_areas[n / 2]).max(1e-6) * 0.5;
             let mut under_pen = 0.0f32;
             for &ar in &areas[..n] {
                 let ratio = ar / median_area;
