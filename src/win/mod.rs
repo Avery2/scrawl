@@ -10,6 +10,7 @@ pub mod overlay;
 pub mod privacy;
 pub mod shell;
 pub mod speech;
+pub mod uia;
 
 use std::ffi::c_void;
 use std::path::PathBuf;

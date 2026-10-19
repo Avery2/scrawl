@@ -1,10 +1,15 @@
 mod agent_context;
 mod audio;
 mod autocrop;
-#[cfg_attr(not(target_os = "macos"), path = "ax_other.rs")]
+// Windows looks elements up through UI Automation (`win/uia.rs`); other systems have no lookup.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows")),
+    path = "ax_other.rs"
+)]
 mod ax;
 mod autocrop_lab;
 mod capture;
+#[cfg_attr(target_os = "windows", path = "win/command_line.rs")]
 mod command_line;
 mod delivery;
 mod export;

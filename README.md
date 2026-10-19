@@ -784,6 +784,11 @@ system owns differ:
   Scrawl loads it from `%APPDATA%\voice-control\models` with measured word timings, so spoken cues
   ("look here") cut keyframes as on macOS. Scrawl never downloads a model. Without one, captures
   have no transcript.
+- **Command-line tool:** **Install** in Settings › Agents writes a `scrawl.cmd` shim into
+  `%LOCALAPPDATA%\Microsoft\WindowsApps`, which is on every user's PATH, so agents and terminals
+  can run `scrawl`.
+- **agentContext:** what clicks and marks land on comes from UI Automation, as it does from the
+  Accessibility tree on macOS.
 - **Not on Windows:** the cabled iPhone (it needs AVFoundation's screen capture devices), video
   export, Sparkle updates (**Check for Updates…** opens the releases page) and the dev-site tab URL
   (`/sdk.js` registrations still route).
