@@ -79,7 +79,7 @@ pub const CONTENT_DELAY: f32 = 0.2;
 /// Whole-pill scale at `alpha = 0` on Entry and Exit with `Origin::Centre` (`0.94 ↔ 1.0`).
 pub const ENTRY_EXIT_SCALE: f32 = 0.94;
 /// Height fraction the capsule unfolds from with `Origin::Top` (anchored on its top edge).
-pub const TOP_FROM: f32 = 0.45;
+pub const TOP_FROM: f32 = 0.6;
 /// Per-element scale at `alpha = 0`, about the element's own centre (never the capsule's).
 pub const CONTENT_SCALE_FROM: f32 = 0.96;
 /// Default peak Gaussian blur sigma (pt) for content entering/leaving in place, and for the shell.
@@ -130,6 +130,9 @@ pub const CONTENT_OUT_SPRING: SpringCfg = SpringCfg::new(0.17, 0.0);
 pub const HIGHLIGHT_SPRING: SpringCfg = SpringCfg::new(0.25, 0.0);
 /// `Origin::Lead` unroll: the right wall leads out of the left end cap with the morph's width bounce.
 pub const UNROLL_SPRING: SpringCfg = SpringCfg::new(0.32, 0.12);
+/// `Origin::Top` entry: the capsule drops open from its top edge, quickly, since it only travels
+/// the last ~16 pt and content can't show until it has.
+pub const DROP_SPRING: SpringCfg = SpringCfg::new(0.18, 0.0);
 /// `Origin::Top` / `Origin::Lead` exit: folds or rolls back up, ~20% quicker than the unroll,
 /// after `FOLD_WAIT_S` so the content (which starts fading at once) is gone before the wall
 /// reaches it.
@@ -141,7 +144,7 @@ pub const FOLD_WAIT_S: f32 = 0.06;
 pub enum Origin {
     /// 0.3.3: scales `0.94 ↔ 1` about its top centre.
     Centre,
-    /// Unfolds downward from its top edge (height `0.45 → 1`), like the Dynamic Island.
+    /// Unfolds downward from its top edge (height `0.6 → 1`), like the Dynamic Island.
     Top,
     /// Unrolls rightward out of its left end cap (a 40 pt circle), where the red dot lives.
     Lead,
@@ -1134,10 +1137,10 @@ impl PillModel {
                     SpringCfg::new((EXIT_SHELL_SPRING.duration * BLUR_LEAD).max(0.04), 0.0),
                 );
             } else if from_hidden {
-                let grow = if self.opts.origin == Origin::Lead {
-                    UNROLL_SPRING
-                } else {
-                    ENTRY_SHELL_SPRING
+                let grow = match self.opts.origin {
+                    Origin::Centre => ENTRY_SHELL_SPRING,
+                    Origin::Top => DROP_SPRING,
+                    Origin::Lead => UNROLL_SPRING,
                 };
                 self.grow.to(1.0, grow);
                 self.shell_alpha.to(1.0, ENTRY_ALPHA_SPRING);
@@ -1561,11 +1564,15 @@ impl PillModel {
             let pres_hidden = matches!(self.pres, Pres::Hidden);
             let entering = self.entering_from_hidden;
 
+            // A Top entry only grows taller, so content may start as soon as it clears the wall:
+            // `room(d)` still caps its opacity until the capsule has fully opened around it.
+            let need = if entering && self.opts.origin == Origin::Top {
+                CLEAR + 0.5
+            } else {
+                CLEAR + EDGE_BAND - 0.8
+            };
             let st = &mut self.elems[idx];
-            let gate = reduced
-                || st.travelling
-                || st.want
-                || (settled_geo && grown && d_rest >= CLEAR + EDGE_BAND - 0.8);
+            let gate = reduced || st.travelling || st.want || (settled_geo && grown && d_rest >= need);
             let want = in_pres && gate;
             if st.want != want {
                 st.want = want;
@@ -2603,12 +2610,33 @@ mod tests {
         };
         let top = first(Origin::Top);
         assert!((top.width() - rest.width()).abs() < 0.5, "top keeps its width");
-        assert!(top.height() < ISLAND_H * 0.6 && top.t == TOP, "top unfolds from the top edge");
-        assert_eq!(top.radius, top.height() * 0.5);
+        assert!(top.height() < ISLAND_H * (TOP_FROM + 0.1) && top.t == TOP, "top unfolds from the top edge");
+        assert!((top.radius - top.height() * 0.5).abs() < 1e-3);
         let lead = first(Origin::Lead);
         assert!((lead.l - rest.l).abs() < 0.5 && lead.width() < ISLAND_H + 6.0, "lead starts as its end cap");
         let centre = first(Origin::Centre);
         assert!(centre.width() < rest.width() && centre.width() > rest.width() * 0.93);
+    }
+
+    #[test]
+    fn top_entry_reads_within_40ms_of_the_centre_scale_in() {
+        let half_lit = |origin| {
+            let mut m = PillModel::new(Metrics::default());
+            m.opts.origin = origin;
+            m.set_pres(Pres::Recording {
+                chips: true,
+                has_iphone: true,
+                stroke_count: 0,
+            });
+            (1..120)
+                .find(|_| {
+                    m.advance(FRAME_DT);
+                    m.frame().elems.iter().any(|e| e.id == ElemId::Lead && e.alpha >= 0.5)
+                })
+                .map_or(f32::INFINITY, |n| n as f32 * FRAME_DT)
+        };
+        let (top, centre) = (half_lit(Origin::Top), half_lit(Origin::Centre));
+        assert!(top - centre <= 0.04, "top {top:.3}s vs centre {centre:.3}s");
     }
 
     #[test]
