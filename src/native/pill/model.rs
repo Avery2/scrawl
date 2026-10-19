@@ -81,7 +81,7 @@ pub const CONTENT_DELAY: f32 = 0.2;
 /// Whole-pill scale at `alpha = 0` on Entry and Exit with `Origin::Centre` (`0.94 ↔ 1.0`).
 pub const ENTRY_EXIT_SCALE: f32 = 0.94;
 /// Height fraction the capsule unfolds from with `Origin::Top` (anchored on its top edge).
-pub const TOP_FROM: f32 = 0.6;
+pub const TOP_FROM: f32 = 0.7;
 /// Per-element scale at `alpha = 0`, about the element's own centre (never the capsule's).
 pub const CONTENT_SCALE_FROM: f32 = 0.96;
 /// Default peak Gaussian blur sigma (pt) for content entering/leaving in place, and for the shell.
@@ -113,46 +113,61 @@ impl SpringCfg {
     }
 }
 
-/// Entry from Hidden: `~235–250 ms` critically damped (`0.94 → 1.0` scale, `4 pt → 0` blur, `0 → 1` alpha).
-pub const ENTRY_SHELL_SPRING: SpringCfg = SpringCfg::new(0.25, 0.0);
+// Springs come from Kit's motion palette (kit-motion SKILL.md) by duration and bounce: exits run
+// 10–25% shorter than entrances, and utility bounce stays ≤ .16. The tunable ones live in
+// `PillOpts` (`scrawl tune pill.*`); these are its defaults and the fixed ones.
+
+/// Entry from Hidden: palette "snappy" `.25 / 0`, the capsule's reveal spring.
+pub const ENTER_SPRING: SpringCfg = SpringCfg::new(0.25, 0.0);
+pub const ENTRY_SHELL_SPRING: SpringCfg = ENTER_SPRING;
 pub const ENTRY_ALPHA_SPRING: SpringCfg = SpringCfg::new(0.22, 0.0);
-/// Exit to Hidden: `~195 ms` critically damped (`1.0 → 0.94` scale, `0 → 4 pt` blur, `1 → 0` alpha).
-pub const EXIT_SHELL_SPRING: SpringCfg = SpringCfg::new(0.21, 0.0);
-/// Visible state-to-state width expansion (`≤ 340 ms` settled, `0.14` width-only morph bounce per `kit-motion`).
-pub const OPEN_SPRING: SpringCfg = SpringCfg::new(0.30, 0.14);
-/// Visible state-to-state width contraction (`≤ 340 ms` settled with `40 ms` collapse wait, critically damped `0.30 / 0`).
-pub const CLOSE_SPRING: SpringCfg = SpringCfg::new(0.30, 0.0);
-pub const TAP_SPRING: SpringCfg = SpringCfg::new(0.30, 0.35);
+/// Exit to Hidden: `.2 / 0`, 20% shorter than the entry (motion-presets `snap` exit).
+pub const EXIT_SPRING: SpringCfg = SpringCfg::new(0.20, 0.0);
+/// Visible state-to-state width morph, palette "morph": `.42 / .16` open, `.38 / .08` close
+/// (knobs `src/panel/morph.ts`). Only the outline's width carries the bounce.
+pub const MORPH_OPEN: SpringCfg = SpringCfg::new(0.42, 0.16);
+pub const MORPH_CLOSE: SpringCfg = SpringCfg::new(0.38, 0.08);
+/// Release squish after a click: motion-presets `pop` (`.25 / .15`, the press role).
+pub const TAP_SPRING: SpringCfg = SpringCfg::new(0.25, 0.15);
 pub const PRESS_SPRING: SpringCfg = SpringCfg::new(0.20, 0.0);
 /// Shared-element slide between visible states (`≤ 230 ms` settled, critically damped).
 pub const SHARED_SPRING: SpringCfg = SpringCfg::new(0.22, 0.0);
 pub const CONTENT_IN_SPRING: SpringCfg = SpringCfg::new(0.24, 0.0);
-pub const CONTENT_OUT_SPRING: SpringCfg = SpringCfg::new(0.17, 0.0);
-/// Selection highlight slide (kit-motion "snap", the segmented-control indicator).
-pub const HIGHLIGHT_SPRING: SpringCfg = SpringCfg::new(0.25, 0.0);
-/// `Origin::Lead` unroll: the right wall leads out of the left end cap with the morph's width bounce.
-pub const UNROLL_SPRING: SpringCfg = SpringCfg::new(0.32, 0.12);
-/// `Origin::Top` entry: the capsule drops open from its top edge, quickly, since it only travels
-/// the last ~16 pt and content can't show until it has.
-pub const DROP_SPRING: SpringCfg = SpringCfg::new(0.18, 0.0);
-/// `Origin::Top` / `Origin::Lead` exit: folds or rolls back up, ~20% quicker than the unroll,
-/// after `FOLD_WAIT_S` so the content (which starts fading at once) is gone before the wall
-/// reaches it.
-pub const FOLD_EXIT_SPRING: SpringCfg = SpringCfg::new(0.26, 0.0);
-pub const FOLD_WAIT_S: f32 = 0.06;
+/// 17% shorter than `CONTENT_IN_SPRING`.
+pub const CONTENT_OUT_SPRING: SpringCfg = SpringCfg::new(0.20, 0.0);
+/// Selection highlight edges (knobs `Edges`, `src/panel/motion.ts`): the edge facing the slide
+/// leads on a quicker spring and the other trails, so the shape stretches toward the chip it is
+/// heading for and settles to its width. Bounce 0, so neither edge reverses.
+pub const HIGHLIGHT_LEAD: SpringCfg = SpringCfg::new(0.18, 0.0);
+pub const HIGHLIGHT_TRAIL: SpringCfg = SpringCfg::new(0.25, 0.0);
+/// Steps the user makes with a key (the hold switcher's S): palette "instant", so the highlight
+/// keeps up with the hand.
+pub const INSTANT_SPRING: SpringCfg = SpringCfg::new(0.10, 0.0);
+/// `Origin::Lead` unroll travels ~8× as far as the Top drop, so it runs 1.28× the entry spring.
+pub const UNROLL_STRETCH: f32 = 1.28;
+/// Punch on the reveal (pt): the capsule shoots out past its rest by this much and decelerates
+/// back into place. Driven by `punch_curve` over the entry spring's progress, never by spring
+/// overshoot. `0` is the plain zero-bounce reveal.
+pub const PUNCH_PT: f32 = 2.0;
+/// Top / Lead exit: content leaves for this long before the wall folds (knobs `GLASS_DELAY`,
+/// `src/panel/morph.ts`).
+pub const FOLD_WAIT_S: f32 = 0.035;
+/// `Origin::Lead` exit: the wall sweeps the whole row from the far end, so the far items get the
+/// same four 60 Hz frames as a narrowing (`COLLAPSE_WAIT_S`).
+pub const ROLL_WAIT_S: f32 = COLLAPSE_WAIT_S;
 
 /// Where the capsule appears from and disappears into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Origin {
     /// 0.3.3: scales `0.94 ↔ 1` about its top centre.
     Centre,
-    /// Unfolds downward from its top edge (height `0.6 → 1`), like the Dynamic Island.
+    /// Unfolds downward from its top edge (height `0.7 → 1`), like the Dynamic Island.
     Top,
     /// Unrolls rightward out of its left end cap (a 40 pt circle), where the red dot lives.
     Lead,
 }
 
-/// Live knobs (`scrawl tune`: `pill.origin`, `pill.anchor`, `pill.blur`, `pill.shellBlur`).
+/// Live knobs (`scrawl tune pill.*`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PillOpts {
     pub origin: Origin,
@@ -162,6 +177,14 @@ pub struct PillOpts {
     pub content_blur: f32,
     /// Peak blur sigma (pt) of the shell's edge on Entry and Exit.
     pub shell_blur: f32,
+    pub enter: SpringCfg,
+    pub exit: SpringCfg,
+    pub morph_open: SpringCfg,
+    pub morph_close: SpringCfg,
+    pub highlight_lead: SpringCfg,
+    pub highlight_trail: SpringCfg,
+    /// How far (pt) the reveal shoots past its rest; see `PUNCH_PT`.
+    pub punch: f32,
 }
 
 impl Default for PillOpts {
@@ -171,8 +194,44 @@ impl Default for PillOpts {
             hold_chips: true,
             content_blur: CONTENT_BLUR_MAX,
             shell_blur: SHELL_BLUR_MAX,
+            enter: ENTER_SPRING,
+            exit: EXIT_SPRING,
+            morph_open: MORPH_OPEN,
+            morph_close: MORPH_CLOSE,
+            highlight_lead: HIGHLIGHT_LEAD,
+            highlight_trail: HIGHLIGHT_TRAIL,
+            punch: PUNCH_PT,
         }
     }
+}
+
+/// The reveal curve over the entry spring's progress `p`: it shoots out (starts `1 + s` times as
+/// fast), passes its rest by `over` of the travel at most, and decelerates back into place. `0`
+/// and `1` stay put, and `over = 0` is `p` itself. The punch comes from this curve; the spring
+/// under it never bounces.
+#[inline]
+pub fn punch_curve(p: f32, over: f32) -> f32 {
+    if over <= 0.0 {
+        return p;
+    }
+    // e = p + s·p·(1 − p) peaks at 1 + (s − 1)² / 4s; solve that for `over`.
+    let s = 1.0 + 2.0 * over + 2.0 * (over + over * over).sqrt();
+    let p = p.clamp(0.0, 1.0);
+    p + s * p * (1.0 - p)
+}
+
+/// Two-edge snap on a 1/128 pt grid (1/64 px at 2×): snap both edges, then take the size, so an
+/// edge that isn't moving can't shimmer.
+#[inline]
+pub fn grid(v: f32) -> f32 {
+    (v * 128.0).round() / 128.0
+}
+
+/// `[x, y, w, h]` with both edges on each axis snapped by `grid`.
+#[inline]
+pub fn snap_rect([x, y, w, h]: [f32; 4]) -> [f32; 4] {
+    let (x0, y0) = (grid(x), grid(y));
+    [x0, y0, grid(x + w) - x0, grid(y + h) - y0]
 }
 
 #[inline]
@@ -923,6 +982,9 @@ pub struct PillModel {
     pub grow: SpringVal,
     /// `grow` holds until then on a folding exit (`FOLD_WAIT_S`).
     fold_at: f32,
+    /// How much of `opts.punch` the reveal curve carries: 1 entering, eased to 0 on exit so an
+    /// exit has no wind-up and one that interrupts an entry doesn't jump.
+    punch_on: SpringVal,
     pub shell_alpha: SpringVal,
     pub shell_blur: SpringVal,
     entering_from_hidden: bool,
@@ -931,8 +993,11 @@ pub struct PillModel {
     elems: [ElemState; ElemId::COUNT],
     ghost: Option<Silhouette>,
     dis: f32,
-    hl_x: SpringVal,
-    hl_w: SpringVal,
+    /// The highlight's two edges (knobs `Edges`).
+    hl_l: SpringVal,
+    hl_r: SpringVal,
+    /// The last selection change came from a key (the hold switcher), so the highlight is instant.
+    hl_keyed: bool,
     hl_a: SpringVal,
     hl_id: Option<ElemId>,
     pub hovered: Option<ElemId>,
@@ -952,13 +1017,14 @@ impl PillModel {
             geo_at: 0.0,
             reduced: false,
             opts: PillOpts::default(),
-            l: SpringVal::new(idle.l, OPEN_SPRING),
-            r: SpringVal::new(idle.r, OPEN_SPRING),
+            l: SpringVal::new(idle.l, MORPH_OPEN),
+            r: SpringVal::new(idle.r, MORPH_OPEN),
             b: SpringVal::new(idle.b, SpringCfg::new(0.24, 0.0)),
             press: SpringVal::new(0.0, PRESS_SPRING),
             squish: SpringVal::new(0.0, TAP_SPRING),
             grow: SpringVal::new(0.0, ENTRY_SHELL_SPRING),
             fold_at: 0.0,
+            punch_on: SpringVal::new(0.0, INSTANT_SPRING),
             shell_alpha: SpringVal::new(0.0, ENTRY_ALPHA_SPRING),
             shell_blur: SpringVal::new(1.0, ENTRY_SHELL_SPRING),
             entering_from_hidden: false,
@@ -967,8 +1033,9 @@ impl PillModel {
             elems: [ElemState::new(); ElemId::COUNT],
             ghost: None,
             dis: 1.0,
-            hl_x: SpringVal::new(CX, HIGHLIGHT_SPRING),
-            hl_w: SpringVal::new(CHIP_H, HIGHLIGHT_SPRING),
+            hl_l: SpringVal::new(CX, HIGHLIGHT_TRAIL),
+            hl_r: SpringVal::new(CX + CHIP_H, HIGHLIGHT_TRAIL),
+            hl_keyed: false,
             hl_a: SpringVal::new(0.0, CONTENT_IN_SPRING),
             hl_id: None,
             hovered: None,
@@ -1007,6 +1074,11 @@ impl PillModel {
         if self.pres == next {
             return;
         }
+        // The hold switcher steps modes with a key: the user's own hand, so no slide to wait for.
+        self.hl_keyed = matches!(
+            (&self.pres, &next),
+            (Pres::Selecting { hold: true, .. }, Pres::Selecting { hold: true, .. })
+        );
         let layout_changed = !self.pres.same_layout(&next);
         let was_visible = !matches!(self.pres, Pres::Hidden);
         let now_hidden = matches!(next, Pres::Hidden);
@@ -1114,55 +1186,64 @@ impl PillModel {
                 self.press.snap(0.0);
             }
 
-            let blur_in = SpringCfg::new((ENTRY_SHELL_SPRING.duration * BLUR_LEAD).max(0.04), 0.0);
+            let blur_in = SpringCfg::new((self.opts.enter.duration * BLUR_LEAD).max(0.04), 0.0);
             if landing_idle {
                 // Exit in place: keep the current layout's target width/height while `grow`
                 // plays the origin's exit and the shell fades in `~190–200 ms`.
                 let cur_l = self.l.target;
                 let cur_r = self.r.target;
                 let cur_b = self.b.target;
-                self.l.to(cur_l, CLOSE_SPRING);
-                self.r.to(cur_r, CLOSE_SPRING);
-                self.b.to(cur_b, CLOSE_SPRING);
-                // A fold or roll-up sweeps a wall across the row, so it runs a little calmer
-                // than the in-place scale-out and its content fades ahead of the wall.
-                let exit = if self.opts.origin == Origin::Centre {
-                    EXIT_SHELL_SPRING
-                } else {
-                    self.fold_at = self.t + FOLD_WAIT_S;
-                    FOLD_EXIT_SPRING
+                self.l.to(cur_l, self.opts.morph_close);
+                self.r.to(cur_r, self.opts.morph_close);
+                self.b.to(cur_b, self.opts.morph_close);
+                // A fold or roll-up sweeps a wall across the row, so its content fades first
+                // and the wall waits `FOLD_WAIT_S` before it moves.
+                let exit = match self.opts.origin {
+                    Origin::Centre => self.opts.exit,
+                    Origin::Top => {
+                        self.fold_at = self.t + FOLD_WAIT_S;
+                        self.opts.exit
+                    }
+                    Origin::Lead => {
+                        self.fold_at = self.t + ROLL_WAIT_S;
+                        SpringCfg::new(self.opts.exit.duration * UNROLL_STRETCH, self.opts.exit.bounce)
+                    }
                 };
                 self.grow.to(0.0, exit);
-                self.shell_alpha.to(0.0, exit);
+                // From rest the curve adds nothing, so drop it at once (an exit never shoots);
+                // an exit that interrupts the entry eases it out instead of jumping.
+                if self.grow.x > 0.98 {
+                    self.punch_on.snap(0.0);
+                } else {
+                    self.punch_on.to(0.0, INSTANT_SPRING);
+                }
+                self.shell_alpha.to(0.0, self.opts.exit);
                 self.shell_blur.to(
                     1.0,
-                    SpringCfg::new((EXIT_SHELL_SPRING.duration * BLUR_LEAD).max(0.04), 0.0),
+                    SpringCfg::new((self.opts.exit.duration * BLUR_LEAD).max(0.04), 0.0),
                 );
             } else if from_hidden {
+                let enter = self.opts.enter;
                 let grow = match self.opts.origin {
-                    Origin::Centre => ENTRY_SHELL_SPRING,
-                    Origin::Top => DROP_SPRING,
-                    Origin::Lead => UNROLL_SPRING,
+                    Origin::Centre | Origin::Top => enter,
+                    Origin::Lead => SpringCfg::new(enter.duration * UNROLL_STRETCH, enter.bounce),
                 };
                 self.grow.to(1.0, grow);
+                if self.grow.x < 0.02 {
+                    self.punch_on.snap(1.0);
+                } else {
+                    self.punch_on.to(1.0, INSTANT_SPRING);
+                }
                 self.shell_alpha.to(1.0, ENTRY_ALPHA_SPRING);
                 self.shell_blur.to(0.0, blur_in);
             } else {
                 // Visible state-to-state width-led morph (`≤ 350 ms` settled, velocity preserved).
                 // Each wall has its own spring, so a wall whose target doesn't move stays put.
-                let dw = (lay.l - before_l).abs().max((lay.r - before_r).abs());
-                let dh = (lay.b - before_b).abs();
-                let opening = lay.width() * lay.height()
-                    >= (before_r - before_l) * (before_b - TOP) - 1.0;
-                let base = if opening { OPEN_SPRING } else { CLOSE_SPRING };
-                let f = (dw.hypot(dh) / REF_DIST).clamp(0.0, 1.0);
-                let dur = (base.duration * mix(DISTANCE_FLOOR, 1.0, f)).max(0.14);
-                let w_bounce = base.bounce;
-
-                self.l.to(lay.l, SpringCfg::new(dur, w_bounce));
-                self.r.to(lay.r, SpringCfg::new(dur, w_bounce));
-                self.b.to(lay.b, SpringCfg::new(dur, 0.0));
-                self.grow.to(1.0, ENTRY_SHELL_SPRING);
+                let (w_cfg, h_cfg) = self.morph_springs(&lay, before_l, before_r, before_b);
+                self.l.to(lay.l, w_cfg);
+                self.r.to(lay.r, w_cfg);
+                self.b.to(lay.b, h_cfg);
+                self.grow.to(1.0, self.opts.enter);
                 self.shell_alpha.to(1.0, ENTRY_ALPHA_SPRING);
                 self.shell_blur.to(0.0, blur_in);
             }
@@ -1194,6 +1275,22 @@ impl PillModel {
                 st.active.to(item.active, SpringCfg::new(0.18, 0.0));
             }
         }
+    }
+
+    /// Width and height springs for a visible morph to `lay` from walls at `l`, `r`, `b`: the
+    /// palette morph (open or close by area), a touch quicker for short moves; only width bounces.
+    fn morph_springs(&self, lay: &Layout, l: f32, r: f32, b: f32) -> (SpringCfg, SpringCfg) {
+        let dw = (lay.l - l).abs().max((lay.r - r).abs());
+        let dh = (lay.b - b).abs();
+        let opening = lay.width() * lay.height() >= (r - l) * (b - TOP) - 1.0;
+        let base = if opening {
+            self.opts.morph_open
+        } else {
+            self.opts.morph_close
+        };
+        let f = (dw.hypot(dh) / REF_DIST).clamp(0.0, 1.0);
+        let dur = (base.duration * mix(DISTANCE_FLOOR, 1.0, f)).max(0.14);
+        (SpringCfg::new(dur, base.bounce), SpringCfg::new(dur, 0.0))
     }
 
     /// Updates the recording clock string (`M:SS`); if the digit count changed (e.g. `9:59 -> 10:00`),
@@ -1305,7 +1402,7 @@ impl PillModel {
         let (mut w, mut h) = (base_w, base_h);
         match self.opts.origin {
             Origin::Centre => {
-                let k = mix(ENTRY_EXIT_SCALE, 1.0, p).clamp(ENTRY_EXIT_SCALE * 0.9, 1.05);
+                let k = self.centre_scale(p, base_w);
                 let mid = (l + r) * 0.5;
                 w = base_w * k;
                 h = base_h * k;
@@ -1313,11 +1410,12 @@ impl PillModel {
                 r = mid + w * 0.5;
             }
             Origin::Top => {
-                h = base_h * mix(TOP_FROM, 1.0, p).clamp(0.2, 1.05);
+                h = base_h * self.top_scale(p, base_h);
             }
             Origin::Lead => {
                 let w0 = base_h.min(base_w);
-                w = (w0 + (base_w - w0) * p.max(0.0)).max(w0);
+                let e = self.reveal(p, base_w - w0);
+                w = (w0 + (base_w - w0) * e).max(w0 * 0.9);
                 r = l + w;
             }
         }
@@ -1339,6 +1437,27 @@ impl PillModel {
         }
     }
 
+    /// The reveal's progress through `punch_curve`, scaled so the overshoot is `opts.punch` pt
+    /// along a reveal that travels `travel` pt. Reduced Motion has no travel.
+    fn reveal(&self, p: f32, travel: f32) -> f32 {
+        if self.reduced || self.opts.punch <= 0.0 || travel <= 1.0 {
+            return p;
+        }
+        punch_curve(p, (self.opts.punch * self.punch_on.x / travel).clamp(0.0, 0.5))
+    }
+
+    /// `Origin::Top` height factor: `TOP_FROM → 1`, dropping from the top edge.
+    fn top_scale(&self, p: f32, h: f32) -> f32 {
+        let e = self.reveal(p, (1.0 - TOP_FROM) * h);
+        mix(TOP_FROM, 1.0, e).clamp(0.2, 1.2)
+    }
+
+    /// `Origin::Centre` scale: `ENTRY_EXIT_SCALE → 1` about the centre.
+    fn centre_scale(&self, p: f32, w: f32) -> f32 {
+        let e = self.reveal(p, (1.0 - ENTRY_EXIT_SCALE) * w * 0.5);
+        mix(ENTRY_EXIT_SCALE, 1.0, e).clamp(ENTRY_EXIT_SCALE * 0.9, 1.05)
+    }
+
     /// Maps a resting rect through the origin's entry/exit pose; returns the rect and its scale.
     fn shell_xf(&self, [x, y, w, h]: [f32; 4]) -> ([f32; 4], f32) {
         if self.reduced {
@@ -1347,7 +1466,7 @@ impl PillModel {
         let p = self.grow.x;
         match self.opts.origin {
             Origin::Centre => {
-                let k = mix(ENTRY_EXIT_SCALE, 1.0, p).clamp(ENTRY_EXIT_SCALE * 0.9, 1.05);
+                let k = self.centre_scale(p, self.r.x - self.l.x);
                 let mx = (self.l.x + self.r.x) * 0.5;
                 (
                     [mx + (x - mx) * k, TOP + (y - TOP) * k, w * k, h * k],
@@ -1356,7 +1475,7 @@ impl PillModel {
             }
             Origin::Top => {
                 // Content stays centred in the unfolding capsule, so it drops in with the bottom edge.
-                let ky = mix(TOP_FROM, 1.0, p).clamp(0.2, 1.05);
+                let ky = self.top_scale(p, self.b.x - TOP);
                 let dy = (ky - 1.0) * (self.b.x - TOP) * 0.5;
                 ([x, y + dy, w, h], 1.0)
             }
@@ -1398,9 +1517,10 @@ impl PillModel {
             if let Some((at, lay)) = pending
                 && t >= at
             {
-                l.to(lay.l, CLOSE_SPRING);
-                r.to(lay.r, CLOSE_SPRING);
-                b.to(lay.b, CLOSE_SPRING);
+                let (w_cfg, h_cfg) = self.morph_springs(&lay, l.x, r.x, b.x);
+                l.to(lay.l, w_cfg);
+                r.to(lay.r, w_cfg);
+                b.to(lay.b, h_cfg);
                 pending = None;
             }
             l.step(AHEAD_STEP);
@@ -1469,6 +1589,7 @@ impl PillModel {
             self.b.step(dt);
             self.press.step(dt);
             self.squish.step(dt);
+            self.punch_on.step(dt);
             if !self.folding_held(self.t) {
                 self.grow.step(dt);
             }
@@ -1645,34 +1766,43 @@ impl PillModel {
         self.step_highlight(dt, &active_items);
     }
 
-    /// The selection highlight follows the active mode chip's current position, so it slides from
-    /// one chip to another and rides along when the chips themselves move.
+    /// The selection highlight follows the active mode chip, so it slides from one chip to
+    /// another and rides along when the chips themselves move. Its edges move separately (knobs
+    /// `Edges`): the one facing the slide leads, the other trails, so it stretches toward the chip
+    /// it is heading for and lands at that chip's width. A key step (hold switcher) is instant.
     fn step_highlight(&mut self, dt: f32, active_items: &[LayoutItem]) {
         let target = active_items
             .iter()
             .find(|item| item.active > 0.5 && item.id.mode().is_some())
-            .map(|item| item.id);
+            .map(|item| item.id)
+            .or(self.hl_id);
         if let Some(id) = target {
             let st = self.elems[id as usize];
-            if self.hl_id.is_none() || self.hl_a.x < 0.02 || self.reduced {
-                self.hl_x.snap(st.x.x);
-                self.hl_w.snap(st.w);
-            } else {
-                self.hl_x.to(st.x.x, HIGHLIGHT_SPRING);
-                self.hl_w.to(st.w, HIGHLIGHT_SPRING);
+            let (l, r) = (st.x.x, st.x.x + st.w);
+            let visible = self.hl_id.is_some() && self.hl_a.x >= 0.02;
+            if !visible || self.reduced {
+                self.hl_l.snap(l);
+                self.hl_r.snap(r);
+            } else if (l - self.hl_l.target).abs() > 1e-4 || (r - self.hl_r.target).abs() > 1e-4 {
+                let (lead, trail) = if self.hl_keyed {
+                    (INSTANT_SPRING, INSTANT_SPRING)
+                } else {
+                    (self.opts.highlight_lead, self.opts.highlight_trail)
+                };
+                let forward = l + r > self.hl_l.target + self.hl_r.target;
+                let (l_cfg, r_cfg) = if forward { (trail, lead) } else { (lead, trail) };
+                self.hl_l.to(l, l_cfg);
+                self.hl_r.to(r, r_cfg);
             }
             self.hl_id = Some(id);
-            self.hl_a.to(1.0, CONTENT_IN_SPRING);
-        } else {
-            if let Some(id) = self.hl_id {
-                let st = self.elems[id as usize];
-                self.hl_x.to(st.x.x, HIGHLIGHT_SPRING);
-                self.hl_w.to(st.w, HIGHLIGHT_SPRING);
-            }
-            self.hl_a.to(0.0, CONTENT_OUT_SPRING);
         }
-        self.hl_x.step(dt);
-        self.hl_w.step(dt);
+        let on = active_items
+            .iter()
+            .any(|item| item.active > 0.5 && item.id.mode().is_some());
+        self.hl_a
+            .to(f32::from(u8::from(on)), if on { CONTENT_IN_SPRING } else { CONTENT_OUT_SPRING });
+        self.hl_l.step(dt);
+        self.hl_r.step(dt);
         self.hl_a.step(dt);
         if self.hl_a.x < 1e-3 && self.hl_a.target < 0.5 {
             self.hl_id = None;
@@ -1737,7 +1867,7 @@ impl PillModel {
             let [px, py, pw, ph] = placed;
             let (icx, icy) = (px + pw * 0.5, py + ph * 0.5);
             let (fw, fh) = (pw * press_k, ph * press_k);
-            let rect = [icx - fw * 0.5, icy - fh * 0.5, fw, fh];
+            let rect = snap_rect([icx - fw * 0.5, icy - fh * 0.5, fw, fh]);
 
             max_blur = max_blur.max(blur * alpha);
             max_alpha = max_alpha.max(alpha);
@@ -1765,7 +1895,8 @@ impl PillModel {
             let st = &self.elems[id as usize];
             let alpha = (self.hl_a.x.clamp(0.0, 1.0) * chip_alpha).clamp(0.0, 1.0);
             (alpha > 1e-3).then(|| {
-                let (rect, _) = self.place(st, [self.hl_x.x, st.y.x, self.hl_w.x, st.h]);
+                let (rect, _) = self.place(st, [self.hl_l.x, st.y.x, self.hl_r.x - self.hl_l.x, st.h]);
+                let rect = snap_rect(rect);
                 Highlight {
                     rect,
                     alpha,
@@ -1774,6 +1905,11 @@ impl PillModel {
             })
         });
 
+        // Two-edge snap the outline: a wall that isn't moving stays exactly where it is.
+        shape.l = grid(shape.l);
+        shape.r = grid(shape.r);
+        shape.b = grid(shape.b);
+        shape.radius = capsule_radius(shape.width(), shape.height());
         FrameState {
             t: self.t,
             shape,
@@ -1801,10 +1937,11 @@ impl PillModel {
             &self.press,
             &self.squish,
             &self.grow,
+            &self.punch_on,
             &self.shell_alpha,
             &self.shell_blur,
-            &self.hl_x,
-            &self.hl_w,
+            &self.hl_l,
+            &self.hl_r,
             &self.hl_a,
         ]
         .into_iter()
@@ -1836,15 +1973,34 @@ mod tests {
 
     const FRAME_DT: f32 = 1.0 / 120.0;
 
+    /// Every origin and anchor, each with the shipped springs ("Tuck"), the zero-bounce "Drop"
+    /// and the stronger "Punch" (`ui::motion::PRESETS`).
     fn all_opts() -> Vec<PillOpts> {
+        let drop = PillOpts {
+            punch: 0.0,
+            morph_open: SpringCfg::new(0.30, 0.0),
+            morph_close: SpringCfg::new(0.25, 0.0),
+            highlight_lead: SpringCfg::new(0.25, 0.0),
+            ..PillOpts::default()
+        };
+        let punch = PillOpts {
+            punch: 4.0,
+            enter: SpringCfg::new(0.30, 0.0),
+            exit: SpringCfg::new(0.24, 0.0),
+            highlight_lead: SpringCfg::new(0.15, 0.0),
+            highlight_trail: SpringCfg::new(0.30, 0.0),
+            ..PillOpts::default()
+        };
         let mut out = Vec::new();
-        for origin in [Origin::Centre, Origin::Top, Origin::Lead] {
-            for hold_chips in [false, true] {
-                out.push(PillOpts {
-                    origin,
-                    hold_chips,
-                    ..PillOpts::default()
-                });
+        for base in [PillOpts::default(), drop, punch] {
+            for origin in [Origin::Centre, Origin::Top, Origin::Lead] {
+                for hold_chips in [false, true] {
+                    out.push(PillOpts {
+                        origin,
+                        hold_chips,
+                        ..base
+                    });
+                }
             }
         }
         out
@@ -2496,6 +2652,7 @@ mod tests {
             has_iphone: false,
         });
         let mut hl_xs = Vec::new();
+        let mut hl_rs = Vec::new();
         for _ in 0..90 {
             m.advance(FRAME_DT);
             let f = m.frame();
@@ -2508,13 +2665,26 @@ mod tests {
                 let e = f.elems.iter().find(|e| e.id == id).unwrap();
                 assert!(e.blur < 1e-4 && e.alpha > 0.999, "{id:?} blurred or faded");
             }
-            assert!((f.shape.r - rest.shape.r).abs() < 1e-3, "right wall moved");
+            // Two-edge snapped: the wall that isn't moving doesn't move by a single bit.
+            assert_eq!(f.shape.r, rest.shape.r, "right wall moved");
             let hl = f.highlight.expect("highlight stays");
             assert!(hl.alpha > 0.999);
             hl_xs.push(hl.rect[0]);
+            hl_rs.push(hl.rect[0] + hl.rect[2]);
         }
         // It slides (passes between the chips, never jumps) and lands on Area.
         assert!(hl_xs.windows(2).all(|w| w[1] <= w[0] + 1e-3), "highlight went backwards");
+        assert!(hl_rs.windows(2).all(|w| w[1] <= w[0] + 1e-3), "trailing edge went backwards");
+        // Width leads: the leading (left) edge gets most of the way first, so mid-slide the
+        // shape is wider than either chip, then it settles to Area's width.
+        let area_w = chip_rect(&rest, ElemId::ChipArea).unwrap()[2];
+        let screen_w = chip_rect(&rest, ElemId::ChipScreen).unwrap()[2];
+        let widest = hl_xs.iter().zip(&hl_rs).map(|(l, r)| r - l).fold(0.0, f32::max);
+        assert!(widest > area_w.max(screen_w) + 8.0, "highlight didn't stretch: {widest}");
+        let half = |v: &[f32], from: f32, to: f32| v.iter().position(|&x| (x - from).abs() >= (to - from).abs() * 0.5);
+        let area_r = area_x + area_w;
+        let screen_r = screen_x + screen_w;
+        assert!(half(&hl_xs, screen_x, area_x) < half(&hl_rs, screen_r, area_r), "the leading edge should lead");
         assert!(hl_xs.iter().any(|&x| x < screen_x - 20.0 && x > area_x + 20.0));
         assert!(hl_xs.windows(2).all(|w| (w[1] - w[0]).abs() < 40.0));
         assert!((hl_xs.last().unwrap() - area_x).abs() < 0.05);
@@ -2549,7 +2719,7 @@ mod tests {
     }
 
     #[test]
-    fn hold_switcher_slides_the_highlight_between_modes() {
+    fn hold_switcher_key_steps_move_the_highlight_instantly() {
         let mut m = PillModel::new(Metrics::default());
         let screen = Pres::Selecting {
             mode: SelectionMode::Screen,
@@ -2566,11 +2736,15 @@ mod tests {
         let window_x = rest.elems.iter().find(|e| e.id == ElemId::ChipWindow).unwrap().rect[0];
         let screen_x = rest.elems.iter().find(|e| e.id == ElemId::ChipScreen).unwrap().rect[0];
         let mut mid = false;
-        for _ in 0..60 {
+        for n in 1..=60 {
             m.advance(FRAME_DT);
             let f = m.frame();
             let hl = f.highlight.unwrap();
             mid |= hl.rect[0] < screen_x - 10.0 && hl.rect[0] > window_x + 10.0;
+            // A key step is the user's own hand: palette "instant" (.1 / 0), there by ~0.1 s.
+            if n as f32 * FRAME_DT >= 0.1 {
+                assert!((hl.rect[0] - window_x).abs() < 2.0, "key step lagged: {:.1}", hl.rect[0]);
+            }
             assert!(hl.alpha > 0.999, "highlight cross-faded instead of sliding");
             for (a, b) in f.elems.iter().zip(&rest.elems) {
                 assert_eq!(a.rect, b.rect, "chips moved on a mode change");
@@ -2609,6 +2783,7 @@ mod tests {
         let first = |origin| {
             let mut m = PillModel::new(Metrics::default());
             m.opts.origin = origin;
+            m.opts.punch = 0.0;
             m.set_pres(pres.clone());
             m.advance(FRAME_DT);
             m.frame().shape
@@ -2678,6 +2853,62 @@ mod tests {
         };
         let (top, centre) = (half_lit(Origin::Top), half_lit(Origin::Centre));
         assert!(top - centre <= 0.04, "top {top:.3}s vs centre {centre:.3}s");
+    }
+
+    #[test]
+    fn reveal_shoots_past_rest_on_a_curve_not_a_bounce() {
+        let pres = Pres::Recording {
+            chips: true,
+            has_iphone: true,
+            stroke_count: 0,
+        };
+        let heights = |punch: f32| {
+            let mut m = PillModel::new(Metrics::default());
+            m.opts.punch = punch;
+            m.set_pres(pres.clone());
+            let mut hs = Vec::new();
+            for _ in 0..90 {
+                m.advance(FRAME_DT);
+                assert_eq!(m.grow.bounce, 0.0, "the punch must come from the curve");
+                hs.push(m.frame().shape.height());
+            }
+            hs
+        };
+        let plain = heights(0.0);
+        assert!(plain.windows(2).all(|w| w[1] >= w[0] - 1e-3), "zero punch drops straight down");
+        assert!(plain.iter().all(|&h| h <= ISLAND_H + 1e-3));
+        let hs = heights(PUNCH_PT);
+        let high = hs.iter().cloned().fold(0.0, f32::max);
+        let at_high = hs.iter().position(|&h| h == high).unwrap();
+        assert!((high - ISLAND_H - PUNCH_PT).abs() < 0.25 * PUNCH_PT, "overshoot {high}");
+        // Out fast: it is further down than the plain drop on the second frame.
+        assert!(hs[1] > plain[1] + 0.5, "no shoot: {} vs {}", hs[1], plain[1]);
+        // Then one smooth deceleration back into place: up to the peak, down after it.
+        assert!(hs[..=at_high].windows(2).all(|w| w[1] >= w[0] - 1e-3));
+        assert!(hs[at_high..].windows(2).all(|w| w[1] <= w[0] + 1e-3));
+        assert!((hs.last().unwrap() - ISLAND_H).abs() < 0.02, "settles at rest");
+        // Exits don't wind up: the fold goes straight up.
+        let mut m = PillModel::new(Metrics::default());
+        settle(&mut m, pres);
+        m.set_pres(Pres::Hidden);
+        let mut last = m.frame().shape.height();
+        for _ in 0..60 {
+            m.advance(FRAME_DT);
+            let h = m.frame().shape.height();
+            assert!(h <= last + 1e-3, "exit grew: {last} -> {h}");
+            last = h;
+        }
+    }
+
+    #[test]
+    fn content_exits_run_shorter_than_entrances() {
+        let ratio = CONTENT_OUT_SPRING.duration / CONTENT_IN_SPRING.duration;
+        assert!((0.75..=0.9).contains(&ratio), "content out/in {ratio}");
+        let ratio = EXIT_SPRING.duration / ENTER_SPRING.duration;
+        assert!((0.75..=0.9).contains(&ratio), "exit/enter {ratio}");
+        for c in [ENTER_SPRING, EXIT_SPRING, MORPH_OPEN, MORPH_CLOSE, TAP_SPRING, HIGHLIGHT_LEAD, HIGHLIGHT_TRAIL] {
+            assert!(c.bounce <= 0.16, "utility bounce {c:?}");
+        }
     }
 
     #[test]

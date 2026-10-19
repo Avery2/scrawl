@@ -84,6 +84,19 @@ pub(crate) struct Tune {
     /// Peak blur (pt) of content entering or leaving in place, and of the shell's edge.
     pub pill_blur: f32,
     pub pill_shell_blur: f32,
+    /// The native capsule's springs, each a duration and a bounce (`model::PillOpts`).
+    pub pill_enter: [f32; 2],
+    pub pill_exit: [f32; 2],
+    pub pill_morph_open: [f32; 2],
+    pub pill_morph_close: [f32; 2],
+    pub pill_highlight_lead: [f32; 2],
+    pub pill_highlight_trail: [f32; 2],
+    /// Reveal anticipation / overshoot (pt).
+    pub pill_punch: f32,
+}
+
+const fn pair(c: crate::native::pill::model::SpringCfg) -> [f32; 2] {
+    [c.duration, c.bounce]
 }
 
 impl Tune {
@@ -103,6 +116,13 @@ impl Tune {
         pill_anchor: 1.0,
         pill_blur: crate::native::pill::model::CONTENT_BLUR_MAX,
         pill_shell_blur: crate::native::pill::model::SHELL_BLUR_MAX,
+        pill_enter: pair(crate::native::pill::model::ENTER_SPRING),
+        pill_exit: pair(crate::native::pill::model::EXIT_SPRING),
+        pill_morph_open: pair(crate::native::pill::model::MORPH_OPEN),
+        pill_morph_close: pair(crate::native::pill::model::MORPH_CLOSE),
+        pill_highlight_lead: pair(crate::native::pill::model::HIGHLIGHT_LEAD),
+        pill_highlight_trail: pair(crate::native::pill::model::HIGHLIGHT_TRAIL),
+        pill_punch: crate::native::pill::model::PUNCH_PT,
     };
 }
 
@@ -187,6 +207,33 @@ pub(super) const KEYS: &[(&str, &str, Field)] = &[
     ("pill.shellBlur", "Capsule edge enter/exit blur (pt)", |t| {
         &mut t.pill_shell_blur
     }),
+    ("pill.enter.duration", "Capsule reveal spring (s)", |t| &mut t.pill_enter[0]),
+    ("pill.enter.bounce", "Capsule reveal bounce", |t| &mut t.pill_enter[1]),
+    ("pill.exit.duration", "Capsule exit spring (s)", |t| &mut t.pill_exit[0]),
+    ("pill.exit.bounce", "Capsule exit bounce", |t| &mut t.pill_exit[1]),
+    ("pill.morph.open.duration", "State morph, growing (s)", |t| &mut t.pill_morph_open[0]),
+    ("pill.morph.open.bounce", "State morph, growing: width bounce", |t| {
+        &mut t.pill_morph_open[1]
+    }),
+    ("pill.morph.close.duration", "State morph, shrinking (s)", |t| {
+        &mut t.pill_morph_close[0]
+    }),
+    ("pill.morph.close.bounce", "State morph, shrinking: width bounce", |t| {
+        &mut t.pill_morph_close[1]
+    }),
+    ("pill.highlight.lead.duration", "Highlight leading edge (s)", |t| {
+        &mut t.pill_highlight_lead[0]
+    }),
+    ("pill.highlight.lead.bounce", "Highlight leading edge bounce", |t| {
+        &mut t.pill_highlight_lead[1]
+    }),
+    ("pill.highlight.trail.duration", "Highlight trailing edge (s)", |t| {
+        &mut t.pill_highlight_trail[0]
+    }),
+    ("pill.highlight.trail.bounce", "Highlight trailing edge bounce", |t| {
+        &mut t.pill_highlight_trail[1]
+    }),
+    ("pill.punch", "Reveal shoots this far past rest (pt, 0 = none)", |t| &mut t.pill_punch),
 ];
 
 /// Numbered presets; 1 is what ships and names nothing.
@@ -238,12 +285,41 @@ pub(super) const PRESETS: &[(&str, &[(&str, f32)])] = &[
     ("Unroll", &[("pill.origin", 2.0)]),
     ("Centred chips", &[("pill.anchor", 0.0)]),
     (
-        "0.3.3 blur",
+        "0.3.3",
         &[
             ("pill.origin", 0.0),
             ("pill.anchor", 0.0),
             ("pill.blur", 5.0),
             ("pill.shellBlur", 4.0),
+            ("pill.punch", 0.0),
+            ("pill.exit.duration", 0.21),
+            ("pill.morph.open.duration", 0.30),
+            ("pill.morph.open.bounce", 0.14),
+            ("pill.morph.close.duration", 0.30),
+            ("pill.morph.close.bounce", 0.0),
+            ("pill.highlight.lead.duration", 0.25),
+        ],
+    ),
+    // The capsule's motion variants (kit-motion workflow): 1 "Today" is "Tuck", what ships.
+    (
+        "Drop",
+        &[
+            ("pill.punch", 0.0),
+            ("pill.morph.open.duration", 0.30),
+            ("pill.morph.open.bounce", 0.0),
+            ("pill.morph.close.duration", 0.25),
+            ("pill.morph.close.bounce", 0.0),
+            ("pill.highlight.lead.duration", 0.25),
+        ],
+    ),
+    (
+        "Punch",
+        &[
+            ("pill.punch", 4.0),
+            ("pill.enter.duration", 0.30),
+            ("pill.exit.duration", 0.24),
+            ("pill.highlight.lead.duration", 0.15),
+            ("pill.highlight.trail.duration", 0.30),
         ],
     ),
 ];
@@ -261,7 +337,8 @@ impl Tune {
 
     /// The native capsule's live options.
     pub fn pill_opts(&self) -> crate::native::pill::model::PillOpts {
-        use crate::native::pill::model::{Origin, PillOpts};
+        use crate::native::pill::model::{Origin, PillOpts, SpringCfg};
+        let cfg = |[d, b]: [f32; 2]| SpringCfg::new(d.max(0.02), b.clamp(0.0, 0.95));
         PillOpts {
             origin: match self.pill_origin.round() as i32 {
                 0 => Origin::Centre,
@@ -271,6 +348,13 @@ impl Tune {
             hold_chips: self.pill_anchor >= 0.5,
             content_blur: self.pill_blur,
             shell_blur: self.pill_shell_blur,
+            enter: cfg(self.pill_enter),
+            exit: cfg(self.pill_exit),
+            morph_open: cfg(self.pill_morph_open),
+            morph_close: cfg(self.pill_morph_close),
+            highlight_lead: cfg(self.pill_highlight_lead),
+            highlight_trail: cfg(self.pill_highlight_trail),
+            punch: self.pill_punch.max(0.0),
         }
     }
 
@@ -874,6 +958,28 @@ mod tests {
             unroll.pill_opts().origin,
             crate::native::pill::model::Origin::Lead
         );
+    }
+
+    #[test]
+    fn every_pill_preset_keeps_to_the_palette() {
+        for n in 1..=PRESETS.len() {
+            let opts = Tune::from_json(&serde_json::json!({ "preset": n })).pill_opts();
+            let name = PRESETS[n - 1].0;
+            if name == "0.3.3" {
+                continue; // the shipped 0.3.3 values, kept to compare against
+            }
+            // Exits run 10–25% shorter than entrances (the palette's morph pair is .38 / .42).
+            let exit = opts.exit.duration / opts.enter.duration;
+            assert!((0.75..=0.9).contains(&exit), "{name}: exit/enter {exit}");
+            let close = opts.morph_close.duration / opts.morph_open.duration;
+            assert!((0.75..=0.91).contains(&close), "{name}: close/open {close}");
+            for c in [opts.enter, opts.exit, opts.morph_open, opts.morph_close, opts.highlight_lead, opts.highlight_trail] {
+                assert!(c.bounce <= 0.16, "{name}: utility bounce {c:?}");
+            }
+            assert_eq!(opts.enter.bounce, 0.0, "{name}: the reveal's punch comes from its curve");
+            assert!(opts.content_blur <= 4.0, "{name}: blur over 4 pt");
+            assert!(opts.highlight_lead.duration <= opts.highlight_trail.duration, "{name}: width leads");
+        }
     }
 
     #[test]
