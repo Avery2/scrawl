@@ -5548,7 +5548,8 @@ fn move_window_to_screen(ns_win: &NSWindow, frame: [f64; 4]) {
 }
 
 fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
-    close_picker_window(cx);
+    // A picker replacing another one keeps the keys.
+    remove_picker_windows(cx);
     let screen = coord_entity.read(cx).display_rect;
     let display = display_at(screen, cx);
     let display_bounds = Bounds {
@@ -5617,6 +5618,7 @@ fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
     // reach the picker while it is. The held switcher takes its keys from the key tap instead,
     // so it leaves the app in front alone.
     if !lab && !coord_entity.read(cx).switcher.is_held() {
+        remember_front_app();
         cx.activate(true);
     }
 
@@ -5745,15 +5747,21 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
 }
 
 fn close_picker_window(cx: &mut App) {
+    if remove_picker_windows(cx) {
+        hand_back_keys(cx);
+    }
+}
+
+fn remove_picker_windows(cx: &mut App) -> bool {
     let mut closed = false;
     for handle in cx.windows() {
         if handle.downcast::<TargetPickerWindow>().is_some() {
-            closed |= handle.update(cx, |_, window, _| window.remove_window()).is_ok();
+            closed |= handle
+                .update(cx, |_, window, _| window.remove_window())
+                .is_ok();
         }
     }
-    if closed {
-        hand_back_keys(cx);
-    }
+    closed
 }
 
 fn close_capture_windows(cx: &mut App) {
@@ -5761,7 +5769,9 @@ fn close_capture_windows(cx: &mut App) {
     for handle in cx.windows() {
         let picker = handle.downcast::<TargetPickerWindow>().is_some();
         if picker || handle.downcast::<HudPillWindow>().is_some() {
-            let closed = handle.update(cx, |_, window, _| window.remove_window()).is_ok();
+            let closed = handle
+                .update(cx, |_, window, _| window.remove_window())
+                .is_ok();
             closed_picker |= picker && closed;
         }
     }
@@ -5770,10 +5780,25 @@ fn close_capture_windows(cx: &mut App) {
     }
 }
 
+/// The app that was in front when `open_picker_windows` activated Scrawl (0: none).
+static PICKER_PREVIOUS_APP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+fn remember_front_app() {
+    use objc2_app_kit::NSWorkspace;
+    let front = NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .map_or(0, |app| app.processIdentifier());
+    if front > 0 && front != std::process::id() as i32 {
+        PICKER_PREVIOUS_APP.store(front, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// `open_picker_windows` activates Scrawl so the picker gets the keys; once it closes, the app
-/// that was in front gets them back (and the window being recorded keeps them), unless the
-/// review window is open.
+/// that was in front gets them back, unless the review window is open. `NSApp.deactivate()`
+/// isn't enough: a menu bar (accessory) app stays frontmost with no windows, and keys go nowhere.
 fn hand_back_keys(cx: &mut App) {
+    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+    let previous = PICKER_PREVIOUS_APP.swap(0, std::sync::atomic::Ordering::AcqRel);
     if cx
         .windows()
         .iter()
@@ -5781,11 +5806,18 @@ fn hand_back_keys(cx: &mut App) {
     {
         return;
     }
-    if let Some(mtm) = MainThreadMarker::new() {
-        let app = NSApplication::sharedApplication(mtm);
-        if app.isActive() {
-            app.deactivate();
-        }
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    if !app.isActive() {
+        return;
+    }
+    let reactivated = previous > 0
+        && NSRunningApplication::runningApplicationWithProcessIdentifier(previous)
+            .is_some_and(|prev| prev.activateWithOptions(NSApplicationActivationOptions::empty()));
+    if !reactivated {
+        app.deactivate();
     }
 }
 
