@@ -272,6 +272,7 @@ unsafe extern "C" {
     fn CGDisplayPixelsHigh(display: u32) -> usize;
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
+    fn AXIsProcessTrusted() -> bool;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -286,6 +287,8 @@ unsafe extern "C" {
     fn CFRunLoopRemoveSource(run_loop: *mut c_void, source: *mut c_void, mode: *const c_void);
     fn CFRunLoopGetCurrent() -> *mut c_void;
     fn CFRunLoopRun();
+    fn CFRunLoopStop(run_loop: *mut c_void);
+    fn CFRetain(value: CfTypeRef) -> CfTypeRef;
     fn CFRelease(value: CfTypeRef);
     static kCFRunLoopCommonModes: *const c_void;
 }
@@ -762,6 +765,12 @@ pub fn request_screen_capture() {
     unsafe {
         let _ = CGRequestScreenCaptureAccess();
     }
+}
+
+/// Whether ⌥⇧V may post ⌘V into the app in front (System Settings › Accessibility). Unlike
+/// Screen Recording, a grant shows up here while Scrawl runs.
+pub fn accessibility_granted() -> bool {
+    unsafe { AXIsProcessTrusted() }
 }
 
 /// The system prompt for Input Monitoring (once; later calls do nothing).
@@ -1861,6 +1870,8 @@ pub struct SharedCaptureTelemetry {
     /// a click landed on Scrawl itself.
     pub passthrough_window_ids: Mutex<Vec<u32>>,
     tap_port: AtomicU64,
+    /// The event tap thread's run loop (retained), so `restart_input_tap` can stop it.
+    tap_run_loop: AtomicU64,
     /// A Screen recording started straight from the shortcut: the overlay flashes an edge glow.
     pub start_glow: AtomicBool,
     /// Whether the event tap is delivering. It can't be enabled without Input Monitoring, and
@@ -1898,6 +1909,7 @@ impl SharedCaptureTelemetry {
             ui_sender,
             passthrough_window_ids: Mutex::new(Vec::new()),
             tap_port: AtomicU64::new(0),
+            tap_run_loop: AtomicU64::new(0),
             tap_live: AtomicBool::new(false),
             start_glow: AtomicBool::new(false),
             last_shortcut_ms: AtomicU64::new(0),
@@ -2251,7 +2263,26 @@ pub fn start_global_input_tap(telemetry: Arc<SharedCaptureTelemetry>) {
     let _ = thread::Builder::new()
         .name("scrawl-hid-poller".into())
         .spawn(move || run_global_hid_poller(hid_telemetry));
+    spawn_event_tap(telemetry);
+}
 
+/// Makes the event tap again after Input Monitoring is granted while Scrawl runs, instead of
+/// asking for a relaunch: a tap made without the grant never gets key events, and macOS doesn't
+/// upgrade it.
+pub fn restart_input_tap(telemetry: &Arc<SharedCaptureTelemetry>) {
+    scrawl_log("Input Monitoring granted; making the event tap again");
+    telemetry.tap_port.store(0, Ordering::Release);
+    let old = telemetry.tap_run_loop.swap(0, Ordering::AcqRel) as *mut c_void;
+    if !old.is_null() {
+        unsafe {
+            CFRunLoopStop(old);
+            CFRelease(old.cast_const());
+        }
+    }
+    spawn_event_tap(Arc::clone(telemetry));
+}
+
+fn spawn_event_tap(telemetry: Arc<SharedCaptureTelemetry>) {
     let _ = thread::Builder::new()
         .name("scrawl-event-tap".into())
         .spawn(move || {
@@ -2281,18 +2312,29 @@ pub fn start_global_input_tap(telemetry: Arc<SharedCaptureTelemetry>) {
             }
             telemetry.tap_port.store(tap as u64, Ordering::Release);
             let source = unsafe { CFMachPortCreateRunLoopSource(ptr::null(), tap, 0) };
-            if !source.is_null() {
-                let run_loop = unsafe { CFRunLoopGetCurrent() };
-                unsafe {
-                    CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
-                    CGEventTapEnable(tap, true);
-                    CFRunLoopRun();
-                    CFRunLoopRemoveSource(run_loop, source, kCFRunLoopCommonModes);
-                    CFRelease(source);
-                }
+            if source.is_null() {
+                return;
             }
-            unsafe { CFRelease(tap) };
-            let _ = unsafe { Arc::from_raw(user_info.cast::<SharedCaptureTelemetry>()) };
+            let run_loop = unsafe { CFRunLoopGetCurrent() };
+            let retained = unsafe { CFRetain(run_loop.cast_const()) } as u64;
+            telemetry.tap_run_loop.store(retained, Ordering::Release);
+            unsafe {
+                CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
+                CGEventTapEnable(tap, true);
+                CFRunLoopRun();
+                // Stopped by `restart_input_tap`. The port and its callback's Arc are left
+                // alive: `check_tap` may still be holding the old pointer.
+                CGEventTapEnable(tap, false);
+                CFRunLoopRemoveSource(run_loop, source, kCFRunLoopCommonModes);
+                CFRelease(source);
+            }
+            if telemetry
+                .tap_run_loop
+                .compare_exchange(retained, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                unsafe { CFRelease(retained as CfTypeRef) };
+            }
         });
 }
 
