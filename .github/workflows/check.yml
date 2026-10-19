@@ -3,7 +3,7 @@ name: Check
 on:
   pull_request:
   push:
-    branches: [main, feat/windows]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
