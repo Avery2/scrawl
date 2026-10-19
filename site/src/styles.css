@@ -690,6 +690,7 @@ kbd {
 .stage-wrap {
   position: relative;
   width: 100%;
+  aspect-ratio: 5 / 3;
   border-radius: 16px;
   overflow: hidden;
   outline: none;
