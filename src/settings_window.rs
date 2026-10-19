@@ -1817,4 +1817,3 @@ impl Render for SettingsWindow {
             .children(self.menu_layer(theme, viewport, cx))
     }
 }
-
