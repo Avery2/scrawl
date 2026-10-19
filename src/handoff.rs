@@ -324,6 +324,12 @@ pub struct Config {
     /// `hex::PREFERRED_MODELS`).
     #[serde(default)]
     pub hex_model: Option<String>,
+    /// Whether to use the native Metal recording pill instead of GPUI's `HudPillWindow` (default `true`).
+    #[serde(default)]
+    pub native_pill: Option<bool>,
+    /// Visual style of the native recording pill: `"black"` (default) or `"glass"` (`NSGlassEffectView`).
+    #[serde(default)]
+    pub pill_style: Option<String>,
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -446,6 +452,30 @@ pub fn hex_model() -> Option<String> {
         .hex_model
         .map(|model| model.trim().to_owned())
         .filter(|model| !model.is_empty())
+}
+
+/// Whether the native AppKit + Metal recording pill is enabled (`SCRAWL_NATIVE_PILL` or
+/// `nativePill` in `config.json`, default `true`).
+pub fn native_pill() -> bool {
+    if let Ok(val) = std::env::var("SCRAWL_NATIVE_PILL") {
+        let s = val.trim().to_ascii_lowercase();
+        if matches!(s.as_str(), "0" | "false" | "gpui" | "off" | "no") {
+            return false;
+        }
+        if matches!(s.as_str(), "1" | "true" | "native" | "metal" | "on" | "yes") {
+            return true;
+        }
+    }
+    config().native_pill.unwrap_or(true)
+}
+
+/// Configured capsule style (`pillStyle` in `config.json`, default `"black"`).
+pub fn pill_style() -> crate::native::pill::PillStyle {
+    config()
+        .pill_style
+        .as_deref()
+        .and_then(crate::native::pill::PillStyle::from_str_opt)
+        .unwrap_or(crate::native::pill::PillStyle::Black)
 }
 
 /// Sets one top-level key in `path`, keeping the rest (and its `0600` mode, since it holds the

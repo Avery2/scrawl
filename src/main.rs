@@ -13,6 +13,7 @@ mod inbox;
 mod keyframes;
 mod laser_overlay;
 mod model;
+mod native;
 mod onboarding;
 mod phone;
 mod render;

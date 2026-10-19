@@ -73,13 +73,13 @@ const PILL_WINDOW_W: f32 = 520.0;
 const PILL_WINDOW_H: f32 = 84.0;
 
 mod lab;
-mod motion;
+pub(crate) mod motion;
 
 pub use lab::{Options as LabOptions, Scene as LabScene, run as run_lab};
 pub(crate) use motion::{TuneAction, tune_command};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Spring {
+pub(crate) struct Spring {
     /// Visual duration in seconds.
     response: f32,
     bounce: f32,
@@ -216,6 +216,7 @@ fn clock_template(clock: &str) -> String {
         .collect()
 }
 
+#[allow(dead_code)]
 fn completed_meta(_duration_ms: u64, frame_count: usize) -> String {
     format!(
         "· {} {} · {}",
@@ -788,7 +789,8 @@ fn find_hud_pill_ns_window() -> Option<Retained<NSWindow>> {
     let app = NSApplication::sharedApplication(mtm);
     for win in app.windows() {
         let size = win.frame().size;
-        if (size.width - f64::from(PILL_WINDOW_W)).abs() < 8.0
+        if ((size.width - f64::from(PILL_WINDOW_W)).abs() < 8.0
+            || (size.width - f64::from(crate::native::pill::model::PANEL_W)).abs() < 8.0)
             && (size.height - f64::from(PILL_WINDOW_H)).abs() < 8.0
         {
             return Some(win);
@@ -822,6 +824,7 @@ fn find_picker_ns_window() -> Option<Retained<NSWindow>> {
         }
         let size = win.frame().size;
         if size.width >= 600.0
+            && size.height >= 200.0
             && (size.width - 1120.0).abs() > 8.0
             && (size.width - f64::from(PILL_WINDOW_W)).abs() > 8.0
         {
@@ -1177,7 +1180,7 @@ impl SelectionMode {
     }
 
     /// Modes shown in the HUD, in order; iPhone only while one is cabled.
-    fn available(has_iphone: bool) -> &'static [SelectionMode] {
+    pub(crate) fn available(has_iphone: bool) -> &'static [SelectionMode] {
         if has_iphone {
             &Self::ALL
         } else {
@@ -1185,7 +1188,7 @@ impl SelectionMode {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Area => "Area",
             Self::Window => "Window",
@@ -1194,7 +1197,7 @@ impl SelectionMode {
         }
     }
 
-    fn icon(self) -> &'static str {
+    pub(crate) fn icon(self) -> &'static str {
         match self {
             Self::Area => crate::icons::AREA,
             Self::Window => crate::icons::WINDOW,
@@ -1213,7 +1216,7 @@ impl SelectionMode {
     }
 
     /// Screen and iPhone need no pointer gesture, so the HUD offers a Record chip for them.
-    fn shows_record(self) -> bool {
+    pub(crate) fn shows_record(self) -> bool {
         matches!(self, Self::Screen | Self::Iphone)
     }
 
@@ -1309,6 +1312,7 @@ pub struct ScrawlCoordinator {
     telemetry: Arc<SharedCaptureTelemetry>,
     active_recording: Option<ActiveRecording>,
     picker_metal_overlay: Option<MetalLaserOverlay>,
+    native_pill: Option<crate::native::pill::NativePill>,
     iphone_preview: Option<PhoneSession>,
     island_phase: IslandPhase,
     island_prev_phase: IslandPhase,
@@ -1413,6 +1417,7 @@ impl ScrawlCoordinator {
             telemetry,
             active_recording: None,
             picker_metal_overlay: None,
+            native_pill: None,
             iphone_preview: None,
             island_phase: IslandPhase::Hidden,
             island_prev_phase: IslandPhase::Hidden,
@@ -1986,6 +1991,7 @@ impl ScrawlCoordinator {
             self.island_y = 0.0;
             self.island_y_velocity = 0.0;
         }
+        self.sync_native_pill();
         cx.notify();
     }
 
@@ -2001,6 +2007,7 @@ impl ScrawlCoordinator {
         self.reveal_since = motion::now();
         self.reveal_outgoing = Some(true);
         self.island_morph = Morph::RevealClose;
+        self.sync_native_pill();
     }
 
     /// A switch chip on a tap-started recording. Screen keeps it. Anything else drops the few
@@ -2375,6 +2382,101 @@ impl ScrawlCoordinator {
             motion::trace_event(format!("phase:{}", phase.trace_name()));
         }
         self.island_phase = phase;
+        if crate::handoff::native_pill() {
+            if !matches!(phase, IslandPhase::Hidden) {
+                self.ensure_native_pill();
+            }
+            self.sync_native_pill();
+        }
+    }
+
+    pub(crate) fn ensure_native_pill(&mut self) {
+        if !crate::handoff::native_pill() || self.native_pill.is_some() {
+            return;
+        }
+        match crate::native::pill::NativePill::open() {
+            Ok(pill) => {
+                let num = pill.window_number();
+                if num > 0 {
+                    self.telemetry
+                        .excluded_window_ids
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(num);
+                }
+                self.native_pill = Some(pill);
+            }
+            Err(err) => {
+                scrawl_log(format!("NativePill::open error: {err}"));
+            }
+        }
+    }
+
+    fn pill_snapshot(&self) -> crate::native::pill::PillSnapshot {
+        use crate::native::pill::{PillSnapshot, PillStyle, model::Pres};
+        let recording_ms = self
+            .active_recording
+            .as_ref()
+            .map(ActiveRecording::elapsed_ms);
+        let elapsed_ms = recording_ms.unwrap_or(self.last_elapsed_ms);
+        let clock = format_clock(elapsed_ms);
+        let has_iphone = self.iphone.is_some();
+        let stroke_count = self
+            .telemetry
+            .strokes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|s| !s.laser)
+            .count();
+
+        let pres = match self.island_phase {
+            IslandPhase::Hidden | IslandPhase::Dismissing => Pres::Hidden,
+            IslandPhase::Selecting { mode } => Pres::Selecting {
+                mode,
+                hold: self.hold_picker,
+                has_iphone,
+            },
+            IslandPhase::Recording => Pres::Recording {
+                chips: self.reveal.is_open(),
+                has_iphone,
+                stroke_count,
+            },
+            IslandPhase::Processing => Pres::Processing,
+            IslandPhase::Completed { inbox_count, .. } => Pres::Completed {
+                label: completed_label(inbox_count, self.completed_note.as_deref()),
+            },
+        };
+        PillSnapshot {
+            pres,
+            clock,
+            reduced_motion: self.reduced_motion,
+            style: PillStyle::current(),
+        }
+    }
+
+    pub(crate) fn sync_native_pill(&mut self) {
+        if self.native_pill.is_some() {
+            let snap = self.pill_snapshot();
+            if let Some(ref pill) = self.native_pill {
+                pill.sync(snap);
+            }
+        }
+    }
+
+    fn apply_pill_action(&mut self, action: crate::native::pill::PillAction, cx: &mut Context<Self>) {
+        use crate::native::pill::PillAction;
+        match action {
+            PillAction::SelectMode(mode) => self.click_selection_mode(mode, cx),
+            PillAction::SwitchRecording(mode) => self.switch_recording(mode, cx),
+            PillAction::RecordSelected => self.record_selected_mode(cx),
+            PillAction::Undo => self.undo_stroke(cx),
+            PillAction::Cancel => self.cancel_recording(cx),
+            PillAction::Finish => self.finish_recording(cx),
+            PillAction::Paste(target) => self.paste_completed_bundle(target, cx),
+            PillAction::Inspect => self.inspect_completed_bundle(cx),
+            PillAction::DismissCompleted => self.dismiss_completed_bundle(cx),
+        }
     }
 
     pub fn dismiss_island(&mut self, cx: &mut Context<Self>) {
@@ -2506,6 +2608,11 @@ impl ScrawlCoordinator {
     /// coming, and the capsule calls it as it draws, so every frame shows its own moment rather
     /// than the loop's last tick (up to 8 ms stale, which made the steps uneven).
     pub fn step_island(&mut self, cx: &mut Context<Self>) {
+        if let Some(actions) = self.native_pill.as_ref().map(|p| p.drain_actions()) {
+            for action in actions {
+                self.apply_pill_action(action, cx);
+            }
+        }
         let tune = motion::tune();
         let real = self.island_stepped.elapsed().as_secs_f32();
         if real < 0.0002 {
@@ -2565,9 +2672,13 @@ impl ScrawlCoordinator {
 
         if self.reveal.is_open() {
             let activity = self.reveal_activity();
+            let on_pill = self
+                .native_pill
+                .as_ref()
+                .map_or_else(pointer_on_hud_pill, |p| p.pointer_on_pill());
             if self
                 .reveal
-                .tick(reveal_clock_ms(), pointer_on_hud_pill(), activity)
+                .tick(reveal_clock_ms(), on_pill, activity)
             {
                 self.play_fold();
             }
@@ -2622,13 +2733,21 @@ impl ScrawlCoordinator {
         self.island_y = y_off.clamp(-18.0, 14.0);
         self.island_y_velocity = y_vel;
         self.island_opacity += (target_opacity - self.island_opacity) * (fade_rate * dt).min(1.0);
+        self.sync_native_pill();
 
-        if matches!(self.island_phase, IslandPhase::Dismissing) && self.island_opacity < 0.03 {
+        let dismiss_done = if let Some(ref pill) = self.native_pill {
+            pill.is_fully_hidden()
+        } else {
+            self.island_opacity < 0.03
+        };
+        if matches!(self.island_phase, IslandPhase::Dismissing) && dismiss_done {
             self.set_island_phase(IslandPhase::Hidden);
             self.island_opacity = 0.0;
             cx.defer(close_capture_windows);
         }
-        cx.notify();
+        if self.native_pill.is_none() {
+            cx.notify();
+        }
     }
 
     /// The menu bar's picker, opening on the mode the last recording used.
@@ -5270,6 +5389,13 @@ fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
 }
 
 fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
+    if crate::handoff::native_pill() {
+        let _ = coord_entity.update(cx, |coord, _| {
+            coord.ensure_native_pill();
+            coord.sync_native_pill();
+        });
+        return;
+    }
     for handle in cx.windows() {
         if let Some(pill) = handle.downcast::<HudPillWindow>() {
             let _ = pill.update(cx, |view, _, cx| {

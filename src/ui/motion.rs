@@ -26,16 +26,16 @@ thread_local! {
 }
 
 /// Animation time in seconds. Every capsule age reads this, so a time scale slows them all.
-pub(super) fn now() -> f64 {
+pub(crate) fn now() -> f64 {
     CLOCK.with_borrow(|c| c.base + c.anchor.elapsed().as_secs_f64() * c.scale)
 }
 
 /// Animation seconds since `since` (a `now()` reading).
-pub(super) fn age(since: f64) -> f32 {
+pub(crate) fn age(since: f64) -> f32 {
     (now() - since).max(0.0) as f32
 }
 
-pub(super) fn time_scale() -> f32 {
+pub(crate) fn time_scale() -> f32 {
     CLOCK.with_borrow(|c| c.scale as f32)
 }
 
@@ -57,7 +57,7 @@ fn set_time_scale(scale: f64) {
 
 /// Every value Kit judges by eye. `DEFAULT` is what ships; `tune.json` overrides it live.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct Tune {
+pub(crate) struct Tune {
     /// Width spring for a phase change (picker, recording, processing, done).
     pub island: Spring,
     /// Open/close scale and drop of the whole capsule.
@@ -75,6 +75,8 @@ pub(super) struct Tune {
     pub reveal_exit_s: f32,
     pub reveal_blur_px: f32,
     pub time_scale: f32,
+    /// Capsule style override (`-1.0` = use config, `0.0` = black, `1.0` = glass).
+    pub pill_glass: f32,
 }
 
 impl Tune {
@@ -89,6 +91,7 @@ impl Tune {
         reveal_exit_s: 0.13,
         reveal_blur_px: 2.5,
         time_scale: 1.0,
+        pill_glass: -1.0,
     };
 }
 
@@ -152,6 +155,11 @@ pub(super) const KEYS: &[(&str, &str, Field)] = &[
         "Animation time scale (0.25 = slow motion)",
         |t| &mut t.time_scale,
     ),
+    (
+        "pill.glass",
+        "Capsule style (-1 = config, 0 = black, 1 = glass)",
+        |t| &mut t.pill_glass,
+    ),
 ];
 
 /// Numbered presets; 1 is what ships and names nothing.
@@ -198,9 +206,20 @@ pub(super) const PRESETS: &[(&str, &[(&str, f32)])] = &[
             ("switch.slide.bounce", 0.08),
         ],
     ),
+    ("Glass", &[("pill.glass", 1.0)]),
 ];
 
 impl Tune {
+    pub fn pill_style_override(&self) -> Option<crate::native::pill::PillStyle> {
+        if self.pill_glass >= 0.5 {
+            Some(crate::native::pill::PillStyle::Glass)
+        } else if self.pill_glass >= -0.5 {
+            Some(crate::native::pill::PillStyle::Black)
+        } else {
+            None
+        }
+    }
+
     pub fn get(&self, key: &str) -> Option<f32> {
         let mut copy = *self;
         KEYS.iter()
@@ -229,7 +248,15 @@ impl Tune {
         }
         if let Some(map) = value.as_object() {
             for (key, v) in map {
-                if let Some(v) = v.as_f64() {
+                if key == "pillStyle"
+                    && let Some(s) = v.as_str()
+                    && let Some(style) = crate::native::pill::PillStyle::from_str_opt(s)
+                {
+                    tune.pill_glass = match style {
+                        crate::native::pill::PillStyle::Black => 0.0,
+                        crate::native::pill::PillStyle::Glass => 1.0,
+                    };
+                } else if let Some(v) = v.as_f64() {
                     tune.set(key, v as f32);
                 }
             }
@@ -254,6 +281,7 @@ impl Tune {
         self.reveal_exit_s = self.reveal_exit_s.clamp(0.0, 2.0);
         self.reveal_blur_px = self.reveal_blur_px.clamp(0.0, 8.0);
         self.time_scale = self.time_scale.clamp(0.02, 4.0);
+        self.pill_glass = self.pill_glass.clamp(-1.0, 1.0);
     }
 }
 
@@ -279,13 +307,13 @@ thread_local! {
 }
 
 /// The live values. One thread-local read; `DEFAULT` unless a tune file is loaded.
-pub(super) fn tune() -> Tune {
+pub(crate) fn tune() -> Tune {
     CURRENT.get()
 }
 
 /// Re-reads `tune.json` if it changed (checked at most four times a second). Debug builds only,
 /// so a release never picks up a stray file.
-pub(super) fn poll_tune() {
+pub(crate) fn poll_tune() {
     if !cfg!(debug_assertions) {
         return;
     }
@@ -528,12 +556,12 @@ fn trace_target() -> Option<&'static PathBuf> {
 }
 
 /// Whether a trace is being written. One `OnceLock` read when off.
-pub(super) fn tracing() -> bool {
+pub(crate) fn tracing() -> bool {
     trace_target().is_some()
 }
 
 /// Opens the trace (once): a motion-lint header sized to the main display in points.
-pub(super) fn trace_open(launch: &str, display: [f32; 2]) {
+pub(crate) fn trace_open(launch: &str, display: [f32; 2]) {
     let Some(path) = trace_target() else { return };
     TRACE.with_borrow_mut(|slot| {
         if slot.is_some() {
@@ -569,7 +597,7 @@ pub(super) fn trace_open(launch: &str, display: [f32; 2]) {
 }
 
 /// An app event (a phase change, a chip click), written with the next frame.
-pub(super) fn trace_event(event: impl Into<String>) {
+pub(crate) fn trace_event(event: impl Into<String>) {
     if !tracing() {
         return;
     }
@@ -583,7 +611,7 @@ pub(super) fn trace_event(event: impl Into<String>) {
 /// Starts a frame: the previous one (now complete, its prepaint bounds included) is written.
 /// Ends the frame in progress without starting one: what is drawn until the next
 /// `trace_frame` isn't recorded (a new window's first frame, drawn fully transparent).
-pub(super) fn trace_skip_frame() {
+pub(crate) fn trace_skip_frame() {
     TRACE.with_borrow_mut(|slot| {
         if let Some(trace) = slot.as_mut() {
             trace.flush_pending();
@@ -591,7 +619,7 @@ pub(super) fn trace_skip_frame() {
     });
 }
 
-pub(super) fn trace_frame() {
+pub(crate) fn trace_frame() {
     TRACE.with_borrow_mut(|slot| {
         let Some(trace) = slot.as_mut() else { return };
         trace.flush_pending();
@@ -605,7 +633,7 @@ pub(super) fn trace_frame() {
 
 /// An element's box in screen points (top-left origin), drawn opacity and corner radius, and
 /// the clip it's drawn inside.
-pub(super) fn trace_element(
+pub(crate) fn trace_element(
     key: impl Into<String>,
     rect: [f32; 4],
     alpha: f32,
@@ -634,7 +662,7 @@ fn visible(rect: [f32; 4], clip: [f32; 4]) -> Option<[f32; 4]> {
 }
 
 /// A scalar per frame: `kind` is motion-lint's `level`, `phase` or `position`.
-pub(super) fn trace_channel(name: &'static str, kind: &'static str, value: f32) {
+pub(crate) fn trace_channel(name: &'static str, kind: &'static str, value: f32) {
     TRACE.with_borrow_mut(|slot| {
         if let Some(pending) = slot.as_mut().and_then(|t| t.pending.as_mut()) {
             pending.channels.push((name, kind, value));
@@ -643,7 +671,7 @@ pub(super) fn trace_channel(name: &'static str, kind: &'static str, value: f32) 
 }
 
 /// Writes the last frame and closes the file.
-pub(super) fn trace_close() {
+pub(crate) fn trace_close() {
     TRACE.with_borrow_mut(|slot| {
         if let Some(mut trace) = slot.take() {
             trace.flush_pending();

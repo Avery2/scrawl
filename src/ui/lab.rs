@@ -36,6 +36,10 @@ pub enum Scene {
     HoldSwitcher,
     /// Tap, chips fold, finish: processing, then done, then dismissed.
     Finish,
+    /// Tap: recording + chips, then cancel straight from the recording.
+    Cancel,
+    /// Open the picker, then dismiss it.
+    Dismiss,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -58,6 +62,8 @@ impl Scene {
             Self::TapThenScreen => "tap-then-screen",
             Self::HoldSwitcher => "hold-switcher",
             Self::Finish => "finish",
+            Self::Cancel => "cancel",
+            Self::Dismiss => "dismiss",
         }
     }
 
@@ -98,6 +104,8 @@ impl Scene {
                 (2.0, Step::Finish),
                 (2.0 + PROCESSING_S + 1.4, Step::Dismiss),
             ],
+            Self::Cancel => vec![(0.0, Step::Tap), (1.2, Step::Cancel)],
+            Self::Dismiss => vec![(0.0, Step::HoldOpen), (1.2, Step::Dismiss)],
         }
     }
 }
@@ -170,6 +178,7 @@ pub fn run(options: Options) {
         if options.backdrop {
             open_backdrop(display, cx);
         }
+        coordinator.update(cx, |coord, _| coord.ensure_native_pill());
         // For screen recordings (`perf/pill/record.sh`): the backdrop's rect in screen points.
         println!(
             "region {},{},{},{}",
@@ -226,17 +235,85 @@ pub fn run(options: Options) {
     });
 }
 
-struct Backdrop;
+struct Backdrop {
+    theme: String,
+}
 
 impl Render for Backdrop {
     fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
-        div().size_full().bg(rgb(0xd9d9de))
+        match self.theme.as_str() {
+            "light" | "white" => div()
+                .size_full()
+                .bg(rgb(0xfafafc))
+                .flex()
+                .flex_col()
+                .justify_center()
+                .gap(px(8.0))
+                .px(px(28.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(div().w(px(84.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x1e293b)))
+                        .child(div().w(px(56.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x3b82f6)))
+                        .child(div().w(px(128.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xcbd5e1)))
+                        .child(div().w(px(72.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x10b981)))
+                        .child(div().w(px(140.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x94a3b8))),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(12.0))
+                        .child(div().w(px(110.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0xe2e8f0)))
+                        .child(div().w(px(96.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0x64748b)))
+                        .child(div().w(px(64.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0xf59e0b)))
+                        .child(div().w(px(150.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0xcbd5e1)))
+                        .child(div().w(px(80.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0x334155))),
+                ),
+            "dark" | "busy-dark" => div()
+                .size_full()
+                .bg(rgb(0x0f1117))
+                .flex()
+                .flex_col()
+                .justify_center()
+                .gap(px(8.0))
+                .px(px(28.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(div().w(px(76.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xf43f5e)))
+                        .child(div().w(px(112.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x38bdf8)))
+                        .child(div().w(px(68.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xfbbf24)))
+                        .child(div().w(px(124.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xe2e8f0)))
+                        .child(div().w(px(92.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xa855f7))),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(12.0))
+                        .child(div().w(px(104.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0x34d399)))
+                        .child(div().w(px(88.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0x94a3b8)))
+                        .child(div().w(px(136.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0x60a5fa)))
+                        .child(div().w(px(64.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0xf97316)))
+                        .child(div().w(px(96.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0xcbd5e1))),
+                ),
+            _ => div().size_full().bg(rgb(0xd9d9de)),
+        }
     }
 }
 
 /// A plain light panel behind the capsule's window, so recordings don't show whatever is on the
 /// desktop. It takes no input.
 fn open_backdrop(display: [f32; 2], cx: &mut App) {
+    let theme = std::env::var("SCRAWL_LAB_BACKDROP")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
     let w = BACKDROP[2];
     let h = BACKDROP[3];
     let bounds = Bounds {
@@ -256,7 +333,7 @@ fn open_backdrop(display: [f32; 2], cx: &mut App) {
             window_background: WindowBackgroundAppearance::Opaque,
             ..Default::default()
         },
-        |_, cx| cx.new(|_| Backdrop),
+        move |_, cx| cx.new(|_| Backdrop { theme }),
     );
     if opened.is_err() {
         return;
@@ -266,7 +343,7 @@ fn open_backdrop(display: [f32; 2], cx: &mut App) {
             let f = win.frame().size;
             if (f.width - f64::from(w)).abs() < 1.0 && (f.height - f64::from(h)).abs() < 1.0 {
                 win.setStyleMask(objc2_app_kit::NSWindowStyleMask::Borderless);
-                super::configure_floating_window(&win, true, 2);
+                super::configure_floating_window(&win, true, 4);
             }
         }
     }

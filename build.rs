@@ -23,11 +23,20 @@ fn main() {
 }
 
 fn compile_laser_shader() {
+    for (src_rel, name) in [
+        ("src/laser_overlay.metal", "laser_overlay"),
+        ("src/native/pill/pill.metal", "pill"),
+    ] {
+        compile_metal_shader(src_rel, name);
+    }
+}
+
+fn compile_metal_shader(src_rel: &str, name: &str) {
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let output_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-    let source = manifest_dir.join("src/laser_overlay.metal");
-    let air = output_dir.join("laser_overlay.air");
-    let library = output_dir.join("laser_overlay.metallib");
+    let source = manifest_dir.join(src_rel);
+    let air = output_dir.join(format!("{name}.air"));
+    let library = output_dir.join(format!("{name}.metallib"));
     println!("cargo:rerun-if-changed={}", source.display());
 
     let metal = Command::new("xcrun")
@@ -36,8 +45,8 @@ fn compile_laser_shader() {
         .arg("-o")
         .arg(&air)
         .status()
-        .expect("xcrun metal is required to build the laser overlay shader");
-    assert!(metal.success(), "Metal shader compilation failed");
+        .expect("xcrun metal is required to build Metal shaders");
+    assert!(metal.success(), "Metal shader compilation failed for {src_rel}");
 
     let metallib = Command::new("xcrun")
         .args(["--sdk", "macosx", "metallib"])
@@ -45,8 +54,8 @@ fn compile_laser_shader() {
         .arg("-o")
         .arg(&library)
         .status()
-        .expect("xcrun metallib is required to build the laser overlay shader");
-    assert!(metallib.success(), "Metal library creation failed");
+        .expect("xcrun metallib is required to build Metal shaders");
+    assert!(metallib.success(), "Metal library creation failed for {src_rel}");
 }
 
 /// Builds `scrawl-helper` (Swift: SpeechAnalyzer, iPhone capture, movie decoding) beside the
