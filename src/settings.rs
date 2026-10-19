@@ -2046,6 +2046,8 @@ mod tests {
         assert_eq!(parse(r#"{"action":"uninstall-cli"}"#), Action::UninstallCli);
     }
 
+    /// Links are a unix thing; Windows has no Scrawl.app to link (`State::Unavailable`).
+    #[cfg(unix)]
     #[test]
     fn the_command_line_row_installs_uninstalls_and_says_why_not() {
         let dir = TempDir::new("cli");
