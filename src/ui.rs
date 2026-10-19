@@ -5327,6 +5327,7 @@ pub fn run_app(
         platform::start_updates();
         crate::retention::start();
         crate::hex::watch();
+        crate::speech_model::ensure();
         let menu_rx = install_status_bar();
 
         // Onboarding opens on first launch, or for a permission that went away.

@@ -93,6 +93,16 @@ impl CandidateBuffer {
         self.interval *= 2;
     }
 
+    /// Forgets frames taken after `t_ms`, except the first.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn drop_since(&mut self, t_ms: u64) {
+        let mut index = 0;
+        self.frames.retain(|(frame, _)| {
+            index += 1;
+            index == 1 || frame.t_ms <= t_ms
+        });
+    }
+
     pub fn into_frames(self) -> Vec<RgbaFrame> {
         self.frames.into_iter().map(|(f, _)| f).collect()
     }
@@ -956,6 +966,13 @@ impl SharedCaptureTelemetry {
     fn pointer_down(&self, t_ms: u64, screen_x: f64, screen_y: f64) {
         if !self.contains_screen_point(screen_x, screen_y) {
             return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let raw = objc2::rc::autoreleasepool(|_| crate::windows::raw_windows());
+            if crate::windows::system_prompt_at(&raw, screen_x, screen_y) {
+                return;
+            }
         }
         let (nx, ny, _, _) = self.normalize_point(screen_x, screen_y);
         self.window_log_request.store(true, Ordering::Release);
@@ -1874,6 +1891,21 @@ mod tests {
         assert!(buffer.len() < 60);
         assert_eq!(buffer.interval(), FRAME_SAMPLE_INTERVAL * 2);
         assert!(buffer.into_frames().iter().any(|f| f.t_ms == 33 * 220));
+    }
+
+    #[test]
+    fn frames_that_may_show_a_system_prompt_are_dropped_but_never_the_first() {
+        let mut buffer = CandidateBuffer::new(1 << 20);
+        for t in [0, 220, 440, 660, 880] {
+            buffer.push(RgbaFrame::new(t, 4, 4, vec![0; 64]), false);
+        }
+        buffer.drop_since(440);
+        let times: Vec<u64> = buffer.into_frames().iter().map(|f| f.t_ms).collect();
+        assert_eq!(times, [0, 220, 440]);
+        let mut buffer = CandidateBuffer::new(1 << 20);
+        buffer.push(RgbaFrame::new(500, 4, 4, vec![0; 64]), false);
+        buffer.drop_since(0);
+        assert_eq!(buffer.len(), 1);
     }
 
     #[test]
