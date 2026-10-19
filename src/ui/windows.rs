@@ -54,6 +54,21 @@ pub(super) fn display_at(
         .or_else(|| cx.primary_display())
 }
 
+/// A window covering the monitor at `frame` (global pixels) lays out in DIPs: the display's size.
+pub(super) fn layout_size(
+    frame: [f32; 4],
+    display: Option<&dyn gpui::PlatformDisplay>,
+) -> gpui::Size<gpui::Pixels> {
+    display.map_or_else(
+        || {
+            let [x, y, w, h] = frame.map(f64::from);
+            let scale = win::monitor_at(x + w / 2.0, y + h / 2.0).map_or(1.0, |m| m.scale) as f32;
+            gpui::size(px(frame[2] / scale), px(frame[3] / scale))
+        },
+        |d| d.bounds().size,
+    )
+}
+
 /// GPUI lays displays out in DIPs: the one whose origin, scaled, is the monitor's.
 pub(crate) fn gpui_display_for(
     monitor: &win::Monitor,

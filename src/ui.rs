@@ -1617,10 +1617,11 @@ impl ScrawlCoordinator {
     /// Picker keyboard map, shared by the picker window and the HUD pill. Returns whether the
     /// key was handled.
     /// ⌘Q and ⌘, in Scrawl's own windows: a menu bar (accessory) app has no main menu to
-    /// carry them.
+    /// carry them (Ctrl+Q and Ctrl+, on Windows).
     pub fn handle_app_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
         let mods = keystroke.modifiers;
-        if !mods.platform || mods.control || mods.alt || mods.shift {
+        // `secondary` is ⌘ on macOS and Ctrl elsewhere; the other of the two must be up.
+        if !mods.secondary() || (mods.control && mods.platform) || mods.alt || mods.shift {
             return false;
         }
         match keystroke.key.as_str() {
@@ -4269,7 +4270,7 @@ impl Render for BundleReviewWindow {
                     let key = event.keystroke.key.as_str();
                     if !handled
                         && (key == "escape"
-                            || (event.keystroke.modifiers.platform
+                            || (event.keystroke.modifiers.secondary()
                                 && key.eq_ignore_ascii_case("w")))
                     {
                         window.remove_window();
@@ -4898,7 +4899,7 @@ fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
     let display = platform::display_at(screen, cx);
     let display_bounds = Bounds {
         origin: Point::default(),
-        size: size(px(screen[2]), px(screen[3])),
+        size: platform::layout_size(screen, display.as_deref()),
     };
     let display_id = display.as_ref().map(|d| d.id());
     let lab = coord_entity.read(cx).lab;
@@ -5115,7 +5116,8 @@ fn open_review_window(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(gpui::TitlebarOptions {
-                title: Some("Scrawl".into()),
+                // The taskbar and Alt+Tab show it on Windows; macOS draws no title here.
+                title: cfg!(target_os = "windows").then(|| "Scrawl".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(16.0), px(16.0))),
             }),

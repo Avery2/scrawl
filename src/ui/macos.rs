@@ -46,6 +46,14 @@ pub(super) fn display_at(
         .or_else(|| cx.primary_display())
 }
 
+/// A window covering the screen at `frame` lays out at its size: global coordinates are points.
+pub(super) fn layout_size(
+    frame: [f32; 4],
+    _display: Option<&dyn gpui::PlatformDisplay>,
+) -> gpui::Size<gpui::Pixels> {
+    gpui::size(gpui::px(frame[2]), gpui::px(frame[3]))
+}
+
 /// Moves a window to cover the screen at `frame` (global points).
 fn move_window_to_screen(ns_win: &NSWindow, frame: [f64; 4]) {
     let Some(mtm) = MainThreadMarker::new() else {
