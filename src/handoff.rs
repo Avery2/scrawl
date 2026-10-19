@@ -331,8 +331,59 @@ pub struct Config {
     #[serde(default)]
     pub pill_style: Option<String>,
     /// Behaviour Kit tries locally before it ships (`{"agentContext": true}`); see `experiment`.
-    #[serde(default)]
+    /// Read leniently (`lenient_experiments`), so a stray value never fails the file.
+    #[serde(default, deserialize_with = "lenient_experiments")]
     pub experiments: std::collections::BTreeMap<String, bool>,
+}
+
+/// `true`/`false`, `"yes"`/`"on"`/`"1"` and their opposites, or a number (non-zero is on). Other
+/// values are skipped and logged once, as is an `experiments` that isn't an object.
+fn lenient_experiments<'de, D>(
+    deserializer: D,
+) -> std::result::Result<std::collections::BTreeMap<String, bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+    let value = Value::deserialize(deserializer)?;
+    let mut out = std::collections::BTreeMap::new();
+    let Value::Object(map) = value else {
+        if !value.is_null() {
+            log_config_once(format!("config.json: ignoring \"experiments\": {value} (expected an object)"));
+        }
+        return Ok(out);
+    };
+    for (name, value) in map {
+        let on = match &value {
+            Value::Bool(b) => Some(*b),
+            Value::Number(n) => n.as_f64().map(|n| n != 0.0),
+            Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" | "yes" | "on" | "1" => Some(true),
+                "false" | "no" | "off" | "0" | "" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        };
+        match on {
+            Some(on) => {
+                out.insert(name, on);
+            }
+            None => log_config_once(format!(
+                "config.json: ignoring experiment \"{name}\": {value} (expected true or false)"
+            )),
+        }
+    }
+    Ok(out)
+}
+
+/// Config problems are logged once per process, not on every read.
+fn log_config_once(message: String) {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !seen.contains(&message) {
+        crate::capture::scrawl_log(&message);
+        seen.push(message);
+    }
 }
 
 /// More of what Scrawl already knows in the summary and on the frames: marks, shortcuts, drags
@@ -380,8 +431,31 @@ pub fn default_config_path() -> PathBuf {
 pub fn load_config_from(path: &Path) -> Config {
     fs::read(path)
         .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .map(config_from_value)
         .unwrap_or_default()
+}
+
+/// The config in `value`. A key whose value doesn't fit (`"autoSend": "maybe"`) is dropped and
+/// logged on its own, so one bad setting never resets the others to their defaults.
+fn config_from_value(value: serde_json::Value) -> Config {
+    let serde_json::Value::Object(map) = value else {
+        return Config::default();
+    };
+    if let Ok(config) = serde_json::from_value(serde_json::Value::Object(map.clone())) {
+        return config;
+    }
+    // Add keys one at a time, keeping each only if everything so far still reads.
+    let mut kept = serde_json::Map::new();
+    for (key, value) in map {
+        kept.insert(key.clone(), value.clone());
+        if let Err(error) = serde_json::from_value::<Config>(serde_json::Value::Object(kept.clone()))
+        {
+            kept.remove(&key);
+            log_config_once(format!("config.json: ignoring \"{key}\": {error}"));
+        }
+    }
+    serde_json::from_value(serde_json::Value::Object(kept)).unwrap_or_default()
 }
 
 fn config() -> Config {
@@ -1417,6 +1491,29 @@ mod tests {
     }
 
     #[test]
+    fn one_bad_setting_never_resets_the_others() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("config.json");
+        fs::write(
+            &path,
+            r#"{"agentHost": "studio", "autoSend": "maybe", "usbApps": "not-a-list", "videoExport": true, "nativePill": 3, "pillStyle": "glass", "unknown": {"x": 1}}"#,
+        )
+        .unwrap();
+        let cfg = load_config_from(&path);
+        assert_eq!(cfg.agent_host.as_deref(), Some("studio"));
+        assert_eq!(cfg.video_export, Some(true));
+        assert_eq!(cfg.pill_style.as_deref(), Some("glass"));
+        assert_eq!(cfg.auto_send, None);
+        assert_eq!(cfg.native_pill, None);
+        assert!(cfg.usb_apps.is_empty());
+        // Both spellings of one field: one is kept rather than neither.
+        fs::write(&path, r#"{"usbApps": ["a"], "tetherApps": ["b"], "agentHost": "pro"}"#).unwrap();
+        let cfg = load_config_from(&path);
+        assert_eq!(cfg.agent_host.as_deref(), Some("pro"));
+        assert_eq!(cfg.usb_apps.len(), 1);
+    }
+
+    #[test]
     fn experiments_are_read_from_config_and_off_by_default() {
         let fixture = Fixture::new();
         let path = fixture.0.join("config.json");
@@ -1429,6 +1526,22 @@ mod tests {
         assert_eq!(cfg.experiments.get(AGENT_CONTEXT), Some(&true));
         assert_eq!(cfg.experiments.get("other"), Some(&false));
         assert!(Config::default().experiments.is_empty());
+        // A bad value skips that experiment, never the file.
+        fs::write(
+            &path,
+            r#"{"autoSend": false, "experiments": {"agentContext": "yes", "a": 1, "b": "maybe", "c": [1], "d": "off"}}"#,
+        )
+        .unwrap();
+        let cfg = load_config_from(&path);
+        assert_eq!(cfg.auto_send, Some(false));
+        assert_eq!(cfg.experiments.get(AGENT_CONTEXT), Some(&true));
+        assert_eq!(cfg.experiments.get("a"), Some(&true));
+        assert_eq!(cfg.experiments.get("d"), Some(&false));
+        assert!(!cfg.experiments.contains_key("b") && !cfg.experiments.contains_key("c"));
+        fs::write(&path, r#"{"autoSend": false, "experiments": true}"#).unwrap();
+        let cfg = load_config_from(&path);
+        assert_eq!(cfg.auto_send, Some(false));
+        assert!(cfg.experiments.is_empty());
         // Tests never read Kit's config, only what this process turned on.
         assert!(!experiment("neverEnabled"));
         enable_experiment("enabledForThisTest");
