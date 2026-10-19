@@ -642,3 +642,7 @@ taskpolicy -c utility cargo test -j 3 --offline -- --test-threads=2
   slow uploads, no network, and retries).
 - **Transcription:** `scrawl-helper transcribe <wav or movie>` prints words with timings;
   `scrawl reprocess <bundle> --out …` reruns transcription and keyframe selection on a real bundle.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
