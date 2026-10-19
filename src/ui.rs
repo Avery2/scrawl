@@ -2495,6 +2495,34 @@ impl ScrawlCoordinator {
         cx.notify();
     }
 
+    /// The picker's mouse-up, inside its window or not: ends an area drag.
+    fn picker_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        let [sx, sy] = current_mouse_screen()
+            .unwrap_or([f32::from(event.position.x), f32::from(event.position.y)]);
+        // The held switcher keeps the area until ⌥⇧ is released.
+        if self.hold_picker {
+            if self.selection_mode() == Some(SelectionMode::Area)
+                && let Some((start, _)) = self.selection_drag
+            {
+                self.selection_drag = Some((start, [sx, sy]));
+            } else {
+                self.selection_drag = None;
+            }
+            self.sync_picker_overlay();
+            cx.notify();
+            return;
+        }
+        if let Some((start, _)) = self.selection_drag.take() {
+            if let Some([x, y, w, h]) = area_rect(start, [sx, sy], self.display_rect) {
+                let target = region_target(x, y, w, h, &self.selectable_windows);
+                self.start_recording_with_target(target, cx);
+            } else {
+                self.sync_picker_overlay();
+                cx.notify();
+            }
+        }
+    }
+
     pub(crate) fn ensure_native_pill(&mut self) {
         if !crate::handoff::native_pill() || self.native_pill.is_some() {
             return;
@@ -4688,35 +4716,18 @@ impl Render for TargetPickerWindow {
                 }
             });
         })
-        .on_mouse_up(
+        .on_mouse_up(MouseButton::Left, {
+            let c_up = c_up.clone();
+            move |event: &MouseUpEvent, _window, cx| {
+                c_up.update(cx, |coord, cx| coord.picker_mouse_up(event, cx));
+            }
+        })
+        // A drag released past the picker's display (on another one) ends there too, at the
+        // display's edge: the window that saw the press gets the release, outside its bounds.
+        .on_mouse_up_out(
             MouseButton::Left,
             move |event: &MouseUpEvent, _window, cx| {
-                let [sx, sy] = current_mouse_screen()
-                    .unwrap_or([f32::from(event.position.x), f32::from(event.position.y)]);
-                c_up.update(cx, |coord, cx| {
-                    // The held switcher keeps the area until ⌥⇧ is released.
-                    if coord.hold_picker {
-                        if coord.selection_mode() == Some(SelectionMode::Area)
-                            && let Some((start, _)) = coord.selection_drag
-                        {
-                            coord.selection_drag = Some((start, [sx, sy]));
-                        } else {
-                            coord.selection_drag = None;
-                        }
-                        coord.sync_picker_overlay();
-                        cx.notify();
-                        return;
-                    }
-                    if let Some((start, _)) = coord.selection_drag.take() {
-                        if let Some([x, y, w, h]) = area_rect(start, [sx, sy], coord.display_rect) {
-                            let target = region_target(x, y, w, h, &coord.selectable_windows);
-                            coord.start_recording_with_target(target, cx);
-                        } else {
-                            coord.sync_picker_overlay();
-                            cx.notify();
-                        }
-                    }
-                });
+                c_up.update(cx, |coord, cx| coord.picker_mouse_up(event, cx));
             },
         )
     }
