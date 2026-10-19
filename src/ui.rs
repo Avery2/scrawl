@@ -54,10 +54,7 @@ const POSITIVE_COLOR: u32 = 0x69d89f;
 // the inset: R_outer (20) = R_chip (16) + border (1) + pad (3), on every side.
 const ISLAND_H: f32 = 40.0;
 /// Width the recording pill opens from when a recording starts without the picker.
-const ISLAND_OPEN_FROM_W: f32 = 120.0;
-const ISLAND_RADIUS: f32 = ISLAND_H / 2.0;
 const ISLAND_INSET: f32 = 4.0;
-const ISLAND_PAD: f32 = ISLAND_INSET - 1.0;
 const CHIP_H: f32 = ISLAND_H - 2.0 * ISLAND_INSET;
 const CHIP_RADIUS: f32 = CHIP_H / 2.0;
 const CHIP_PX: f32 = 12.0;
@@ -69,9 +66,10 @@ const HUD_TEXT: f32 = 13.0;
 const SEG_PX: f32 = 10.0;
 const SEG_ICON: f32 = 14.0;
 const SEG_ICON_GAP: f32 = 5.0;
-const PILL_WINDOW_W: f32 = 520.0;
+const PILL_WINDOW_W: f32 = 560.0;
 const PILL_WINDOW_H: f32 = 84.0;
 
+mod island;
 mod lab;
 mod motion;
 
@@ -95,72 +93,8 @@ impl Spring {
     }
 }
 
-// The capsule's springs and durations live in `motion::Tune` (defaults in `Tune::DEFAULT`, live
-// overrides from `~/.config/scrawl/tune.json` in debug builds; `scrawl tune`).
-//
-// Switch chips on a tap-started recording (`crate::hold::Reveal`). One shape: the recording pill
-// grows into the chip row and folds back. The width leads the morph palette (.42/.16 open,
-// .38/.08 close) on a slightly faster spring; the lead (dot + clock) stays pinned to the left
-// edge, and each trailing item fades in as the moving edge uncovers it, on the same frame. The
-// chips ↔ controls swap fades in place with a sine blur pulse (sharp at both ends) and no content
-// scale, so the pinned lead never travels.
-
-/// Which width spring the current morph uses.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Morph {
-    /// A phase change (`Tune::island`).
-    Phase,
-    /// The switch chips opening (`Tune::reveal_open`).
-    RevealOpen,
-    /// The switch chips folding back (`Tune::reveal_close`).
-    RevealClose,
-    /// A switch chip turning the recording into the picker (`Tune::switch_width`).
-    Switch,
-}
-
-impl Morph {
-    fn spring(self, tune: &motion::Tune) -> Spring {
-        match self {
-            Self::Phase => tune.island,
-            Self::RevealOpen => tune.reveal_open,
-            Self::RevealClose => tune.reveal_close,
-            Self::Switch => tune.switch_width,
-        }
-    }
-}
-
-/// Reduced motion: no width travel, the groups only cross-fade over this long.
-const REDUCED_FADE_S: f32 = 0.18;
 /// The picker's highlight moving from one mode to another cross-fades over this long.
 const HIGHLIGHT_FADE_S: f32 = 0.18;
-
-/// A switch chip turning the recording into the picker (`switch_recording`). The capsule stays
-/// one shape: the chips are the picker's chips, so the picker row starts where they were and
-/// slides to its place on `Tune::switch_slide` while the width springs on `Tune::switch_width`
-/// (a touch faster, so it leads). The lead (dot and clock, frozen) and its divider ride along in
-/// front of the row and leave under the capsule's left edge; Record, the divider and ✕ ride
-/// behind it and fade in as the right edge uncovers them.
-#[derive(Clone, Copy, Debug)]
-struct SwitchMorph {
-    /// The row's offset from its resting place and its velocity, in points. Measured by the
-    /// first frame that draws it (text widths need the window).
-    slide: Option<(f32, f32)>,
-}
-
-/// Advances a damped spring with fixed 4ms sub-steps so long frames stay stable.
-fn spring_step(value: f32, velocity: f32, target: f32, dt: f32, spring: Spring) -> (f32, f32) {
-    let omega = std::f32::consts::TAU / spring.response;
-    let stiffness = omega * omega;
-    let damping = 2.0 * (1.0 - spring.bounce) * omega;
-    let steps = (dt / 0.004).ceil().max(1.0) as usize;
-    let h = dt / steps as f32;
-    let (mut x, mut v) = (value, velocity);
-    for _ in 0..steps {
-        v += ((target - x) * stiffness - v * damping) * h;
-        x += v * h;
-    }
-    (x, v)
-}
 
 fn with_alpha(color: u32, alpha: f32) -> gpui::Rgba {
     rgba((color << 8) | (alpha.clamp(0.0, 1.0) * 255.0).round() as u32)
@@ -257,20 +191,6 @@ fn completed_delivery_note(delivery: &crate::delivery::Delivery, title: &str) ->
     }
 }
 
-/// Inner width of the Selecting row: mode segments, an optional Record chip, divider, and ✕.
-fn selecting_row_width(label_widths: &[f32], record_width: Option<f32>) -> f32 {
-    let segments: f32 = label_widths
-        .iter()
-        .map(|label| label + 2.0 * SEG_PX + SEG_ICON + SEG_ICON_GAP)
-        .sum();
-    let items = label_widths.len() + usize::from(record_width.is_some()) + 2;
-    segments
-        + record_width.unwrap_or(0.0)
-        + 1.0
-        + 2.0 * DIVIDER_MX
-        + CHIP_H
-        + (items - 1) as f32 * CHIP_GAP
-}
 
 fn segment_width(window: &Window, mode: SelectionMode) -> f32 {
     measure_text(window, mode.label(), HUD_TEXT, FontWeight::MEDIUM)
@@ -279,68 +199,9 @@ fn segment_width(window: &Window, mode: SelectionMode) -> f32 {
         + SEG_ICON_GAP
 }
 
-/// Widths of the items after a Recording capsule's divider: the switch chips while the reveal
-/// is open (`crate::hold::Reveal`), else Undo · Cancel · Finish.
-fn recording_trail_widths(window: &Window, chips: bool, iphone: bool) -> Vec<f32> {
-    if chips {
-        SelectionMode::available(iphone)
-            .iter()
-            .map(|&mode| segment_width(window, mode))
-            .collect()
-    } else {
-        vec![
-            chip_width(window, "Undo", FontWeight::MEDIUM),
-            chip_width(window, "Cancel", FontWeight::MEDIUM),
-            chip_width(window, "Finish", FontWeight::SEMIBOLD),
-        ]
-    }
-}
 
-/// Trace names for a Recording capsule's trailing group, with each item's opacity.
-fn trail_keys(
-    chips: bool,
-    iphone: bool,
-    alphas: &[f32],
-    prefix: &str,
-) -> Vec<Option<(String, f32)>> {
-    let names: Vec<String> = if chips {
-        SelectionMode::available(iphone)
-            .iter()
-            .map(|m| format!("chip:{}", m.label()))
-            .collect()
-    } else {
-        ["undo", "cancel", "finish"].map(String::from).to_vec()
-    };
-    names
-        .into_iter()
-        .enumerate()
-        .map(|(i, n)| {
-            Some((
-                format!("{prefix}{n}"),
-                alphas.get(i).copied().unwrap_or(1.0),
-            ))
-        })
-        .collect()
-}
 
-/// Left edges of a trailing group's items, starting at `x0`.
-fn trail_offsets(x0: f32, widths: &[f32]) -> Vec<f32> {
-    widths
-        .iter()
-        .scan(x0, |x, w| {
-            let left = *x;
-            *x += w + CHIP_GAP;
-            Some(left)
-        })
-        .collect()
-}
 
-/// How much of an item at `x` (width `w`) the capsule's moving right edge has uncovered, eased:
-/// trailing items fade in as the pill grows into them and out as it folds over them.
-fn edge_alpha(inner_now: f32, x: f32, w: f32) -> f32 {
-    let t = ((inner_now - x) / w.max(1.0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
 
 /// The switch chips' clock: the animation clock, so they stay open as long in slow motion
 /// (`motion::time_scale`). The held switcher keeps the real clock: it times key presses.
@@ -348,14 +209,6 @@ fn reveal_clock_ms() -> u64 {
     (motion::now() * 1000.0) as u64
 }
 
-/// An item of the picker row sliding in from under the capsule's right edge (`outer`, the
-/// shell's outer edge): invisible while the edge would still cut into its middle, opaque once
-/// it is clear, so nothing shows half cut.
-fn uncover_alpha(outer: f32, x: f32, w: f32) -> f32 {
-    let inside = (outer - x) / w.max(1.0);
-    let t = ((inside - 0.7) / 0.4).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
 
 /// Whether macOS asks for reduced motion (Accessibility ▸ Display ▸ Reduce motion).
 fn reduce_motion() -> bool {
@@ -367,70 +220,6 @@ fn reduce_motion() -> bool {
         let workspace: *mut AnyObject = msg_send![cls, sharedWorkspace];
         !workspace.is_null() && msg_send![workspace, accessibilityDisplayShouldReduceMotion]
     }
-}
-
-/// Intrinsic outer width of the capsule for a phase, mirroring the layout in `HudPillWindow`.
-/// `hold`: the held switcher, which always lists iPhone and records on release (no Record chip).
-/// `chips`: a Recording capsule showing its switch chips.
-fn island_content_width(
-    window: &Window,
-    phase: IslandPhase,
-    clock: &str,
-    iphone: bool,
-    hold: bool,
-    chips: bool,
-    completed_note: Option<&str>,
-) -> f32 {
-    let divider = 1.0 + 2.0 * DIVIDER_MX;
-    let inner = match phase {
-        IslandPhase::Selecting { mode } => {
-            let labels: Vec<f32> = SelectionMode::available(iphone || hold)
-                .iter()
-                .map(|m| measure_text(window, m.label(), HUD_TEXT, FontWeight::MEDIUM))
-                .collect();
-            let record = (mode.shows_record() && !hold)
-                .then(|| chip_width(window, "Record", FontWeight::SEMIBOLD));
-            selecting_row_width(&labels, record)
-        }
-        IslandPhase::Recording => {
-            let trail = recording_trail_widths(window, chips, iphone);
-            CHIP_H
-                + measure_text(
-                    window,
-                    &clock_template(clock),
-                    HUD_TEXT,
-                    FontWeight::SEMIBOLD,
-                )
-                + LEAD_TRAIL
-                + divider
-                + trail.iter().sum::<f32>()
-                + (trail.len() + 1) as f32 * CHIP_GAP
-        }
-        IslandPhase::Processing => {
-            CHIP_H
-                + 6.0
-                + measure_text(window, "Processing…", HUD_TEXT, FontWeight::SEMIBOLD)
-                + CHIP_PX
-        }
-        IslandPhase::Completed { inbox_count, .. } => {
-            CHIP_H
-                + 8.0
-                + measure_text(
-                    window,
-                    &completed_label(inbox_count, completed_note),
-                    HUD_TEXT,
-                    FontWeight::SEMIBOLD,
-                )
-                + LEAD_TRAIL
-                + divider
-                + chip_width(window, "Paste", FontWeight::SEMIBOLD)
-                + chip_width(window, "Inspect", FontWeight::MEDIUM)
-                + CHIP_H
-                + 3.0 * CHIP_GAP
-        }
-        IslandPhase::Hidden | IslandPhase::Dismissing => return ISLAND_H,
-    };
-    inner + 2.0 * ISLAND_INSET
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -797,20 +586,41 @@ fn find_hud_pill_ns_window() -> Option<Retained<NSWindow>> {
     None
 }
 
-/// Whether the pointer is over the HUD pill's window: the capsule plus a small margin, so the
-/// switch chips stay while the user reaches for them.
-fn pointer_on_hud_pill() -> bool {
+/// Whether the pointer is within `margin` pt of the capsule's target shape (`target_w` wide,
+/// centred in its window): where the capsule is heading, not where its spring has it this frame.
+fn pointer_near_hud_pill(target_w: f32, margin: f64) -> Option<bool> {
     use objc2::runtime::AnyClass;
     use objc2_foundation::NSPoint;
-    let (Some(win), Some(cls)) = (find_hud_pill_ns_window(), AnyClass::get(c"NSEvent")) else {
-        return false;
-    };
+    let (win, cls) = (find_hud_pill_ns_window()?, AnyClass::get(c"NSEvent")?);
     let p: NSPoint = unsafe { msg_send![cls, mouseLocation] };
     let f = win.frame();
-    p.x >= f.origin.x
-        && p.x <= f.origin.x + f.size.width
-        && p.y >= f.origin.y
-        && p.y <= f.origin.y + f.size.height
+    let (cx, cy) = (
+        f.origin.x + f.size.width * 0.5,
+        f.origin.y + f.size.height * 0.5,
+    );
+    let (hw, hh) = (
+        f64::from(target_w) * 0.5 + margin,
+        f64::from(ISLAND_H) * 0.5 + margin,
+    );
+    Some((p.x - cx).abs() <= hw && (p.y - cy).abs() <= hh)
+}
+
+/// The switch chips stay while the pointer is on the capsule or reaching for it.
+fn pointer_on_hud_pill(target_w: f32) -> bool {
+    pointer_near_hud_pill(target_w, 10.0).unwrap_or(false)
+}
+
+/// The capsule's window is a fixed 560 × 84 that never moves or resizes per state; its
+/// transparent margin lets clicks through to whatever is under it, and only the target shape
+/// takes them (plus 4 pt of slop).
+fn sync_hud_pill_hit_test(target_w: Option<f32>) {
+    let Some(win) = find_hud_pill_ns_window() else {
+        return;
+    };
+    let takes = target_w.is_some_and(|w| pointer_near_hud_pill(w, 4.0).unwrap_or(false));
+    if win.ignoresMouseEvents() == takes {
+        win.setIgnoresMouseEvents(!takes);
+    }
 }
 
 fn find_picker_ns_window() -> Option<Retained<NSWindow>> {
@@ -931,24 +741,15 @@ unsafe impl objc2::Encode for CATransform3D {
     );
 }
 
-/// Two-layer Dynamic Island effect on `HudPillWindow`:
-/// 1. `shell_layer` (inserted behind GPUI's `contentView.layer()`) renders the outer black pill
-///    capsule, `1px` specular border, and drop shadow with **zero blur** so the pill's border and
-///    silhouette are always 100% razor-sharp.
-/// 2. `contentView.layer()` (which renders only the inner chips/text on a transparent background)
-///    receives `CAFilter("gaussianBlur")` + `CATransform3D` scale so only the inner contents blur.
+/// Draws the outline (`island::Frame`) in the shell layer under GPUI's content layer, and gives
+/// the content layer its whole-content blur and scale about the window's centre. The shell is
+/// never blurred, so the silhouette stays sharp.
 fn apply_pill_layer_effect(
     ns_window: &NSWindow,
     shell_slot: &mut Option<Retained<objc2_quartz_core::CALayer>>,
-    pill_width: f32,
-    pill_height: f32,
-    scale: f32,
-    y_offset: f32,
-    opacity: f32,
+    ghost_slot: &mut Option<Retained<objc2_quartz_core::CALayer>>,
+    frame: &island::Frame,
     is_completed: bool,
-    blur_radius: f32,
-    // Content scale lost per px of blur (0.015 for whole-state morphs, 0 to keep it still).
-    content_shrink: f32,
 ) {
     use objc2::runtime::AnyClass;
     use objc2_foundation::{NSArray, NSNumber, NSPoint, NSRect, NSSize};
@@ -974,71 +775,67 @@ fn apply_pill_layer_effect(
     let bounds = cv.bounds();
     let cx = bounds.size.width * 0.5;
     let cy = bounds.size.height * 0.5;
-    let s = f64::from(scale.clamp(0.50, 1.15));
-    let ty_unflipped = -f64::from(y_offset);
-    let is_flipped = gpui_view
-        .as_ref()
-        .map_or_else(|| cv.isFlipped(), |v| v.isFlipped());
-    let ty_cv = if is_flipped {
-        f64::from(y_offset)
-    } else {
-        -f64::from(y_offset)
-    };
-
-    if shell_slot.is_none() {
-        let shell = CALayer::new();
-        cv_layer.insertSublayer_below(&shell, Some(&content_layer));
-        *shell_slot = Some(shell);
+    for slot in [&mut *ghost_slot, &mut *shell_slot] {
+        if slot.is_none() {
+            let layer = CALayer::new();
+            cv_layer.insertSublayer_below(&layer, Some(&content_layer));
+            *slot = Some(layer);
+        }
     }
+    // Shapes are in points from the content's centre, y down; the layers are y up.
+    let rect = |sh: &island::Shape| {
+        let centre_down = f64::from(sh.t + sh.height() * 0.5);
+        NSRect::new(
+            NSPoint::new(
+                cx + f64::from(sh.l),
+                cy - centre_down - f64::from(sh.height()) * 0.5,
+            ),
+            NSSize::new(f64::from(sh.width()), f64::from(sh.height())),
+        )
+    };
+    // Reduce Motion: the old and new silhouettes, coverage added. They share a centre line and
+    // height, so the narrower lies inside the wider: it draws fully and the wider fades.
+    let (main, main_alpha, wide) = match frame.ghost {
+        Some((ghost, ghost_alpha)) if ghost.width() > frame.shape.width() => {
+            (frame.shape, 1.0, Some((ghost, ghost_alpha)))
+        }
+        Some((ghost, ghost_alpha)) => (ghost, 1.0, Some((frame.shape, 1.0 - ghost_alpha))),
+        None => (frame.shape, 1.0, None),
+    };
+    let alpha = frame.shell_alpha;
 
-    let w_scaled = f64::from(pill_width) * s;
-    let h_scaled = f64::from(pill_height) * s;
-    let shell_rect = NSRect::new(
-        NSPoint::new(cx - w_scaled * 0.5, cy - h_scaled * 0.5 + ty_unflipped),
-        NSSize::new(w_scaled, h_scaled),
-    );
-
-    // Content scales subtly (`0.93 .. 1.0`) inside the crisp outer shell during morphs.
-    let content_s = content_scale(scale, blur_radius, content_shrink);
     let transform = CATransform3D {
-        m11: content_s,
+        m11: f64::from(frame.content_scale),
         m12: 0.0,
         m13: 0.0,
         m14: 0.0,
         m21: 0.0,
-        m22: content_s,
+        m22: f64::from(frame.content_scale),
         m23: 0.0,
         m24: 0.0,
         m31: 0.0,
         m32: 0.0,
         m33: 1.0,
         m34: 0.0,
-        m41: cx * (1.0 - content_s),
-        m42: cy * (1.0 - content_s) + ty_cv,
+        m41: cx * (1.0 - f64::from(frame.content_scale)),
+        m42: cy * (1.0 - f64::from(frame.content_scale)),
         m43: 0.0,
         m44: 1.0,
     };
 
-    CATransaction::begin();
-    CATransaction::setDisableActions(true);
-    if let Some(ref shell) = *shell_slot {
-        shell.setFrame(shell_rect);
-        shell.setCornerRadius(h_scaled * 0.5);
-        shell.setBorderWidth(1.0);
-        shell.setOpacity(opacity);
-        shell.setShadowOpacity(0.40 * opacity);
-        shell.setShadowRadius(14.0);
-        shell.setShadowOffset(NSSize::new(0.0, -5.0));
+    let paint = |layer: &CALayer, sh: &island::Shape, opacity: f32, shadow: bool| {
+        layer.setFrame(rect(sh));
+        layer.setCornerRadius(f64::from(sh.radius));
+        layer.setBorderWidth(1.0);
+        layer.setOpacity(opacity);
+        layer.setShadowOpacity(if shadow { 0.40 * opacity } else { 0.0 });
+        layer.setShadowRadius(14.0);
+        layer.setShadowOffset(NSSize::new(0.0, -5.0));
         unsafe {
-            let bg_ns = NSColor::colorWithSRGBRed_green_blue_alpha(
-                20.0 / 255.0,
-                20.0 / 255.0,
-                22.0 / 255.0,
-                0.96,
-            );
+            let bg_ns =
+                NSColor::colorWithSRGBRed_green_blue_alpha(20.0 / 255.0, 20.0 / 255.0, 22.0 / 255.0, 0.96);
             let bg_cg: *const OpaqueCGColor = msg_send![&*bg_ns, CGColor];
-            let _: () = msg_send![&**shell, setBackgroundColor: bg_cg];
-
+            let _: () = msg_send![layer, setBackgroundColor: bg_cg];
             let border_ns = if is_completed {
                 NSColor::colorWithSRGBRed_green_blue_alpha(
                     105.0 / 255.0,
@@ -1050,12 +847,24 @@ fn apply_pill_layer_effect(
                 NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.12)
             };
             let border_cg: *const OpaqueCGColor = msg_send![&*border_ns, CGColor];
-            let _: () = msg_send![&**shell, setBorderColor: border_cg];
+            let _: () = msg_send![layer, setBorderColor: border_cg];
+        }
+    };
+
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    if let Some(ref shell) = *shell_slot {
+        paint(shell, &main, alpha * main_alpha, true);
+    }
+    if let Some(ref ghost) = *ghost_slot {
+        match wide {
+            Some((sh, a)) => paint(ghost, &sh, alpha * a, false),
+            None => ghost.setOpacity(0.0),
         }
     }
-
     unsafe {
         let _: () = msg_send![&*content_layer, setTransform: transform];
+        let blur_radius = frame.content_blur;
         if blur_radius > 0.18
             && let Some(ca_filter_cls) = AnyClass::get(c"CAFilter")
         {
@@ -1076,13 +885,7 @@ fn apply_pill_layer_effect(
     CATransaction::commit();
 }
 
-/// The content layer's scale: the capsule's, less a little per px of blur.
-fn content_scale(scale: f32, blur_radius: f32, content_shrink: f32) -> f64 {
-    let s = f64::from(scale.clamp(0.50, 1.15));
-    (s * (1.0 - f64::from(blur_radius).min(5.0) * f64::from(content_shrink))).clamp(0.85, 1.06)
-}
-
-/// The pill window's frame in screen points with a top-left origin (the primary display's).
+/// The window's frame in top-left screen points (motion-lint's space).
 fn top_left_frame(ns_window: &NSWindow) -> [f32; 4] {
     let f = ns_window.frame();
     let primary_h = MainThreadMarker::new()
@@ -1096,37 +899,27 @@ fn top_left_frame(ns_window: &NSWindow) -> [f32; 4] {
     ]
 }
 
-/// One trace frame for the capsule (`SCRAWL_MOTION_TRACE`): its window, the shell as drawn, the
-/// content's blur and opacity. Returns the mapping for the content's children.
-#[allow(clippy::too_many_arguments)]
-fn trace_capsule(
-    ns_window: &NSWindow,
-    width: f32,
-    scale: f32,
-    y_off: f32,
-    opacity: f32,
-    content_alpha: f32,
-    blur_radius: f32,
-    content_shrink: f32,
-) -> motion::Xf {
+/// Traces this frame's window, outline and content layer (`SCRAWL_MOTION_TRACE`), and returns
+/// the mapping for the items' boxes.
+fn trace_capsule(ns_window: &NSWindow, frame: &island::Frame) -> motion::Xf {
     let win = top_left_frame(ns_window);
     let (cx, cy) = (win[2] * 0.5, win[3] * 0.5);
-    let s = scale.clamp(0.50, 1.15);
-    let (w, h) = (width * s, ISLAND_H * s);
-    let shell = [win[0] + cx - w * 0.5, win[1] + cy - h * 0.5 + y_off, w, h];
+    let sh = frame.shape;
+    let shell = [win[0] + cx + sh.l, win[1] + cy + sh.t, sh.width(), sh.height()];
     motion::trace_element("window", win, 0.0, 0.0, None, None);
-    motion::trace_element("shell", shell, opacity, h * 0.5, None, None);
-    motion::trace_channel("content.blur", "level", blur_radius);
-    motion::trace_channel("content.alpha", "level", content_alpha);
-    motion::trace_channel("shell.width", "position", width);
+    motion::trace_element("shell", shell, frame.shell_alpha, sh.radius, None, None);
+    motion::trace_channel("content.blur", "level", frame.content_blur);
+    motion::trace_channel("content.scale", "level", frame.content_scale);
+    motion::trace_channel("shell.width", "position", sh.width());
+    motion::trace_channel("shell.height", "position", sh.height());
     motion::Xf {
-        s: content_scale(scale, blur_radius, content_shrink) as f32,
+        s: frame.content_scale,
         cx,
         cy,
-        ty: y_off,
+        ty: 0.0,
         ox: win[0],
         oy: win[1],
-        alpha: opacity * content_alpha,
+        alpha: 1.0,
         clip: shell,
     }
 }
@@ -1311,33 +1104,16 @@ pub struct ScrawlCoordinator {
     picker_metal_overlay: Option<MetalLaserOverlay>,
     iphone_preview: Option<PhoneSession>,
     island_phase: IslandPhase,
-    island_prev_phase: IslandPhase,
     /// `motion::now()` when the phase last changed.
     island_phase_since: f64,
-    island_dismissed_from: IslandPhase,
-    island_width: f32,
-    island_target_width: f32,
-    island_velocity: f32,
-    island_scale: f32,
-    island_scale_velocity: f32,
-    island_y: f32,
-    island_y_velocity: f32,
-    island_opacity: f32,
-    /// Which width spring the current morph uses.
-    island_morph: Morph,
+    /// The capsule's outline and content motion (`island`): one shape retargeted per state.
+    island: island::Island,
     /// Switch chips on a tap-started recording (`crate::hold::Reveal`).
     reveal: crate::hold::Reveal,
-    /// When the chips last opened or folded, for the in-place swap of the trailing group.
-    reveal_since: f64,
-    /// The trailing group fading out after that change: `Some(true)` the chips, `Some(false)` the
-    /// controls, `None` when the capsule opened straight into its state (nothing to swap).
-    reveal_outgoing: Option<bool>,
-    /// The chips were open when the island last changed phase, so a Recording capsule that is
-    /// blurring out or dismissing keeps them.
-    reveal_prev_chips: bool,
-    /// macOS Reduce motion, read when a reveal starts.
+    /// macOS Reduce motion, read when the island changes state.
     reduced_motion: bool,
-    switch: Option<SwitchMorph>,
+    /// The pointer is over the ✕ chip, since then (its "Esc" hint shows after a moment).
+    close_hover: Option<f64>,
     /// When the springs were last advanced (`step_island`).
     island_stepped: Instant,
     /// A new capsule window has drawn its first frame and not its second (which comes late):
@@ -1415,24 +1191,11 @@ impl ScrawlCoordinator {
             picker_metal_overlay: None,
             iphone_preview: None,
             island_phase: IslandPhase::Hidden,
-            island_prev_phase: IslandPhase::Hidden,
             island_phase_since: motion::now(),
-            island_dismissed_from: IslandPhase::Hidden,
-            island_width: 205.0,
-            island_target_width: 205.0,
-            island_velocity: 0.0,
-            island_scale: 0.92,
-            island_scale_velocity: 0.0,
-            island_y: -6.0,
-            island_y_velocity: 0.0,
-            island_opacity: 0.0,
-            island_morph: Morph::Phase,
+            island: island::Island::new(),
             reveal: crate::hold::Reveal::default(),
-            reveal_since: motion::now(),
-            reveal_outgoing: None,
-            reveal_prev_chips: false,
             reduced_motion: false,
-            switch: None,
+            close_hover: None,
             island_stepped: Instant::now(),
             island_await_frame: false,
             last_elapsed_ms: 0,
@@ -1977,30 +1740,13 @@ impl ScrawlCoordinator {
         self.reduced_motion = reduce_motion();
         let activity = self.reveal_activity();
         self.reveal.show(reveal_clock_ms(), activity);
-        self.reveal_since = motion::now();
-        self.reveal_outgoing = None;
-        self.island_morph = Morph::RevealOpen;
-        if self.reduced_motion {
-            self.island_scale = 1.0;
-            self.island_scale_velocity = 0.0;
-            self.island_y = 0.0;
-            self.island_y_velocity = 0.0;
-        }
+        self.island.reduced = self.reduced_motion;
         cx.notify();
     }
 
     /// The chips fold back into the recording pill (timeout, work started, or a chip chosen).
     fn fold_reveal(&mut self) {
-        if self.reveal.is_open() {
-            self.reveal.close();
-            self.play_fold();
-        }
-    }
-
-    fn play_fold(&mut self) {
-        self.reveal_since = motion::now();
-        self.reveal_outgoing = Some(true);
-        self.island_morph = Morph::RevealClose;
+        self.reveal.close();
     }
 
     /// A switch chip on a tap-started recording. Screen keeps it. Anything else drops the few
@@ -2045,11 +1791,10 @@ impl ScrawlCoordinator {
         }
         self.open_picker(Some(mode), false, cx);
         if self.is_selecting() && chips_shown && !self.reduced_motion {
-            // The chips showed Screen; the picker shows `mode`.
+            // The chips are the picker's chips (`island`: shared items travel); their highlight
+            // moves from Screen to `mode`.
             self.highlight_prev = Some(SelectionMode::Screen);
             self.highlight_since = motion::now();
-            self.island_morph = Morph::Switch;
-            self.switch = Some(SwitchMorph { slide: None });
         }
     }
 
@@ -2071,6 +1816,15 @@ impl ScrawlCoordinator {
         }
         let _ = std::fs::remove_dir_all(rec.bundle_dir);
         Some((rec.target, rec._metal_overlay))
+    }
+
+    /// The width the capsule takes clicks over: its target, while it is showing a state.
+    fn hit_width(&self) -> Option<f32> {
+        (!matches!(
+            self.island_phase,
+            IslandPhase::Hidden | IslandPhase::Dismissing
+        ))
+        .then(|| self.island.target_width())
     }
 
     pub fn is_island_visible(&self) -> bool {
@@ -2134,8 +1888,8 @@ impl ScrawlCoordinator {
         self.open_iphone_when_found = false;
         if let IslandPhase::Selecting { mode: prev_mode } = self.island_phase {
             if prev_mode != mode {
-                // Crisp tactile Dynamic Island scale micro-pulse when Space toggles camera/crosshair mode.
-                self.island_scale_velocity += 1.25;
+                // The outline's tactile squish (`Tune::squish`) as the mode changes.
+                self.island.kick(&motion::tune());
             }
             if mode != SelectionMode::Iphone
                 && let Some(ref mut preview) = self.iphone_preview
@@ -2351,25 +2105,20 @@ impl ScrawlCoordinator {
         }
         let changed = std::mem::discriminant(&self.island_phase) != std::mem::discriminant(&phase);
         if changed {
-            // A new phase replaces the whole content; the chips go with it, and the outgoing
-            // Recording content keeps showing them while it blurs away.
-            self.reveal_prev_chips = self.reveal.is_open();
+            // A new phase is a new layout for the same outline (`island`): what it shares with
+            // the old one travels, the rest comes and goes.
             self.reveal.close();
-            self.reveal_outgoing = None;
-            self.island_morph = Morph::Phase;
-            self.switch = None;
             self.highlight_prev = None;
+            self.close_hover = None;
+            self.reduced_motion = reduce_motion();
+            self.island.reduced = self.reduced_motion;
             if matches!(self.island_phase, IslandPhase::Hidden) {
                 self.island_stepped = Instant::now();
             }
-            self.island_prev_phase = self.island_phase;
-            if matches!(phase, IslandPhase::Dismissing) {
-                self.island_dismissed_from = self.island_phase;
-            } else if matches!(self.island_phase, IslandPhase::Hidden) {
-                self.island_scale = 0.92;
-                self.island_scale_velocity = 0.0;
-                self.island_y = -6.0;
-                self.island_y_velocity = 0.0;
+            match phase {
+                IslandPhase::Hidden => self.island.hide_now(),
+                IslandPhase::Dismissing => self.island.dismiss(&motion::tune()),
+                _ => self.island.open(),
             }
             self.island_phase_since = motion::now();
             motion::trace_event(format!("phase:{}", phase.trace_name()));
@@ -2410,7 +2159,6 @@ impl ScrawlCoordinator {
             self.mark_handled(&dir);
         }
         self.set_island_phase(IslandPhase::Hidden);
-        self.island_opacity = 0.0;
         let entity = cx.entity().clone();
         cx.defer(move |cx| {
             close_capture_windows(cx);
@@ -2506,7 +2254,6 @@ impl ScrawlCoordinator {
     /// coming, and the capsule calls it as it draws, so every frame shows its own moment rather
     /// than the loop's last tick (up to 8 ms stale, which made the steps uneven).
     pub fn step_island(&mut self, cx: &mut Context<Self>) {
-        let tune = motion::tune();
         let real = self.island_stepped.elapsed().as_secs_f32();
         if real < 0.0002 {
             return;
@@ -2554,78 +2301,18 @@ impl ScrawlCoordinator {
             self.sync_picker_overlay();
         }
 
-        // Keep layout width at `island_target_width` during open and dismiss so the capsule never
-        // clips its inner chips; open/dismiss use a restrained 0.92 <-> 1.0 scale.
-        let (target_w, target_scale, target_y, target_opacity, fade_rate) = match self.island_phase
-        {
-            IslandPhase::Hidden => return,
-            IslandPhase::Dismissing => (self.island_target_width, 0.92, -6.0, 0.0, 18.0),
-            _ => (self.island_target_width, 1.0, 0.0, 1.0, 20.0),
-        };
-
+        if matches!(self.island_phase, IslandPhase::Hidden) {
+            return;
+        }
         if self.reveal.is_open() {
             let activity = self.reveal_activity();
-            if self
-                .reveal
-                .tick(reveal_clock_ms(), pointer_on_hud_pill(), activity)
-            {
-                self.play_fold();
-            }
+            let hovered = pointer_on_hud_pill(self.island.target_width());
+            self.reveal.tick(reveal_clock_ms(), hovered, activity);
         }
-
-        let (width, velocity) = if self.reduced_motion && self.island_morph != Morph::Phase {
-            // Reduce motion: the reveal's groups fade in place with no width travel; a shrink
-            // waits for the outgoing chips to fade so none are clipped while visible.
-            let fading =
-                self.reveal_outgoing.is_some() && motion::age(self.reveal_since) < REDUCED_FADE_S;
-            if fading && target_w < self.island_width {
-                (self.island_width, 0.0)
-            } else {
-                (target_w, 0.0)
-            }
-        } else {
-            spring_step(
-                self.island_width,
-                self.island_velocity,
-                target_w,
-                dt,
-                self.island_morph.spring(&tune),
-            )
-        };
-        let (scale, s_vel) = spring_step(
-            self.island_scale,
-            self.island_scale_velocity,
-            target_scale,
-            dt,
-            tune.island_scale,
-        );
-        let (y_off, y_vel) = spring_step(
-            self.island_y,
-            self.island_y_velocity,
-            target_y,
-            dt,
-            tune.island_scale,
-        );
-        if let Some(morph) = self.switch.as_mut()
-            && let Some((x, v)) = morph.slide
-        {
-            let (x, v) = spring_step(x, v, 0.0, dt, tune.switch_slide);
-            morph.slide = Some((x, v));
-            if x.abs() < 0.2 && v.abs() < 2.0 {
-                self.switch = None;
-            }
-        }
-        self.island_width = width.clamp(120.0, PILL_WINDOW_W - 16.0);
-        self.island_velocity = velocity;
-        self.island_scale = scale.clamp(0.35, 1.18);
-        self.island_scale_velocity = s_vel;
-        self.island_y = y_off.clamp(-18.0, 14.0);
-        self.island_y_velocity = y_vel;
-        self.island_opacity += (target_opacity - self.island_opacity) * (fade_rate * dt).min(1.0);
-
-        if matches!(self.island_phase, IslandPhase::Dismissing) && self.island_opacity < 0.03 {
+        let tune = motion::tune();
+        self.island.step(dt, &tune);
+        if matches!(self.island_phase, IslandPhase::Dismissing) && self.island.is_landed() {
             self.set_island_phase(IslandPhase::Hidden);
-            self.island_opacity = 0.0;
             cx.defer(close_capture_windows);
         }
         cx.notify();
@@ -2712,19 +2399,8 @@ impl ScrawlCoordinator {
         })
         .detach();
         self.selection_drag = None;
-        if matches!(
-            self.island_phase,
-            IslandPhase::Hidden | IslandPhase::Dismissing
-        ) {
-            // Enter near full size (0.92 -> 1.0) at full intrinsic layout width so inner buttons
-            // are never clipped.
-            self.island_width = self.island_target_width.max(195.0);
-            self.island_velocity = 0.0;
-            self.island_scale = 0.92;
-            self.island_scale_velocity = 0.0;
-            self.island_y = -6.0;
-            self.island_y_velocity = 0.0;
-            self.island_opacity = 0.0;
+        if matches!(self.island_phase, IslandPhase::Dismissing) {
+            // Landing: the picker takes the outline over where it is (`Island::open`).
             self.island_phase = IslandPhase::Hidden;
         }
         // Open on the mode the last recording used. The phone needs a live preview, started once
@@ -2897,14 +2573,6 @@ impl ScrawlCoordinator {
     /// The island turns into the recording pill: from the picker it morphs, from nothing it opens
     /// from a compact capsule so the shell springs out to its width, Dynamic Island style.
     fn present_recording_island(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.island_phase, IslandPhase::Hidden) {
-            self.island_width = ISLAND_OPEN_FROM_W;
-            self.island_velocity = 0.0;
-            self.island_scale = 0.92;
-            self.island_scale_velocity = 0.0;
-            self.island_y = -6.0;
-            self.island_y_velocity = 0.0;
-        }
         self.set_island_phase(IslandPhase::Recording);
         let entity = cx.entity().clone();
         cx.defer(move |cx| {
@@ -3205,8 +2873,140 @@ pub struct HudPillWindow {
     focus: FocusHandle,
     ns_window: Option<Retained<NSWindow>>,
     shell_layer: Option<Retained<objc2_quartz_core::CALayer>>,
+    /// Reduce Motion's dissolving silhouette (`island::Frame::ghost`).
+    ghost_layer: Option<Retained<objc2_quartz_core::CALayer>>,
     /// Frames drawn so far, counting to 2.
     frames: u8,
+}
+
+/// The ink of a lead: the dot's halo (up to 10 pt round, centred in the left slot) and the text.
+const LEAD_INK: island::Ink = island::Ink {
+    left: CHIP_H / 2.0 - 10.0,
+    right: LEAD_TRAIL,
+    half_h: 10.0,
+    round: 10.0,
+};
+
+fn divider_spec(key: &str) -> island::Spec {
+    island::Spec::new(
+        key,
+        1.0 + 2.0 * DIVIDER_MX,
+        island::Ink {
+            left: DIVIDER_MX,
+            right: DIVIDER_MX,
+            half_h: 8.0,
+            round: 0.5,
+        },
+    )
+}
+
+fn mode_for_label(label: &str) -> Option<SelectionMode> {
+    SelectionMode::ALL.into_iter().find(|m| m.label() == label)
+}
+
+/// The capsule's items for a phase, left to right, at their measured widths (`island::Spec`).
+/// Keys are identities: an item in two states' layouts is the same element and travels.
+fn capsule_specs(
+    window: &Window,
+    phase: IslandPhase,
+    clock: &str,
+    iphone: bool,
+    hold: bool,
+    chips: bool,
+    completed_note: Option<&str>,
+) -> Vec<island::Spec> {
+    use island::Spec;
+    let chip = |key: &str, label: &str, weight| Spec::chip(key, chip_width(window, label, weight));
+    let mode_chip =
+        |m: SelectionMode| Spec::chip(format!("chip:{}", m.label()), segment_width(window, m));
+    let close = [divider_spec("divider.close"), Spec::chip("close", CHIP_H)];
+    match phase {
+        IslandPhase::Recording => {
+            let clock_w = measure_text(window, &clock_template(clock), HUD_TEXT, FontWeight::SEMIBOLD);
+            let mut specs = vec![
+                Spec::new("lead", CHIP_H + clock_w + LEAD_TRAIL, LEAD_INK),
+                divider_spec("divider.lead"),
+            ];
+            if chips {
+                specs.extend(SelectionMode::available(iphone).iter().map(|&m| mode_chip(m)));
+            } else {
+                specs.push(chip("undo", "Undo", FontWeight::MEDIUM));
+                specs.push(chip("finish", "Finish", FontWeight::SEMIBOLD));
+            }
+            specs.extend(close);
+            specs
+        }
+        IslandPhase::Selecting { mode } => {
+            let mut specs: Vec<Spec> = SelectionMode::available(iphone || hold)
+                .iter()
+                .map(|&m| mode_chip(m))
+                .collect();
+            if mode.shows_record() && !hold {
+                specs.push(chip("record", "Record", FontWeight::SEMIBOLD));
+            }
+            specs.extend(close);
+            specs
+        }
+        IslandPhase::Processing => vec![Spec::new(
+            "processing",
+            CHIP_H + 6.0 + measure_text(window, "Processing…", HUD_TEXT, FontWeight::SEMIBOLD) + CHIP_PX,
+            island::Ink {
+                left: 6.0,
+                right: CHIP_PX,
+                half_h: 9.0,
+                round: 9.0,
+            },
+        )],
+        IslandPhase::Completed { inbox_count, .. } => vec![
+            Spec::new(
+                "done.lead",
+                CHIP_H
+                    + 8.0
+                    + measure_text(
+                        window,
+                        &completed_label(inbox_count, completed_note),
+                        HUD_TEXT,
+                        FontWeight::SEMIBOLD,
+                    )
+                    + LEAD_TRAIL,
+                island::Ink {
+                    right: LEAD_TRAIL,
+                    ..island::Ink::CHIP
+                },
+            ),
+            divider_spec("divider.lead"),
+            chip("paste", "Paste", FontWeight::SEMIBOLD),
+            chip("inspect", "Inspect", FontWeight::MEDIUM),
+            Spec::chip("close", CHIP_H),
+        ],
+        IslandPhase::Hidden | IslandPhase::Dismissing => Vec::new(),
+    }
+}
+
+/// What one frame of the capsule needs to draw any item, whichever state it belongs to (a
+/// leaving item keeps drawing after its state is gone).
+struct ItemContext {
+    phase: IslandPhase,
+    clock: String,
+    clock_w: f32,
+    phase_age: f32,
+    stroke_count: usize,
+    selected: Option<SelectionMode>,
+    highlight_prev: Option<SelectionMode>,
+    highlight_p: f32,
+    completed: String,
+}
+
+impl ItemContext {
+    /// A mode chip's highlight, cross-fading from the mode it left.
+    fn highlight(&self, m: SelectionMode) -> f32 {
+        let mode = self.selected.unwrap_or(SelectionMode::Screen);
+        match self.highlight_prev.filter(|prev| *prev != mode) {
+            Some(_) if m == mode => self.highlight_p,
+            Some(prev) if m == prev => 1.0 - self.highlight_p,
+            _ => f32::from(u8::from(m == mode)),
+        }
+    }
 }
 
 impl Render for HudPillWindow {
@@ -3215,21 +3015,20 @@ impl Render for HudPillWindow {
             self.ns_window = find_hud_pill_ns_window();
         }
         let tracing = motion::tracing();
-        let frame = self.frames;
-        if tracing && frame == 0 {
+        let frame_n = self.frames;
+        if tracing && frame_n == 0 {
             motion::trace_skip_frame();
         } else if tracing {
             motion::trace_frame();
         }
         self.frames = self.frames.saturating_add(1).min(2);
-        if frame == 0 {
-            // A new window shows a few frames after it's asked for; its opening fade and blur
-            // start from the frame that is seen, not from the request.
+        let tune = motion::tune();
+        if frame_n == 0 {
+            // A new window shows a few frames after it's asked for; its opening starts from the
+            // frame that is seen, not from the request.
             self.coordinator.update(cx, |coord, _| {
-                if coord.island_opacity < 0.98
-                    && !matches!(coord.island_phase, IslandPhase::Dismissing)
-                {
-                    coord.island_opacity = 0.0;
+                if !matches!(coord.island_phase, IslandPhase::Dismissing) {
+                    coord.island.restart_open(&tune);
                     coord.island_phase_since = motion::now();
                     coord.island_stepped = Instant::now();
                     coord.island_await_frame = true;
@@ -3237,36 +3036,27 @@ impl Render for HudPillWindow {
             });
         }
         self.coordinator.update(cx, |coord, cx| {
-            if frame == 1 {
+            if frame_n == 1 {
                 coord.island_await_frame = false;
             }
             if coord.is_island_visible() {
                 coord.step_island(cx);
             }
         });
+
         let coord = self.coordinator.read(cx);
         let phase = coord.island_phase;
-        let prev_phase = coord.island_prev_phase;
-        let target_phase = match phase {
-            IslandPhase::Dismissing => coord.island_dismissed_from,
-            other => other,
-        };
         let phase_age = motion::age(coord.island_phase_since);
-        let width = coord.island_width;
-        let scale = coord.island_scale;
-        let y_off = coord.island_y;
-        let opacity = coord.island_opacity.clamp(0.0, 1.0);
         let recording_ms = coord
             .active_recording
             .as_ref()
             .map(ActiveRecording::elapsed_ms);
         let elapsed_ms = recording_ms.unwrap_or(coord.last_elapsed_ms);
-        let switch = coord
-            .switch
-            .filter(|_| matches!(phase, IslandPhase::Selecting { .. }));
-        let island_velocity = coord.island_velocity;
-        let highlight_prev = coord.highlight_prev;
-        let highlight_p = ease_out_cubic(motion::age(coord.highlight_since) / HIGHLIGHT_FADE_S);
+        let clock = format_clock(elapsed_ms);
+        let has_iphone = coord.iphone.is_some();
+        let completed_note = coord.completed_note.clone();
+        let hold = coord.hold_picker;
+        let chips = matches!(phase, IslandPhase::Recording) && coord.reveal.is_open();
         let stroke_count = coord
             .telemetry
             .strokes
@@ -3275,490 +3065,280 @@ impl Render for HudPillWindow {
             .iter()
             .filter(|s| !s.laser)
             .count();
-
-        let clock = format_clock(elapsed_ms);
-        let has_iphone = coord.iphone.is_some();
-        let completed_note = coord.completed_note.clone();
-        let hold = coord.hold_picker;
-        // The Recording capsule's trailing group: switch chips or controls, and the swap between.
-        let chips = if matches!(phase, IslandPhase::Recording) {
-            coord.reveal.is_open()
-        } else {
-            coord.reveal_prev_chips
+        let close_hover = coord.close_hover;
+        let ctx = ItemContext {
+            phase,
+            clock_w: measure_text(window, &clock_template(&clock), HUD_TEXT, FontWeight::SEMIBOLD),
+            clock: clock.clone(),
+            phase_age,
+            stroke_count,
+            selected: match phase {
+                IslandPhase::Selecting { mode } => Some(mode),
+                _ => None,
+            },
+            highlight_prev: coord.highlight_prev,
+            highlight_p: ease_out_cubic(motion::age(coord.highlight_since) / HIGHLIGHT_FADE_S),
+            completed: match phase {
+                IslandPhase::Completed { inbox_count, .. } => {
+                    completed_label(inbox_count, completed_note.as_deref())
+                }
+                _ => String::new(),
+            },
         };
-        let reduced = coord.reduced_motion;
-        let tune = motion::tune();
-        let swap_age = motion::age(coord.reveal_since);
-        let (enter_s, exit_s) = if reduced {
-            (REDUCED_FADE_S, REDUCED_FADE_S * 0.8)
-        } else {
-            (tune.reveal_enter_s, tune.reveal_exit_s)
-        };
-        let swap = matches!(phase, IslandPhase::Recording)
-            .then_some(coord.reveal_outgoing)
-            .flatten()
-            .filter(|_| swap_age < enter_s.max(exit_s));
-        let target_width = island_content_width(
+        let is_completed = matches!(phase, IslandPhase::Completed { .. });
+        let specs = capsule_specs(
             window,
-            target_phase,
+            phase,
             &clock,
             has_iphone,
             hold,
             chips,
             completed_note.as_deref(),
         );
-        let snap_initial_width =
-            phase_age < 0.025 && matches!(phase, IslandPhase::Selecting { .. }) && opacity < 0.35;
-        let switch_layout = switch.map(|morph| {
-            let clock_w = measure_text(
-                window,
-                &clock_template(&clock),
-                HUD_TEXT,
-                FontWeight::SEMIBOLD,
-            );
-            SwitchLayout::new(morph, width, target_width, clock_w)
-        });
         self.coordinator.update(cx, |coord, _| {
-            coord.island_target_width = target_width;
-            if snap_initial_width {
-                coord.island_width = target_width;
+            if !specs.is_empty() {
+                coord.island.present(&specs, &tune);
             }
             if recording_ms.is_some() {
                 coord.last_elapsed_ms = elapsed_ms;
             }
-            if let (Some(morph), Some(layout)) = (coord.switch.as_mut(), switch_layout)
-                && morph.slide.is_none()
-            {
-                // The chips were pinned to the left edge, so they moved at half the width's
-                // speed: the row starts there, at that speed.
-                morph.slide = Some((layout.dx, -0.5 * island_velocity));
-            }
         });
-        let render_width = if snap_initial_width {
-            target_width
-        } else {
-            width
-        };
-
-        // Two-beat `.blurReplace` cross-transition inside the springing shell:
-        // - When morphing between two visible states (`has_prev`):
-        //   * 0..55ms (exit): outgoing `prev_phase` stays mounted while blurring `0 -> 3.5px` and fading `1 -> 0.15`.
-        //   * 55..140ms (enter): incoming `target_phase` mounts and unblurs `3.5 -> 0px` while fading `0.15 -> 1`.
-        // - When opening/dismissing: subtle `3.5px -> 0px` blur over 110ms.
-        // A switch chip's morph keeps its items, so nothing is replaced (`SwitchMorph`).
-        let has_prev = !matches!(prev_phase, IslandPhase::Hidden | IslandPhase::Dismissing)
-            && !matches!(phase, IslandPhase::Hidden | IslandPhase::Dismissing)
-            && switch_layout.is_none();
-        // Reduce motion keeps the cross-fade and drops the blur.
-        let swap_blur = if reduced { 0.0 } else { 3.5 };
-        let (content_phase, blur_radius, content_alpha) =
-            if matches!(phase, IslandPhase::Dismissing) {
-                (
-                    target_phase,
-                    ((1.0 - opacity) * 3.5).clamp(0.0, 3.5),
-                    opacity,
-                )
-            } else if switch_layout.is_some() {
-                (target_phase, 0.0, 1.0)
-            } else if has_prev && phase_age < 0.055 {
-                let t_out = (phase_age / 0.055).clamp(0.0, 1.0);
-                (prev_phase, swap_blur * t_out, 1.0 - 0.85 * t_out)
-            } else if has_prev && phase_age < 0.145 {
-                let t_in = ease_out_cubic(((phase_age - 0.055) / 0.090).clamp(0.0, 1.0));
-                (target_phase, swap_blur * (1.0 - t_in), 0.15 + 0.85 * t_in)
-            } else if swap.is_some() && !reduced {
-                // Chips ↔ controls in place: a sine blur pulse, sharp at both ends.
-                let t = (swap_age / enter_s).clamp(0.0, 1.0);
-                (
-                    target_phase,
-                    tune.reveal_blur_px * (std::f32::consts::PI * t).sin(),
-                    1.0,
-                )
-            } else if !has_prev && matches!(target_phase, IslandPhase::Recording) {
-                // Opening straight into Recording: the shell springs out from a compact capsule
-                // with the lead pinned to its left edge, and each trailing item fades in as the
-                // edge uncovers it (`edge_alpha`), so nothing waits for the shell.
-                (target_phase, 0.0, 1.0)
-            } else if !has_prev && opacity < 0.999 {
-                // Opening: the content sharpens as the capsule fades in (both step-driven).
-                (target_phase, swap_blur * (1.0 - opacity), 1.0)
-            } else {
-                (target_phase, 0.0, 1.0)
-            };
-        // The swap's blur leaves the content's scale alone so the pinned lead stays put.
-        let content_shrink = if swap.is_some() { 0.0 } else { 0.015 };
-        let is_completed = matches!(target_phase, IslandPhase::Completed { .. });
+        let frame = self.coordinator.read(cx).island.frame(&tune);
 
         if let Some(ref ns_win) = self.ns_window {
             apply_pill_layer_effect(
                 ns_win,
                 &mut self.shell_layer,
-                render_width,
-                ISLAND_H,
-                scale,
-                y_off,
-                opacity,
+                &mut self.ghost_layer,
+                &frame,
                 is_completed,
-                blur_radius,
-                content_shrink,
             );
         }
-        let trace_xf = self.ns_window.as_ref().filter(|_| tracing).map(|ns_win| {
-            trace_capsule(
-                ns_win,
-                render_width,
-                scale,
-                y_off,
-                opacity,
-                content_alpha,
-                blur_radius,
-                content_shrink,
-            )
-        });
+        let trace_xf = self
+            .ns_window
+            .as_ref()
+            .filter(|_| tracing)
+            .map(|ns_win| trace_capsule(ns_win, &frame));
 
-        let c_paste_down = self.coordinator.clone();
-        let c_paste_up = self.coordinator.clone();
-        let c_paste_out = self.coordinator.clone();
-        let c_inspect = self.coordinator.clone();
-        let c_dismiss = self.coordinator.clone();
-        let c_record = self.coordinator.clone();
-        let c_sel_cancel = self.coordinator.clone();
+        let viewport = window.viewport_size();
+        let (cx0, cy0) = (
+            f32::from(viewport.width) * 0.5,
+            f32::from(viewport.height) * 0.5,
+        );
+        let row_top = cy0 - CHIP_H * 0.5;
+        let items: Vec<AnyElement> = frame
+            .items
+            .iter()
+            .map(|f| {
+                div()
+                    .absolute()
+                    .left(px(cx0 + f.x))
+                    .top(px(row_top))
+                    .h(px(CHIP_H))
+                    .w(px(f.w))
+                    .flex()
+                    .items_center()
+                    .opacity(f.alpha)
+                    .child(self.item_element(&f.key, &ctx, f.live))
+                    .into_any_element()
+            })
+            .collect();
+        let keys: Vec<Option<(String, f32)>> = frame
+            .items
+            .iter()
+            .map(|f| Some((f.key.clone(), f.alpha)))
+            .collect();
+        let content = div().absolute().inset_0().children(items);
+        let content = match trace_xf {
+            Some(xf) => content.on_children_prepainted(motion::trace_children(keys, xf, "row")),
+            None => content,
+        };
 
-        // Keep typography (`HUD_TEXT`) and spacing (`CHIP_GAP`) 100% constant so glyphs never
-        // re-hint or jump; all scaling happens in the GPU CALayer transform.
-        let row = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(CHIP_GAP))
+        // The ✕'s hint: Esc does the same, shown after a moment's hover.
+        let hint = close_hover
+            .map(motion::age)
+            .filter(|age| *age > 0.45)
+            .zip(frame.items.iter().find(|f| f.key == "close" && f.live))
+            .map(|(age, close)| {
+                let alpha = ease_out_cubic((age - 0.45) / 0.12) * close.alpha;
+                div()
+                    .absolute()
+                    .left(px(cx0 + close.x + close.w * 0.5 - 15.0))
+                    .top(px(cy0 + ISLAND_H * 0.5 + 4.0))
+                    .w(px(30.0))
+                    .h(px(16.0))
+                    .rounded(px(4.0))
+                    .bg(rgba(0x141416e6))
+                    .border_1()
+                    .border_color(rgba(0xffffff26))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(10.0))
+                    .text_color(rgb(MUTED_COLOR))
+                    .opacity(alpha)
+                    .child("Esc")
+            });
+
+        let has_shell = self.shell_layer.is_some();
+        let shape = frame.shape;
+        let c_keys = self.coordinator.clone();
+        div()
+            .track_focus(&self.focus)
+            // Clicking a chip can make the pill the key window; keep the picker's keyboard map.
+            .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                c_keys.update(cx, |coord, cx| {
+                    coord.handle_selection_key(&event.keystroke, cx)
+                });
+            })
+            .size_full()
+            .relative()
+            .text_color(rgb(TEXT_COLOR))
             .text_size(px(HUD_TEXT))
             .whitespace_nowrap()
-            .opacity(content_alpha);
-        // Traces a row's children under these names (`SCRAWL_MOTION_TRACE`).
-        let traced = |group: Div, keys: Vec<Option<(String, f32)>>| match trace_xf {
-            Some(xf) => group.on_children_prepainted(motion::trace_children(keys, xf, "row")),
-            None => group,
-        };
-        let named = |names: &[&str]| -> Vec<Option<(String, f32)>> {
-            names.iter().map(|n| Some(((*n).to_owned(), 1.0))).collect()
-        };
-
-        // The highlight cross-fades from the mode it left.
-        let highlight = |m: SelectionMode, mode: SelectionMode| -> f32 {
-            match highlight_prev.filter(|prev| *prev != mode) {
-                _ if m == mode && highlight_prev.is_none() => 1.0,
-                Some(_) if m == mode => highlight_p,
-                Some(prev) if m == prev => 1.0 - highlight_p,
-                _ => f32::from(u8::from(m == mode)),
-            }
-        };
-        // Per-item opacity of the picker row while it slides in (`SwitchMorph`).
-        let selecting_alphas = |mode: SelectionMode| -> Vec<f32> {
-            let Some(layout) = switch_layout else {
-                return Vec::new();
-            };
-            let modes = SelectionMode::available(has_iphone || hold);
-            let mut widths: Vec<f32> = modes.iter().map(|&m| segment_width(window, m)).collect();
-            if mode.shows_record() && !hold {
-                widths.push(chip_width(window, "Record", FontWeight::SEMIBOLD));
-            }
-            widths.extend([layout.divider_w, CHIP_H]);
-            trail_offsets(layout.row_left(), &widths)
-                .iter()
-                .zip(&widths)
-                .map(|(&x, &w)| uncover_alpha(layout.inner_now + ISLAND_INSET, x, w))
-                .collect()
-        };
-        let ghost = switch_layout.map(|layout| {
-            let pieces = layout.ghost_alphas();
-            div()
-                .absolute()
-                .top(px(ISLAND_INSET))
-                .left(px(ISLAND_INSET + layout.ghost_left()))
-                .h(px(CHIP_H))
-                .flex()
-                .items_center()
-                .gap(px(CHIP_GAP))
-                .text_size(px(HUD_TEXT))
-                .whitespace_nowrap()
-                .child(
+            .when(!has_shell, |d| {
+                d.child(
                     div()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .pr(px(LEAD_TRAIL))
-                        .child(
-                            div()
-                                .size(px(CHIP_H))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .opacity(pieces[0])
-                                .child(div().size(px(8.0)).rounded_full().bg(rgb(INK_RED))),
-                        )
-                        .child(
-                            div()
-                                .w(px(layout.clock_w))
-                                .font(tabular_font(FontWeight::SEMIBOLD))
-                                .opacity(pieces[1])
-                                .child(clock.clone()),
-                        ),
+                        .absolute()
+                        .left(px(cx0 + shape.l))
+                        .top(px(cy0 + shape.t))
+                        .w(px(shape.width()))
+                        .h(px(shape.height()))
+                        .rounded(px(shape.radius))
+                        .opacity(frame.shell_alpha)
+                        .bg(rgba(0x141416f5))
+                        .border_1()
+                        .border_color(if is_completed {
+                            rgba(0x69d89f4d)
+                        } else {
+                            rgba(0xffffff1a)
+                        }),
                 )
-                .child(island_divider().opacity(pieces[2]))
-        });
-        let ghost = match (ghost, trace_xf) {
-            (Some(g), Some(xf)) => {
-                let lead_alpha = switch_layout.map_or(0.0, |l| l.ghost_alphas()[1]);
-                let divider_alpha = switch_layout.map_or(0.0, |l| l.ghost_alphas()[2]);
-                Some(g.on_children_prepainted(motion::trace_children(
-                    vec![
-                        Some(("lead".into(), lead_alpha)),
-                        Some(("divider.lead".into(), divider_alpha)),
-                    ],
-                    xf,
-                    "row",
-                )))
-            }
-            (ghost, _) => ghost,
-        };
+            })
+            .child(content)
+            .when_some(hint, |d, hint| d.child(hint))
+    }
+}
 
-        let capsule_content = match content_phase {
-            IslandPhase::Selecting { mode } => {
-                let alphas = selecting_alphas(mode);
-                let alpha = |i: usize| alphas.get(i).copied().unwrap_or(1.0);
-                let n_modes = SelectionMode::available(has_iphone || hold).len();
-                let record = mode.shows_record() && !hold;
-                let after = n_modes + usize::from(record);
-                traced(
-                    row.when_some(switch_layout, |row, layout| {
-                        row.relative().left(px(layout.dx))
-                    }),
-                    SelectionMode::available(has_iphone || hold)
-                        .iter()
-                        .map(|m| m.label())
-                        .map(|label| format!("chip:{label}"))
-                        .chain(record.then(|| "record".to_owned()))
-                        .chain(["divider.close".to_owned(), "close".to_owned()])
-                        .enumerate()
-                        .map(|(i, key)| Some((key, alpha(i))))
-                        .collect(),
-                )
-                .children(
-                    SelectionMode::available(has_iphone || hold)
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &segment)| {
-                            let c_segment = self.coordinator.clone();
-                            mode_segment_level(segment, highlight(segment, mode))
-                                .opacity(alpha(i))
-                                .on_click(move |_, _, cx| {
-                                    c_segment.update(cx, |coord, cx| {
-                                        coord.click_selection_mode(segment, cx)
-                                    });
-                                })
-                        }),
-                )
-                .when(record, |row| {
-                    row.child(
-                        primary_chip("sel-record", "Record")
-                            .opacity(alpha(n_modes))
-                            .on_click(move |_, _, cx| {
-                                c_record.update(cx, |coord, cx| coord.record_selected_mode(cx));
-                            }),
-                    )
+impl HudPillWindow {
+    /// One item of the capsule by its key (`capsule_specs`). Only `live` items (in the current
+    /// layout and showing) take clicks.
+    fn item_element(&self, key: &str, ctx: &ItemContext, live: bool) -> AnyElement {
+        let coordinator = self.coordinator.clone();
+        let phase = ctx.phase;
+        if let Some(mode) = key.strip_prefix("chip:").and_then(mode_for_label) {
+            let recording = matches!(phase, IslandPhase::Recording);
+            return mode_segment_level(mode, ctx.highlight(mode))
+                .when(live, |d| {
+                    d.on_click(move |_, _, cx| {
+                        coordinator.update(cx, |coord, cx| {
+                            if recording {
+                                coord.switch_recording(mode, cx);
+                            } else {
+                                coord.click_selection_mode(mode, cx);
+                            }
+                        });
+                    })
                 })
-                .child(island_divider().opacity(alpha(after)))
-                .child(
-                    icon_circle_chip("sel-cancel", "✕")
-                        .opacity(alpha(after + 1))
-                        .on_click(move |_, _, cx| {
-                            c_sel_cancel.update(cx, |coord, cx| coord.cancel_recording(cx));
-                        }),
-                )
-            }
-            IslandPhase::Completed { inbox_count, .. } => traced(
-                row,
-                named(&["done.lead", "divider.lead", "paste", "inspect", "close"]),
-            )
-            .child(
+                .into_any_element();
+        }
+        match key {
+            "lead" => {
+                // A soft ripple leaves the dot every 1.6s while the dot itself breathes.
+                let cycle = 1.6;
+                let ripple = (ctx.phase_age / cycle).fract();
+                let breath = 0.5 + 0.5 * (std::f32::consts::TAU * ctx.phase_age / cycle).cos();
+                let halo = 8.0 + 12.0 * ease_out_cubic(ripple);
                 island_lead()
                     .child(
                         div()
                             .size(px(CHIP_H))
-                            .rounded_full()
                             .flex_none()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .bg(rgba(0x34c7592e))
-                            .text_color(rgb(POSITIVE_COLOR))
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::BOLD)
-                            .child("✓"),
+                            .child(
+                                div()
+                                    .size(px(halo))
+                                    .rounded_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(with_alpha(INK_RED, 0.34 * (1.0 - ripple).powi(2)))
+                                    .child(
+                                        div()
+                                            .size(px(8.0))
+                                            .rounded_full()
+                                            .bg(with_alpha(INK_RED, 0.72 + 0.28 * breath)),
+                                    ),
+                            ),
                     )
                     .child(
                         div()
-                            .ml(px(8.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(TEXT_COLOR))
-                            .child(completed_label(inbox_count, completed_note.as_deref())),
-                    ),
-            )
-            .child(island_divider())
-            .child(
-                primary_chip("hud-paste", "Paste")
-                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                        let start = current_mouse_screen();
-                        c_paste_down.update(cx, |coord, _| {
-                            coord.paste_drag_start = start;
-                        });
-                    })
-                    .on_mouse_up(MouseButton::Left, move |_, _, cx| {
-                        c_paste_up.update(cx, |coord, cx| {
-                            coord.paste_drag_start = None;
-                            coord.paste_completed_bundle(None, cx);
-                        });
-                    })
-                    .on_mouse_up_out(MouseButton::Left, move |_, _, cx| {
-                        let end = current_mouse_screen();
-                        c_paste_out.update(cx, |coord, cx| {
-                            if let (Some(start), Some(drop_pt)) =
-                                (coord.paste_drag_start.take(), end)
-                            {
-                                let dist = (drop_pt[0] - start[0]).hypot(drop_pt[1] - start[1]);
-                                if dist >= 24.0 {
-                                    coord.paste_completed_bundle(Some(drop_pt), cx);
-                                }
-                            }
-                        });
-                    }),
-            )
-            .child(
-                pill_chip("hud-inspect", "Inspect", true).on_click(move |_, _, cx| {
-                    c_inspect.update(cx, |coord, cx| coord.inspect_completed_bundle(cx));
-                }),
-            )
-            .child(
-                icon_circle_chip("hud-dismiss", "✕").on_click(move |_, _, cx| {
-                    c_dismiss.update(cx, |coord, cx| coord.dismiss_completed_bundle(cx));
-                }),
-            ),
-            IslandPhase::Recording => {
-                // A soft ripple leaves the dot every 1.6s while the dot itself breathes.
-                let cycle = 1.6;
-                let ripple = (phase_age / cycle).fract();
-                let breath = 0.5 + 0.5 * (std::f32::consts::TAU * phase_age / cycle).cos();
-                let halo = 8.0 + 12.0 * ease_out_cubic(ripple);
-                let clock_w = measure_text(
-                    window,
-                    &clock_template(&clock),
-                    HUD_TEXT,
-                    FontWeight::SEMIBOLD,
-                );
-                traced(
-                    row,
-                    vec![
-                        Some(("lead".into(), 1.0)),
-                        Some(("divider.lead".into(), 1.0)),
-                        None,
-                    ],
-                )
-                .child(
-                    island_lead()
-                        .child(
-                            div()
-                                .size(px(CHIP_H))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .size(px(halo))
-                                        .rounded_full()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .bg(with_alpha(INK_RED, 0.34 * (1.0 - ripple).powi(2)))
-                                        .child(
-                                            div()
-                                                .size(px(8.0))
-                                                .rounded_full()
-                                                .bg(with_alpha(INK_RED, 0.72 + 0.28 * breath)),
-                                        ),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .w(px(clock_w))
-                                .font(tabular_font(FontWeight::SEMIBOLD))
-                                .child(clock),
-                        ),
-                )
-                .child(island_divider())
-                .child({
-                    // The trailing slot: switch chips or controls. The lead is pinned to the
-                    // shell's left edge (`justify_start` below), so each item's fade follows how
-                    // far the springing right edge has uncovered it.
-                    let trail_x0 = CHIP_H
-                        + clock_w
-                        + LEAD_TRAIL
-                        + CHIP_GAP
-                        + (1.0 + 2.0 * DIVIDER_MX)
-                        + CHIP_GAP;
-                    let inner_now = render_width - 2.0 * ISLAND_INSET;
-                    let alphas = |group_chips: bool, fade: f32| -> (Vec<f32>, f32) {
-                        let widths = recording_trail_widths(window, group_chips, has_iphone);
-                        let alphas = trail_offsets(trail_x0, &widths)
-                            .iter()
-                            .zip(&widths)
-                            .map(|(&x, &w)| fade * edge_alpha(inner_now, x, w))
-                            .collect();
-                        let total = widths.iter().sum::<f32>()
-                            + widths.len().saturating_sub(1) as f32 * CHIP_GAP;
-                        (alphas, total)
-                    };
-                    let enter = swap.map_or(1.0, |_| ease_out_cubic(swap_age / enter_s));
-                    let (in_alphas, in_w) = alphas(chips, enter);
-                    let outgoing = swap.and_then(|out_chips| {
-                        let fade = 1.0 - ease_out_cubic(swap_age / exit_s);
-                        (fade > 0.002).then(|| {
-                            let (out_alphas, _) = alphas(out_chips, fade);
-                            traced(
-                                self.recording_trail(
-                                    out_chips,
-                                    has_iphone,
-                                    stroke_count,
-                                    &out_alphas,
-                                    false,
-                                ),
-                                trail_keys(out_chips, has_iphone, &out_alphas, "out:"),
-                            )
-                        })
-                    });
-                    div()
-                        .relative()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .h(px(CHIP_H))
-                        .w(px(in_w))
-                        .when_some(outgoing, |slot, group| {
-                            slot.child(div().absolute().left(px(0.0)).top(px(0.0)).child(group))
-                        })
-                        .child(traced(
-                            self.recording_trail(chips, has_iphone, stroke_count, &in_alphas, true),
-                            trail_keys(chips, has_iphone, &in_alphas, ""),
-                        ))
-                })
+                            .w(px(ctx.clock_w))
+                            .font(tabular_font(FontWeight::SEMIBOLD))
+                            .child(ctx.clock.clone()),
+                    )
+                    .into_any_element()
             }
-            IslandPhase::Processing => {
+            "divider.lead" | "divider.close" => island_divider().into_any_element(),
+            "undo" => {
+                let enabled = ctx.stroke_count > 0;
+                pill_chip("hud-undo", "Undo", enabled)
+                    .when(live && enabled, |d| {
+                        d.on_click(move |_, _, cx| {
+                            coordinator.update(cx, |coord, cx| coord.undo_stroke(cx));
+                        })
+                    })
+                    .into_any_element()
+            }
+            "finish" => primary_chip("hud-done", "Finish")
+                .when(live, |d| {
+                    d.on_click(move |_, _, cx| {
+                        coordinator.update(cx, |coord, cx| coord.finish_recording(cx));
+                    })
+                })
+                .into_any_element(),
+            "record" => primary_chip("sel-record", "Record")
+                .when(live, |d| {
+                    d.on_click(move |_, _, cx| {
+                        coordinator.update(cx, |coord, cx| coord.record_selected_mode(cx));
+                    })
+                })
+                .into_any_element(),
+            "close" => {
+                let completed = matches!(phase, IslandPhase::Completed { .. });
+                let c_hover = self.coordinator.clone();
+                icon_circle_chip(if completed { "hud-dismiss" } else { "hud-cancel" }, "✕")
+                    .when(live, |d| {
+                        d.on_click(move |_, _, cx| {
+                            coordinator.update(cx, |coord, cx| {
+                                if completed {
+                                    coord.dismiss_completed_bundle(cx);
+                                } else {
+                                    // Discards the recording, as Esc does.
+                                    coord.cancel_recording(cx);
+                                }
+                            });
+                        })
+                    })
+                    .when(live && !completed, |d| {
+                        d.on_hover(move |hovered, _, cx| {
+                            let hovered = *hovered;
+                            c_hover.update(cx, |coord, cx| {
+                                coord.close_hover = hovered.then(motion::now);
+                                cx.notify();
+                            });
+                        })
+                    })
+                    .into_any_element()
+            }
+            "processing" => {
                 // 120Hz 8-dot orbiting progress ring inside the leading 32px slot.
                 let dots = (0..8).map(|i| {
                     let frac = i as f32 / 8.0;
                     let angle = frac * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
-                    let turn = (phase_age * 2.1 - frac).rem_euclid(1.0);
+                    let turn = (ctx.phase_age * 2.1 - frac).rem_euclid(1.0);
                     let intensity = (1.0 - turn).powi(2);
                     let dot_r = 1.35 + 0.65 * intensity;
                     let cx_dot = 16.0 + 7.2 * angle.cos() - dot_r;
@@ -3771,197 +3351,91 @@ impl Render for HudPillWindow {
                         .rounded_full()
                         .bg(with_alpha(TEXT_COLOR, 0.20 + 0.80 * intensity))
                 });
-                traced(row, named(&["processing"])).child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .pr(px(CHIP_PX))
-                        .whitespace_nowrap()
-                        .child(div().size(px(CHIP_H)).flex_none().relative().children(dots))
-                        .child(
-                            div()
-                                .ml(px(6.0))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(TEXT_COLOR))
-                                .child("Processing…"),
-                        ),
-                )
-            }
-            IslandPhase::Hidden | IslandPhase::Dismissing => row,
-        };
-
-        let has_shell = self.shell_layer.is_some();
-        let c_keys = self.coordinator.clone();
-        let pin_lead = matches!(content_phase, IslandPhase::Recording);
-
-        div()
-            .track_focus(&self.focus)
-            // Clicking a chip can make the pill the key window; keep the picker's keyboard map.
-            .on_key_down(move |event: &KeyDownEvent, _, cx| {
-                c_keys.update(cx, |coord, cx| {
-                    coord.handle_selection_key(&event.keystroke, cx)
-                });
-            })
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .opacity(opacity)
-            .child(
                 div()
-                    .w(px(render_width))
-                    .h(px(ISLAND_H))
-                    .flex_none()
-                    .p(px(if has_shell { ISLAND_INSET } else { ISLAND_PAD }))
-                    .rounded(px(ISLAND_RADIUS))
-                    .overflow_hidden()
                     .flex()
+                    .flex_none()
                     .items_center()
-                    .when(pin_lead, |d| d.justify_start())
-                    .when(!pin_lead, |d| d.justify_center())
-                    .when(!has_shell, |d| {
-                        d.bg(rgba(0x141416f5))
-                            .border_1()
-                            .border_color(if is_completed {
-                                rgba(0x69d89f4d)
-                            } else {
-                                rgba(0xffffff1a)
-                            })
-                    })
-                    .text_color(rgb(TEXT_COLOR))
-                    .text_size(px(HUD_TEXT))
+                    .pr(px(CHIP_PX))
                     .whitespace_nowrap()
-                    .relative()
-                    .when_some(ghost, |d, ghost| d.child(ghost))
-                    .child(capsule_content),
-            )
-    }
-}
-
-/// Where a switch chip's morph is this frame (`SwitchMorph`), in points from the capsule's
-/// inner left edge.
-#[derive(Clone, Copy, Debug)]
-struct SwitchLayout {
-    /// The picker row's offset from its resting place.
-    dx: f32,
-    clock_w: f32,
-    lead_w: f32,
-    divider_w: f32,
-    /// The capsule's inner width now, and the picker row's width.
-    inner_now: f32,
-    inner_row: f32,
-}
-
-impl SwitchLayout {
-    fn new(morph: SwitchMorph, width: f32, target_width: f32, clock_w: f32) -> Self {
-        let lead_w = CHIP_H + clock_w + LEAD_TRAIL;
-        let divider_w = 1.0 + 2.0 * DIVIDER_MX;
-        let inner_row = target_width - 2.0 * ISLAND_INSET;
-        let dx = morph.slide.map_or_else(
-            || {
-                // From the capsule's centre: where the chips were, pinned behind the lead, and
-                // where the centred picker row rests.
-                let chips = -width / 2.0 + ISLAND_INSET + lead_w + divider_w + 2.0 * CHIP_GAP;
-                chips + inner_row / 2.0
-            },
-            |(x, _)| x,
-        );
-        Self {
-            dx,
-            clock_w,
-            lead_w,
-            divider_w,
-            inner_now: width - 2.0 * ISLAND_INSET,
-            inner_row,
+                    .child(div().size(px(CHIP_H)).flex_none().relative().children(dots))
+                    .child(
+                        div()
+                            .ml(px(6.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT_COLOR))
+                            .child("Processing…"),
+                    )
+                    .into_any_element()
+            }
+            "done.lead" => island_lead()
+                .child(
+                    div()
+                        .size(px(CHIP_H))
+                        .rounded_full()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(rgba(0x34c7592e))
+                        .text_color(rgb(POSITIVE_COLOR))
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::BOLD)
+                        .child("✓"),
+                )
+                .child(
+                    div()
+                        .ml(px(8.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT_COLOR))
+                        .child(ctx.completed.clone()),
+                )
+                .into_any_element(),
+            "paste" => {
+                let (c_down, c_up, c_out) = (
+                    self.coordinator.clone(),
+                    self.coordinator.clone(),
+                    self.coordinator.clone(),
+                );
+                primary_chip("hud-paste", "Paste")
+                    .when(live, |d| {
+                        d.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            let start = current_mouse_screen();
+                            c_down.update(cx, |coord, _| {
+                                coord.paste_drag_start = start;
+                            });
+                        })
+                        .on_mouse_up(MouseButton::Left, move |_, _, cx| {
+                            c_up.update(cx, |coord, cx| {
+                                coord.paste_drag_start = None;
+                                coord.paste_completed_bundle(None, cx);
+                            });
+                        })
+                        .on_mouse_up_out(MouseButton::Left, move |_, _, cx| {
+                            let end = current_mouse_screen();
+                            c_out.update(cx, |coord, cx| {
+                                if let (Some(start), Some(drop_pt)) =
+                                    (coord.paste_drag_start.take(), end)
+                                {
+                                    let dist =
+                                        (drop_pt[0] - start[0]).hypot(drop_pt[1] - start[1]);
+                                    if dist >= 24.0 {
+                                        coord.paste_completed_bundle(Some(drop_pt), cx);
+                                    }
+                                }
+                            });
+                        })
+                    })
+                    .into_any_element()
+            }
+            "inspect" => pill_chip("hud-inspect", "Inspect", true)
+                .when(live, |d| {
+                    d.on_click(move |_, _, cx| {
+                        coordinator.update(cx, |coord, cx| coord.inspect_completed_bundle(cx));
+                    })
+                })
+                .into_any_element(),
+            _ => div().into_any_element(),
         }
-    }
-
-    fn row_left(&self) -> f32 {
-        (self.inner_now - self.inner_row) / 2.0 + self.dx
-    }
-
-    /// The leaving lead and divider sit just in front of the row, as they did in the pill.
-    fn ghost_left(&self) -> f32 {
-        self.row_left() - 2.0 * CHIP_GAP - self.divider_w - self.lead_w
-    }
-
-    /// Dot, clock and divider each fade out as they near the capsule's left edge and are gone
-    /// when they reach it, so nothing is cut by a hard edge while it still shows.
-    fn ghost_alphas(&self) -> [f32; 3] {
-        // Each piece's left edge in the pill, from the shell's outer edge.
-        let rests = [
-            ISLAND_INSET + CHIP_H / 2.0 - 4.0,
-            ISLAND_INSET + CHIP_H,
-            ISLAND_INSET + self.lead_w + CHIP_GAP + DIVIDER_MX,
-        ];
-        rests.map(|rest| {
-            let left = self.ghost_left() + rest;
-            let t = (left / rest.min(40.0)).clamp(0.0, 1.0);
-            t * t * (3.0 - 2.0 * t)
-        })
-    }
-}
-
-impl HudPillWindow {
-    /// One trailing group of the Recording capsule, each item faded by `alphas`: the switch chips
-    /// (Screen selected, as a tap records the screen) or Undo · Cancel · Finish. An outgoing
-    /// group isn't `interactive`.
-    fn recording_trail(
-        &self,
-        chips: bool,
-        has_iphone: bool,
-        stroke_count: usize,
-        alphas: &[f32],
-        interactive: bool,
-    ) -> Div {
-        let alpha = |i: usize| alphas.get(i).copied().unwrap_or(1.0);
-        let group = div().flex().flex_none().items_center().gap(px(CHIP_GAP));
-        if chips {
-            return group.children(SelectionMode::available(has_iphone).iter().enumerate().map(
-                |(i, &mode)| {
-                    let c_switch = self.coordinator.clone();
-                    mode_segment(mode, mode == SelectionMode::Screen)
-                        .opacity(alpha(i))
-                        .when(interactive, |d| {
-                            d.on_click(move |_, _, cx| {
-                                c_switch.update(cx, |coord, cx| coord.switch_recording(mode, cx));
-                            })
-                        })
-                },
-            ));
-        }
-        let c_undo = self.coordinator.clone();
-        let c_cancel = self.coordinator.clone();
-        let c_finish = self.coordinator.clone();
-        group
-            .child(
-                pill_chip("hud-undo", "Undo", stroke_count > 0)
-                    .opacity(alpha(0))
-                    .when(interactive && stroke_count > 0, |d| {
-                        d.on_click(move |_, _, cx| {
-                            c_undo.update(cx, |coord, cx| coord.undo_stroke(cx));
-                        })
-                    }),
-            )
-            .child(
-                pill_chip("hud-cancel", "Cancel", true)
-                    .opacity(alpha(1))
-                    .when(interactive, |d| {
-                        d.on_click(move |_, _, cx| {
-                            c_cancel.update(cx, |coord, cx| coord.cancel_recording(cx));
-                        })
-                    }),
-            )
-            .child(
-                primary_chip("hud-done", "Finish")
-                    .opacity(alpha(2))
-                    .when(interactive, |d| {
-                        d.on_click(move |_, _, cx| {
-                            c_finish.update(cx, |coord, cx| coord.finish_recording(cx));
-                        })
-                    }),
-            )
     }
 }
 
@@ -4042,11 +3516,6 @@ fn icon_circle_chip(id: &'static str, icon: &'static str) -> gpui::Stateful<Div>
         .child(icon)
 }
 
-/// One segment of the selection-mode control: line icon + label. Weight stays constant across
-/// states so switching never shifts the measured capsule width (`selecting_row_width`).
-fn mode_segment(mode: SelectionMode, active: bool) -> gpui::Stateful<Div> {
-    mode_segment_level(mode, f32::from(u8::from(active)))
-}
 
 fn mix_rgb(from: u32, to: u32, t: f32) -> gpui::Rgba {
     let t = t.clamp(0.0, 1.0);
@@ -5319,6 +4788,7 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
         move |window, cx| {
             let ns_window = find_hud_pill_ns_window();
             let mut shell_layer = None;
+            let mut ghost_layer = None;
             if let Some(ref ns_win) = ns_window {
                 ns_win.setStyleMask(
                     NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
@@ -5332,17 +4802,13 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
                 }
                 configure_floating_window(ns_win, false, 3);
                 ns_win.orderFrontRegardless();
+                // Unseen until the island opens it.
                 apply_pill_layer_effect(
                     ns_win,
                     &mut shell_layer,
-                    205.0,
-                    ISLAND_H,
-                    0.92,
-                    -6.0,
-                    0.0,
+                    &mut ghost_layer,
+                    &island::Island::new().frame(&motion::tune()),
                     false,
-                    3.5,
-                    0.015,
                 );
                 let num = ns_win.windowNumber().max(0) as u32;
                 if num > 0 {
@@ -5364,6 +4830,7 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
                     focus,
                     ns_window,
                     shell_layer,
+                    ghost_layer,
                     frames: 0,
                 }
             })
@@ -5714,6 +5181,7 @@ pub fn run_app(
                     if loop_coord.read(cx).is_island_visible() {
                         record_external_frontmost_app();
                         loop_coord.update(cx, |coord, cx| coord.island_tick(cx));
+                        sync_hud_pill_hit_test(loop_coord.read(cx).hit_width());
                     }
                 });
                 if should_quit {
@@ -5862,8 +5330,8 @@ mod tests {
 
     #[test]
     fn island_geometry_is_concentric() {
-        assert_eq!(ISLAND_RADIUS, CHIP_RADIUS + ISLAND_INSET);
-        assert_eq!(ISLAND_PAD + 1.0, ISLAND_INSET);
+        // Chips are concentric with the capsule: inner radius = outer − inset.
+        assert_eq!(ISLAND_H / 2.0, CHIP_RADIUS + ISLAND_INSET);
         assert_eq!(CHIP_H + 2.0 * ISLAND_INSET, ISLAND_H);
         assert!(ISLAND_H <= PILL_WINDOW_H);
     }
@@ -5913,58 +5381,31 @@ mod tests {
     }
 
     #[test]
-    fn selecting_row_width_mirrors_layout() {
-        let segment = |label: f32| label + 2.0 * SEG_PX + SEG_ICON + SEG_ICON_GAP;
-        let divider = 1.0 + 2.0 * DIVIDER_MX;
-        // Three segments, divider, ✕: four gaps between five items.
-        assert_eq!(
-            selecting_row_width(&[30.0, 50.0, 45.0], None),
-            segment(30.0) + segment(50.0) + segment(45.0) + divider + CHIP_H + 4.0 * CHIP_GAP
+    fn the_widest_layouts_fit_the_pill_window() {
+        // Generous label estimates: segment ≈ label + padding + icon.
+        let seg = |label: f32| label + 2.0 * SEG_PX + SEG_ICON + SEG_ICON_GAP;
+        let close = [divider_spec("divider.close"), island::Spec::chip("close", CHIP_H)];
+        let mut picker: Vec<island::Spec> = [34.0, 56.0, 50.0, 46.0]
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| island::Spec::chip(format!("chip:{i}"), seg(l)))
+            .collect();
+        picker.push(island::Spec::chip("record", 2.0 * CHIP_PX + 52.0));
+        picker.extend(close.clone());
+        let mut recording = vec![
+            island::Spec::new("lead", CHIP_H + 46.0 + LEAD_TRAIL, LEAD_INK),
+            divider_spec("divider.lead"),
+        ];
+        recording.extend(
+            [34.0, 56.0, 50.0, 46.0]
+                .iter()
+                .enumerate()
+                .map(|(i, &l)| island::Spec::chip(format!("chip:{i}"), seg(l))),
         );
-        // A fourth segment and the Record chip each add their width and one gap.
-        assert_eq!(
-            selecting_row_width(&[30.0, 50.0, 45.0, 42.0], Some(70.0)),
-            selecting_row_width(&[30.0, 50.0, 45.0], None) + segment(42.0) + 70.0 + 2.0 * CHIP_GAP
-        );
-        // The widest row (generous label estimates) still fits the pill window.
-        let widest = selecting_row_width(&[34.0, 56.0, 50.0, 46.0], Some(2.0 * CHIP_PX + 52.0));
-        assert!(
-            widest + 2.0 * ISLAND_INSET <= PILL_WINDOW_W - 16.0,
-            "{widest}"
-        );
-    }
-
-    #[test]
-    fn island_spring_settles_without_large_overshoot() {
-        let (mut x, mut v) = (200.0_f32, 0.0_f32);
-        let mut peak = x;
-        for _ in 0..90 {
-            (x, v) = spring_step(x, v, 300.0, 1.0 / 60.0, motion::Tune::DEFAULT.island);
-            peak = peak.max(x);
-        }
-        assert!((x - 300.0).abs() < 0.5, "settled at {x}");
-        assert!(peak < 300.0 + 100.0 * 0.05, "overshoot peak {peak}");
-    }
-
-    #[test]
-    fn reveal_springs_lead_the_morph_palette_and_settle() {
-        let t = motion::Tune::DEFAULT;
-        // Width leads morph .42/.16 open and .38/.08 close on a slightly faster spring.
-        assert!(t.reveal_open.response < 0.42);
-        assert!(t.reveal_close.response < 0.38);
-        assert!(t.reveal_close.response < t.reveal_open.response);
-        assert!((t.reveal_open.bounce - 0.16).abs() < 1e-6);
-        assert!(t.reveal_exit_s < t.reveal_enter_s && t.reveal_exit_s >= 0.75 * t.reveal_enter_s);
-        assert!(t.reveal_blur_px <= 4.0);
-        for (spring, from, to) in [
-            (t.reveal_open, ISLAND_OPEN_FROM_W, 430.0),
-            (t.reveal_close, 430.0, 330.0),
-        ] {
-            let (mut x, mut v) = (from, 0.0_f32);
-            for _ in 0..60 {
-                (x, v) = spring_step(x, v, to, 1.0 / 60.0, spring);
-            }
-            assert!((x - to).abs() < 0.5, "settled at {x}");
+        recording.extend(close);
+        for specs in [picker, recording] {
+            let w = island::row_width(&specs);
+            assert!(w <= PILL_WINDOW_W - 16.0, "{w}");
         }
     }
 
@@ -5973,44 +5414,6 @@ mod tests {
         let _ = reduce_motion();
         let cls = objc2::runtime::AnyClass::get(c"NSEvent").expect("NSEvent");
         let _: objc2_foundation::NSPoint = unsafe { msg_send![cls, mouseLocation] };
-    }
-
-    #[test]
-    fn trailing_items_fade_in_as_the_edge_uncovers_them() {
-        let offsets = trail_offsets(100.0, &[50.0, 60.0]);
-        assert_eq!(offsets, vec![100.0, 100.0 + 50.0 + CHIP_GAP]);
-        assert_eq!(edge_alpha(100.0, 100.0, 50.0), 0.0);
-        assert!((edge_alpha(125.0, 100.0, 50.0) - 0.5).abs() < 1e-6);
-        assert_eq!(edge_alpha(150.0, 100.0, 50.0), 1.0);
-        assert_eq!(edge_alpha(400.0, 100.0, 50.0), 1.0);
-    }
-
-    #[test]
-    fn a_switch_chip_morph_starts_where_the_pill_was_and_rests_centred() {
-        let (width, target, clock_w) = (336.0, 298.0, 35.0);
-        let start = SwitchLayout::new(SwitchMorph { slide: None }, width, target, clock_w);
-        // The lead is still pinned to the left edge and the chips start behind its divider.
-        assert!(start.ghost_left().abs() < 1e-3, "{}", start.ghost_left());
-        let chips_x = CHIP_H + clock_w + LEAD_TRAIL + 2.0 * CHIP_GAP + 1.0 + 2.0 * DIVIDER_MX;
-        assert!((start.row_left() - chips_x).abs() < 1e-3);
-        assert_eq!(start.ghost_alphas(), [1.0, 1.0, 1.0]);
-        // At rest the picker row is centred in the capsule, the lead past its edge and gone.
-        let rest = SwitchLayout::new(
-            SwitchMorph {
-                slide: Some((0.0, 0.0)),
-            },
-            target,
-            target,
-            clock_w,
-        );
-        assert!(rest.row_left().abs() < 1e-3);
-        assert_eq!(rest.ghost_alphas(), [0.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn island_spring_is_stable_for_long_frames() {
-        let (x, _) = spring_step(200.0, 0.0, 300.0, 0.05, motion::Tune::DEFAULT.island);
-        assert!(x > 200.0 && x < 300.0);
     }
 
     #[test]

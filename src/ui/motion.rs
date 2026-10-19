@@ -55,149 +55,183 @@ fn set_time_scale(scale: f64) {
 // ---------------------------------------------------------------------------------------------
 // Tuning
 
-/// Every value Kit judges by eye. `DEFAULT` is what ships; `tune.json` overrides it live.
+/// Every value Kit judges by eye, for the capsule's island model (`super::island`). `DEFAULT` is
+/// what ships (Kit Motion); `tune.json` overrides it live. Keys follow the KIT MOTION study's
+/// `island.*` TuningStore names where one exists.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Tune {
-    /// Width spring for a phase change (picker, recording, processing, done).
-    pub island: Spring,
-    /// Open/close scale and drop of the whole capsule.
-    pub island_scale: Spring,
-    /// Width spring as the switch chips open on a tap's recording.
-    pub reveal_open: Spring,
-    /// Width spring as they fold back into the recording pill.
-    pub reveal_close: Spring,
-    /// Width spring when a switch chip turns the recording into the picker.
-    pub switch_width: Spring,
-    /// The chips' slide to their place in the picker. Slightly slower than the width, which leads.
-    pub switch_slide: Spring,
-    /// Chips ↔ controls swap in place: incoming fade, outgoing fade, peak blur.
-    pub reveal_enter_s: f32,
-    pub reveal_exit_s: f32,
-    pub reveal_blur_px: f32,
+    /// The outline growing (any change to a larger area), and shrinking.
+    pub open: Spring,
+    pub close: Spring,
+    /// Opening, the width's spring is this much shorter; closing, this much longer (the height
+    /// leads, so the sides close in last).
+    pub width_lead: f32,
+    pub height_lead: f32,
+    /// The radius eases into its cap over this many points (0 = a hard minimum).
+    pub radius_blend: f32,
+    /// The tactile squish on a mode change: its spring and how far it widens (× width).
+    pub squish: Spring,
+    pub squish_amount: f32,
+    /// Closing over leaving content, the outline waits this long for it.
+    pub collapse_wait: f32,
+    /// New content waits for this share of the outline's growth.
+    pub content_delay: f32,
+    /// Content fades in and out (zero-bounce springs, seconds).
+    pub content_in: f32,
+    pub content_out: f32,
+    /// Coming and going together, content blurs from this many points and scales from this.
+    pub content_blur: f32,
+    pub content_scale: f32,
+    /// Blur settles within this share of the fade.
+    pub blur_lead: f32,
+    /// Items follow each other outward by this much, travelling `content_push` points.
+    pub stagger: f32,
+    pub content_push: f32,
+    /// Content clears the edge this far ahead of it (seconds of look-ahead).
+    pub exit_lead: f32,
+    /// Nothing shows within `clear` pt of the edge; it fades in over the next `band` pt.
+    pub clear: f32,
+    pub band: f32,
+    /// Items in both layouts travel on this spring (`shared_travel` 1), else fade out and back
+    /// (Native's swap, 0).
+    pub shared: Spring,
+    pub shared_travel: f32,
+    /// Reduce Motion's dissolve.
+    pub reduced_fade: f32,
     pub time_scale: f32,
 }
 
+const fn s(duration: f32, bounce: f32) -> Spring {
+    Spring::visual(duration, bounce)
+}
+
 impl Tune {
-    pub const DEFAULT: Tune = Tune {
-        island: Spring::visual(0.32, 0.0),
-        island_scale: Spring::visual(0.22, 0.0),
-        reveal_open: Spring::visual(0.36, 0.16),
-        reveal_close: Spring::visual(0.32, 0.08),
-        switch_width: Spring::visual(0.30, 0.0),
-        switch_slide: Spring::visual(0.36, 0.0),
-        reveal_enter_s: 0.16,
-        reveal_exit_s: 0.13,
-        reveal_blur_px: 2.5,
+    /// Apple's system island as the study reads it (`NATIVE` in model.js): outline .5/.28 open,
+    /// .45/.18 close, content after half the growth, in .3, out .15 from 8 pt blur and .82
+    /// scale, the outline waiting .1 s for content, shared items swapping. The pill's 4 pt
+    /// inset sets `clear` and `band`: full room 1 pt short of the resting inset, so a row as
+    /// tall as the pill shows before the height's zero-bounce tail ends (the phone's 2 + 3 pt
+    /// would never reach full room at rest).
+    pub const NATIVE: Tune = Tune {
+        open: s(0.5, 0.28),
+        close: s(0.45, 0.18),
+        width_lead: 0.0,
+        height_lead: 0.0,
+        radius_blend: 0.0,
+        squish: s(0.35, 0.45),
+        squish_amount: 0.03,
+        collapse_wait: 0.1,
+        content_delay: 0.5,
+        content_in: 0.3,
+        content_out: 0.15,
+        content_blur: 8.0,
+        content_scale: 0.82,
+        blur_lead: 0.7,
+        stagger: 0.0,
+        content_push: 0.0,
+        exit_lead: 0.08,
+        clear: 1.0,
+        band: 2.0,
+        shared: s(0.4, 0.0),
+        shared_travel: 0.0,
+        reduced_fade: 0.2,
         time_scale: 1.0,
     };
+
+    /// Kit Motion: Native's timings plus what Kit adds: content clears the edge .1 s ahead, blur
+    /// resolves within .55 of the fade, items .013 s apart travelling 1.75 pt outward, shared
+    /// items travel on .24 s zero bounce, the width leads opening and the height leads
+    /// closing, and a smooth radius.
+    pub const KIT_MOTION: Tune = Tune {
+        width_lead: 0.04,
+        height_lead: 0.04,
+        radius_blend: 8.0,
+        blur_lead: 0.55,
+        stagger: 0.013,
+        content_push: 1.75,
+        exit_lead: 0.1,
+        shared: s(0.24, 0.0),
+        shared_travel: 1.0,
+        ..Self::NATIVE
+    };
+
+    /// Kit Motion with no bounce anywhere.
+    pub const STILL: Tune = Tune {
+        open: s(0.5, 0.0),
+        close: s(0.45, 0.0),
+        squish: s(0.35, 0.0),
+        ..Self::KIT_MOTION
+    };
+
+    /// The model run with today's (pre-island) values: the morph palette's springs, the chips'
+    /// short fades and light blur, content as soon as there is room, no wait.
+    pub const TODAY: Tune = Tune {
+        open: s(0.36, 0.16),
+        close: s(0.32, 0.08),
+        width_lead: 0.0,
+        height_lead: 0.0,
+        radius_blend: 0.0,
+        squish: s(0.22, 0.0),
+        squish_amount: 0.03,
+        collapse_wait: 0.0,
+        content_delay: 0.0,
+        content_in: 0.16,
+        content_out: 0.13,
+        content_blur: 2.5,
+        content_scale: 1.0,
+        blur_lead: 1.0,
+        stagger: 0.0,
+        content_push: 0.0,
+        exit_lead: 0.08,
+        clear: 1.0,
+        band: 2.0,
+        shared: s(0.36, 0.0),
+        shared_travel: 1.0,
+        reduced_fade: 0.18,
+        time_scale: 1.0,
+    };
+
+    pub const DEFAULT: Tune = Self::KIT_MOTION;
 }
 
 type Field = fn(&mut Tune) -> &mut f32;
 
 /// `tune.json` keys, in the order `scrawl tune list` prints them.
 pub(super) const KEYS: &[(&str, &str, Field)] = &[
-    ("island.duration", "Phase morph width spring (s)", |t| {
-        &mut t.island.response
-    }),
-    ("island.bounce", "Phase morph width bounce", |t| {
-        &mut t.island.bounce
-    }),
-    ("scale.duration", "Open/close scale spring (s)", |t| {
-        &mut t.island_scale.response
-    }),
-    ("scale.bounce", "Open/close scale bounce", |t| {
-        &mut t.island_scale.bounce
-    }),
-    ("reveal.open.duration", "Chips open width spring (s)", |t| {
-        &mut t.reveal_open.response
-    }),
-    ("reveal.open.bounce", "Chips open bounce", |t| {
-        &mut t.reveal_open.bounce
-    }),
-    (
-        "reveal.close.duration",
-        "Chips fold width spring (s)",
-        |t| &mut t.reveal_close.response,
-    ),
-    ("reveal.close.bounce", "Chips fold bounce", |t| {
-        &mut t.reveal_close.bounce
-    }),
-    (
-        "switch.width.duration",
-        "Chip → picker width spring (s)",
-        |t| &mut t.switch_width.response,
-    ),
-    ("switch.width.bounce", "Chip → picker width bounce", |t| {
-        &mut t.switch_width.bounce
-    }),
-    (
-        "switch.slide.duration",
-        "Chip → picker slide spring (s)",
-        |t| &mut t.switch_slide.response,
-    ),
-    ("switch.slide.bounce", "Chip → picker slide bounce", |t| {
-        &mut t.switch_slide.bounce
-    }),
-    ("reveal.enter", "Chips ↔ controls fade in (s)", |t| {
-        &mut t.reveal_enter_s
-    }),
-    ("reveal.exit", "Chips ↔ controls fade out (s)", |t| {
-        &mut t.reveal_exit_s
-    }),
-    ("reveal.blur", "Chips ↔ controls peak blur (px)", |t| {
-        &mut t.reveal_blur_px
-    }),
-    (
-        "timeScale",
-        "Animation time scale (0.25 = slow motion)",
-        |t| &mut t.time_scale,
-    ),
+    ("open.duration", "Outline grows (s)", |t| &mut t.open.response),
+    ("open.bounce", "Outline grows: bounce (width only)", |t| &mut t.open.bounce),
+    ("close.duration", "Outline shrinks (s)", |t| &mut t.close.response),
+    ("close.bounce", "Outline shrinks: bounce (width only)", |t| &mut t.close.bounce),
+    ("widthLead", "Width leads the growth by (s)", |t| &mut t.width_lead),
+    ("heightLead", "Height leads the collapse by (s)", |t| &mut t.height_lead),
+    ("radius.blend", "Radius eases into its cap over (pt)", |t| &mut t.radius_blend),
+    ("tap.duration", "Squish spring (s)", |t| &mut t.squish.response),
+    ("tap.bounce", "Squish bounce", |t| &mut t.squish.bounce),
+    ("tap.squish", "Squish amount (× width)", |t| &mut t.squish_amount),
+    ("collapse.wait", "Outline waits for leaving content (s)", |t| &mut t.collapse_wait),
+    ("content.delay", "Content waits for this share of the growth", |t| &mut t.content_delay),
+    ("content.in", "Content fades in (s)", |t| &mut t.content_in),
+    ("content.out", "Content fades out (s)", |t| &mut t.content_out),
+    ("content.blur", "Whole-content blur coming and going (pt)", |t| &mut t.content_blur),
+    ("content.scale", "Whole-content scale coming and going", |t| &mut t.content_scale),
+    ("content.blurLead", "Blur settles within (× fade)", |t| &mut t.blur_lead),
+    ("content.stagger", "Items follow each other outward by (s)", |t| &mut t.stagger),
+    ("content.push", "Items arrive travelling outward by (pt)", |t| &mut t.content_push),
+    ("content.exitLead", "Content clears the edge ahead by (s)", |t| &mut t.exit_lead),
+    ("content.clear", "Nothing within this of the edge (pt)", |t| &mut t.clear),
+    ("content.band", "Then fades in over (pt)", |t| &mut t.band),
+    ("shared.duration", "Shared items travel (s)", |t| &mut t.shared.response),
+    ("shared.travel", "Shared items travel (1) or swap (0)", |t| &mut t.shared_travel),
+    ("reduced.fade", "Reduce Motion dissolve (s)", |t| &mut t.reduced_fade),
+    ("timeScale", "Animation time scale (0.25 = slow motion)", |t| &mut t.time_scale),
 ];
 
-/// Numbered presets; 1 is what ships and names nothing.
-pub(super) const PRESETS: &[(&str, &[(&str, f32)])] = &[
-    ("Today", &[]),
-    (
-        "Before",
-        &[
-            ("island.duration", 0.28),
-            ("island.bounce", 0.18),
-            ("scale.bounce", 0.14),
-            ("switch.width.duration", 0.28),
-            ("switch.width.bounce", 0.18),
-            ("switch.slide.duration", 0.28),
-            ("switch.slide.bounce", 0.18),
-        ],
-    ),
-    (
-        "Calm",
-        &[
-            ("island.duration", 0.4),
-            ("switch.width.duration", 0.38),
-            ("switch.slide.duration", 0.45),
-            ("reveal.open.duration", 0.42),
-            ("reveal.close.duration", 0.38),
-        ],
-    ),
-    (
-        "Brisk",
-        &[
-            ("island.duration", 0.25),
-            ("switch.width.duration", 0.22),
-            ("switch.slide.duration", 0.28),
-            ("reveal.open.duration", 0.3),
-            ("reveal.close.duration", 0.26),
-        ],
-    ),
-    (
-        "Shape",
-        &[
-            ("switch.width.duration", 0.42),
-            ("switch.width.bounce", 0.16),
-            ("switch.slide.duration", 0.42),
-            ("switch.slide.bounce", 0.08),
-        ],
-    ),
+/// Numbered presets, each a full set of values. `DEFAULT` is Kit Motion.
+pub(super) const PRESETS: &[(&str, Tune)] = &[
+    ("Today", Tune::TODAY),
+    ("Native", Tune::NATIVE),
+    ("Kit Motion", Tune::KIT_MOTION),
+    ("Still", Tune::STILL),
 ];
 
 impl Tune {
@@ -218,15 +252,13 @@ impl Tune {
         }
     }
 
-    /// `DEFAULT`, then the preset the file names (1-based), then the file's own keys.
+    /// The preset the file names (1-based) or `DEFAULT`, then the file's own keys.
     pub(super) fn from_json(value: &serde_json::Value) -> Tune {
-        let mut tune = Tune::DEFAULT;
         let preset = value.get("preset").and_then(serde_json::Value::as_u64);
-        if let Some((_, values)) = preset.and_then(|n| PRESETS.get((n as usize).checked_sub(1)?)) {
-            for (key, v) in *values {
-                tune.set(key, *v);
-            }
-        }
+        let mut tune = preset
+            .and_then(|n| PRESETS.get((n as usize).checked_sub(1)?))
+            .map_or(Tune::DEFAULT, |(_, t)| *t);
+        let scale = tune.time_scale;
         if let Some(map) = value.as_object() {
             for (key, v) in map {
                 if let Some(v) = v.as_f64() {
@@ -234,25 +266,45 @@ impl Tune {
                 }
             }
         }
+        if value.get("timeScale").is_none() {
+            tune.time_scale = scale;
+        }
         tune.sanitize();
         tune
     }
 
     fn sanitize(&mut self) {
         for spring in [
-            &mut self.island,
-            &mut self.island_scale,
-            &mut self.reveal_open,
-            &mut self.reveal_close,
-            &mut self.switch_width,
-            &mut self.switch_slide,
+            &mut self.open,
+            &mut self.close,
+            &mut self.squish,
+            &mut self.shared,
         ] {
             spring.response = spring.response.clamp(0.04, 3.0);
             spring.bounce = spring.bounce.clamp(0.0, 0.9);
         }
-        self.reveal_enter_s = self.reveal_enter_s.clamp(0.0, 2.0);
-        self.reveal_exit_s = self.reveal_exit_s.clamp(0.0, 2.0);
-        self.reveal_blur_px = self.reveal_blur_px.clamp(0.0, 8.0);
+        for v in [
+            &mut self.width_lead,
+            &mut self.height_lead,
+            &mut self.collapse_wait,
+        ] {
+            *v = v.clamp(0.0, 0.5);
+        }
+        self.radius_blend = self.radius_blend.clamp(0.0, 16.0);
+        self.squish_amount = self.squish_amount.clamp(0.0, 0.08);
+        self.content_delay = self.content_delay.clamp(0.0, 0.95);
+        self.content_in = self.content_in.clamp(0.02, 2.0);
+        self.content_out = self.content_out.clamp(0.02, 2.0);
+        self.content_blur = self.content_blur.clamp(0.0, 12.0);
+        self.content_scale = self.content_scale.clamp(0.5, 1.0);
+        self.blur_lead = self.blur_lead.clamp(0.1, 1.0);
+        self.stagger = self.stagger.clamp(0.0, 0.1);
+        self.content_push = self.content_push.clamp(0.0, 12.0);
+        self.exit_lead = self.exit_lead.clamp(0.02, 0.3);
+        self.clear = self.clear.clamp(0.0, 4.0);
+        self.band = self.band.clamp(0.5, 6.0);
+        self.shared_travel = if self.shared_travel >= 0.5 { 1.0 } else { 0.0 };
+        self.reduced_fade = self.reduced_fade.clamp(0.05, 1.0);
         self.time_scale = self.time_scale.clamp(0.02, 4.0);
     }
 }
@@ -363,7 +415,8 @@ pub(crate) fn tune_command(action: TuneAction) -> anyhow::Result<()> {
             let preset = file.get("preset").and_then(serde_json::Value::as_u64);
             println!("{}", path.display());
             for (i, (name, _)) in PRESETS.iter().enumerate() {
-                let mark = if preset == Some(i as u64 + 1) || (preset.is_none() && i == 0) {
+                let default = PRESETS[i].1 == Tune::DEFAULT;
+                let mark = if preset == Some(i as u64 + 1) || (preset.is_none() && default) {
                     "●"
                 } else {
                     " "
@@ -413,17 +466,9 @@ pub(crate) fn tune_command(action: TuneAction) -> anyhow::Result<()> {
         },
         TuneAction::Rust => {
             let t = Tune::from_json(&serde_json::Value::Object(read()));
-            let spring = |s: Spring| format!("Spring::visual({:?}, {:?})", s.response, s.bounce);
-            println!("// Paste into `Tune::DEFAULT` in src/ui/motion.rs.");
-            println!("island: {},", spring(t.island));
-            println!("island_scale: {},", spring(t.island_scale));
-            println!("reveal_open: {},", spring(t.reveal_open));
-            println!("reveal_close: {},", spring(t.reveal_close));
-            println!("switch_width: {},", spring(t.switch_width));
-            println!("switch_slide: {},", spring(t.switch_slide));
-            println!("reveal_enter_s: {:?},", t.reveal_enter_s);
-            println!("reveal_exit_s: {:?},", t.reveal_exit_s);
-            println!("reveal_blur_px: {:?},", t.reveal_blur_px);
+            // `Debug` prints a valid struct literal (`Spring`'s fields are visible in `ui`).
+            println!("// Paste over `Tune::DEFAULT` in src/ui/motion.rs.");
+            println!("pub const DEFAULT: Tune = {t:#?};");
         }
     }
     Ok(())
@@ -766,22 +811,31 @@ mod tests {
 
     #[test]
     fn tune_json_layers_a_preset_and_keys_over_the_defaults() {
-        let tune = Tune::from_json(&serde_json::json!({ "preset": 2, "reveal.blur": 3.0 }));
-        assert_eq!(tune.island, Spring::visual(0.28, 0.18));
-        assert_eq!(tune.reveal_blur_px, 3.0);
-        assert_eq!(tune.reveal_open, Tune::DEFAULT.reveal_open);
+        let tune = Tune::from_json(&serde_json::json!({ "preset": 2, "content.blur": 3.0 }));
+        assert_eq!(tune.open, Tune::NATIVE.open);
+        assert_eq!(tune.content_blur, 3.0);
+        assert_eq!(tune.shared_travel, 0.0);
         // Unknown keys are ignored and values are clamped.
-        let tune = Tune::from_json(&serde_json::json!({ "nope": 1, "island.bounce": 5 }));
-        assert_eq!(tune.island.bounce, 0.9);
+        let tune = Tune::from_json(&serde_json::json!({ "nope": 1, "open.bounce": 5 }));
+        assert_eq!(tune.open.bounce, 0.9);
         assert_eq!(Tune::from_json(&serde_json::json!({})), Tune::DEFAULT);
     }
 
     #[test]
-    fn every_preset_names_real_keys() {
-        for (name, values) in PRESETS {
-            for (key, _) in *values {
-                assert!(Tune::DEFAULT.get(key).is_some(), "{name}: {key}");
+    fn presets_are_sane_and_kit_motion_ships() {
+        assert_eq!(Tune::DEFAULT, Tune::KIT_MOTION);
+        for (name, tune) in PRESETS {
+            let mut copy = *tune;
+            copy.sanitize();
+            assert_eq!(copy, *tune, "{name} is inside the clamps");
+            for (key, ..) in KEYS {
+                assert!(tune.get(key).is_some(), "{name}: {key}");
             }
         }
+        // Only the outline bounces.
+        let kit = Tune::KIT_MOTION;
+        assert_eq!(kit.shared.bounce, 0.0);
+        assert_eq!((kit.open.response, kit.open.bounce), (0.5, 0.28));
+        assert_eq!((kit.close.response, kit.close.bounce), (0.45, 0.18));
     }
 }

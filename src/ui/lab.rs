@@ -21,7 +21,7 @@ const LEAD_IN_S: f32 = 1.7;
 /// Quiet time after the last step (and between repeats).
 const TAIL_S: f32 = 0.9;
 /// The backdrop: x offset from the display's centre line, top, width and height in points.
-/// The capsule window is 520 × 84 at y = 34, under the menu bar.
+/// The capsule window is 560 × 84 at y = 34, under the menu bar.
 pub const BACKDROP: [f32; 4] = [0.0, 38.0, 640.0, 76.0];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -36,6 +36,11 @@ pub enum Scene {
     HoldSwitcher,
     /// Tap, chips fold, finish: processing, then done, then dismissed.
     Finish,
+    /// Tap, then the pointer rests on ✕ (its Esc hint shows) and clicks it: discarded.
+    TapThenCancel,
+    /// Changes fired mid-flight of the one before: tap, Area at .15 s, cancel at .35 s, a new
+    /// tap mid-landing, then Window and a key press on Screen .15 s apart.
+    Interrupt,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -45,6 +50,9 @@ enum Step {
     HoldOpen,
     HoldShow(SelectionMode),
     HoldRelease,
+    /// The pointer onto the ✕ (the hint shows after a moment).
+    HoverClose,
+    /// Esc or the ✕: both discard the recording.
     Cancel,
     Finish,
     Dismiss,
@@ -58,6 +66,8 @@ impl Scene {
             Self::TapThenScreen => "tap-then-screen",
             Self::HoldSwitcher => "hold-switcher",
             Self::Finish => "finish",
+            Self::TapThenCancel => "tap-then-cancel",
+            Self::Interrupt => "interrupt",
         }
     }
 
@@ -97,6 +107,20 @@ impl Scene {
                 (0.9, Step::Chip(Screen)),
                 (2.0, Step::Finish),
                 (2.0 + PROCESSING_S + 1.4, Step::Dismiss),
+            ],
+            Self::TapThenCancel => vec![
+                (0.0, Step::Tap),
+                (1.1, Step::HoverClose),
+                (2.0, Step::Cancel),
+            ],
+            Self::Interrupt => vec![
+                (0.0, Step::Tap),
+                (0.15, Step::Chip(Area)),
+                (0.35, Step::Cancel),
+                (0.55, Step::Tap),
+                (1.6, Step::Chip(Window)),
+                (1.75, Step::HoldShow(Screen)),
+                (2.9, Step::Cancel),
             ],
         }
     }
@@ -140,7 +164,11 @@ fn apply(step: Step, coord: &mut ScrawlCoordinator, cx: &mut gpui::Context<Scraw
             let mode = coord.selection_mode().unwrap_or(SelectionMode::Screen);
             coord.commit_switcher(mode, cx);
         }
-        Step::Cancel => coord.cancel_recording(cx),
+        Step::HoverClose => coord.close_hover = Some(motion::now()),
+        Step::Cancel => {
+            coord.close_hover = None;
+            coord.cancel_recording(cx);
+        }
         Step::Finish => coord.finish_recording(cx),
         Step::Dismiss => coord.dismiss_island(cx),
     }
