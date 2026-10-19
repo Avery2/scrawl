@@ -1078,6 +1078,7 @@ pub fn pick_display(
 /// Like `discover_target`, recording the display under `point` (see `pick_display`).
 pub fn discover_target_at(window_query: Option<&str>, point: Option<[f64; 2]>) -> TargetInfo {
     let frontmost = frontmost_app_info();
+    let screens = crate::screens::displays();
     if let Ok(content) = SCShareableContent::get() {
         let our_pid = std::process::id() as i32;
         if let Some(query) = window_query {
@@ -1096,13 +1097,10 @@ pub fn discover_target_at(window_query: Option<&str>, point: Option<[f64; 2]>) -
                             .as_ref()
                             .is_some_and(|a| a.application_name().to_lowercase().contains(&q)))
             }) {
-                let frame = win.frame();
+                let f = win.frame();
+                let rect = [f.origin.x, f.origin.y, f.size.width, f.size.height];
                 let owner = win.owning_application();
-                let display_id = content
-                    .displays()
-                    .first()
-                    .map(|d| d.display_id())
-                    .unwrap_or_else(|| unsafe { CGMainDisplayID() });
+                let (display_id, scale) = display_of(&screens, rect);
                 return TargetInfo {
                     mode: CaptureMode::Window,
                     app: owner.as_ref().map(|a| a.application_name()),
@@ -1110,13 +1108,7 @@ pub fn discover_target_at(window_query: Option<&str>, point: Option<[f64; 2]>) -
                     window_title: win.title(),
                     window_id: Some(win.window_id()),
                     display_id,
-                    frame: TargetFrame {
-                        x: frame.origin.x,
-                        y: frame.origin.y,
-                        width: frame.size.width.max(1.0),
-                        height: frame.size.height.max(1.0),
-                        scale: 2.0,
-                    },
+                    frame: crate::screens::with_scale(rect, scale),
                 };
             }
         }
@@ -1143,8 +1135,13 @@ pub fn discover_target_at(window_query: Option<&str>, point: Option<[f64; 2]>) -
             [f.origin.x, f.origin.y, f.size.width, f.size.height]
         });
         if let Some(display) = displays.get(pick_display(&rects, point, focused)) {
-            let frame = display.frame();
+            let f = display.frame();
+            let rect = [f.origin.x, f.origin.y, f.size.width, f.size.height];
             let window_title = front_window.as_ref().and_then(|w| w.title());
+            let scale = screens
+                .iter()
+                .find(|s| s.id == display.display_id())
+                .map_or_else(|| display_of(&screens, rect).1, |s| s.scale);
             return TargetInfo {
                 mode: CaptureMode::Display,
                 app: frontmost.as_ref().map(|(_, name, _)| name.clone()),
@@ -1152,20 +1149,22 @@ pub fn discover_target_at(window_query: Option<&str>, point: Option<[f64; 2]>) -
                 window_title,
                 window_id: None,
                 display_id: display.display_id(),
-                frame: TargetFrame {
-                    x: frame.origin.x,
-                    y: frame.origin.y,
-                    width: frame.size.width.max(1.0),
-                    height: frame.size.height.max(1.0),
-                    scale: 2.0,
-                },
+                frame: crate::screens::with_scale(rect, scale),
             };
         }
     }
 
-    let display_id = unsafe { CGMainDisplayID() };
-    let width = (unsafe { CGDisplayPixelsWide(display_id) } as f64).max(1440.0);
-    let height = (unsafe { CGDisplayPixelsHigh(display_id) } as f64).max(900.0);
+    // No ScreenCaptureKit: the display under `point` from CoreGraphics.
+    let rects: Vec<[f64; 4]> = screens.iter().map(|s| s.frame).collect();
+    let (display_id, frame) = screens.get(pick_display(&rects, point, None)).map_or_else(
+        || {
+            let id = unsafe { CGMainDisplayID() };
+            let w = (unsafe { CGDisplayPixelsWide(id) } as f64).max(1440.0);
+            let h = (unsafe { CGDisplayPixelsHigh(id) } as f64).max(900.0);
+            (id, crate::screens::with_scale([0.0, 0.0, w, h], 2.0))
+        },
+        |s| (s.id, crate::screens::with_scale(s.frame, s.scale)),
+    );
     TargetInfo {
         mode: CaptureMode::Display,
         app: frontmost.as_ref().map(|(_, name, _)| name.clone()),
@@ -1173,14 +1172,16 @@ pub fn discover_target_at(window_query: Option<&str>, point: Option<[f64; 2]>) -
         window_title: None,
         window_id: None,
         display_id,
-        frame: TargetFrame {
-            x: 0.0,
-            y: 0.0,
-            width,
-            height,
-            scale: 2.0,
-        },
+        frame,
     }
+}
+
+/// The display a global rect is on (its centre, else most of it) and that display's scale.
+fn display_of(screens: &[crate::screens::Screen], rect: [f64; 4]) -> (u32, f64) {
+    crate::screens::index_for_rect(screens, rect).map_or_else(
+        || (unsafe { CGMainDisplayID() }, 2.0),
+        |i| (screens[i].id, screens[i].scale),
+    )
 }
 
 /// Lists all on-screen normal (`window_layer == 0`) windows in front-to-back order for the Window picker.
@@ -1189,11 +1190,7 @@ pub fn list_selectable_windows() -> Vec<TargetInfo> {
         return Vec::new();
     };
     let our_pid = std::process::id() as i32;
-    let display_id = content
-        .displays()
-        .first()
-        .map(|d| d.display_id())
-        .unwrap_or_else(|| unsafe { CGMainDisplayID() });
+    let screens = crate::screens::displays();
 
     content
         .windows()
@@ -1210,6 +1207,8 @@ pub fn list_selectable_windows() -> Vec<TargetInfo> {
         })
         .map(|w| {
             let f = w.frame();
+            let rect = [f.origin.x, f.origin.y, f.size.width, f.size.height];
+            let (display_id, scale) = display_of(&screens, rect);
             let owner = w.owning_application();
             TargetInfo {
                 mode: CaptureMode::Window,
@@ -1221,13 +1220,7 @@ pub fn list_selectable_windows() -> Vec<TargetInfo> {
                 window_title: w.title().map(|t| clean_label(&t)).filter(|t| !t.is_empty()),
                 window_id: Some(w.window_id()),
                 display_id,
-                frame: TargetFrame {
-                    x: f.origin.x,
-                    y: f.origin.y,
-                    width: f.size.width.max(1.0),
-                    height: f.size.height.max(1.0),
-                    scale: 2.0,
-                },
+                frame: crate::screens::with_scale(rect, scale),
             }
         })
         .collect()
@@ -1524,6 +1517,71 @@ mod tests {
         assert_eq!(pick_display(&displays, None, focused), 1);
         assert_eq!(pick_display(&displays, Some([-50.0, 0.0]), focused), 1);
         assert_eq!(pick_display(&displays, None, None), 0);
+        // A display left of the laptop, at negative x.
+        let left = [[0.0, 0.0, 1728.0, 1117.0], [-1920.0, 37.0, 1920.0, 1080.0]];
+        assert_eq!(pick_display(&left, Some([-5.0, 600.0]), None), 1);
+        // One above it, at negative y.
+        let above = [[0.0, 0.0, 1728.0, 1117.0], [0.0, -1440.0, 2560.0, 1440.0]];
+        assert_eq!(pick_display(&above, Some([10.0, -1.0]), None), 1);
+        assert_eq!(pick_display(&above, Some([10.0, 0.0]), None), 0);
+    }
+
+    /// Clicks and ink on a display left of, right of or above the laptop normalize into that
+    /// display, and land on the recording's pixels at its own scale.
+    #[test]
+    fn input_on_an_external_display_normalizes_into_it() {
+        let (sender, _receiver) = flume::unbounded();
+        let telemetry = SharedCaptureTelemetry::new(sender);
+        let cases = [
+            // left, 1x: recorded at 1920×1080
+            ([-1920.0, 37.0, 1920.0, 1080.0], 1.0, [-960.0, 577.0], (1920, 1080)),
+            // right, 1x
+            ([1728.0, 0.0, 1920.0, 1080.0], 1.0, [1728.0 + 480.0, 270.0], (1920, 1080)),
+            // above, 2x: recorded at the 2560 px long edge
+            ([0.0, -1440.0, 2560.0, 1440.0], 2.0, [640.0, -360.0], (2560, 1440)),
+            // left, 2x, a smaller display: 1280×800 pt at 2560×1600
+            ([-1280.0, -100.0, 1280.0, 800.0], 2.0, [-320.0, 500.0], (2560, 1600)),
+        ];
+        for (rect, scale, point, size) in cases {
+            let frame = crate::screens::with_scale(rect, scale);
+            let target = TargetInfo {
+                mode: CaptureMode::Display,
+                app: None,
+                bundle_id: None,
+                window_title: None,
+                window_id: None,
+                display_id: 2,
+                frame,
+            };
+            assert_eq!(capture_size(&target, 2560.0), size, "{rect:?}");
+            telemetry.reset_for_session(frame);
+            assert!(telemetry.contains_screen_point(point[0], point[1]));
+            // The laptop's centre is outside this target.
+            assert!(!telemetry.contains_screen_point(864.0, 558.0));
+            let (nx, ny, fw, fh) = telemetry.normalize_point(point[0], point[1]);
+            let [lx, ly] = crate::screens::to_local(rect, point);
+            assert_eq!((nx, ny), ((lx / rect[2]) as f32, (ly / rect[3]) as f32));
+            assert_eq!((fw, fh), (rect[2] as u32, rect[3] as u32));
+            // A click there is recorded at those coordinates.
+            telemetry.pointer_down(10, point[0], point[1]);
+            telemetry.pointer_up(20, point[0], point[1], false);
+            let (events, _) = telemetry.finish_session();
+            assert!(
+                matches!(events[..], [InteractionEvent::Click { x, y, .. }] if (x, y) == (nx, ny)),
+                "{events:?}"
+            );
+        }
+        // In recording pixels: the left 1x display's centre is (960, 540).
+        let frame = crate::screens::with_scale([-1920.0, 37.0, 1920.0, 1080.0], 1.0);
+        telemetry.reset_for_session(frame);
+        let (nx, ny, _, _) = telemetry.normalize_point(-960.0, 577.0);
+        assert_eq!((nx * 1920.0, ny * 1080.0), (960.0, 540.0));
+        // Above 2x: (640, -360) is a quarter in → (640, 1080) px of 2560×1440.
+        let frame = crate::screens::with_scale([0.0, -1440.0, 2560.0, 1440.0], 2.0);
+        telemetry.reset_for_session(frame);
+        let (nx, ny, _, _) = telemetry.normalize_point(640.0, -360.0);
+        assert_eq!((nx * 2560.0, ny * 1440.0), (640.0, 1080.0));
+        telemetry.finish_session();
     }
 
     #[test]
@@ -1588,6 +1646,23 @@ mod tests {
         let region = target(CaptureMode::Region, 480.0, 320.0);
         assert_eq!(capture_size(&region, CANDIDATE_EDGE), (480, 320));
         assert_eq!(capture_size(&region, 1280.0), (960, 640));
+
+        // A 1x external display is recorded at its own pixels, never upscaled.
+        let external = |mode, width, height| TargetInfo {
+            frame: crate::screens::with_scale([-1920.0, 37.0, width, height], 1.0),
+            ..target(mode, width, height)
+        };
+        let screen = external(CaptureMode::Display, 1920.0, 1080.0);
+        assert_eq!(capture_size(&screen, 2560.0), (1920, 1080));
+        assert_eq!(capture_size(&screen, CANDIDATE_EDGE), (480, 270));
+        let region = external(CaptureMode::Region, 480.0, 320.0);
+        assert_eq!(capture_size(&region, 1280.0), (480, 320));
+        // A 2x one above the laptop keeps the 2560 px long edge.
+        let above = TargetInfo {
+            frame: crate::screens::with_scale([0.0, -1440.0, 2560.0, 1440.0], 2.0),
+            ..target(CaptureMode::Display, 2560.0, 1440.0)
+        };
+        assert_eq!(capture_size(&above, 2560.0), (2560, 1440));
     }
 
     #[test]
@@ -1643,7 +1718,15 @@ pub fn region_target(
     let mid_y = y + height * 0.5;
     let hit = selectable_window_at(windows, mid_x, mid_y);
     let frontmost = frontmost_app_info();
-    let display_id = unsafe { CGMainDisplayID() };
+    // One display per recording: the area's (by its centre), trimmed to that display.
+    let screens = crate::screens::displays();
+    let (display_id, scale) = display_of(&screens, [x, y, width, height]);
+    let [x, y, width, height] = screens
+        .iter()
+        .find(|s| s.id == display_id)
+        .map_or([x, y, width, height], |s| {
+            crate::screens::clamp_to([x, y, width, height], s.frame)
+        });
     TargetInfo {
         mode: CaptureMode::Region,
         app: hit
@@ -1660,7 +1743,7 @@ pub fn region_target(
             y,
             width: width.max(32.0),
             height: height.max(32.0),
-            scale: 2.0,
+            scale,
         },
     }
 }
@@ -1991,11 +2074,12 @@ fn build_sck_filter_and_config(
     Some((filter, sck_config(target, long_edge)))
 }
 
-/// The capture size for `target` with its long edge at most `long_edge` px (and at most 2× its
-/// size in points).
+/// The capture size for `target` with its long edge at most `long_edge` px (and at most its
+/// display's pixels: a 1x display isn't upscaled).
 pub fn capture_size(target: &TargetInfo, long_edge: f64) -> (u32, u32) {
     let max_dim = target.frame.width.max(target.frame.height).max(1.0);
-    let scale = (long_edge / max_dim).min(2.0);
+    let native = target.frame.scale.clamp(1.0, 2.0);
+    let scale = (long_edge / max_dim).min(native);
     (
         ((target.frame.width * scale).round() as u32).max(48) & !1,
         ((target.frame.height * scale).round() as u32).max(48) & !1,
@@ -2009,12 +2093,21 @@ fn sck_config(target: &TargetInfo, long_edge: f64) -> SCStreamConfiguration {
         .with_height(height)
         .with_shows_cursor(true);
     if target.mode == CaptureMode::Region {
-        config.set_source_rect(CGRect::new(
+        // `sourceRect` is in the display's own points, not global ones.
+        let b = core_graphics::display::CGDisplay::new(target.display_id).bounds();
+        let display = [b.origin.x, b.origin.y, b.size.width, b.size.height];
+        let area = [
             target.frame.x,
             target.frame.y,
             target.frame.width.max(32.0),
             target.frame.height.max(32.0),
-        ));
+        ];
+        let [x, y, w, h] = if display[2] > 0.0 && display[3] > 0.0 {
+            crate::screens::source_rect(area, display)
+        } else {
+            area
+        };
+        config.set_source_rect(CGRect::new(x, y, w, h));
     }
     config
 }

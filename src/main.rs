@@ -19,6 +19,7 @@ mod phone;
 mod render;
 mod retention;
 mod routing;
+mod screens;
 mod settings;
 mod sketch;
 mod sparkle;
