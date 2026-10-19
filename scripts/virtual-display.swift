@@ -85,11 +85,16 @@ case "right": origin = CGPoint(x: main.width, y: 0)
 case "above": origin = CGPoint(x: 0, y: -size.height)
 default: fail("--place left|right|above")
 }
-var config: CGDisplayConfigRef?
-CGBeginDisplayConfiguration(&config)
-CGConfigureDisplayOrigin(config, id, Int32(origin.x), Int32(origin.y))
-CGCompleteDisplayConfiguration(config, .forSession)
-Thread.sleep(forTimeInterval: 1.0)
+// macOS may still be arranging the new display; retry until it stays where it was put.
+for _ in 0..<10 {
+  var config: CGDisplayConfigRef?
+  CGBeginDisplayConfiguration(&config)
+  CGConfigureDisplayOrigin(config, id, Int32(origin.x), Int32(origin.y))
+  let error = CGCompleteDisplayConfiguration(config, .forSession)
+  Thread.sleep(forTimeInterval: 1.0)
+  if CGDisplayBounds(id).origin == origin { break }
+  FileHandle.standardError.write("placing display: \(error.rawValue), at \(CGDisplayBounds(id).origin)\n".data(using: .utf8)!)
+}
 
 let b = CGDisplayBounds(id)
 let pixels = CGDisplayCopyDisplayMode(id).map { "\($0.pixelWidth)x\($0.pixelHeight)" } ?? "?"
