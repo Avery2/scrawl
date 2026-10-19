@@ -1750,8 +1750,11 @@ impl PillModel {
                 if d < CLEAR {
                     st.cap = if hidden { 1.0 } else { 0.0 };
                 } else if contact.is_finite() {
-                    // Aim to be gone one short frame early, so the last visible step is small.
-                    st.cap -= st.cap * (dt / (contact - CAP_EARLY_S).max(dt)).min(1.0);
+                    // Ease to nothing one short frame early with the square of the time left
+                    // (`c ∝ T²`), so the last visible step is small where a straight ramp would
+                    // drop a quarter of full opacity at once at 60 Hz.
+                    let keep = (1.0 - dt / (contact - CAP_EARLY_S).max(dt)).max(0.0);
+                    st.cap *= keep * keep;
                 } else if hidden {
                     st.cap = 1.0;
                 } else {
@@ -2953,7 +2956,13 @@ mod tests {
                                 let now = f.elems.iter().find(|e| e.id == id).map_or(0.0, |e| e.alpha);
                                 // The collapse wait gives a leaving item about four 60 Hz frames
                                 // before the wall reaches it; it must ramp to nothing, never cut.
-                                let max_cut = if dt > 0.01 { 0.35 } else { 0.25 };
+                                // The roll-up's wall reaches the far end's ✕ almost at once.
+                                let roll_up = opts.origin == Origin::Lead && matches!(pres, Pres::Hidden);
+                                let max_cut = match (dt > 0.01, roll_up) {
+                                    (true, true) => 0.3,
+                                    (true, false) => 0.18,
+                                    (false, _) => 0.09,
+                                };
                                 assert!(
                                     now > 0.02 || a < max_cut,
                                     "{id:?} cut from {a:.2} to {now:.2} in one frame ({opts:?}, -> {pres:?}, dt {dt:.4})"
