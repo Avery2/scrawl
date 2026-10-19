@@ -475,7 +475,6 @@ pub struct View {
     pub version: String,
     pub login: LoginView,
     pub auto_send: bool,
-    pub show_in_dock: bool,
     pub shortcuts: Vec<ShortcutView>,
     pub transcriber: TranscriberView,
     pub video_export: bool,
@@ -610,7 +609,7 @@ fn shortcut_view(
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum Action {
-    /// A toggle or popup: `launchAtLogin`, `autoSend`, `showInDock`, `videoExport` (bool), `transcriber`
+    /// A toggle or popup: `launchAtLogin`, `autoSend`, `videoExport` (bool), `transcriber`
     /// ("apple"/"hex"), `hexModel` (an id), `retention` (a preset id).
     Set {
         key: String,
@@ -670,7 +669,6 @@ pub trait Host {
     fn pause_shortcuts(&mut self, paused: bool);
     fn config_path(&self) -> PathBuf;
     fn set_login_item(&mut self, on: bool) -> anyhow::Result<()>;
-    fn show_in_dock(&mut self, on: bool);
 }
 
 /// The window's own state: what it's recording, what failed, what was asked for.
@@ -797,10 +795,6 @@ impl Panel {
                 }
             }
             ("autoSend" | "videoExport", serde_json::Value::Bool(on)) => write(key, (*on).into()),
-            ("showInDock", serde_json::Value::Bool(on)) => {
-                write(key, (*on).into());
-                host.show_in_dock(*on);
-            }
             ("transcriber", serde_json::Value::String(name)) => {
                 if let Some(engine) = crate::transcribe::Engine::parse(name) {
                     write("transcriber", engine.name().into());
@@ -879,7 +873,6 @@ impl Panel {
                 needs_approval: login == LoginItem::NeedsApproval,
             },
             auto_send: config.auto_send.unwrap_or(true),
-            show_in_dock: config.show_in_dock.unwrap_or(false),
             shortcuts: ShortcutKind::ALL
                 .into_iter()
                 .map(|kind| {
@@ -967,10 +960,6 @@ impl Host for AppHost<'_> {
 
     fn set_login_item(&mut self, on: bool) -> anyhow::Result<()> {
         set_login_item(on)
-    }
-
-    fn show_in_dock(&mut self, on: bool) {
-        crate::ui::set_dock_icon(on);
     }
 }
 
@@ -1195,7 +1184,6 @@ mod tests {
         path: PathBuf,
         paused: Vec<bool>,
         refuse: Option<String>,
-        dock: Vec<bool>,
     }
 
     impl Host for Fake {
@@ -1219,9 +1207,6 @@ mod tests {
         }
         fn set_login_item(&mut self, _on: bool) -> anyhow::Result<()> {
             Ok(())
-        }
-        fn show_in_dock(&mut self, on: bool) {
-            self.dock.push(on);
         }
     }
 
@@ -1260,7 +1245,6 @@ mod tests {
             path: dir.0.join("config.json"),
             paused: Vec::new(),
             refuse: None,
-            dock: Vec::new(),
         }
     }
 
@@ -1558,12 +1542,8 @@ mod tests {
             )
         };
         assert!(panel.view(&host).auto_send);
-        assert!(!panel.view(&host).show_in_dock);
         set(&mut panel, &mut host, "autoSend", false.into());
         set(&mut panel, &mut host, "videoExport", true.into());
-        set(&mut panel, &mut host, "showInDock", true.into());
-        assert!(panel.view(&host).show_in_dock);
-        assert_eq!(host.dock, [true]);
         set(&mut panel, &mut host, "transcriber", "hex".into());
         assert_eq!(
             set(&mut panel, &mut host, "retention", "month".into()),

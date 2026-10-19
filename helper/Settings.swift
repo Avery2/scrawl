@@ -5,7 +5,7 @@ import SwiftUI
 // `scrawl-helper settings [--pane P] [--icon PNG] [--render DIR]`: the Settings window.
 // Scrawl decides everything (`src/settings.rs`) and sends what to show as JSON lines on stdin:
 //   {"type":"state","version":"0.3.2","login":{"on":false,"available":true,"needsApproval":false},
-//    "autoSend":true,"showInDock":false,"shortcuts":[{"kind":"record","title":"Record","label":"⌥⇧S","key":"S",
+//    "autoSend":true,"shortcuts":[{"kind":"record","title":"Record","label":"⌥⇧S","key":"S",
 //    "shift":true,"control":false,"option":true,"command":false,"isDefault":true,
 //    "recording":false,"error":null},…],"transcriber":{…},"videoExport":false,
 //    "retention":{"preset":"week","options":[{"id":"week","label":"…"}],"note":"…"},
@@ -87,7 +87,6 @@ struct SettingsState: Decodable, Equatable {
   var version = "0.3.2"
   var login = SettingsLogin()
   var autoSend = true
-  var showInDock = false
   var shortcuts: [SettingsShortcut] = [
     SettingsShortcut(),
     SettingsShortcut(kind: "paste", title: "Paste last capture", label: "⌥⇧V", key: "V"),
@@ -215,7 +214,7 @@ enum SettingsMotion {
 /// Sizes: 16 titles, 14 rows, 12 captions, 11 keycap names, 20 keycap letters.
 enum SettingsMetrics {
   static let width: CGFloat = 620
-  static let height: CGFloat = 490
+  static let height: CGFloat = 448
   static let sidebar: CGFloat = 210
   static let titlebar: CGFloat = 52
   static let inset: CGFloat = 20
@@ -662,10 +661,6 @@ struct SettingsView: View {
       SettingsGroup {
         SettingsRow(title: "Launch at login", enabled: state.login.available) {
           SettingsSwitch(on: state.login.on, enabled: state.login.available) { model.set("launchAtLogin", $0) }
-        }
-        SettingsSeparator()
-        SettingsRow(title: "Show in Dock") {
-          SettingsSwitch(on: state.showInDock) { model.set("showInDock", $0) }
         }
         SettingsSeparator()
         SettingsRow(title: "Send dev-site captures to OpenCode") {
