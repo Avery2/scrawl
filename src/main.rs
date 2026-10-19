@@ -19,6 +19,7 @@ mod live_transcribe;
 mod model;
 mod native;
 mod onboarding;
+mod page;
 mod phone;
 mod render;
 mod retention;

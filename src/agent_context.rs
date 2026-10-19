@@ -203,6 +203,10 @@ fn events(bundle: &ScrawlBundle) -> Vec<(u64, String)> {
                 }
                 key_t = *t;
             }
+            // On a Mac capture these come from the dev page (`crate::page`), not an app.
+            InteractionEvent::AppEvent { t, label } if bundle.device.is_none() => {
+                out.push((*t, label.clone()));
+            }
             InteractionEvent::AppChange { t, app, .. } => {
                 // Window titles stay in scrawl.json; the summary names apps only.
                 out.push((*t, format!("switched to {app}")));

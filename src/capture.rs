@@ -2727,6 +2727,12 @@ impl SharedCaptureTelemetry {
         if self.agent_context.swap(false, Ordering::AcqRel) {
             let hits = crate::ax::Prober::shared().finish();
             crate::ax::apply(&hits, &mut events, &mut strokes);
+            if self.capture_mode.load(Ordering::Acquire) != 3 {
+                let end = crate::now_epoch_ms();
+                let start = end.saturating_sub(self.elapsed_ms());
+                let page = crate::page::between(start, end);
+                crate::page::apply(&page, start, &mut events, &mut strokes);
+            }
         }
         (events, strokes)
     }

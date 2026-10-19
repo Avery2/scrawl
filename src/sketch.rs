@@ -214,10 +214,10 @@ pub fn describe_mark(mark: &Mark) -> String {
     text
 }
 
-/// A label in curly quotes, unless it already quotes its own parts (`button “Area” #area`, from
-/// `crate::ax`).
+/// A label in curly quotes, unless it already quotes its own parts (`button “Area” #area` from
+/// `crate::ax`, `<div.capsule> in Pill (src/Pill.tsx:42)` from `crate::page`).
 fn quote_label(label: &str) -> String {
-    if label.contains('“') {
+    if label.contains('“') || label.starts_with('<') {
         label.to_owned()
     } else {
         format!("“{label}”")
