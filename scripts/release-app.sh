@@ -159,4 +159,9 @@ fi
 
 if [[ "${MODE}" == "publish" ]]; then
   (cd "${REPO_DIR}/site" && bun run build && bunx wrangler@latest deploy)
+  # The DMG is live now, so the Homebrew cask can point at it.
+  "${REPO_DIR}/scripts/bump-cask.sh" --push "${VERSION}" \
+    || echo "warning: the Homebrew cask wasn't updated; run scripts/bump-cask.sh --push ${VERSION}" >&2
+else
+  echo "After publishing, scripts/bump-cask.sh --push ${VERSION} updates the Homebrew cask (publish mode does it)."
 fi
