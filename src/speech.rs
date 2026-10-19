@@ -221,6 +221,9 @@ pub fn start_download() {
                         "Speech model ready",
                         "Scrawl transcribes your captures on this computer now.",
                     );
+                    crate::speech_model::transcribe_pending(
+                        &crate::handoff::default_captures_dir(),
+                    );
                 }
                 Err(error) => {
                     crate::capture::scrawl_log(format!("Speech model download: {error:#}"));
@@ -248,7 +251,19 @@ pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
                     "Download Parakeet in Scrawl's Settings › Recording to get transcripts.",
                 );
             });
-            bail!("No transcription model: download Parakeet in Scrawl's Settings › Recording");
+            // The audio is kept: the transcript is added once the model is downloaded
+            // (`crate::speech_model::transcribe_pending`).
+            return Ok(TranscriptData {
+                source: "offline".into(),
+                missing: Some(crate::model::MissingTranscript {
+                    reason: "Scrawl has no speech model yet. The audio is saved: download \
+                             Parakeet in Scrawl Settings › Recording and Scrawl adds the \
+                             transcript to this bundle."
+                        .into(),
+                    retry: true,
+                }),
+                ..Default::default()
+            });
         }
         #[cfg(not(target_os = "linux"))]
         bail!(

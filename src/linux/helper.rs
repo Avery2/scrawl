@@ -35,6 +35,31 @@ pub fn devices() -> Result<Vec<PhoneDevice>> {
     Ok(Vec::new())
 }
 
+/// One line of macOS's `scrawl-helper speech-model [--install]`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct SpeechModelLine {
+    pub status: String,
+    #[serde(default)]
+    pub engine: Option<String>,
+    #[serde(default)]
+    pub locale: Option<String>,
+    #[serde(default)]
+    pub progress: Option<f64>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Apple's speech model doesn't exist here: the Parakeet model is downloaded from Settings
+/// (`crate::speech::start_download`), which then transcribes the bundles that waited for it.
+pub fn install_speech_model(mut line: impl FnMut(SpeechModelLine)) -> Result<()> {
+    let installed = !crate::speech::installed_models().is_empty();
+    line(SpeechModelLine {
+        status: if installed { "installed" } else { "unsupported" }.into(),
+        ..Default::default()
+    });
+    Ok(())
+}
+
 /// On-device transcription with measured word timings (Parakeet through `transcribe.cpp`).
 pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
     crate::speech::transcribe(audio)

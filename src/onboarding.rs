@@ -907,7 +907,15 @@ impl Session {
     /// app: `Close` or `Relaunch`.
     pub fn input(&mut self, input: Input) -> Effect {
         let effect = self.flow.on(input);
-        crate::capture::scrawl_log(format!("onboarding: {:?} -> {effect:?}", self.flow.step()));
+        // The in-process window feeds the flow on every refresh: log only what changed.
+        static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+        let line = format!("onboarding: {:?} -> {effect:?}", self.flow.step());
+        let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *last != line {
+            crate::capture::scrawl_log(&line);
+            *last = line;
+        }
+        drop(last);
         let result = match effect {
             // Attributed to whichever process asks, so Scrawl itself asks.
             Effect::Request(Permission::ScreenRecording) => {
