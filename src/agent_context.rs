@@ -22,11 +22,14 @@ const CLAUSE_SNAP_AFTER_MS: u64 = 1_200;
 /// A pause this long ends a clause (`keyframes::CLAUSE_GAP_MS`).
 const CLAUSE_GAP_MS: u64 = 1_500;
 
+/// How long before a click keyframe its click can be.
+const CLICK_ANCHOR_MS: u64 = 1_500;
+
 /// Drags that moved less than this (normalized) are a held click's jitter, not a drag.
 const MIN_DRAG: f32 = 0.01;
 
-/// Repeats of one shortcut closer together than this read as one line (`pressed ⌘T ×3`).
-const KEY_REPEAT_MS: u64 = 2_000;
+/// Repeats of one thing closer together than this read as one line (`pressed ⌘T ×3`).
+const REPEAT_MS: u64 = 3_000;
 
 /// More on-screen windows than this changing at once (a Space switch) is one line.
 const WINDOW_BURST: usize = 4;
@@ -161,7 +164,24 @@ fn frame_starts(bundle: &ScrawlBundle, words: Option<&[Vec<&WordTiming>]>) -> Ve
     for (i, frame) in bundle.keyframes.iter().enumerate() {
         let first_word = words.and_then(|w| w[i].first().map(|w| w.t0));
         let first_mark = marks_on(frame, &bundle.marks).first().map(|m| m.t0);
-        let start = [Some(frame.t), first_word, first_mark]
+        // A click keyframe is cut a moment after its click.
+        let click = (frame.reason == KeyframeReason::Click)
+            .then(|| {
+                bundle
+                    .events
+                    .iter()
+                    .filter(|e| {
+                        matches!(
+                            e,
+                            InteractionEvent::Click { .. } | InteractionEvent::Drag { .. }
+                        )
+                    })
+                    .map(InteractionEvent::timestamp_ms)
+                    .filter(|&t| t <= frame.t + 200 && frame.t.saturating_sub(t) <= CLICK_ANCHOR_MS)
+                    .max()
+            })
+            .flatten();
+        let start = [Some(frame.t), first_word, first_mark, click]
             .into_iter()
             .flatten()
             .min()
@@ -172,37 +192,12 @@ fn frame_starts(bundle: &ScrawlBundle, words: Option<&[Vec<&WordTiming>]>) -> Ve
     starts
 }
 
-/// Everything besides marks that the summary shows inline, in time order.
+/// Everything besides marks that the summary shows inline, in time order, with repeats of one
+/// thing (a shortcut, a click on one spot) folded into `×N`.
 fn events(bundle: &ScrawlBundle) -> Vec<(u64, String)> {
     let mut out: Vec<(u64, String)> = Vec::new();
-    let mut last_key: Option<(u64, String, usize)> = None;
-    fn flush_key(out: &mut Vec<(u64, String)>, key: Option<(u64, String, usize)>) {
-        if let Some((t, shortcut, count)) = key {
-            let times = if count > 1 {
-                format!(" ×{count}")
-            } else {
-                String::new()
-            };
-            out.push((t, format!("pressed {shortcut}{times}")));
-        }
-    }
-    let mut key_t = 0;
     for event in settled_events(&bundle.events) {
         match &event {
-            InteractionEvent::Key { t, shortcut } => {
-                match &mut last_key {
-                    Some((_, prev, count))
-                        if prev == shortcut && t.saturating_sub(key_t) < KEY_REPEAT_MS =>
-                    {
-                        *count += 1;
-                    }
-                    _ => {
-                        flush_key(&mut out, last_key.take());
-                        last_key = Some((*t, shortcut.clone(), 1));
-                    }
-                }
-                key_t = *t;
-            }
             // On a Mac capture these come from the dev page (`crate::page`), not an app.
             InteractionEvent::AppEvent { t, label } if bundle.device.is_none() => {
                 out.push((*t, label.clone()));
@@ -216,7 +211,6 @@ fn events(bundle: &ScrawlBundle) -> Vec<(u64, String)> {
             other => out.push((other.timestamp_ms(), describe_event(other))),
         }
     }
-    flush_key(&mut out, last_key);
     out.extend(window_changes(&bundle.windows));
     out.extend(bundle.context_changes.iter().map(|change| {
         let text = match &change.value {
@@ -226,7 +220,29 @@ fn events(bundle: &ScrawlBundle) -> Vec<(u64, String)> {
         (change.t, text)
     }));
     out.sort_by_key(|(t, _)| *t);
-    out
+    fold_repeats(out)
+}
+
+fn fold_repeats(items: Vec<(u64, String)>) -> Vec<(u64, String)> {
+    let mut out: Vec<(u64, String, u64, usize)> = Vec::new();
+    for (t, text) in items {
+        match out.last_mut() {
+            Some((_, prev, last, count)) if *prev == text && t - *last < REPEAT_MS => {
+                *last = t;
+                *count += 1;
+            }
+            _ => out.push((t, text, t, 1)),
+        }
+    }
+    out.into_iter()
+        .map(|(t, text, _, count)| {
+            if count > 1 {
+                (t, format!("{text} ×{count}"))
+            } else {
+                (t, text)
+            }
+        })
+        .collect()
 }
 
 fn one_line(raw: &str) -> String {
@@ -360,9 +376,16 @@ fn split_point(t: u64, words: &[&WordTiming], clauses: &[usize]) -> u64 {
     if t.saturating_sub(words[start].t0) <= CLAUSE_SNAP_MS {
         return words[start].t0;
     }
-    match clauses.iter().find(|&&c| c > inside) {
-        Some(&end) if words[end].t0.saturating_sub(t) <= CLAUSE_SNAP_AFTER_MS => words[end].t0,
-        _ => t,
+    // Forward to just after the clause's last word, if it ends soon.
+    let end = clauses
+        .iter()
+        .find(|&&c| c > inside)
+        .copied()
+        .unwrap_or(words.len());
+    if words[end - 1].t1.saturating_sub(t) <= CLAUSE_SNAP_AFTER_MS {
+        words.get(end).map_or(words[end - 1].t1 + 1, |w| w.t0)
+    } else {
+        t
     }
 }
 
@@ -766,5 +789,40 @@ mod tests {
             on.contains("- #1 (0:01)\n  · 0:00 pressed ⌘K “Look here.”\n"),
             "{on}"
         );
+    }
+
+    #[test]
+    fn repeated_clicks_fold_and_a_click_keyframe_owns_its_click() {
+        let click = |t, x| InteractionEvent::Click {
+            t,
+            x,
+            y: 0.5,
+            button: None,
+            label: None,
+            role: None,
+        };
+        let mut b = bundle(
+            Vec::new(),
+            vec![
+                keyframe(1, 500, KeyframeReason::SceneChange, ""),
+                keyframe(2, 9_300, KeyframeReason::Click, ""),
+            ],
+        );
+        b.events = vec![
+            click(1_000, 0.63),
+            click(2_500, 0.63),
+            click(4_000, 0.63),
+            click(9_000, 0.2),
+        ];
+        let texts = keyframe_texts(&b);
+        assert_eq!(
+            texts[0].lines,
+            vec!["· 0:01 clicked (x 0.63, y 0.50) ×3".to_owned()]
+        );
+        assert_eq!(
+            texts[1].lines,
+            vec!["· 0:09 clicked (x 0.20, y 0.50)".to_owned()]
+        );
+        assert_eq!(texts[1].head, "");
     }
 }
