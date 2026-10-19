@@ -10,6 +10,7 @@
 //   scrawl-helper export PLAN.json                      shareable .mp4: crop/camera, burned-in ink, audio (Export.swift)
 //   scrawl-helper permissions                           what Scrawl has been granted, as JSON
 //   scrawl-helper onboarding [--shortcut L] [--render DIR]   the welcome window (Onboarding.swift)
+//   scrawl-helper settings [--pane P] [--render DIR]         the Settings window (Settings.swift)
 //
 // Every timestamp in the output is integer milliseconds. Scrawl drives the long-running
 // `mirror` command over stdin (`stop`, `cancel`) and reads its events from stdout.
@@ -143,11 +144,13 @@ case "permissions":
   emit(Permissions.statuses())
 case "onboarding":
   Onboarding.run(arguments: arguments)
+case "settings":
+  SettingsWindow.run(arguments: arguments)
 case "qr":
   guard arguments.count >= 2, let qr = renderQR(arguments[1]) else {
     fail("qr needs a text argument")
   }
   emit(["qr": qr])
 default:
-  fail("usage: scrawl-helper devices|mirror|transcribe|frames|audio|probe|export|shrink|guide|permissions|onboarding|qr …")
+  fail("usage: scrawl-helper devices|mirror|transcribe|frames|audio|probe|export|shrink|guide|permissions|onboarding|settings|qr …")
 }

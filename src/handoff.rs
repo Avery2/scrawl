@@ -474,10 +474,6 @@ pub fn set_config_value_in(path: &Path, key: &str, value: serde_json::Value) -> 
     fs::rename(&tmp, path).with_context(|| format!("Could not write {}", path.display()))
 }
 
-pub fn set_config_value(key: &str, value: serde_json::Value) -> Result<()> {
-    set_config_value_in(&default_config_path(), key, value)
-}
-
 /// Bundle IDs whose `Documents/Scrawl` (and legacy `Documents/Tether`) container the USB watcher
 /// checks (`usbApps` in config, with `tetherApps` accepted as a fallback alias; default empty so
 /// USB polling is off unless configured).

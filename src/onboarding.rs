@@ -137,6 +137,8 @@ pub enum Input {
     Relaunch,
     /// The window was closed.
     Closed,
+    /// "Open Settings" on the last screen.
+    Settings,
     Grants {
         grants: Grants,
         now_ms: u64,
@@ -163,6 +165,8 @@ pub enum Effect {
     Hide,
     Show,
     Close,
+    /// Close the tour and open the Settings window.
+    Settings,
 }
 
 /// One row on the permissions screen.
@@ -264,6 +268,8 @@ impl Flow {
                 Effect::None
             }
             Input::Later | Input::Closed => Effect::Close,
+            Input::Settings if self.step == Step::Done => Effect::Settings,
+            Input::Settings => Effect::None,
             Input::Grant(permission) => self.grant(permission),
             Input::Relaunch => self.relaunch(),
             Input::Grants { grants, now_ms } => {
@@ -532,19 +538,9 @@ impl Progress {
         let _ = self.save_to(&crate::handoff::default_config_path());
     }
 
-    /// Writes `"onboarding"`, keeping the rest of the config as it is.
+    /// Writes `"onboarding"`, keeping the rest of the config (and its `0600` mode) as it is.
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
-        let mut config = std::fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .filter(serde_json::Value::is_object)
-            .unwrap_or_else(|| serde_json::json!({}));
-        config["onboarding"] = serde_json::to_value(self)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, serde_json::to_vec_pretty(&config)?)?;
-        Ok(())
+        crate::handoff::set_config_value_in(path, "onboarding", serde_json::to_value(self)?)
     }
 
     /// Remembers what's granted now; returns whether anything new was.
@@ -622,7 +618,8 @@ impl Session {
 
         let mut command = Command::new(crate::helper::path()?);
         command
-            .args(["onboarding", "--shortcut", shortcut, "--paste", "⌥⇧V"])
+            .args(["onboarding", "--shortcut", shortcut, "--paste"])
+            .arg(crate::settings::paste_label())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -732,6 +729,7 @@ impl Session {
             "later" => Input::Later,
             "relaunch" => Input::Relaunch,
             "close" => Input::Closed,
+            "settings" => Input::Settings,
             other => match other
                 .strip_prefix("grant:")
                 .and_then(|p| serde_json::from_value(serde_json::Value::String(p.into())).ok())
@@ -1056,6 +1054,7 @@ mod tests {
             Effect::Show
         );
         assert_eq!(flow.step(), Step::Done);
+        assert_eq!(flow.on(Input::Settings), Effect::Settings);
         assert_eq!(flow.on(Input::Continue), Effect::Close);
         // A cancelled capture comes back to the same step.
         let mut flow = Flow::tour(Step::TryIt, None);

@@ -218,9 +218,10 @@ fn clock_template(clock: &str) -> String {
 
 fn completed_meta(_duration_ms: u64, frame_count: usize) -> String {
     format!(
-        "· {} {} · ⌥⇧V",
+        "· {} {} · {}",
         frame_count,
-        if frame_count == 1 { "frame" } else { "frames" }
+        if frame_count == 1 { "frame" } else { "frames" },
+        crate::settings::paste_label()
     )
 }
 
@@ -436,17 +437,10 @@ fn island_content_width(
 enum MenuAction {
     ToggleCapture,
     ChooseTarget,
-    RecordIphone,
     OpenLatest,
     OpenInbox(PathBuf),
-    RunDemo,
-    Welcome,
-    KeepRecordings(crate::retention::Preset),
-    ToggleAutoSend,
-    SetTranscriber(crate::transcribe::Engine),
-    SetHexModel(String),
     ExportVideo,
-    ShowCaptures,
+    Settings,
     CheckForUpdates,
     Quit,
 }
@@ -474,67 +468,9 @@ objc2::define_class!(
             let _ = self.ivars().sender.try_send(MenuAction::ChooseTarget);
         }
 
-        #[unsafe(method(recordIphone:))]
-        fn record_iphone(&self, _sender: &AnyObject) {
-            let _ = self.ivars().sender.try_send(MenuAction::RecordIphone);
-        }
-
         #[unsafe(method(openLatest:))]
         fn open_latest(&self, _sender: &AnyObject) {
             let _ = self.ivars().sender.try_send(MenuAction::OpenLatest);
-        }
-
-        #[unsafe(method(runDemo:))]
-        fn run_demo(&self, _sender: &AnyObject) {
-            let _ = self.ivars().sender.try_send(MenuAction::RunDemo);
-        }
-
-        #[unsafe(method(welcome:))]
-        fn welcome(&self, _sender: &AnyObject) {
-            let _ = self.ivars().sender.try_send(MenuAction::Welcome);
-        }
-
-        #[unsafe(method(keepRecordings:))]
-        fn keep_recordings(&self, sender: &NSMenuItem) {
-            let index = usize::try_from(sender.tag() - KEEP_MENU_TAG - 1).unwrap_or(usize::MAX);
-            if let Some(&preset) = crate::retention::Preset::ALL.get(index) {
-                let _ = self
-                    .ivars()
-                    .sender
-                    .try_send(MenuAction::KeepRecordings(preset));
-            }
-        }
-
-        #[unsafe(method(toggleAutoSend:))]
-        fn toggle_auto_send(&self, _sender: &AnyObject) {
-            let _ = self.ivars().sender.try_send(MenuAction::ToggleAutoSend);
-        }
-
-        #[unsafe(method(useAppleSpeech:))]
-        fn use_apple_speech(&self, _sender: &AnyObject) {
-            let _ = self
-                .ivars()
-                .sender
-                .try_send(MenuAction::SetTranscriber(crate::transcribe::Engine::Apple));
-        }
-
-        #[unsafe(method(useHex:))]
-        fn use_hex(&self, _sender: &AnyObject) {
-            let _ = self
-                .ivars()
-                .sender
-                .try_send(MenuAction::SetTranscriber(crate::transcribe::Engine::Hex));
-        }
-
-        #[unsafe(method(pickHexModel:))]
-        fn pick_hex_model(&self, sender: &NSMenuItem) {
-            let model = sender
-                .representedObject()
-                .and_then(|object| object.downcast::<NSString>().ok())
-                .map(|model| model.to_string());
-            if let Some(model) = model {
-                let _ = self.ivars().sender.try_send(MenuAction::SetHexModel(model));
-            }
         }
 
         #[unsafe(method(exportVideo:))]
@@ -542,9 +478,9 @@ objc2::define_class!(
             let _ = self.ivars().sender.try_send(MenuAction::ExportVideo);
         }
 
-        #[unsafe(method(showCaptures:))]
-        fn show_captures(&self, _sender: &AnyObject) {
-            let _ = self.ivars().sender.try_send(MenuAction::ShowCaptures);
+        #[unsafe(method(openSettings:))]
+        fn open_settings(&self, _sender: &AnyObject) {
+            let _ = self.ivars().sender.try_send(MenuAction::Settings);
         }
 
         #[unsafe(method(checkForUpdates:))]
@@ -573,10 +509,8 @@ objc2::define_class!(
         #[unsafe(method(menuNeedsUpdate:))]
         fn menu_needs_update(&self, menu: &NSMenu) {
             rebuild_inbox_menu_items(menu, self);
-            refresh_keep_menu(menu);
-            refresh_transcription_menu(menu, self);
-            if let Some(item) = menu.itemWithTag(AUTO_SEND_MENU_TAG) {
-                item.setState(if crate::handoff::auto_send() { 1 } else { 0 });
+            if let Some(item) = menu.itemWithTag(RECORD_MENU_TAG) {
+                item.setTitle(&NSString::from_str(&record_menu_title()));
             }
             if let Some(item) = menu.itemWithTag(EXPORT_VIDEO_MENU_TAG) {
                 item.setHidden(!crate::handoff::video_export());
@@ -587,109 +521,17 @@ objc2::define_class!(
 
 /// Tag on the status menu's inbox rows, so each open can replace them.
 const INBOX_MENU_TAG: isize = 0x5c4a;
-/// Tag on the Keep Recordings item; its choices are tagged one past it, in `Preset::ALL` order.
-const KEEP_MENU_TAG: isize = 0x5c50;
 /// Tag on **Export Last Capture as Video…**, shown only with `"videoExport": true`.
 const EXPORT_VIDEO_MENU_TAG: isize = 0x5c4e;
-/// Tag on the Transcription item; Apple is one past it, Hex two past, and the Hex model rows
-/// (header, separator and one per ready model) sit from `TRANSCRIBE_MODELS_TAG` up.
-const TRANSCRIBE_MENU_TAG: isize = 0x5c60;
-const TRANSCRIBE_MODELS_TAG: isize = TRANSCRIBE_MENU_TAG + 10;
-/// Tag on the toggle for sending dev-site captures to their session (`crate::routing`).
-const AUTO_SEND_MENU_TAG: isize = 0x5c4f;
+/// Tag on **Record Screen**, whose title carries the record shortcut.
+const RECORD_MENU_TAG: isize = 0x5c4d;
 
-/// Ticks the current Keep Recordings choice and shows how much the captures take up.
-fn refresh_keep_menu(menu: &NSMenu) {
-    let Some(submenu) = menu
-        .itemWithTag(KEEP_MENU_TAG)
-        .and_then(|item| item.submenu())
-    else {
-        return;
-    };
-    let current = crate::retention::Policy::load().preset();
-    for (index, preset) in crate::retention::Preset::ALL.into_iter().enumerate() {
-        if let Some(item) = submenu.itemWithTag(KEEP_MENU_TAG + 1 + index as isize) {
-            item.setState(if current == Some(preset) { 1 } else { 0 });
-        }
-    }
-    if let Some(item) = submenu.itemWithTag(KEEP_MENU_TAG + 100) {
-        let size = crate::retention::captures_size(&crate::handoff::default_captures_dir());
-        item.setTitle(&NSString::from_str(&format!(
-            "Captures use {}",
-            crate::retention::format_bytes(size)
-        )));
-    }
-}
-
-/// Ticks the engine recordings would use now, greys out Hex while it isn't connected (from the
-/// last background check, so opening the menu never waits on it) and lists Hex's ready models.
-fn refresh_transcription_menu(menu: &NSMenu, target: &ScrawlMenuTarget) {
-    let Some(mtm) = MainThreadMarker::new() else {
-        return;
-    };
-    let Some(submenu) = menu
-        .itemWithTag(TRANSCRIBE_MENU_TAG)
-        .and_then(|item| item.submenu())
-    else {
-        return;
-    };
-    let status = crate::hex::cached_status();
-    crate::hex::refresh_in_background();
-    let state = crate::transcribe::menu_state(
-        crate::transcribe::Engine::configured(),
-        status.as_ref(),
-        crate::handoff::hex_model().as_deref(),
-    );
-    if let Some(item) = submenu.itemWithTag(TRANSCRIBE_MENU_TAG + 1) {
-        item.setState(isize::from(state.apple_checked));
-    }
-    if let Some(item) = submenu.itemWithTag(TRANSCRIBE_MENU_TAG + 2) {
-        item.setTitle(&NSString::from_str(state.hex_title));
-        item.setEnabled(state.hex_enabled);
-        item.setState(isize::from(state.hex_checked));
-    }
-    for index in (0..submenu.numberOfItems()).rev() {
-        if submenu
-            .itemAtIndex(index)
-            .is_some_and(|item| item.tag() >= TRANSCRIBE_MODELS_TAG)
-        {
-            submenu.removeItemAtIndex(index);
-        }
-    }
-    if state.models.is_empty() {
-        return;
-    }
-    let separator = NSMenuItem::separatorItem(mtm);
-    separator.setTag(TRANSCRIBE_MODELS_TAG);
-    submenu.addItem(&separator);
-    let header = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Hex model"),
-            None,
-            &NSString::new(),
-        )
-    };
-    header.setEnabled(false);
-    header.setTag(TRANSCRIBE_MODELS_TAG + 1);
-    submenu.addItem(&header);
-    for (index, (id, title, chosen)) in state.models.iter().enumerate() {
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(title),
-                Some(sel!(pickHexModel:)),
-                &NSString::new(),
-            )
-        };
-        unsafe {
-            item.setTarget(Some(target));
-            item.setRepresentedObject(Some(&NSString::from_str(id)));
-        }
-        item.setTag(TRANSCRIBE_MODELS_TAG + 2 + index as isize);
-        item.setState(isize::from(*chosen));
-        submenu.addItem(&item);
-    }
+/// "Record Screen" with the record shortcut as it is now (Settings can change it).
+fn record_menu_title() -> String {
+    format!(
+        "Record Screen  {}",
+        crate::settings::Shortcuts::load().record.label
+    )
 }
 
 /// Lists unhandled iPhone captures at the top of the status menu, read fresh from disk so the
@@ -885,93 +727,28 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
         menu.addItem(&item);
     };
 
-    let shortcut = crate::capture::ShortcutConfig::load().label;
-    add(&format!("Record Screen  {shortcut}"), sel!(toggleCapture:));
+    add(&record_menu_title(), sel!(toggleCapture:));
+    if let Some(item) = menu.itemAtIndex(menu.numberOfItems() - 1) {
+        item.setTag(RECORD_MENU_TAG);
+    }
     add("Choose What to Record…", sel!(chooseTarget:));
-    add("Record iPhone", sel!(recordIphone:));
-    add("Open Latest Bundle", sel!(openLatest:));
-    add("Generate Demo Bundle", sel!(runDemo:));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add("Open Latest Capture", sel!(openLatest:));
     add("Export Last Capture as Video…", sel!(exportVideo:));
     if let Some(item) = menu.itemAtIndex(menu.numberOfItems() - 1) {
         item.setTag(EXPORT_VIDEO_MENU_TAG);
         item.setHidden(!crate::handoff::video_export());
     }
-    add("Show Captures in Finder", sel!(showCaptures:));
-    let keep = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Keep Recordings"));
-    for (index, preset) in crate::retention::Preset::ALL.into_iter().enumerate() {
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(preset.label()),
-                Some(sel!(keepRecordings:)),
-                &NSString::new(),
-            )
-        };
-        unsafe { item.setTarget(Some(&target)) };
-        item.setTag(KEEP_MENU_TAG + 1 + index as isize);
-        keep.addItem(&item);
-    }
-    keep.addItem(&NSMenuItem::separatorItem(mtm));
-    let size_row = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Captures use …"),
-            None,
-            &NSString::new(),
-        )
-    };
-    size_row.setEnabled(false);
-    size_row.setTag(KEEP_MENU_TAG + 100);
-    keep.addItem(&size_row);
-    let keep_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Keep Recordings"),
-            None,
-            &NSString::new(),
-        )
-    };
-    keep_item.setTag(KEEP_MENU_TAG);
-    keep_item.setSubmenu(Some(&keep));
-    menu.addItem(&keep_item);
-    let transcription =
-        NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Transcription"));
-    for (offset, title, action) in [
-        (1, "Apple Speech", sel!(useAppleSpeech:)),
-        (2, "Hex", sel!(useHex:)),
-    ] {
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(title),
-                Some(action),
-                &NSString::new(),
-            )
-        };
-        unsafe { item.setTarget(Some(&target)) };
-        item.setTag(TRANSCRIBE_MENU_TAG + offset);
-        transcription.addItem(&item);
-    }
-    let transcription_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Transcription"),
-            None,
-            &NSString::new(),
-        )
-    };
-    transcription_item.setTag(TRANSCRIBE_MENU_TAG);
-    transcription_item.setSubmenu(Some(&transcription));
-    menu.addItem(&transcription_item);
-    add("Send Dev Site Captures to OpenCode", sel!(toggleAutoSend:));
-    if let Some(item) = menu.itemAtIndex(menu.numberOfItems() - 1) {
-        item.setTag(AUTO_SEND_MENU_TAG);
-    }
     menu.addItem(&NSMenuItem::separatorItem(mtm));
-    add("Welcome to Scrawl…", sel!(welcome:));
+    add("Settings…", sel!(openSettings:));
+    if let Some(item) = menu.itemAtIndex(menu.numberOfItems() - 1) {
+        item.setKeyEquivalent(&NSString::from_str(","));
+    }
     add("Check for Updates…", sel!(checkForUpdates:));
     add("Quit Scrawl", sel!(quitApp:));
+    if let Some(item) = menu.itemAtIndex(menu.numberOfItems() - 1) {
+        item.setKeyEquivalent(&NSString::from_str("q"));
+    }
 
     menu.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*target)));
 
@@ -1603,6 +1380,8 @@ pub struct ScrawlCoordinator {
     open_iphone_when_found: bool,
     /// The welcome window, while it's open (`crate::onboarding`).
     onboarding: Option<crate::onboarding::Session>,
+    /// The Settings window, while it's open (`crate::settings`).
+    settings: Option<crate::settings::Session>,
     /// The last fresh read of what macOS has granted (at launch, then while onboarding is open).
     grants: Option<crate::onboarding::Grants>,
     /// Holds the permissions window until the shortcut's modifiers are up.
@@ -1681,6 +1460,7 @@ impl ScrawlCoordinator {
             last_mode: SelectionMode::load_last_used(),
             open_iphone_when_found: false,
             onboarding: None,
+            settings: None,
             grants: None,
             gate: crate::onboarding::Gate::default(),
             switcher: crate::hold::Switcher::default(),
@@ -1814,6 +1594,53 @@ impl ScrawlCoordinator {
         }
     }
 
+    /// Opens Settings, or brings it forward on `pane`.
+    pub fn open_settings(&mut self, pane: Option<crate::settings::Pane>) {
+        if let Some(session) = self.settings.as_mut() {
+            session.show(pane);
+            return;
+        }
+        let sender = self.telemetry.ui_sender.clone();
+        let events = move |event| {
+            let _ = sender.send(LiveOverlayEvent::Settings(event));
+        };
+        match crate::settings::Session::open(pane, self.grants.clone(), events) {
+            Ok(mut session) => {
+                session.sync(&crate::settings::AppHost {
+                    telemetry: &self.telemetry,
+                });
+                self.settings = Some(session);
+            }
+            Err(error) => scrawl_log(format!("Settings could not open: {error:#}")),
+        }
+    }
+
+    fn settings_event(&mut self, event: crate::settings::Event, cx: &mut Context<Self>) {
+        use crate::settings::{Effect, Event};
+        if let Event::Grants(grants) = &event {
+            self.note_grants(grants);
+        }
+        let Some(session) = self.settings.as_mut() else {
+            return;
+        };
+        let mut host = crate::settings::AppHost {
+            telemetry: &self.telemetry,
+        };
+        match session.event(event, &mut host) {
+            Effect::Close => self.settings = None,
+            Effect::Tour => self.open_onboarding(crate::onboarding::Flow::tour(
+                crate::onboarding::Step::Welcome,
+                self.grants.clone(),
+            )),
+            Effect::Relaunch => {
+                self.settings = None;
+                crate::onboarding::relaunch();
+                cx.quit();
+            }
+            _ => {}
+        }
+    }
+
     /// Keeps a fresh read of the grants: remembers what was granted, and remakes the event tap
     /// when Input Monitoring comes on, so it works without a relaunch.
     fn note_grants(&mut self, grants: &crate::onboarding::Grants) {
@@ -1929,7 +1756,10 @@ impl ScrawlCoordinator {
             }
         };
         match effect {
-            Effect::Close => {
+            Effect::Close | Effect::Settings => {
+                if effect == Effect::Settings {
+                    self.open_settings(None);
+                }
                 let mut progress = Progress::load();
                 progress.seen = true;
                 progress.resume = None;
@@ -2456,11 +2286,14 @@ impl ScrawlCoordinator {
             return false;
         }
         let has_iphone = self.iphone.is_some();
+        // The record shortcut's key ("S") also records on its own while the picker is up.
+        let label = self.shortcut_label();
+        let record_key = crate::capture::shortcut_parts(&label).1;
         match keystroke.key.as_str() {
             "space" | " " => self.toggle_selection_mode(cx),
             "escape" => self.cancel_recording(cx),
             "enter" => self.record_selected_mode(cx),
-            key if key.eq_ignore_ascii_case("s") => self.record_selected_mode(cx),
+            key if key.eq_ignore_ascii_case(record_key) => self.record_selected_mode(cx),
             "tab" => self.choose_selection_mode(mode.cycled(!mods.shift, has_iphone), cx),
             "right" => self.choose_selection_mode(mode.cycled(true, has_iphone), cx),
             "left" => self.choose_selection_mode(mode.cycled(false, has_iphone), cx),
@@ -5782,15 +5615,6 @@ pub fn run_app(
                                         }
                                     });
                                 }
-                                MenuAction::RecordIphone => {
-                                    loop_coord.update(cx, |coord, cx| {
-                                        if coord.is_recording() {
-                                            coord.finish_recording(cx);
-                                        } else {
-                                            coord.start_recording_iphone(cx);
-                                        }
-                                    });
-                                }
                                 MenuAction::OpenLatest => {
                                     if let Ok((dir, bundle)) =
                                         crate::handoff::load_bundle(std::path::Path::new("latest"))
@@ -5817,71 +5641,9 @@ pub fn run_app(
                                         open_review_window(&loop_coord, cx);
                                     }
                                 }
-                                MenuAction::RunDemo => {
-                                    if let Ok((dir, bundle, _)) = crate::generate_demo_bundle(None)
-                                    {
-                                        loop_coord.update(cx, |coord, cx| {
-                                            coord.set_review_bundle(
-                                                (dir, bundle),
-                                                Some("Generated demo bundle".into()),
-                                            );
-                                            cx.notify();
-                                        });
-                                        open_review_window(&loop_coord, cx);
-                                    }
-                                }
-                                MenuAction::Welcome => {
-                                    loop_coord.update(cx, |coord, _| {
-                                        coord.open_onboarding(crate::onboarding::Flow::tour(
-                                            crate::onboarding::Step::Welcome,
-                                            coord.grants.clone(),
-                                        ));
-                                    });
-                                }
-                                MenuAction::KeepRecordings(preset) => {
-                                    if let Err(error) = preset.policy().save() {
-                                        scrawl_log(format!(
-                                            "Saving Keep Recordings failed: {error:#}"
-                                        ));
-                                    }
-                                    crate::retention::nudge();
-                                }
-                                MenuAction::ToggleAutoSend => {
-                                    let on = !crate::handoff::auto_send();
-                                    if let Err(error) = crate::handoff::set_config_value(
-                                        "autoSend",
-                                        serde_json::Value::Bool(on),
-                                    ) {
-                                        scrawl_log(format!("Saving autoSend failed: {error:#}"));
-                                    }
-                                }
-                                MenuAction::SetTranscriber(engine) => {
-                                    if let Err(error) = crate::handoff::set_config_value(
-                                        "transcriber",
-                                        engine.name().into(),
-                                    ) {
-                                        scrawl_log(format!("Saving transcriber failed: {error:#}"));
-                                    }
-                                }
-                                MenuAction::SetHexModel(model) => {
-                                    // Picking a Hex model is choosing Hex.
-                                    for (key, value) in
-                                        [("hexModel", model.as_str()), ("transcriber", "hex")]
-                                    {
-                                        if let Err(error) =
-                                            crate::handoff::set_config_value(key, value.into())
-                                        {
-                                            scrawl_log(format!("Saving {key} failed: {error:#}"));
-                                        }
-                                    }
-                                }
                                 MenuAction::ExportVideo => start_video_export(),
-                                MenuAction::ShowCaptures => {
-                                    let dir = crate::handoff::default_captures_dir();
-                                    let _ = std::fs::create_dir_all(&dir);
-                                    let _ = std::process::Command::new("/usr/bin/open")
-                                        .arg(dir)
-                                        .spawn();
+                                MenuAction::Settings => {
+                                    loop_coord.update(cx, |coord, _| coord.open_settings(None));
                                 }
                                 MenuAction::CheckForUpdates => {
                                     crate::sparkle::check_for_updates();
@@ -5916,6 +5678,7 @@ pub fn run_app(
                             LiveOverlayEvent::Onboarding(event) => {
                                 coord.onboarding_event(event, cx)
                             }
+                            LiveOverlayEvent::Settings(event) => coord.settings_event(event, cx),
                             LiveOverlayEvent::IngestedBundle {
                                 dir,
                                 bundle,
