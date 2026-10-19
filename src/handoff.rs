@@ -339,6 +339,10 @@ pub struct Config {
 /// and windows inline at their time, numbered marks on shared frames, where a screen changed.
 pub const AGENT_CONTEXT: &str = "agentContext";
 
+/// Transcribe Mac recordings while they record, so finishing only waits for the last words
+/// (`live_transcribe`).
+pub const LIVE_TRANSCRIBE: &str = "liveTranscribe";
+
 static EXPERIMENT_OVERRIDES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Turns an experiment on for this process (`scrawl reprocess --experiment <name>`).

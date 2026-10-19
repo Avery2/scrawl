@@ -701,6 +701,20 @@ downloads or prepares a model: install it in Hex first.
   will use. `scrawl reprocess <bundle> --out … --transcriber hex|apple` (also `scrawl import`) picks
   an engine for one run.
 
+### Transcribing while recording (experiment)
+
+```json
+{ "experiments": { "liveTranscribe": true } }
+```
+
+With this in `~/.config/scrawl/config.json`, a Mac recording transcribed by Apple Speech streams the
+microphone to `scrawl-helper transcribe-stream` as it records, so finishing only waits for the last
+words (tens of milliseconds) instead of transcribing the whole recording. The streamed samples are
+exactly the ones `audio.wav` holds, so word times are on the same clock. If the stream fails, the
+speech model isn't installed yet, or it takes too long, the recording is transcribed afterwards as
+usual; the log says which (`Live transcription: …`). Hex and iPhone recordings are unaffected.
+`scrawl reprocess <bundle> --out … --bench 1 --live-speed 1` replays a bundle's audio through it.
+
 ## Helper
 
 `scrawl-helper` is a small Swift executable built by `build.rs` from `helper/` and shipped inside

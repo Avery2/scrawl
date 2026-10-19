@@ -11,6 +11,8 @@ pub struct RecordedAudio {
     pub sample_count: usize,
     pub duration_ms: u64,
     pub wav_bytes: Vec<u8>,
+    /// The transcription that ran while recording, if one did (`live_transcribe`).
+    pub live: crate::live_transcribe::Slot,
 }
 
 pub struct AudioRecorder {
@@ -18,6 +20,7 @@ pub struct AudioRecorder {
     stop_sender: Option<std::sync::mpsc::Sender<()>>,
     samples: Arc<Mutex<Vec<f32>>>,
     error: Arc<Mutex<Option<String>>>,
+    live: Option<crate::live_transcribe::Live>,
 }
 
 impl AudioRecorder {
@@ -42,11 +45,20 @@ impl AudioRecorder {
                 Ok(())
             })
             .context("Could not spawn microphone worker")?;
+        let live = crate::live_transcribe::wanted()
+            .then(|| crate::live_transcribe::Live::start(Arc::clone(&samples)))
+            .and_then(|live| {
+                live.inspect_err(|error| {
+                    crate::capture::scrawl_log(format!("Live transcription: {error:#}"));
+                })
+                .ok()
+            });
         Ok(Self {
             worker: Some(worker),
             stop_sender: Some(stop_sender),
             samples,
             error,
+            live,
         })
     }
 
@@ -122,6 +134,7 @@ impl AudioRecorder {
             sample_count,
             duration_ms,
             wav_bytes,
+            live: crate::live_transcribe::Slot::new(self.live.take()),
         })
     }
 }
@@ -197,6 +210,7 @@ pub fn recorded_audio_from_wav(wav_bytes: Vec<u8>) -> Result<RecordedAudio> {
         sample_count,
         duration_ms: sample_count as u64 * 1_000 / u64::from(SAMPLE_RATE),
         wav_bytes,
+        live: Default::default(),
     })
 }
 
@@ -269,6 +283,16 @@ pub fn speech_islands(samples_16k: &[f32]) -> Vec<(u64, u64)> {
     islands
 }
 
+/// One sample as `audio.wav` stores it.
+pub fn pcm16(sample: f32) -> i16 {
+    let sample = if sample.is_finite() {
+        sample.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    (sample * 32_768.0).round().clamp(-32_768.0, 32_767.0) as i16
+}
+
 pub fn encode_wav_16k(samples_16k: &[f32]) -> Result<Vec<u8>> {
     let mut bytes = Cursor::new(Vec::with_capacity(44 + samples_16k.len() * 2));
     {
@@ -283,12 +307,7 @@ pub fn encode_wav_16k(samples_16k: &[f32]) -> Result<Vec<u8>> {
         )?;
         let mut i16_writer = writer.get_i16_writer(samples_16k.len() as u32);
         for &sample in samples_16k {
-            let sample = if sample.is_finite() {
-                sample.clamp(-1.0, 1.0)
-            } else {
-                0.0
-            };
-            i16_writer.write_sample((sample * 32_768.0).round().clamp(-32_768.0, 32_767.0) as i16);
+            i16_writer.write_sample(pcm16(sample));
         }
         i16_writer.flush()?;
         writer.finalize()?;
@@ -320,6 +339,7 @@ mod tests {
             stop_sender: Some(stop_sender),
             samples,
             error: Arc::new(Mutex::new(None)),
+            live: None,
         }
         .stop()
         .unwrap();
@@ -339,6 +359,7 @@ mod tests {
             stop_sender: None,
             samples: Arc::new(Mutex::new(Vec::new())),
             error: Arc::new(Mutex::new(None)),
+            live: None,
         };
         assert!(
             recorder

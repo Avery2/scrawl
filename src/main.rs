@@ -15,6 +15,7 @@ mod icons;
 mod inbox;
 mod keyframes;
 mod laser_overlay;
+mod live_transcribe;
 mod model;
 mod native;
 mod onboarding;
@@ -227,6 +228,10 @@ enum Command {
         /// captures) to benchmark finish-to-done wall clock.
         #[arg(long, hide = true)]
         bench: Option<u32>,
+        /// With `--bench` on a Screen capture: play the audio into a live transcription at this
+        /// many times real time first, as if recording, so the finish only transcribes the tail.
+        #[arg(long, hide = true, requires = "bench")]
+        live_speed: Option<f64>,
         /// Transcribe with `apple` or `hex` instead of the configured transcriber.
         #[arg(long, value_parser = parse_engine)]
         transcriber: Option<crate::transcribe::Engine>,
@@ -1497,6 +1502,7 @@ fn main() -> Result<()> {
             bundle,
             out,
             bench,
+            live_speed,
             transcriber,
             experiments,
         } => {
@@ -1612,10 +1618,20 @@ fn main() -> Result<()> {
                             ..Default::default()
                         };
                         let iter_wav = wav_bytes.clone();
+                        let live = match (live_speed, &iter_wav) {
+                            (Some(speed), Some(wav)) => {
+                                Some(live_transcribe::simulate(wav, speed)?)
+                            }
+                            _ => None,
+                        };
                         let t0 = std::time::Instant::now();
                         let recorded = iter_wav
                             .map(audio::recorded_audio_from_wav)
-                            .transpose()?;
+                            .transpose()?
+                            .map(|mut recorded| {
+                                recorded.live = live_transcribe::Slot::new(live);
+                                recorded
+                            });
                         iter_activity.stop_started = Some(t0);
                         iter_activity.stop_ms = Some(t0.elapsed().as_millis() as u64);
                         finalize_capture_bundle(
