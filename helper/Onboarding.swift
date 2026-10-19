@@ -2,18 +2,17 @@ import AVFoundation
 import AppKit
 import ApplicationServices
 import CoreGraphics
-import IOKit.hid
 import SwiftUI
 
 // `scrawl-helper onboarding`: the welcome window. Scrawl decides what it shows
 // (`src/onboarding.rs`) and sends it as JSON lines on stdin:
 //   {"type":"state","step":"permissions","index":2,"count":4,"rows":[{"permission":"microphone",
-//     "status":"not-determined","requested":false,"required":true,"relaunch":false},…],
-//     "ready":false,"relaunch":false,"fix":false}
+//     "status":"not-determined","requested":false,"required":true,"reopening":false,
+//     "relaunch":false},…],"ready":false,"fix":false}
 //   {"type":"request","permission":"microphone"}      ask macOS (the system prompt)
 //   {"type":"open-settings","permission":"camera"}    its System Settings pane
 //   {"type":"hide"} {"type":"show"} {"type":"close"}
-// Buttons come back on stdout as {"action":"continue"|"back"|"later"|"relaunch"|"close"} or
+// Buttons come back on stdout as {"action":"continue"|"back"|"later"|"close"|"settings"} or
 // {"action":"grant","permission":"microphone"} for a row's button.
 //
 // `scrawl-helper permissions` prints what Scrawl has been granted, and
@@ -30,16 +29,9 @@ enum Permissions {
       default: return "not-determined"
       }
     }
-    let listen: String
-    switch IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) {
-    case kIOHIDAccessTypeGranted: listen = "granted"
-    case kIOHIDAccessTypeDenied: listen = "denied"
-    default: listen = "not-determined"
-    }
     return [
       "screen-recording": CGPreflightScreenCaptureAccess() ? "granted" : "not-determined",
       "microphone": av(.audio),
-      "input-monitoring": listen,
       "accessibility": AXIsProcessTrusted() ? "granted" : "not-determined",
       "camera": av(.video),
     ]
@@ -53,23 +45,19 @@ enum Permissions {
       let prompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
       _ = AXIsProcessTrustedWithOptions([prompt: true] as CFDictionary)
     case "screen-recording": _ = CGRequestScreenCaptureAccess()
-    case "input-monitoring": _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
     default: break
     }
   }
 
-  /// The drag guides shown beside System Settings, so they go away once their row is granted.
-  static var guides: [String: Process] = [:]
+  /// The drag panels docked beside System Settings, told when their row is granted.
+  static var panels: [String: Process] = [:]
 
-  /// The System Settings pane; for lists an app can be dragged into, also the drag guide.
-  static func openSettings(_ permission: String) {
-    if GuidePermission(rawValue: permission) != nil {
-      guides[permission]?.terminate()
-      let guide = Process()
-      guide.executableURL = URL(filePath: CommandLine.arguments[0])
-      guide.arguments = ["guide", permission]
-      try? guide.run()
-      guides[permission] = guide
+  /// The System Settings pane; for lists an app can be dragged into, the drag panel flies there
+  /// from the row's button (`button`, screen coordinates).
+  static func openSettings(_ permission: String, from button: NSRect? = nil) {
+    if PermissionPanel.Kind(rawValue: permission) != nil {
+      if let old = panels[permission] { PermissionPanel.tell(old, "cancel") }
+      panels[permission] = PermissionPanel.launch(permission: permission, from: button) { _ in }
       return
     }
     let anchor = permission == "camera" ? "Privacy_Camera" : "Privacy_Microphone"
@@ -79,7 +67,7 @@ enum Permissions {
   }
 
   static func closeGuide(_ permission: String) {
-    guides.removeValue(forKey: permission)?.terminate()
+    if let panel = panels.removeValue(forKey: permission) { PermissionPanel.tell(panel, "granted") }
   }
 }
 
@@ -90,6 +78,7 @@ struct PermissionRow: Decodable, Equatable, Identifiable {
   var status = "not-determined"
   var requested = false
   var required = true
+  var reopening = false
   var relaunch = false
 
   var id: String { permission }
@@ -102,7 +91,6 @@ struct OnboardingState: Decodable, Equatable {
   var count = 4
   var rows: [PermissionRow] = []
   var ready = false
-  var relaunch = false
   var fix = false
 
   /// A fix is shorter than the tour: it has no art or page dots.
@@ -123,6 +111,9 @@ final class OnboardingModel: ObservableObject {
   let icon: NSImage?
   var send: (String) -> Void = { _ in }
   var grant: (String) -> Void = { _ in }
+  /// Each row button's frame in the window (SwiftUI global, top-left), where the drag panel
+  /// flies from.
+  var buttonFrames: [String: CGRect] = [:]
 
   init(shortcut: String, paste: String, icon: NSImage?) {
     self.shortcut = shortcut
@@ -275,17 +266,19 @@ struct QuietButton: View {
 
 struct RowButton: View {
   let title: String
+  /// The next row to do: filled in red.
+  var prominent = false
   let action: () -> Void
 
   var body: some View {
     Button(action: action) {
       Text(title)
         .font(.system(size: 12, weight: .semibold))
-        .foregroundStyle(Palette.text)
+        .foregroundStyle(prominent ? .white : Palette.text)
         .padding(.horizontal, 12)
         .frame(height: 26)
-        .background(Capsule().fill(Color.white.opacity(0.10)))
-        .overlay(Capsule().strokeBorder(Color.white.opacity(0.14), lineWidth: 1))
+        .background(Capsule().fill(prominent ? Palette.ink : Color.white.opacity(0.10)))
+        .overlay(Capsule().strokeBorder(Color.white.opacity(prominent ? 0.18 : 0.14), lineWidth: 1))
         .contentShape(Capsule())
     }
     .buttonStyle(.plain)
@@ -387,16 +380,18 @@ struct PermissionInfo {
   let why: String
 }
 
+/// What System Settings calls the Accessibility list. macOS 27 renamed it.
+let accessibilityName = ProcessInfo.processInfo.isOperatingSystemAtLeast(OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0))
+  ? "Device Control and Data Access" : "Accessibility"
+
 func permissionInfo(_ permission: String, paste: String) -> PermissionInfo {
   switch permission {
   case "screen-recording":
     return PermissionInfo(symbol: "rectangle.dashed.badge.record", name: "Screen & System Audio Recording", why: "See your screen while you record")
   case "microphone":
     return PermissionInfo(symbol: "mic", name: "Microphone", why: "Hear what you say while you record")
-  case "input-monitoring":
-    return PermissionInfo(symbol: "cursorarrow.click.2", name: "Input Monitoring", why: "Notice your clicks and shortcuts in every app")
   case "accessibility":
-    return PermissionInfo(symbol: "accessibility", name: "Accessibility", why: "Press ⌘V for you when you use \(paste)")
+    return PermissionInfo(symbol: "accessibility", name: accessibilityName, why: "Undo with ⌘Z while you record, and paste with \(paste)")
   case "camera":
     return PermissionInfo(symbol: "iphone", name: "Camera", why: "Show and record a cabled iPhone")
   default:
@@ -408,6 +403,9 @@ struct PermissionRowView: View {
   let row: PermissionRow
   let paste: String
   let showOptional: Bool
+  /// The first row still to turn on.
+  var next = false
+  var buttonFrame: (CGRect) -> Void = { _ in }
   let grant: () -> Void
 
   var body: some View {
@@ -448,12 +446,15 @@ struct PermissionRowView: View {
 
   @ViewBuilder private var trailing: some View {
     ZStack(alignment: .trailing) {
-      if row.granted && row.relaunch {
-        HStack(spacing: 5) {
-          Image(systemName: "arrow.clockwise").foregroundStyle(Palette.positive)
-          Text("On after reopen")
+      if row.granted && row.reopening {
+        HStack(spacing: 6) {
+          Spinner()
+          Text("Reopening Scrawl")
         }
         .transition(Motion.swap)
+      } else if row.granted && row.relaunch {
+        RowButton(title: "Reopen Scrawl", prominent: true, action: grant)
+          .transition(Motion.swap)
       } else if row.granted {
         HStack(spacing: 5) {
           Image(systemName: "checkmark.circle.fill").foregroundStyle(Palette.positive)
@@ -461,11 +462,16 @@ struct PermissionRowView: View {
         }
         .transition(Motion.swap)
       } else {
+        // A list Scrawl can be dragged into gets the drag card either way, so it says Allow
+        // until it has been pressed, even when macOS already lists Scrawl as switched off.
+        let draggable = PermissionPanel.Kind(rawValue: row.permission) != nil
+        let settings = row.requested || (row.status == "denied" && !draggable)
         HStack(spacing: 8) {
-          if row.requested && row.status != "denied" {
+          if row.requested && (row.status != "denied" || draggable) {
             Spinner()
           }
-          RowButton(title: row.requested || row.status == "denied" ? "Open Settings" : "Allow", action: grant)
+          RowButton(title: settings ? "Open Settings" : "Allow", prominent: next && !row.requested, action: grant)
+            .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { buttonFrame($0) }
         }
         .transition(Motion.swap)
       }
@@ -597,53 +603,34 @@ struct OnboardingView: View {
     }
   }
 
-  private var permissionsCopy: (title: String, body: String) {
+  private var permissionsCopy: (title: String, body: String?) {
     let required = state.rows.filter(\.required).count
-    if state.fix, state.rows.count == 1, let only = state.rows.first {
-      switch only.permission {
-      case "camera":
-        return ("Camera, for your iPhone", "macOS treats a cabled iPhone's screen as a camera, so Scrawl needs Camera access to show and record it. Pick iPhone again once it's on.")
-      case "accessibility":
-        return ("Accessibility, for \(model.paste)", "\(model.paste) pastes a capture into the app in front by pressing ⌘V for you, and that needs Accessibility. Pressing ⌘V yourself works without it.")
-      default: break
-      }
+    if state.fix, state.rows.count == 1, state.rows.first?.permission == "camera" {
+      return ("Camera, for your iPhone", "macOS treats a cabled iPhone's screen as a camera, so Scrawl needs Camera access to show and record it. Pick iPhone again once it's on.")
     }
-    let note = "If macOS offers to Quit & Reopen Scrawl, choose Later; Scrawl reopens once when you're done."
     if state.fix {
-      return ("Scrawl can't record yet", "Turn these on, then press \(model.shortcut) again. \(note)")
+      return ("Scrawl can't record yet", "Turn these on, then press \(model.shortcut) again.")
     }
     let count = ["zero", "one", "two", "three", "four", "five"][min(required, 5)]
-    return ("Scrawl needs \(count) permissions", "Each button opens the macOS prompt or System Settings. \(note)")
+    return ("Scrawl needs \(count) permissions", nil)
   }
 
   private var permissions: some View {
     let copy = permissionsCopy
+    let next = state.rows.first { !$0.granted }?.permission
     return VStack(spacing: 0) {
       heading(copy.title, copy.body)
       card {
         ForEach(Array(state.rows.enumerated()), id: \.element.id) { i, row in
           if i > 0 { divider }
-          PermissionRowView(row: row, paste: model.paste, showOptional: !state.fix) {
-            model.grant(row.permission)
-          }
+          PermissionRowView(
+            row: row, paste: model.paste, showOptional: !state.fix, next: row.permission == next,
+            buttonFrame: { model.buttonFrames[row.permission] = $0 },
+            grant: { model.grant(row.permission) }
+          )
         }
       }
       .padding(.top, 22)
-      ZStack {
-        if state.relaunch {
-          HStack(spacing: 6) {
-            Image(systemName: "arrow.clockwise").foregroundStyle(Palette.positive)
-            Text(state.fix
-              ? "Screen Recording turns on when Scrawl reopens."
-              : "Screen Recording turns on when Scrawl reopens. You'll pick up on the next step.")
-          }
-          .transition(Motion.swap)
-        }
-      }
-      .font(.system(size: 12))
-      .foregroundStyle(Palette.soft)
-      .frame(height: 18)
-      .padding(.top, 14)
     }
   }
 
@@ -652,7 +639,6 @@ struct OnboardingView: View {
     case "welcome": return ("Get Started", "continue", true)
     case "how-it-works": return ("Continue", "continue", true)
     case "permissions":
-      if state.relaunch { return ("Reopen Scrawl", "relaunch", true) }
       return (state.fix ? "Done" : "Continue", "continue", state.ready)
     case "done": return ("Done", "continue", true)
     default: return nil
@@ -818,7 +804,7 @@ final class Onboarding: NSObject, NSApplicationDelegate, NSWindowDelegate {
               self.apply(state)
             }
           case "request": Permissions.request(permission)
-          case "open-settings": Permissions.openSettings(permission)
+          case "open-settings": Permissions.openSettings(permission, from: self.screenFrame(of: permission))
           case "hide": self.window?.orderOut(nil)
           case "show": self.present()
           case "close": exit(0)
@@ -832,31 +818,44 @@ final class Onboarding: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
   private var presented = false
 
+  /// A row button's frame on screen (AppKit coordinates).
+  private func screenFrame(of permission: String) -> NSRect? {
+    guard let frame = model.buttonFrames[permission], let window, let content = window.contentView else { return nil }
+    let local = NSRect(x: frame.minX, y: content.bounds.height - frame.maxY, width: frame.width, height: frame.height)
+    return window.convertToScreen(local)
+  }
+
   /// Every step as `NN-step.png`, for review without running the app.
   @MainActor static func render(model: OnboardingModel, to dir: URL) {
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    func row(_ permission: String, _ status: String = "not-determined", requested: Bool = false, relaunch: Bool = false) -> PermissionRow {
-      PermissionRow(permission: permission, status: status, requested: requested, required: ["screen-recording", "microphone", "input-monitoring"].contains(permission), relaunch: relaunch)
+    func row(_ permission: String, _ status: String = "not-determined", requested: Bool = false, reopening: Bool = false, relaunch: Bool = false) -> PermissionRow {
+      PermissionRow(permission: permission, status: status, requested: requested, required: ["screen-recording", "microphone", "accessibility"].contains(permission), reopening: reopening, relaunch: relaunch)
     }
-    let none = [row("screen-recording"), row("microphone"), row("input-monitoring")]
-    let some = [row("screen-recording", requested: true), row("microphone", "granted"), row("input-monitoring")]
-    let denied = [row("screen-recording", "granted"), row("microphone", "denied"), row("input-monitoring", "granted")]
-    let all = [row("screen-recording", "granted"), row("microphone", "granted"), row("input-monitoring", "granted")]
-    let reopen = [row("screen-recording", "granted", relaunch: true), row("microphone", "granted"), row("input-monitoring", "granted")]
-    let lost = [row("screen-recording", "granted"), row("microphone", "granted"), row("input-monitoring")]
+    let none = [row("screen-recording"), row("microphone"), row("accessibility")]
+    let waiting = [row("screen-recording", requested: true), row("microphone"), row("accessibility")]
+    let reopening = [row("screen-recording", "granted", reopening: true), row("microphone"), row("accessibility")]
+    let resumed = [row("screen-recording", "granted"), row("microphone"), row("accessibility")]
+    let some = [row("screen-recording", "granted"), row("microphone", "granted"), row("accessibility", requested: true)]
+    let denied = [row("screen-recording", "granted"), row("microphone", "denied"), row("accessibility", "granted")]
+    let all = [row("screen-recording", "granted"), row("microphone", "granted"), row("accessibility", "granted")]
+    let fallback = [row("screen-recording", "granted", relaunch: true), row("microphone", "granted"), row("accessibility", "granted")]
+    let lost = [row("screen-recording", "granted"), row("microphone", "granted"), row("accessibility")]
     let samples: [(String, OnboardingState, Double)] = [
       ("welcome", OnboardingState(step: "welcome", index: 0), 0.25),
       ("how-it-works", OnboardingState(step: "how-it-works", index: 1), 0),
       ("permissions-none", OnboardingState(step: "permissions", index: 2, rows: none), 0),
+      ("permissions-screen-waiting", OnboardingState(step: "permissions", index: 2, rows: waiting), 0.3),
+      ("permissions-screen-reopening", OnboardingState(step: "permissions", index: 2, rows: reopening), 0.3),
+      ("permissions-resumed", OnboardingState(step: "permissions", index: 2, rows: resumed), 0),
       ("permissions-some", OnboardingState(step: "permissions", index: 2, rows: some), 0.3),
       ("permissions-denied", OnboardingState(step: "permissions", index: 2, rows: denied), 0),
       ("permissions-all", OnboardingState(step: "permissions", index: 2, rows: all, ready: true), 0),
-      ("permissions-reopen", OnboardingState(step: "permissions", index: 2, rows: reopen, ready: true, relaunch: true), 0),
+      ("permissions-reopen-fallback", OnboardingState(step: "permissions", index: 2, rows: fallback), 0),
       ("try-it", OnboardingState(step: "try-it", index: 2, count: 3), 0.3),
       ("done", OnboardingState(step: "done", index: 3), 0),
       ("fix-required", OnboardingState(step: "permissions", index: 0, count: 1, rows: lost, fix: true), 0),
+      ("fix-screen-reopening", OnboardingState(step: "permissions", index: 0, count: 1, rows: reopening, fix: true), 0.3),
       ("fix-camera", OnboardingState(step: "permissions", index: 0, count: 1, rows: [row("camera", requested: true)], fix: true), 0.3),
-      ("fix-accessibility", OnboardingState(step: "permissions", index: 0, count: 1, rows: [row("accessibility")], fix: true), 0),
     ]
     for (i, (name, state, phase)) in samples.enumerated() {
       onboardingFixedPhase = phase

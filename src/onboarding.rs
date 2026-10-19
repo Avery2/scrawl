@@ -3,12 +3,17 @@
 //! this module decides what it shows (`Flow`) and remembers progress in
 //! `~/.config/scrawl/config.json` (`"onboarding"`, see `Progress`).
 //!
-//! Screen Recording, Microphone and Input Monitoring are required and asked for together on the
-//! permissions screen. Accessibility (⌥⇧V's paste) and Camera (the cabled iPhone) are asked for
-//! the first time they're used, in the same window with just that row (`Flow::fix`). Until the
-//! required ones are on, ⌥⇧S starts nothing: it brings this window forward once the keys are up
-//! (`Gate`). A Screen Recording grant only reaches a running copy of Scrawl after it relaunches,
-//! so the permissions screen relaunches at most once, at the end, and the tour picks up after it.
+//! Screen Recording, Microphone and Accessibility are required and asked for together on the
+//! permissions screen, Screen Recording first. Camera (the cabled iPhone) is asked for the first
+//! time it's used, in the same window with just that row (`Flow::fix`). Until the required ones
+//! are on, ⌥⇧S starts nothing: it brings this window forward once the keys are up (`Gate`).
+//!
+//! A Screen Recording grant may only reach a running copy of Scrawl after it relaunches, and
+//! macOS offers "Quit & Reopen" the moment it's granted. Whatever the user picks there, nobody
+//! reopens Scrawl by hand: when a fresh helper says it's granted but this process still can't
+//! capture, the window relaunches Scrawl by itself (once, see `Progress::relaunched_at`) and the
+//! tour comes back on the same screen. Input Monitoring is never asked for: clicks come from an
+//! AppKit mouse monitor that needs no permission, keys from an Accessibility event tap.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -20,22 +25,34 @@ use serde::{Deserialize, Serialize};
 pub enum Permission {
     ScreenRecording,
     Microphone,
+    /// No longer asked for, shown or read (macOS wants a relaunch after granting it). Kept so
+    /// a config written by 0.3.x, which lists it under `granted`, still loads.
     InputMonitoring,
     Accessibility,
     Camera,
 }
 
 impl Permission {
-    /// What a capture needs. Accessibility only serves ⌥⇧V's paste and Camera the iPhone; both
-    /// are asked for when first used.
+    /// What a capture needs, in the order the checklist shows them. Screen Recording comes first
+    /// because it's the one that may relaunch Scrawl. Accessibility drives the key event tap
+    /// (⌘Z, Esc, the switcher's presses) and ⌥⇧V's paste. Camera is asked for when first used.
     pub const REQUIRED: [Permission; 3] = [
         Permission::ScreenRecording,
         Permission::Microphone,
-        Permission::InputMonitoring,
+        Permission::Accessibility,
     ];
 
     pub fn required(self) -> bool {
         Self::REQUIRED.contains(&self)
+    }
+
+    /// Privacy lists the app can be dragged into: Grant flies the drag panel to System
+    /// Settings (`scrawl-helper permission-panel`) instead of raising Apple's prompt.
+    pub fn draggable(self) -> bool {
+        matches!(
+            self,
+            Permission::ScreenRecording | Permission::Accessibility
+        )
     }
 }
 
@@ -115,6 +132,13 @@ impl Grants {
 /// Once everything a fix asks for is on, its window shows the checks this long, then closes.
 pub const AUTO_ADVANCE_MS: u64 = 800;
 
+/// Screen Recording's check shows this long before Scrawl relaunches to use it.
+pub const RELAUNCH_AFTER_MS: u64 = 1_000;
+
+/// After relaunching itself, Scrawl doesn't do it again by itself for this long; the row offers
+/// Reopen instead. Stops a loop if a fresh copy still can't capture.
+pub const RELAUNCH_GUARD_MS: u64 = 120_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     /// The whole tour, first launch or "Welcome to Scrawl…".
@@ -134,7 +158,6 @@ pub enum Input {
     Later,
     /// A permission row's button.
     Grant(Permission),
-    Relaunch,
     /// The window was closed.
     Closed,
     /// "Open Settings" on the last screen.
@@ -158,7 +181,8 @@ pub enum Effect {
     Request(Permission),
     /// Already asked or denied: open its System Settings pane.
     OpenSettings(Permission),
-    /// Relaunch Scrawl; the tour resumes at `resume` (a fix has nothing to resume).
+    /// Relaunch Scrawl so Screen Recording works. The tour comes back at `resume`; a fix (no
+    /// `resume`) opens again.
     Relaunch {
         resume: Option<Step>,
     },
@@ -178,7 +202,10 @@ pub struct Row {
     /// The button was pressed once already: it now opens System Settings.
     pub requested: bool,
     pub required: bool,
-    /// Granted, but it only takes effect when Scrawl reopens.
+    /// Granted, and Scrawl is about to relaunch by itself to use it.
+    pub reopening: bool,
+    /// Granted, but this copy can't use it and won't relaunch by itself again: the row's
+    /// button reopens Scrawl.
     pub relaunch: bool,
 }
 
@@ -191,10 +218,8 @@ pub struct View {
     pub index: usize,
     pub count: usize,
     pub rows: Vec<Row>,
-    /// Everything the permissions screen needs is granted: Continue is enabled.
+    /// Everything the permissions screen needs works: Continue is enabled.
     pub ready: bool,
-    /// Continue relaunches Scrawl first.
-    pub relaunch: bool,
     pub fix: bool,
 }
 
@@ -208,26 +233,27 @@ pub struct Flow {
     requested: BTreeSet<Permission>,
     ready_at: Option<u64>,
     hidden: bool,
+    /// May relaunch by itself once Screen Recording is granted (off right after a relaunch).
+    auto_relaunch: bool,
+    /// When a Screen Recording grant this copy can't use was first seen.
+    stale_since: Option<u64>,
+    /// A relaunch was asked for; never twice from one window.
+    relaunching: bool,
 }
 
 impl Flow {
-    /// The tour from `start`. The permissions screen is passed when everything on it is usable,
-    /// and a later step never shows before it's done.
+    /// The tour from `start`. Walking forward passes the permissions screen when everything on
+    /// it works, and a later step never shows before it's done. A tour resumed on the
+    /// permissions screen (after a relaunch) stays there, so the window comes back where it was.
     pub fn tour(start: Step, grants: Option<Grants>) -> Self {
-        let mut flow = Self {
-            mode: Mode::Tour,
-            step: start,
-            grants,
-            asks: Permission::REQUIRED.to_vec(),
-            requested: BTreeSet::new(),
-            ready_at: None,
-            hidden: false,
-        };
+        let mut flow = Self::new(Mode::Tour, start, Permission::REQUIRED.to_vec(), grants);
         flow.step = if start.position() > Step::Permissions.position()
             && flow.grants.is_some()
             && !flow.done()
         {
             Step::Permissions
+        } else if start == Step::Permissions {
+            start
         } else {
             flow.forward_from(start)
         };
@@ -236,15 +262,28 @@ impl Flow {
 
     /// The permissions screen with just `asks`.
     pub fn fix(asks: Vec<Permission>, grants: Option<Grants>) -> Self {
+        Self::new(Mode::Fix, Step::Permissions, asks, grants)
+    }
+
+    fn new(mode: Mode, step: Step, asks: Vec<Permission>, grants: Option<Grants>) -> Self {
         Self {
-            mode: Mode::Fix,
-            step: Step::Permissions,
+            mode,
+            step,
             grants,
             asks,
             requested: BTreeSet::new(),
             ready_at: None,
             hidden: false,
+            auto_relaunch: true,
+            stale_since: None,
+            relaunching: false,
         }
+    }
+
+    /// Whether this window may relaunch Scrawl by itself (`relaunch_allowed`).
+    pub fn with_auto_relaunch(mut self, allowed: bool) -> Self {
+        self.auto_relaunch = allowed;
+        self
     }
 
     pub fn step(&self) -> Step {
@@ -271,7 +310,6 @@ impl Flow {
             Input::Settings if self.step == Step::Done => Effect::Settings,
             Input::Settings => Effect::None,
             Input::Grant(permission) => self.grant(permission),
-            Input::Relaunch => self.relaunch(),
             Input::Grants { grants, now_ms } => {
                 self.grants = Some(grants);
                 self.tick(now_ms)
@@ -313,16 +351,19 @@ impl Flow {
             rows: self
                 .asks
                 .iter()
-                .map(|&permission| Row {
-                    permission,
-                    status: self.status(permission),
-                    requested: self.requested.contains(&permission),
-                    required: permission.required(),
-                    relaunch: permission == Permission::ScreenRecording && self.screen_relaunch(),
+                .map(|&permission| {
+                    let stale = permission == Permission::ScreenRecording && self.screen_relaunch();
+                    Row {
+                        permission,
+                        status: self.status(permission),
+                        requested: self.requested.contains(&permission),
+                        required: permission.required(),
+                        reopening: stale && self.auto_relaunch,
+                        relaunch: stale && !self.auto_relaunch,
+                    }
                 })
                 .collect(),
-            ready: self.ready(),
-            relaunch: self.ready() && self.screen_relaunch(),
+            ready: self.done(),
             fix: self.mode == Mode::Fix,
         }
     }
@@ -349,11 +390,7 @@ impl Flow {
             .filter(|p| self.mode == Mode::Fix || p.required())
     }
 
-    fn ready(&self) -> bool {
-        self.needed().all(|p| self.granted(p))
-    }
-
-    /// Screen Recording is on the screen and granted, but only reaches Scrawl after a relaunch.
+    /// Screen Recording is on the screen and granted, but this copy of Scrawl can't capture yet.
     fn screen_relaunch(&self) -> bool {
         self.asks.contains(&Permission::ScreenRecording)
             && self.granted(Permission::ScreenRecording)
@@ -406,41 +443,66 @@ impl Flow {
     fn primary(&mut self) -> Effect {
         match self.step {
             Step::TryIt | Step::Done => Effect::Close,
-            Step::Permissions if !self.ready() => Effect::None,
-            Step::Permissions if self.screen_relaunch() => self.relaunch(),
+            Step::Permissions if !self.done() => Effect::None,
             _ => self.advance(),
         }
     }
 
     fn grant(&mut self, permission: Permission) -> Effect {
-        if self.step != Step::Permissions
-            || !self.asks.contains(&permission)
-            || self.granted(permission)
-        {
+        if self.step != Step::Permissions || !self.asks.contains(&permission) {
             return Effect::None;
         }
-        if self.requested.insert(permission) && self.status(permission) != Status::Denied {
+        // The fallback after a relaunch that didn't take: the row's button is Reopen.
+        if permission == Permission::ScreenRecording && self.screen_relaunch() {
+            return if self.auto_relaunch {
+                Effect::None
+            } else {
+                self.relaunch()
+            };
+        }
+        if self.granted(permission) {
+            return Effect::None;
+        }
+        if self.requested.insert(permission)
+            && self.status(permission) != Status::Denied
+            && !permission.draggable()
+        {
             Effect::Request(permission)
         } else {
             Effect::OpenSettings(permission)
         }
     }
 
-    /// The one relaunch: only from the permissions screen, once everything needed is granted
-    /// and Screen Recording still waits for it.
-    fn relaunch(&self) -> Effect {
-        if self.step != Step::Permissions || !self.ready() || !self.screen_relaunch() {
+    /// Relaunch so Screen Recording works, coming back to this same screen. Once per window.
+    fn relaunch(&mut self) -> Effect {
+        if self.relaunching || self.step != Step::Permissions || !self.screen_relaunch() {
             return Effect::None;
         }
+        self.relaunching = true;
         let resume = match self.mode {
-            Mode::Tour => Some(Step::Permissions.next()),
+            Mode::Tour => Some(Step::Permissions),
             Mode::Fix => None,
         };
         Effect::Relaunch { resume }
     }
 
-    /// A fix closes by itself once everything it asked for works; the tour waits for Continue.
+    /// A Screen Recording grant this copy can't use relaunches Scrawl a moment after its check
+    /// shows, whatever was picked in macOS's "Quit & Reopen" sheet. Otherwise a fix closes by
+    /// itself once everything it asked for works; the tour waits for Continue.
     fn tick(&mut self, now_ms: u64) -> Effect {
+        if self.step == Step::Permissions && self.screen_relaunch() {
+            self.ready_at = None;
+            if !self.auto_relaunch {
+                return Effect::None;
+            }
+            let since = *self.stale_since.get_or_insert(now_ms);
+            return if now_ms.saturating_sub(since) >= RELAUNCH_AFTER_MS {
+                self.relaunch()
+            } else {
+                Effect::None
+            };
+        }
+        self.stale_since = None;
         if self.mode != Mode::Fix || !self.done() {
             self.ready_at = None;
             return Effect::None;
@@ -454,13 +516,19 @@ impl Flow {
     }
 }
 
-/// Required permissions that keep ⌥⇧S from recording now. Screen Recording is read in this
-/// process (a grant it can't use yet still blocks); the others come from the last fresh read.
-pub fn missing_to_record(grants: Option<&Grants>, screen_usable: bool) -> Vec<Permission> {
+/// Required permissions that keep ⌥⇧S from recording now. Screen Recording and Accessibility
+/// are read in this process (a Screen Recording grant it can't use yet still blocks;
+/// Accessibility is live); Microphone comes from the last fresh read.
+pub fn missing_to_record(
+    grants: Option<&Grants>,
+    screen_usable: bool,
+    accessibility: bool,
+) -> Vec<Permission> {
     Permission::REQUIRED
         .into_iter()
         .filter(|p| match p {
             Permission::ScreenRecording => !screen_usable,
+            Permission::Accessibility => !accessibility,
             p => grants.is_some_and(|g| !g.granted(*p)),
         })
         .collect()
@@ -508,6 +576,7 @@ impl Gate {
 
 /// Onboarding progress, under `"onboarding"` in `~/.config/scrawl/config.json`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Progress {
     /// The tour was finished or closed; it doesn't open by itself again.
     #[serde(default)]
@@ -518,6 +587,13 @@ pub struct Progress {
     /// Every permission seen granted, so a later loss reopens the permissions screen.
     #[serde(default)]
     pub granted: BTreeSet<Permission>,
+    /// When Scrawl last relaunched itself for Screen Recording (Unix ms), so it never does it
+    /// twice in a row (`relaunch_allowed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relaunched_at: Option<u64>,
+    /// A permissions fix was open when Scrawl relaunched itself; it opens again at launch.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reopen_fix: bool,
 }
 
 impl Progress {
@@ -555,18 +631,47 @@ impl Progress {
         );
         self.granted.len() != before
     }
+
+    /// Notes a relaunch Scrawl is about to do by itself, so the next launch comes back to the
+    /// same window: the tour at `resume`, or the fix.
+    pub fn relaunching(&mut self, resume: Option<Step>, now_ms: u64) {
+        self.relaunched_at = Some(now_ms);
+        match resume {
+            Some(step) => {
+                self.seen = false;
+                self.resume = Some(step);
+            }
+            None => self.reopen_fix = true,
+        }
+    }
 }
 
-/// What opens at launch: the tour until it's been seen (resuming where it was left), else the
-/// permissions screen when a required permission that was granted once is gone, else nothing.
+/// Whether Scrawl may relaunch itself now: not within `RELAUNCH_GUARD_MS` of the last time.
+pub fn relaunch_allowed(progress: &Progress, now_ms: u64) -> bool {
+    progress
+        .relaunched_at
+        .is_none_or(|at| now_ms.saturating_sub(at) >= RELAUNCH_GUARD_MS)
+}
+
+pub fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// What opens at launch: the tour until it's been seen (resuming where it was left), else a fix
+/// that was open when Scrawl relaunched itself, else the permissions screen when a required
+/// permission that was granted once is gone, else nothing.
 pub fn launch_plan(progress: &Progress, grants: &Grants) -> Option<Flow> {
     if !progress.seen {
         let start = progress.resume.unwrap_or(Step::Welcome);
         return Some(Flow::tour(start, Some(grants.clone())));
     }
-    Permission::REQUIRED
+    let lost = Permission::REQUIRED
         .into_iter()
-        .any(|p| progress.granted.contains(&p) && !grants.granted(p))
+        .any(|p| progress.granted.contains(&p) && !grants.granted(p));
+    (progress.reopen_fix || lost)
         .then(|| Flow::fix(Permission::REQUIRED.to_vec(), Some(grants.clone())))
 }
 
@@ -576,13 +681,14 @@ pub enum Event {
     /// Grants read at launch, to decide whether onboarding opens (`launch_plan`).
     Launch(Grants),
     Grants(Grants),
-    /// A button: `continue`, `back`, `later`, `relaunch`, `close` or `grant:<permission>`.
+    /// A button: `continue`, `back`, `later`, `close`, `settings` or `grant:<permission>`.
     Action(String),
     Exited,
 }
 
 /// Reads what's granted now from a fresh helper, plus whether this process can use a Screen
-/// Recording grant yet.
+/// Recording grant yet. Only once the helper says it's granted does this process try a real
+/// ScreenCaptureKit capture (`capture::screen_capture_usable`), so no prompt can come of it.
 pub fn read_grants() -> Option<Grants> {
     let statuses = crate::helper::permissions()
         .inspect_err(|error| crate::capture::scrawl_log(format!("permissions: {error:#}")))
@@ -590,7 +696,7 @@ pub fn read_grants() -> Option<Grants> {
     let screen = statuses.get(&Permission::ScreenRecording) == Some(&Status::Granted);
     Some(Grants {
         statuses,
-        screen_needs_relaunch: screen && !crate::capture::screen_capture_granted(),
+        screen_needs_relaunch: screen && !crate::capture::screen_capture_usable(true),
     })
 }
 
@@ -650,8 +756,9 @@ impl Session {
             }
         });
 
+        let allowed = relaunch_allowed(&Progress::load(), unix_ms());
         let mut session = Self {
-            flow,
+            flow: flow.with_auto_relaunch(allowed),
             transport,
             polling,
             last_view: String::new(),
@@ -718,13 +825,9 @@ impl Session {
         let effect = self.flow.on(input);
         crate::capture::scrawl_log(format!("onboarding: {:?} -> {effect:?}", self.flow.step()));
         let result = match effect {
-            // These two are attributed to whichever process asks, so Scrawl itself asks.
+            // Attributed to whichever process asks, so Scrawl itself asks.
             Effect::Request(Permission::ScreenRecording) => {
                 crate::capture::request_screen_capture();
-                Effect::None
-            }
-            Effect::Request(Permission::InputMonitoring) => {
-                crate::capture::request_listen_access();
                 Effect::None
             }
             Effect::Request(permission) => {
@@ -755,7 +858,6 @@ impl Session {
             "continue" => Input::Continue,
             "back" => Input::Back,
             "later" => Input::Later,
-            "relaunch" => Input::Relaunch,
             "close" => Input::Closed,
             "settings" => Input::Settings,
             other => match other
@@ -850,7 +952,14 @@ pub fn relaunch() {
     let _ = std::process::Command::new("cmd.exe").args(args).spawn();
 }
 
-/// Starts Scrawl again a moment after this copy quits (after a Screen Recording grant).
+#[cfg(not(windows))]
+/// Waits (at most 10 s) for process `$1` to exit, then runs the rest.
+const AFTER_EXIT: &str = "pid=$1; shift; i=0; \
+    while kill -0 \"$pid\" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done; ";
+
+/// Starts Scrawl again once this copy has quit (after a Screen Recording grant). The app is
+/// opened without `-n`: if macOS's own "Quit & Reopen" already started a new copy, `open` only
+/// brings that one forward, so there are never two.
 #[cfg(not(windows))]
 pub fn relaunch() {
     let Ok(exe) = std::env::current_exe() else {
@@ -859,17 +968,26 @@ pub fn relaunch() {
     let bundle = exe
         .ancestors()
         .find(|p| p.extension().is_some_and(|ext| ext == "app"));
+    let pid = std::process::id().to_string();
     let mut command = std::process::Command::new("/bin/sh");
     match bundle {
         Some(app) => command
-            .args(["-c", "sleep 1; exec /usr/bin/open \"$0\""])
+            .arg("-c")
+            .arg(format!("{AFTER_EXIT}exec /usr/bin/open \"$1\""))
+            .args(["scrawl-relaunch", &pid])
             .arg(app),
         None => command
-            .args(["-c", "sleep 1; exec \"$0\" \"$@\""])
+            .arg("-c")
+            .arg(format!("{AFTER_EXIT}exec \"$@\""))
+            .args(["scrawl-relaunch", &pid])
             .arg(&exe)
             .args(std::env::args_os().skip(1)),
     };
-    let _ = command.spawn();
+    let _ = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 #[cfg(test)]
@@ -878,10 +996,20 @@ mod tests {
 
     use Permission::{Accessibility, Camera, InputMonitoring, Microphone, ScreenRecording};
 
+    const ALL: [Permission; 3] = [ScreenRecording, Microphone, Accessibility];
+
     fn grants(granted: &[Permission]) -> Grants {
         Grants {
             statuses: granted.iter().map(|p| (*p, Status::Granted)).collect(),
             screen_needs_relaunch: false,
+        }
+    }
+
+    /// The helper says Screen Recording is granted, but this copy can't capture yet.
+    fn stale(granted: &[Permission]) -> Grants {
+        Grants {
+            screen_needs_relaunch: true,
+            ..grants(granted)
         }
     }
 
@@ -906,9 +1034,8 @@ mod tests {
         assert_eq!(flow.step(), Step::Permissions);
         assert_eq!(rows(&flow), Permission::REQUIRED);
         assert!(flow.view().rows.iter().all(|r| r.required));
-        // Camera and Accessibility are asked for when used, never in the tour.
+        // Camera is asked for when used, never in the tour.
         assert!(!rows(&flow).contains(&Camera));
-        assert!(!rows(&flow).contains(&Accessibility));
         // Continue does nothing until the required ones are on.
         assert!(!flow.view().ready);
         assert_eq!(flow.on(Input::Continue), Effect::None);
@@ -918,11 +1045,63 @@ mod tests {
     }
 
     #[test]
+    fn screen_recording_is_the_first_row_and_accessibility_the_third() {
+        assert_eq!(Permission::REQUIRED, ALL);
+        let flow = Flow::tour(Step::Permissions, Some(grants(&[])));
+        assert_eq!(rows(&flow), ALL);
+        let fix = Flow::fix(Permission::REQUIRED.to_vec(), Some(grants(&[])));
+        assert_eq!(rows(&fix)[0], ScreenRecording);
+        assert_eq!(rows(&fix)[2], Accessibility);
+        assert!(Accessibility.required() && Accessibility.draggable());
+    }
+
+    #[test]
+    fn input_monitoring_is_never_requested() {
+        assert!(!InputMonitoring.required());
+        assert!(!InputMonitoring.draggable());
+        let mut flow = Flow::tour(Step::Permissions, Some(grants(&[])));
+        assert!(!rows(&flow).contains(&InputMonitoring));
+        assert_eq!(flow.on(Input::Grant(InputMonitoring)), Effect::None);
+        assert!(missing_to_record(Some(&grants(&ALL)), true, true).is_empty());
+        // Nothing in Scrawl or its helper asks macOS for it.
+        let sources = [
+            include_str!("capture.rs"),
+            include_str!("capture/macos.rs"),
+            include_str!("ui/macos.rs"),
+            include_str!("onboarding.rs"),
+            include_str!("settings.rs"),
+            include_str!("ui.rs"),
+            include_str!("../helper/Onboarding.swift"),
+            include_str!("../helper/Settings.swift"),
+            include_str!("../helper/PermissionPanel.swift"),
+        ];
+        let calls = [
+            concat!("CGRequest", "ListenEventAccess"),
+            concat!("CGPreflight", "ListenEventAccess"),
+            concat!("IOHIDRequest", "Access"),
+            concat!("IOHIDCheck", "Access"),
+            concat!("kCGEventTapOption", "ListenOnly"),
+        ];
+        for source in sources {
+            for call in calls {
+                assert!(!source.contains(call), "{call} is still called");
+            }
+        }
+        // A 0.3.x config that remembers it granted still loads.
+        let old: Progress = serde_json::from_str(
+            r#"{"seen":true,"granted":["screen-recording","microphone","input-monitoring"]}"#,
+        )
+        .unwrap();
+        assert!(old.seen);
+    }
+
+    #[test]
     fn permissions_are_granted_in_any_order_then_continue_moves_on() {
         let mut flow = Flow::tour(Step::Permissions, Some(grants(&[])));
+        // A list the app can be dragged into goes straight to System Settings and the panel.
         assert_eq!(
-            flow.on(Input::Grant(InputMonitoring)),
-            Effect::Request(InputMonitoring)
+            flow.on(Input::Grant(Accessibility)),
+            Effect::OpenSettings(Accessibility)
         );
         assert_eq!(
             flow.on(Input::Grant(Microphone)),
@@ -933,17 +1112,17 @@ mod tests {
             flow.on(Input::Grant(Microphone)),
             Effect::OpenSettings(Microphone)
         );
-        let some = grants(&[Microphone, InputMonitoring]);
+        let some = grants(&[Microphone, Accessibility]);
         tick(&mut flow, &some, 0);
         let view = flow.view();
         assert_eq!(view.rows[1].status, Status::Granted);
         assert!(!view.rows[0].requested && !view.ready);
         // No auto-advance in the tour, even long after.
-        let all = grants(&[ScreenRecording, Microphone, InputMonitoring]);
+        let all = grants(&ALL);
         tick(&mut flow, &all, 1);
         tick(&mut flow, &all, 10_000);
         assert_eq!(flow.step(), Step::Permissions);
-        assert!(flow.view().ready && !flow.view().relaunch);
+        assert!(flow.view().ready);
         // A granted row's button does nothing.
         assert_eq!(flow.on(Input::Grant(Microphone)), Effect::None);
         assert_eq!(flow.on(Input::Continue), Effect::None);
@@ -966,7 +1145,7 @@ mod tests {
 
     #[test]
     fn granted_permissions_pass_the_screen_and_leave_the_dots() {
-        let all = grants(&[ScreenRecording, Microphone, InputMonitoring]);
+        let all = grants(&ALL);
         let mut flow = Flow::tour(Step::HowItWorks, Some(all.clone()));
         assert_eq!(flow.view().count, 3);
         flow.on(Input::Continue);
@@ -978,44 +1157,123 @@ mod tests {
             Flow::tour(Step::TryIt, Some(some)).step(),
             Step::Permissions
         );
-        assert_eq!(Flow::tour(Step::Permissions, Some(all)).step(), Step::TryIt);
+        // Resumed on the screen itself, it stays there with every check showing.
+        let resumed = Flow::tour(Step::Permissions, Some(all));
+        assert_eq!(resumed.step(), Step::Permissions);
+        assert!(resumed.view().ready);
     }
 
     #[test]
-    fn screen_recording_relaunches_once_at_the_end_and_resumes_after_the_screen() {
-        let mut stale = grants(&[ScreenRecording]);
-        stale.screen_needs_relaunch = true;
-        let mut flow = Flow::tour(Step::Permissions, Some(stale.clone()));
-        assert_eq!(flow.step(), Step::Permissions);
-        let view = flow.view();
-        assert!(view.rows[0].relaunch);
-        // Nothing relaunches while another required permission is still off.
-        assert!(!view.relaunch);
-        assert_eq!(flow.on(Input::Relaunch), Effect::None);
-        assert_eq!(flow.on(Input::Continue), Effect::None);
-        // All granted: the one relaunch, resuming at Try it.
-        let mut all = grants(&[ScreenRecording, Microphone, InputMonitoring]);
-        all.screen_needs_relaunch = true;
-        tick(&mut flow, &all, 0);
-        assert!(flow.view().relaunch);
-        let relaunch = Effect::Relaunch {
-            resume: Some(Step::TryIt),
-        };
-        assert_eq!(flow.on(Input::Continue), relaunch);
-        assert_eq!(flow.on(Input::Relaunch), relaunch);
-        // After it, the tour starts at Try it with nothing more to grant.
-        let progress = Progress {
-            seen: false,
-            resume: Some(Step::TryIt),
-            granted: BTreeSet::new(),
-        };
-        let fresh = grants(&[ScreenRecording, Microphone, InputMonitoring]);
-        let flow = launch_plan(&progress, &fresh).expect("the tour");
-        assert_eq!((flow.mode(), flow.step()), (Mode::Tour, Step::TryIt));
-        // Without a stale grant there's nothing to relaunch for.
+    fn a_screen_recording_grant_this_copy_cant_use_relaunches_by_itself_once() {
         let mut flow = Flow::tour(Step::Permissions, Some(grants(&[])));
-        tick(&mut flow, &fresh, 0);
-        assert_eq!(flow.on(Input::Relaunch), Effect::None);
+        // The user drags Scrawl into Screen Recording; macOS offers Quit & Reopen and the user
+        // picks Later (or nothing): the helper says granted, this process still can't capture.
+        let granted = stale(&[ScreenRecording]);
+        assert_eq!(tick(&mut flow, &granted, 1_000), Effect::None);
+        let row = flow.view().rows[0].clone();
+        assert_eq!(row.status, Status::Granted);
+        assert!(row.reopening && !row.relaunch);
+        // Not ready: Continue can't skip past a grant that doesn't work yet.
+        assert_eq!(flow.on(Input::Continue), Effect::None);
+        // The check shows a moment, then Scrawl relaunches, back on this screen, even though
+        // the other two rows are still off.
+        assert_eq!(tick(&mut flow, &granted, 1_500), Effect::None);
+        let relaunch = Effect::Relaunch {
+            resume: Some(Step::Permissions),
+        };
+        assert_eq!(tick(&mut flow, &granted, 1_000 + RELAUNCH_AFTER_MS), relaunch);
+        // Never twice from one window.
+        assert_eq!(tick(&mut flow, &granted, 9_000), Effect::None);
+        assert_eq!(flow.on(Input::Grant(ScreenRecording)), Effect::None);
+        // A grant this copy can use (ScreenCaptureKit works without a relaunch, or macOS's
+        // Quit & Reopen already restarted it) relaunches nothing.
+        let mut flow = Flow::tour(Step::Permissions, Some(grants(&[])));
+        for t in [0, 5_000, 60_000] {
+            assert_eq!(tick(&mut flow, &grants(&[ScreenRecording]), t), Effect::None);
+        }
+        assert!(!flow.view().rows[0].reopening);
+    }
+
+    #[test]
+    fn a_fix_relaunches_too_and_reopens_after() {
+        let mut flow = Flow::fix(Permission::REQUIRED.to_vec(), Some(grants(&[Microphone])));
+        let granted = stale(&[ScreenRecording, Microphone]);
+        tick(&mut flow, &granted, 0);
+        assert_eq!(
+            tick(&mut flow, &granted, RELAUNCH_AFTER_MS),
+            Effect::Relaunch { resume: None }
+        );
+        let mut progress = Progress {
+            seen: true,
+            ..Progress::default()
+        };
+        progress.relaunching(None, 42);
+        assert!(progress.reopen_fix && progress.seen);
+        let flow = launch_plan(&progress, &grants(&[ScreenRecording, Microphone])).expect("fix");
+        assert_eq!((flow.mode(), flow.step()), (Mode::Fix, Step::Permissions));
+        assert_eq!(rows(&flow), Permission::REQUIRED);
+    }
+
+    #[test]
+    fn right_after_a_relaunch_it_never_relaunches_by_itself_again() {
+        let now = 1_000_000;
+        let mut progress = Progress::default();
+        assert!(relaunch_allowed(&progress, now));
+        progress.relaunching(Some(Step::Permissions), now);
+        assert!(!relaunch_allowed(&progress, now + 5_000));
+        assert!(!relaunch_allowed(&progress, now + RELAUNCH_GUARD_MS - 1));
+        assert!(relaunch_allowed(&progress, now + RELAUNCH_GUARD_MS));
+        // The fresh copy still can't capture (something else is wrong): no loop. The row offers
+        // Reopen, and only pressing it relaunches.
+        let mut flow = Flow::tour(Step::Permissions, Some(grants(&[]))).with_auto_relaunch(false);
+        let granted = stale(&[ScreenRecording]);
+        for t in [0, RELAUNCH_AFTER_MS, 60_000] {
+            assert_eq!(tick(&mut flow, &granted, t), Effect::None);
+        }
+        let row = flow.view().rows[0].clone();
+        assert!(row.relaunch && !row.reopening);
+        assert_eq!(
+            flow.on(Input::Grant(ScreenRecording)),
+            Effect::Relaunch {
+                resume: Some(Step::Permissions)
+            }
+        );
+        assert_eq!(flow.on(Input::Grant(ScreenRecording)), Effect::None);
+    }
+
+    #[test]
+    fn after_either_kind_of_relaunch_the_tour_resumes_on_the_permissions_screen() {
+        // Scrawl's own relaunch (the user picked Later, or nothing).
+        let mut progress = Progress::default();
+        progress.relaunching(Some(Step::Permissions), 7);
+        assert_eq!(progress.resume, Some(Step::Permissions));
+        assert!(!progress.seen);
+        let fresh = grants(&[ScreenRecording]);
+        let flow = launch_plan(&progress, &fresh).expect("the tour");
+        assert_eq!((flow.mode(), flow.step()), (Mode::Tour, Step::Permissions));
+        let view = flow.view();
+        assert_eq!(view.rows[0].status, Status::Granted);
+        assert!(!view.rows[0].reopening && !view.rows[0].relaunch);
+        // The next row to do is Microphone.
+        assert_eq!(
+            view.rows.iter().find(|r| r.status != Status::Granted).map(|r| r.permission),
+            Some(Microphone)
+        );
+        // macOS's Quit & Reopen: Scrawl never noted a relaunch, but the step it saved while
+        // the window was open brings it back to the same place.
+        let progress = Progress {
+            resume: Flow::tour(Step::Permissions, Some(grants(&[]))).resume_point(),
+            ..Progress::default()
+        };
+        assert_eq!(progress.relaunched_at, None);
+        let flow = launch_plan(&progress, &fresh).expect("the tour");
+        assert_eq!((flow.mode(), flow.step()), (Mode::Tour, Step::Permissions));
+        // Screen Recording was the last one: the screen shows every check and Continue goes on.
+        let mut flow = launch_plan(&progress, &grants(&ALL)).expect("the tour");
+        assert_eq!(flow.step(), Step::Permissions);
+        assert!(flow.view().ready);
+        flow.on(Input::Continue);
+        assert_eq!(flow.step(), Step::TryIt);
     }
 
     #[test]
@@ -1025,11 +1283,9 @@ mod tests {
         flow.on(Input::Continue);
         flow.on(Input::Continue);
         assert_eq!(flow.resume_point(), Some(Step::Permissions));
-        // macOS's "Quit & Reopen": the next launch opens on the permissions screen.
         let progress = Progress {
-            seen: false,
             resume: flow.resume_point(),
-            granted: BTreeSet::new(),
+            ..Progress::default()
         };
         let flow = launch_plan(&progress, &grants(&[ScreenRecording])).expect("the tour");
         assert_eq!(flow.step(), Step::Permissions);
@@ -1049,10 +1305,15 @@ mod tests {
 
     #[test]
     fn the_shortcut_with_a_permission_off_starts_nothing_and_opens_the_window_on_release() {
-        // Mic and Input Monitoring granted, Screen Recording not usable in this process.
-        let some = grants(&[Microphone, InputMonitoring]);
-        let missing = missing_to_record(Some(&some), false);
+        // Mic and Accessibility on, Screen Recording not usable in this process.
+        let some = grants(&[Microphone, Accessibility]);
+        let missing = missing_to_record(Some(&some), false, true);
         assert_eq!(missing, [ScreenRecording]);
+        // Accessibility is read live in this process, not from the last helper read.
+        assert_eq!(
+            missing_to_record(Some(&grants(&ALL)), true, false),
+            [Accessibility]
+        );
         let mut gate = Gate::default();
         assert!(!gate.press(missing.clone()), "nothing starts");
         // Pressing again while it waits starts nothing either.
@@ -1068,22 +1329,21 @@ mod tests {
         assert_eq!(flow.step(), Step::Permissions);
         assert_eq!(
             flow.on(Input::Grant(ScreenRecording)),
-            Effect::Request(ScreenRecording)
+            Effect::OpenSettings(ScreenRecording)
         );
         // With everything on, the shortcut goes through.
-        let all = grants(&[ScreenRecording, Microphone, InputMonitoring]);
-        assert!(missing_to_record(Some(&all), true).is_empty());
+        assert!(missing_to_record(Some(&grants(&ALL)), true, true).is_empty());
         assert!(gate.press(Vec::new()));
         // A tour that's still explaining jumps to the permissions screen.
         let mut tour = Flow::tour(Step::Welcome, Some(some));
         assert_eq!(tour.on(Input::Blocked), Effect::Show);
         assert_eq!(tour.step(), Step::Permissions);
-        // Unknown grants (the launch read failed): only Screen Recording, read here, blocks.
-        assert!(missing_to_record(None, true).is_empty());
+        // Unknown grants (the launch read failed): only what's read here blocks.
+        assert!(missing_to_record(None, true, true).is_empty());
     }
 
     #[test]
-    fn camera_and_accessibility_are_asked_for_on_their_own_when_first_used() {
+    fn camera_is_asked_for_on_its_own_when_first_used() {
         let mut flow = Flow::fix(vec![Camera], Some(grants(&[ScreenRecording])));
         assert_eq!(rows(&flow), [Camera]);
         let view = flow.view();
@@ -1098,6 +1358,7 @@ mod tests {
             tick(&mut flow, &camera, 100 + AUTO_ADVANCE_MS),
             Effect::Close
         );
+        // ⌥⇧V after Accessibility was turned off asks for just that row.
         let mut flow = Flow::fix(vec![Accessibility], Some(grants(&[])));
         assert_eq!(flow.on(Input::Later), Effect::Close);
         // A fix never steps back into the tour.
@@ -1129,7 +1390,7 @@ mod tests {
 
     #[test]
     fn launch_shows_the_tour_once_then_only_a_lost_permission() {
-        let all = grants(&[ScreenRecording, Microphone, InputMonitoring]);
+        let all = grants(&ALL);
         let mut progress = Progress::default();
         assert_eq!(
             launch_plan(&progress, &all).map(|f| (f.mode(), f.step())),
@@ -1139,13 +1400,13 @@ mod tests {
         assert!(progress.note(&all));
         assert!(!progress.note(&all));
         assert!(launch_plan(&progress, &all).is_none());
-        // Input Monitoring went away: the permissions screen, as a fix.
+        // Accessibility went away: the permissions screen, as a fix.
         let lost = grants(&[ScreenRecording, Microphone]);
         let flow = launch_plan(&progress, &lost).expect("a fix");
         assert_eq!((flow.mode(), flow.step()), (Mode::Fix, Step::Permissions));
         assert_eq!(rows(&flow), Permission::REQUIRED);
         // Never granted (put off in the tour): no nagging at launch.
-        progress.granted.remove(&InputMonitoring);
+        progress.granted.remove(&Accessibility);
         assert!(launch_plan(&progress, &lost).is_none());
     }
 
@@ -1160,6 +1421,8 @@ mod tests {
             seen: true,
             resume: Some(Step::Permissions),
             granted: [Microphone].into_iter().collect(),
+            relaunched_at: Some(1_792_000_000_000),
+            reopen_fix: true,
         };
         progress.save_to(&path).unwrap();
         assert_eq!(Progress::load_from(&path), progress);
@@ -1168,6 +1431,8 @@ mod tests {
         assert_eq!(config["agentHost"], "studio");
         assert_eq!(config["autocrop"], false);
         assert_eq!(config["onboarding"]["resume"], "permissions");
+        assert_eq!(config["onboarding"]["relaunchedAt"], 1_792_000_000_000_u64);
+        assert_eq!(config["onboarding"]["reopenFix"], true);
         // A resume point saved by 0.3.2's one-permission-per-step tour still loads.
         std::fs::write(
             &path,

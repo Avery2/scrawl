@@ -4,7 +4,7 @@
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,6 +26,11 @@ use crate::model::{CaptureMode, InteractionEvent, RgbaFrame, TargetFrame, Target
 
 /// Recordings may hold up to twice a frame's size in points (Retina pixels).
 pub const MAX_CAPTURE_SCALE: f64 = 2.0;
+
+/// Where a session's clicks and keys come from, for the log.
+pub(super) const MOUSE_SOURCE: &str = "the mouse monitor";
+pub(super) const KEY_SOURCE: &str = "the key tap";
+pub(super) const NO_KEY_SOURCE: &str = "nowhere (Accessibility off; the record shortcut still works)";
 
 /// `~/Library/Logs/Scrawl`.
 pub fn log_dir() -> Option<PathBuf> {
@@ -55,8 +60,6 @@ const EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = u32::MAX;
 
 const KEYBOARD_EVENT_KEYCODE: u32 = 9;
 const KEYBOARD_EVENT_AUTOREPEAT: u32 = 8;
-/// `kCGEventTargetUnixProcessID`: the process an annotated session event is going to.
-const EVENT_TARGET_UNIX_PROCESS_ID: u32 = 40;
 const SCROLL_WHEEL_DELTA_AXIS_1: u32 = 11;
 const SCROLL_WHEEL_DELTA_AXIS_2: u32 = 12;
 
@@ -175,8 +178,6 @@ unsafe extern "C" {
     fn CGEventTapEnable(tap: *mut c_void, enable: bool);
     fn CGEventTapIsEnabled(tap: *mut c_void) -> bool;
     fn CGEventSourceButtonState(state_id: u32, button: u32) -> bool;
-    fn CGPreflightListenEventAccess() -> bool;
-    fn CGRequestListenEventAccess() -> bool;
     fn CGEventCreate(source: *const c_void) -> EventRef;
     fn CGEventCreateMouseEvent(
         source: *const c_void,
@@ -192,8 +193,8 @@ unsafe extern "C" {
     fn CGEventSetFlags(event: EventRef, flags: u64);
     fn CGEventPost(tap: u32, event: EventRef);
     fn CGEventSourceFlagsState(state_id: u32) -> u64;
-    fn CGEventSourceKeyState(state_id: u32, key: u16) -> bool;
     fn CGEventGetFlags(event: EventRef) -> u64;
+    fn CGEventGetType(event: EventRef) -> u32;
     fn CGEventGetLocation(event: EventRef) -> CGPoint;
     fn CGEventGetIntegerValueField(event: EventRef, field: u32) -> i64;
     fn CGMainDisplayID() -> u32;
@@ -546,10 +547,78 @@ pub fn update_global_shortcut(telemetry: &SharedCaptureTelemetry, config: Shortc
     }
 }
 
-/// Whether this running copy of Scrawl may record the screen. A grant made while it runs may
-/// only show up here after a relaunch.
+/// Whether this running copy of Scrawl may record the screen, by `CGPreflightScreenCaptureAccess`,
+/// which keeps its first answer for the life of the process. See `screen_capture_usable`.
 pub fn screen_capture_granted() -> bool {
     unsafe { CGPreflightScreenCaptureAccess() }
+}
+
+/// A ScreenCaptureKit capture worked in this process (`screen_capture_probe`).
+static SCREEN_PROBE_OK: AtomicBool = AtomicBool::new(false);
+static SCREEN_PROBE_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Whether this copy of Scrawl can capture the screen now: `CGPreflightScreenCaptureAccess`, or
+/// a ScreenCaptureKit capture that already worked here. With `probe` (only once a fresh helper
+/// says Screen Recording is granted, so no prompt can come of it, and never on the UI thread) a
+/// stale preflight is checked with a real one-frame capture, at most every 2 s. Whether a grant
+/// reaches a running process this way on macOS 26 and 27 is what the probe finds out; when it
+/// does, Scrawl doesn't relaunch.
+pub fn screen_capture_usable(probe: bool) -> bool {
+    if screen_capture_granted() || SCREEN_PROBE_OK.load(Ordering::Acquire) {
+        return true;
+    }
+    if !probe {
+        return false;
+    }
+    {
+        let mut at = SCREEN_PROBE_AT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if at.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+            return false;
+        }
+        *at = Some(Instant::now());
+    }
+    let started = Instant::now();
+    let result = screen_capture_probe();
+    scrawl_log(format!(
+        "screen probe after a grant, without relaunching: {} in {} ms",
+        match &result {
+            Ok((w, h)) => format!("captured {w}x{h}"),
+            Err(error) => format!("failed ({error})"),
+        },
+        started.elapsed().as_millis()
+    ));
+    let ok = result.is_ok();
+    if ok {
+        SCREEN_PROBE_OK.store(true, Ordering::Release);
+    }
+    ok
+}
+
+/// One small ScreenCaptureKit screenshot of the first display: `SCShareableContent`, then
+/// `SCScreenshotManager`. Returns the image size. Asks for Screen Recording if it was never
+/// decided, so only call it once it's known to be granted (or from `scrawl sck-probe`).
+pub fn screen_capture_probe() -> Result<(u32, u32), String> {
+    let content = SCShareableContent::get().map_err(|e| format!("SCShareableContent: {e:?}"))?;
+    let display = content
+        .displays()
+        .into_iter()
+        .next()
+        .ok_or("SCShareableContent: no displays")?;
+    let filter = SCContentFilter::create()
+        .with_display(&display)
+        .with_excluding_windows(&[] as &[&SCWindow])
+        .build()
+        .map_err(|e| format!("SCContentFilter: {e:?}"))?;
+    let config = SCStreamConfiguration::new().with_width(64).with_height(40);
+    let image = SCScreenshotManager::capture_image(&filter, &config)
+        .map_err(|e| format!("SCScreenshotManager: {e:?}"))?;
+    let (w, h) = (image.width() as u32, image.height() as u32);
+    if w == 0 || h == 0 {
+        return Err("SCScreenshotManager: empty image".into());
+    }
+    Ok((w, h))
 }
 
 /// The system prompt for Screen Recording (once; later calls do nothing).
@@ -565,22 +634,11 @@ pub fn accessibility_granted() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
 
-/// The system prompt for Input Monitoring (once; later calls do nothing).
-pub fn request_listen_access() {
-    unsafe {
-        let _ = CGRequestListenEventAccess();
-    }
-}
-
-/// The ⌃⌥⇧⌘ modifier flags held right now (as `CGEventFlags` bits).
+/// The ⌃⌥⇧⌘ modifier flags held right now (as `CGEventFlags` bits). Reading modifier state
+/// needs no permission (unlike key codes, which are Input Monitoring's).
 pub fn modifier_flags() -> u64 {
     let flags = unsafe { CGEventSourceFlagsState(0) | CGEventSourceFlagsState(1) };
     flags & (FLAG_COMMAND | FLAG_CONTROL | FLAG_ALTERNATE | FLAG_SHIFT)
-}
-
-/// Whether Esc is down right now, whichever app has focus.
-pub fn escape_down() -> bool {
-    unsafe { CGEventSourceKeyState(0, KEY_ESCAPE) || CGEventSourceKeyState(1, KEY_ESCAPE) }
 }
 
 pub fn shortcut_from_key_and_mods(
@@ -1168,10 +1226,30 @@ fn capture_sck_frame(
     Some(RgbaFrame::new(t_ms, width, height, rgba))
 }
 
-/// Re-enables the event tap if macOS turned it off, and notes whether it is delivering.
-pub(super) fn check_tap(telemetry: &SharedCaptureTelemetry) -> bool {
+/// Keeps the key event tap in step with Accessibility, which macOS reports live: makes the tap
+/// once it's on (no relaunch), stops it if it's turned off (an active tap whose grant is gone can
+/// hold up input), and re-enables it if macOS turned it off. Returns whether it is delivering.
+/// Called every 500 ms from the HID poller.
+fn check_key_tap(telemetry: &Arc<SharedCaptureTelemetry>) -> bool {
+    let trusted = accessibility_granted();
     let tap = telemetry.tap_port.load(Ordering::Acquire) as *mut c_void;
-    let live = !tap.is_null()
+    if !trusted && !tap.is_null() {
+        stop_key_tap(telemetry);
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    if trusted
+        && tap.is_null()
+        && now_ms.saturating_sub(telemetry.tap_tried_ms.load(Ordering::Acquire)) >= 2_000
+        && !telemetry.tap_starting.swap(true, Ordering::AcqRel)
+    {
+        telemetry.tap_tried_ms.store(now_ms, Ordering::Release);
+        spawn_key_tap(Arc::clone(telemetry));
+    }
+    let live = trusted
+        && !tap.is_null()
         && unsafe {
             CGEventTapIsEnabled(tap) || {
                 CGEventTapEnable(tap, true);
@@ -1180,36 +1258,133 @@ pub(super) fn check_tap(telemetry: &SharedCaptureTelemetry) -> bool {
         };
     if telemetry.tap_live.swap(live, Ordering::AcqRel) != live {
         scrawl_log(if live {
-            "event tap live".to_string()
+            "key tap live"
+        } else if !trusted {
+            "key tap off: Accessibility is off"
         } else {
-            format!(
-                "event tap off (Input Monitoring {}, or Secure Input is on); clicks come from \
-                 polling the mouse buttons",
-                if unsafe { CGPreflightListenEventAccess() } {
-                    "granted"
-                } else {
-                    "not granted"
-                }
-            )
+            "key tap off (being made, or Secure Input is on)"
         });
     }
     live
 }
 
+/// Starts watching input across every app, with no Input Monitoring:
+/// - clicks, drags and scrolls from an AppKit global mouse monitor, which needs no permission
+///   (only key events need Accessibility, per `addGlobalMonitorForEvents`' documentation);
+/// - ⇧ (ink), the laser and the switcher's held modifiers from polled modifier flags, which need
+///   no permission either (the HID poller);
+/// - key presses (the switcher's S, Esc, ⌘Z, ⌘-chords for the window log) from an active key
+///   event tap, which Accessibility allows and which is made, without a relaunch, as soon as
+///   Accessibility is on (`check_key_tap`).
+///
+/// ⌥⇧S and ⌥⇧V themselves are Carbon hotkeys and need nothing. Call on the main thread.
 pub fn start_global_input_tap(telemetry: Arc<SharedCaptureTelemetry>) {
-    let hid_telemetry = Arc::clone(&telemetry);
+    let live = install_mouse_monitor(Arc::clone(&telemetry));
+    telemetry.mouse_live.store(live, Ordering::Release);
+    scrawl_log(format!(
+        "mouse monitor {}",
+        if live {
+            "installed"
+        } else {
+            "unavailable; polling the mouse buttons"
+        }
+    ));
     let _ = thread::Builder::new()
         .name("scrawl-hid-poller".into())
-        .spawn(move || run_global_hid_poller(hid_telemetry));
-    spawn_event_tap(telemetry);
+        .spawn(move || run_global_hid_poller(telemetry));
 }
 
-/// Makes the event tap again after Input Monitoring is granted while Scrawl runs, instead of
-/// asking for a relaunch: a tap made without the grant never gets key events, and macOS doesn't
-/// upgrade it.
-pub fn restart_input_tap(telemetry: &Arc<SharedCaptureTelemetry>) {
-    scrawl_log("Input Monitoring granted; making the event tap again");
-    telemetry.tap_port.store(0, Ordering::Release);
+/// `struct __CGEvent`, so `-[NSEvent CGEvent]` passes objc2's encoding check.
+#[repr(C)]
+struct OpaqueCgEvent {
+    _private: [u8; 0],
+}
+
+unsafe impl objc2::encode::RefEncode for OpaqueCgEvent {
+    const ENCODING_REF: objc2::encode::Encoding =
+        objc2::encode::Encoding::Pointer(&objc2::encode::Encoding::Struct("__CGEvent", &[]));
+}
+
+const MOUSE_MONITOR_MASK: u64 = (1 << EVENT_LEFT_MOUSE_DOWN)
+    | (1 << EVENT_LEFT_MOUSE_UP)
+    | (1 << EVENT_RIGHT_MOUSE_DOWN)
+    | (1 << EVENT_RIGHT_MOUSE_UP)
+    | (1 << EVENT_SCROLL_WHEEL);
+
+/// `+[NSEvent addGlobalMonitorForEventsMatchingMask:handler:]` for mouse buttons and scrolls.
+/// AppKit sends it events bound for other apps only, so clicks on Scrawl's own windows (the stop
+/// control, the HUD) never arrive. The monitor lives as long as the app.
+fn install_mouse_monitor(telemetry: Arc<SharedCaptureTelemetry>) -> bool {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
+    let Some(class) = AnyClass::get(c"NSEvent") else {
+        return false;
+    };
+    let block = block2::RcBlock::new(move |event: ptr::NonNull<AnyObject>| {
+        let event: &AnyObject = unsafe { event.as_ref() };
+        let cg: *mut OpaqueCgEvent = unsafe { msg_send![event, CGEvent] };
+        if !cg.is_null() {
+            mouse_event(&telemetry, cg.cast());
+        }
+    });
+    let monitor: Option<objc2::rc::Retained<AnyObject>> = unsafe {
+        msg_send![class, addGlobalMonitorForEventsMatchingMask: MOUSE_MONITOR_MASK, handler: &*block]
+    };
+    monitor.map(std::mem::forget).is_some()
+}
+
+/// A mouse button or scroll in another app, from the mouse monitor (main thread).
+fn mouse_event(telemetry: &SharedCaptureTelemetry, event: EventRef) {
+    if !telemetry.active.load(Ordering::Acquire) {
+        return;
+    }
+    let event_type = unsafe { CGEventGetType(event) };
+    let flags = unsafe { CGEventGetFlags(event) };
+    let pure_shift = (flags & FLAG_SHIFT) != 0
+        && (flags & (FLAG_COMMAND | FLAG_CONTROL | FLAG_ALTERNATE)) == 0;
+    let t_ms = telemetry.elapsed_ms();
+    let loc = unsafe { CGEventGetLocation(event) };
+    match event_type {
+        // A ⇧-drag is ink (the poller), not a click.
+        EVENT_LEFT_MOUSE_DOWN | EVENT_RIGHT_MOUSE_DOWN if !pure_shift => {
+            telemetry.pointer_down(t_ms, loc.x, loc.y);
+        }
+        EVENT_LEFT_MOUSE_UP | EVENT_RIGHT_MOUSE_UP if !pure_shift => {
+            telemetry.pointer_up(t_ms, loc.x, loc.y, event_type == EVENT_RIGHT_MOUSE_UP);
+        }
+        EVENT_SCROLL_WHEEL => {
+            let dy =
+                unsafe { CGEventGetIntegerValueField(event, SCROLL_WHEEL_DELTA_AXIS_1) } as f32;
+            let dx =
+                unsafe { CGEventGetIntegerValueField(event, SCROLL_WHEEL_DELTA_AXIS_2) } as f32;
+            if dx.abs() > 0.0 || dy.abs() > 0.0 {
+                let (nx, ny, _, _) = telemetry.normalize_point(loc.x, loc.y);
+                telemetry
+                    .events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(InteractionEvent::Scroll {
+                        t: t_ms,
+                        x: nx,
+                        y: ny,
+                        dx,
+                        dy,
+                        label: None,
+                    });
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Stops the key tap (Accessibility was turned off). The port and its callback's `Arc` are left
+/// alive: `check_key_tap` may still hold the old pointer.
+fn stop_key_tap(telemetry: &SharedCaptureTelemetry) {
+    scrawl_log("Accessibility is off; stopping the key tap");
+    let tap = telemetry.tap_port.swap(0, Ordering::AcqRel) as *mut c_void;
+    if !tap.is_null() {
+        unsafe { CGEventTapEnable(tap, false) };
+    }
     let old = telemetry.tap_run_loop.swap(0, Ordering::AcqRel) as *mut c_void;
     if !old.is_null() {
         unsafe {
@@ -1217,51 +1392,48 @@ pub fn restart_input_tap(telemetry: &Arc<SharedCaptureTelemetry>) {
             CFRelease(old.cast_const());
         }
     }
-    spawn_event_tap(Arc::clone(telemetry));
 }
 
-fn spawn_event_tap(telemetry: Arc<SharedCaptureTelemetry>) {
-    let _ = thread::Builder::new()
-        .name("scrawl-event-tap".into())
+/// Makes the key tap on its own thread and runs it until `stop_key_tap`. It's an active tap
+/// (`kCGEventTapOptionDefault`), which needs Accessibility; a listen-only one would need Input
+/// Monitoring. It hands every event on unchanged.
+fn spawn_key_tap(telemetry: Arc<SharedCaptureTelemetry>) {
+    let starting = Arc::clone(&telemetry);
+    let spawned = thread::Builder::new()
+        .name("scrawl-key-tap".into())
         .spawn(move || {
-            let mask = (1_u64 << EVENT_LEFT_MOUSE_DOWN)
-                | (1_u64 << EVENT_LEFT_MOUSE_UP)
-                | (1_u64 << EVENT_RIGHT_MOUSE_DOWN)
-                | (1_u64 << EVENT_RIGHT_MOUSE_UP)
-                | (1_u64 << EVENT_KEY_DOWN)
-                | (1_u64 << EVENT_SCROLL_WHEEL);
-
+            let mask = 1_u64 << EVENT_KEY_DOWN;
             let user_info = Arc::into_raw(Arc::clone(&telemetry))
                 .cast_mut()
                 .cast::<c_void>();
-            // tap = 2 (kCGAnnotatedSessionEventTap), options = 1 (kCGEventTapOptionListenOnly)
-            let tap = unsafe { CGEventTapCreate(2, 0, 1, mask, tap_callback, user_info) };
+            // tap = 1 (kCGSessionEventTap), place = 1 (kCGTailAppendEventTap),
+            // options = 0 (kCGEventTapOptionDefault).
+            let tap = unsafe { CGEventTapCreate(1, 1, 0, mask, key_tap_callback, user_info) };
             scrawl_log(format!(
-                "CGEventTapCreate -> tap={tap:p} (Input Monitoring {})",
-                if unsafe { CGPreflightListenEventAccess() } {
-                    "granted"
-                } else {
-                    "not granted"
-                }
+                "key tap: CGEventTapCreate -> {tap:p} (Accessibility {})",
+                if accessibility_granted() { "on" } else { "off" }
             ));
-            if tap.is_null() {
-                let _ = unsafe { Arc::from_raw(user_info.cast::<SharedCaptureTelemetry>()) };
-                return;
-            }
-            telemetry.tap_port.store(tap as u64, Ordering::Release);
-            let source = unsafe { CFMachPortCreateRunLoopSource(ptr::null(), tap, 0) };
+            let source = if tap.is_null() {
+                ptr::null_mut()
+            } else {
+                unsafe { CFMachPortCreateRunLoopSource(ptr::null(), tap, 0) }
+            };
             if source.is_null() {
+                if tap.is_null() {
+                    let _ = unsafe { Arc::from_raw(user_info.cast::<SharedCaptureTelemetry>()) };
+                }
+                telemetry.tap_starting.store(false, Ordering::Release);
                 return;
             }
             let run_loop = unsafe { CFRunLoopGetCurrent() };
             let retained = unsafe { CFRetain(run_loop.cast_const()) } as u64;
             telemetry.tap_run_loop.store(retained, Ordering::Release);
+            telemetry.tap_port.store(tap as u64, Ordering::Release);
+            telemetry.tap_starting.store(false, Ordering::Release);
             unsafe {
                 CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
                 CGEventTapEnable(tap, true);
                 CFRunLoopRun();
-                // Stopped by `restart_input_tap`. The port and its callback's Arc are left
-                // alive: `check_tap` may still be holding the old pointer.
                 CGEventTapEnable(tap, false);
                 CFRunLoopRemoveSource(run_loop, source, kCFRunLoopCommonModes);
                 CFRelease(source);
@@ -1274,9 +1446,13 @@ fn spawn_event_tap(telemetry: Arc<SharedCaptureTelemetry>) {
                 unsafe { CFRelease(retained as CfTypeRef) };
             }
         });
+    if spawned.is_err() {
+        starting.tap_starting.store(false, Ordering::Release);
+    }
 }
 
-unsafe extern "C" fn tap_callback(
+/// Key presses in any app, from the key tap. Always returns the event unchanged.
+unsafe extern "C" fn key_tap_callback(
     _proxy: *mut c_void,
     event_type: u32,
     event: EventRef,
@@ -1294,109 +1470,61 @@ unsafe extern "C" fn tap_callback(
         }
         return event;
     }
+    if event_type != EVENT_KEY_DOWN {
+        return event;
+    }
 
     let flags = unsafe { CGEventGetFlags(event) };
     let cmd = (flags & FLAG_COMMAND) != 0;
     let ctrl = (flags & FLAG_CONTROL) != 0;
     let alt = (flags & FLAG_ALTERNATE) != 0;
     let shift = (flags & FLAG_SHIFT) != 0;
-    let pure_shift = shift && !cmd && !ctrl && !alt;
-
-    if event_type == EVENT_KEY_DOWN {
-        let keycode = unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_KEYCODE) } as u16;
-        if telemetry.matches_shortcut(keycode, cmd, ctrl, alt, shift) {
-            // Holding S repeats the key; only a fresh press switches modes.
-            if unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_AUTOREPEAT) } == 0 {
-                telemetry.emit_capture_shortcut();
-            }
-            return event;
+    let keycode = unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_KEYCODE) } as u16;
+    if telemetry.matches_shortcut(keycode, cmd, ctrl, alt, shift) {
+        // Holding S repeats the key; only a fresh press switches modes.
+        if unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_AUTOREPEAT) } == 0 {
+            telemetry.emit_capture_shortcut();
         }
+        return event;
     }
-
+    if keycode == KEY_ESCAPE && !cmd && !ctrl {
+        telemetry.escape_pressed.store(true, Ordering::Release);
+    }
     if !telemetry.active.load(Ordering::Acquire) {
         return event;
     }
 
     let t_ms = telemetry.elapsed_ms();
-    let loc = unsafe { CGEventGetLocation(event) };
-    let (nx, ny, _, _) = telemetry.normalize_point(loc.x, loc.y);
-
-    // Scrawl's own controls (the stop button, the HUD) aren't part of what is being shown.
-    let on_scrawl = || {
-        let target = unsafe { CGEventGetIntegerValueField(event, EVENT_TARGET_UNIX_PROCESS_ID) };
-        target == i64::from(std::process::id())
-    };
-    match event_type {
-        EVENT_LEFT_MOUSE_DOWN | EVENT_RIGHT_MOUSE_DOWN => {
-            if pure_shift || on_scrawl() {
-                return event;
+    if cmd && !ctrl && !alt && !shift && (keycode == layout_z_keycode() || keycode == KEY_Z) {
+        let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::UndoStroke);
+    } else if cmd || ctrl {
+        // Only log modifier-chord shortcuts, never ordinary typing or secrets.
+        if let Some(key_name) = shortcut_key_name(keycode) {
+            let mut chord = String::new();
+            if ctrl {
+                chord.push('⌃');
             }
-            telemetry.pointer_down(t_ms, loc.x, loc.y);
-        }
-        EVENT_LEFT_MOUSE_UP | EVENT_RIGHT_MOUSE_UP => {
-            if pure_shift {
-                return event;
+            if alt {
+                chord.push('⌥');
             }
-            telemetry.pointer_up(t_ms, loc.x, loc.y, event_type == EVENT_RIGHT_MOUSE_UP);
-        }
-        EVENT_SCROLL_WHEEL if on_scrawl() => {}
-        EVENT_SCROLL_WHEEL => {
-            let dy =
-                unsafe { CGEventGetIntegerValueField(event, SCROLL_WHEEL_DELTA_AXIS_1) } as f32;
-            let dx =
-                unsafe { CGEventGetIntegerValueField(event, SCROLL_WHEEL_DELTA_AXIS_2) } as f32;
-            if dx.abs() > 0.0 || dy.abs() > 0.0 {
-                telemetry
-                    .events
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(InteractionEvent::Scroll {
-                        t: t_ms,
-                        x: nx,
-                        y: ny,
-                        dx,
-                        dy,
-                        label: None,
-                    });
+            if shift {
+                chord.push('⇧');
             }
-        }
-        EVENT_KEY_DOWN => {
-            let keycode =
-                unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_KEYCODE) } as u16;
-            if cmd && (keycode == layout_z_keycode() || keycode == KEY_Z) {
-                let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::UndoStroke);
-            } else if cmd || ctrl {
-                // Only log modifier-chord shortcuts, never ordinary typing or secrets.
-                if let Some(key_name) = shortcut_key_name(keycode) {
-                    let mut chord = String::new();
-                    if ctrl {
-                        chord.push('⌃');
-                    }
-                    if alt {
-                        chord.push('⌥');
-                    }
-                    if shift {
-                        chord.push('⇧');
-                    }
-                    if cmd {
-                        chord.push('⌘');
-                    }
-                    chord.push_str(key_name);
-                    telemetry.window_log_request.store(true, Ordering::Release);
-                    telemetry
-                        .events
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(InteractionEvent::Key {
-                            t: t_ms,
-                            shortcut: chord,
-                        });
-                }
+            if cmd {
+                chord.push('⌘');
             }
+            chord.push_str(key_name);
+            telemetry.window_log_request.store(true, Ordering::Release);
+            telemetry
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(InteractionEvent::Key {
+                    t: t_ms,
+                    shortcut: chord,
+                });
         }
-        _ => {}
     }
-
     event
 }
 
@@ -1465,22 +1593,21 @@ pub fn post_synthetic_click(screen_x: f64, screen_y: f64) {
     }
 }
 
-/// 120Hz global HID & session state poller so shortcuts, Shift-laser (`⇧` + move), and
-/// Shift-drag ink (`⇧` + drag) work across all apps (including Karabiner virtual HID).
+/// 120 Hz poller of modifier flags and mouse buttons, neither of which needs a permission, so
+/// Shift-laser (`⇧` + move) and Shift-drag ink (`⇧` + drag) work across all apps (including
+/// Karabiner's virtual HID). Every 500 ms it also keeps the key tap in step with Accessibility.
+/// Key codes are never polled: reading them is Input Monitoring's.
 fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
-    let mut prev_shortcut = false;
-    let mut prev_paste = false;
     let mut prev_shift_ink = false;
-    let mut prev_undo = false;
     let mut await_shift_release = false;
-    let mut prev_mod_mask = (0_u8, false, false);
+    let mut prev_mod_mask = 0_u8;
     let mut prev_buttons = [false; 2];
-    let mut last_tap_check = Instant::now();
+    let mut last_tap_check: Option<Instant> = None;
     loop {
         thread::sleep(Duration::from_millis(8));
-        if last_tap_check.elapsed() >= Duration::from_millis(500) {
-            telemetry.check_tap();
-            last_tap_check = Instant::now();
+        if last_tap_check.is_none_or(|t| t.elapsed() >= Duration::from_millis(500)) {
+            check_key_tap(&telemetry);
+            last_tap_check = Some(Instant::now());
         }
 
         // Combine COMBINED_SESSION_STATE (0, includes Karabiner virtual HID) and HID_SYSTEM_STATE (1).
@@ -1496,39 +1623,12 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
         }
         let mod_mask =
             (u8::from(cmd) << 3) | (u8::from(ctrl) << 2) | (u8::from(alt) << 1) | u8::from(shift);
-
-        let z_code = layout_z_keycode();
-        let (record_cfg, paste_cfg) = telemetry.shortcuts();
-        let key_down =
-            |code: u16| unsafe { CGEventSourceKeyState(1, code) || CGEventSourceKeyState(0, code) };
-        // Whether `kind`'s shortcut is down: its own key, or for a default its alias keys.
-        let shortcut_down = |kind: ShortcutKind, cfg: &ShortcutConfig| {
-            let mut codes = vec![cfg.key_code as u16];
-            if cfg.is_default_for(kind) {
-                codes.extend([layout_default_keycode(kind), kind.ansi_code()]);
-            }
-            codes.into_iter().any(|code| {
-                key_down(code) && shortcut_matches(kind, cfg, code, code, cmd, ctrl, alt, shift)
-            })
-        };
-        let shortcut_now = shortcut_down(ShortcutKind::Record, &record_cfg);
-        let paste_now = shortcut_down(ShortcutKind::Paste, &paste_cfg);
-        let key_state = (mod_mask, shortcut_now, paste_now);
-        if key_state != prev_mod_mask {
+        if mod_mask != prev_mod_mask {
             scrawl_log(format!(
-                "hid_poller: cmd={cmd} ctrl={ctrl} alt={alt} shift={shift} record={shortcut_now} paste={paste_now}"
+                "hid_poller: cmd={cmd} ctrl={ctrl} alt={alt} shift={shift}"
             ));
-            prev_mod_mask = key_state;
+            prev_mod_mask = mod_mask;
         }
-        if shortcut_now && !prev_shortcut {
-            telemetry.emit_capture_shortcut();
-        }
-        prev_shortcut = shortcut_now;
-
-        if paste_now && !prev_paste && !telemetry.active.load(Ordering::Acquire) {
-            telemetry.emit_paste_shortcut();
-        }
-        prev_paste = paste_now;
 
         let buttons = unsafe {
             [
@@ -1538,21 +1638,9 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
         };
         if !telemetry.active.load(Ordering::Acquire) {
             prev_shift_ink = false;
-            prev_undo = false;
             prev_buttons = buttons;
             continue;
         }
-
-        let key_z = unsafe {
-            CGEventSourceKeyState(1, z_code)
-                || CGEventSourceKeyState(0, z_code)
-                || CGEventSourceKeyState(1, KEY_Z)
-        };
-        let undo_now = cmd && !ctrl && !alt && !shift && key_z;
-        if undo_now && !prev_undo {
-            let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::UndoStroke);
-        }
-        prev_undo = undo_now;
 
         let Some(loc) = current_mouse_location() else {
             continue;
@@ -1604,5 +1692,57 @@ fn shortcut_key_name(keycode: u16) -> Option<&'static str> {
         49 => Some("Space"),
         51 => Some("⌫"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The mouse monitor's AppKit calls pass objc2's encoding checks (which debug builds, the
+    /// installed app included, run on every message), and a monitored click is recorded.
+    #[test]
+    fn the_mouse_monitor_reads_cg_events_from_appkit_events() {
+        use objc2::msg_send;
+        use objc2::runtime::{AnyClass, AnyObject};
+        let class = AnyClass::get(c"NSEvent").expect("NSEvent");
+        let point = CGPoint { x: 100.0, y: 200.0 };
+        let cg = unsafe { CGEventCreateMouseEvent(ptr::null(), EVENT_LEFT_MOUSE_DOWN, point, 0) };
+        assert!(!cg.is_null());
+        let event: Option<objc2::rc::Retained<AnyObject>> =
+            unsafe { msg_send![class, eventWithCGEvent: cg.cast::<OpaqueCgEvent>()] };
+        let event = event.expect("an NSEvent");
+        let back: *mut OpaqueCgEvent = unsafe { msg_send![&*event, CGEvent] };
+        assert!(!back.is_null());
+        assert_eq!(unsafe { CGEventGetType(back.cast()) }, EVENT_LEFT_MOUSE_DOWN);
+
+        let (sender, _receiver) = flume::unbounded();
+        let telemetry = SharedCaptureTelemetry::new(sender);
+        telemetry.reset_for_session(TargetFrame {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 1000.0,
+            scale: 2.0,
+        });
+        mouse_event(&telemetry, back.cast());
+        let up = unsafe { CGEventCreateMouseEvent(ptr::null(), EVENT_LEFT_MOUSE_UP, point, 0) };
+        mouse_event(&telemetry, up);
+        unsafe {
+            CFRelease(up.cast());
+            CFRelease(cg.cast());
+        }
+        let (events, _) = telemetry.finish_session();
+        assert!(
+            matches!(events[..], [InteractionEvent::Click { x, y, .. }] if (x - 0.1).abs() < 1e-3 && (y - 0.2).abs() < 1e-3),
+            "{events:?}"
+        );
+        assert_eq!(MOUSE_MONITOR_MASK & (1 << EVENT_KEY_DOWN), 0, "keys need Accessibility");
+    }
+
+    #[test]
+    fn the_mouse_monitor_installs_without_a_permission() {
+        let (sender, _receiver) = flume::unbounded();
+        assert!(install_mouse_monitor(SharedCaptureTelemetry::new(sender)));
     }
 }

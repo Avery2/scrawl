@@ -479,7 +479,7 @@ impl NativePill {
                     st.window.orderFrontRegardless();
                 }
             }
-            if (motion::now() - st.last_tick_now) >= f64::from(0.016 * motion::time_scale()) {
+            if (motion::now() - st.last_tick_now) >= f64::from(0.045 * motion::time_scale()) {
                 needs_fallback_tick = true;
             }
         }
@@ -638,7 +638,7 @@ impl SharedNativePill {
         st.dirty = false;
 
         let frame = st.model.frame();
-        if motion::tracing() && !st.model.is_fully_hidden() {
+        if motion::tracing() && (!st.model.is_fully_hidden() || animating) {
             st.emit_trace(&frame);
         }
         st.render_frame(&frame);
@@ -773,7 +773,11 @@ impl PillRuntimeState {
         motion::trace_element("shell", shell, sh.alpha, sh.radius, None, None);
         motion::trace_channel("content.blur", "level", frame.content_blur);
         motion::trace_channel("content.alpha", "level", frame.content_alpha);
-        motion::trace_channel("shell.width", "position", sh.width());
+        motion::trace_channel(
+            "shell.width",
+            "position",
+            (self.model.r.x - self.model.l.x).max(0.0),
+        );
 
         for elem in &frame.elems {
             let [ex, ey, ew, eh] = elem.rect;
@@ -1206,13 +1210,13 @@ impl PillRuntimeState {
                 }
                 let tx = atlas.label(label);
                 let fg = if !elem.enabled {
-                    if is_glass { 0.72 } else { 0.42 }
+                    if is_glass { 0.78 } else { 0.56 }
                 } else if is_glass {
                     0.92 + 0.08 * elem.hover
                 } else {
-                    0.72 + 0.24 * elem.hover
+                    0.74 + 0.22 * elem.hover
                 };
-                let fg_a = if !elem.enabled { 0.55 } else { 1.0 };
+                let fg_a = if !elem.enabled { 0.90 } else { 1.0 };
                 push_sprite(out, center_text(tx), tx.uv, [fg, fg, fg, fg_a]);
             }
             ElemId::Close => {

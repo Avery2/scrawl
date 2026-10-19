@@ -665,16 +665,27 @@ pub struct SharedCaptureTelemetry {
     /// Scrawl's windows that let clicks through (the ink overlay), skipped when deciding whether
     /// a click landed on Scrawl itself.
     pub passthrough_window_ids: Mutex<Vec<u32>>,
+    /// macOS's key event tap (`CFMachPortRef`), made once Accessibility is on (`check_key_tap`).
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     tap_port: AtomicU64,
-    /// The event tap thread's run loop (retained), so `restart_input_tap` can stop it.
+    /// The key event tap thread's run loop (retained), so `check_key_tap` can stop it.
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     tap_run_loop: AtomicU64,
+    /// A key tap thread is being started.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    tap_starting: AtomicBool,
+    /// When the last key tap was tried (ms since `UNIX_EPOCH`), to space out retries.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    tap_tried_ms: AtomicU64,
+    /// Whether key presses are arriving (macOS's key tap, Windows' keyboard hook).
+    tap_live: AtomicBool,
+    /// Esc went down since the switcher last looked (`take_escape`).
+    escape_pressed: AtomicBool,
     /// A Screen recording started straight from the shortcut: the overlay flashes an edge glow.
     pub start_glow: AtomicBool,
-    /// Whether the event tap is delivering. It can't be enabled without Input Monitoring, and
-    /// macOS turns it off under Secure Input; the HID poller records clicks while it is off.
-    tap_live: AtomicBool,
+    /// Clicks are arriving (macOS's global mouse monitor, Windows' mouse hook). Until then the
+    /// poller records clicks from polled button state.
+    mouse_live: AtomicBool,
     last_shortcut_ms: AtomicU64,
     drag_start: Mutex<Option<(u64, f32, f32, Option<String>, TargetFrame)>>,
 }
@@ -712,15 +723,19 @@ impl SharedCaptureTelemetry {
             passthrough_window_ids: Mutex::new(Vec::new()),
             tap_port: AtomicU64::new(0),
             tap_run_loop: AtomicU64::new(0),
+            tap_starting: AtomicBool::new(false),
+            tap_tried_ms: AtomicU64::new(0),
             tap_live: AtomicBool::new(false),
+            escape_pressed: AtomicBool::new(false),
             start_glow: AtomicBool::new(false),
+            mouse_live: AtomicBool::new(false),
             last_shortcut_ms: AtomicU64::new(0),
             drag_start: Mutex::new(None),
         })
     }
 
-    /// Each source (Carbon, the event tap, the HID poller) reports the same press within a few
-    /// ms; a press after that is a new one, as when S is pressed again to switch modes.
+    /// Each source (Carbon or `RegisterHotKey`, the key tap or hook) reports the same press within
+    /// a few ms; a press after that is a new one, as when S is pressed again to switch modes.
     pub fn emit_capture_shortcut(&self) {
         if self.shortcuts_paused.load(Ordering::Acquire) {
             return;
@@ -860,12 +875,22 @@ impl SharedCaptureTelemetry {
         self.shift_held.store(false, Ordering::Release);
         self.window_log_request.store(false, Ordering::Release);
         self.active.store(true, Ordering::Release);
-        let tap = if self.check_tap() {
-            "event tap"
+        let clicks = if self.mouse_live.load(Ordering::Acquire) {
+            platform::MOUSE_SOURCE
         } else {
-            "polled mouse buttons (event tap off)"
+            "polled mouse buttons"
         };
-        scrawl_log(format!("session clicks from {tap}"));
+        let keys = if self.tap_live.load(Ordering::Acquire) {
+            platform::KEY_SOURCE
+        } else {
+            platform::NO_KEY_SOURCE
+        };
+        scrawl_log(format!("session clicks from {clicks}, keys from {keys}"));
+    }
+
+    /// Whether Esc went down since the last call (the switcher cancels on it).
+    pub fn take_escape(&self) -> bool {
+        self.escape_pressed.swap(false, Ordering::AcqRel)
     }
 
     pub fn elapsed_ms(&self) -> u64 {
@@ -968,12 +993,6 @@ impl SharedCaptureTelemetry {
         crate::windows::owned_window_at(&windows, x, y, std::process::id() as i32, &passthrough)
     }
 
-    /// Re-enables the input monitor if the system turned it off, and notes whether it is
-    /// delivering.
-    fn check_tap(&self) -> bool {
-        platform::check_tap(self)
-    }
-
     pub fn normalize_point(&self, screen_x: f64, screen_y: f64) -> (f32, f32, u32, u32) {
         let frame = *self
             .target_frame
@@ -1054,8 +1073,8 @@ impl SharedCaptureTelemetry {
     }
 }
 
-/// Clicks from the mouse buttons' polled state, while the event tap is off: a press starts a
-/// click like the tap's mouse-down (unless it lands on Scrawl's own window), a release ends it.
+/// Clicks from the mouse buttons' polled state, while the mouse monitor (or hook) is missing: a
+/// press starts a click (unless it lands on Scrawl's own window), a release ends it.
 fn poll_clicks(
     telemetry: &SharedCaptureTelemetry,
     prev: &mut [bool; 2],
@@ -1065,7 +1084,7 @@ fn poll_clicks(
     on_scrawl: impl Fn(f64, f64) -> bool,
 ) {
     let was = std::mem::replace(prev, now);
-    if telemetry.tap_live.load(Ordering::Acquire) || pure_shift {
+    if telemetry.mouse_live.load(Ordering::Acquire) || pure_shift {
         return;
     }
     for (button, (&down, &before)) in now.iter().zip(&was).enumerate() {
@@ -1273,10 +1292,11 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    /// Kit's Screen capture on the Pro: the event tap was off (no Input Monitoring), so his
-    /// clicks on OpenCode's composer never reached the bundle. Polled button state stands in.
+    /// Kit's Screen capture on the Pro: the old listen-only event tap was off (no Input
+    /// Monitoring), so his clicks on OpenCode's composer never reached the bundle. Clicks now
+    /// come from the mouse monitor; polled button state stands in if it couldn't be installed.
     #[test]
-    fn clicks_are_recorded_from_polled_buttons_while_the_event_tap_is_off() {
+    fn clicks_are_recorded_from_polled_buttons_while_the_mouse_monitor_is_missing() {
         let (sender, _receiver) = flume::unbounded();
         let telemetry = SharedCaptureTelemetry::new(sender);
         telemetry.reset_for_session(TargetFrame {
@@ -1286,7 +1306,7 @@ mod tests {
             height: 1117.0,
             scale: 2.0,
         });
-        assert!(!telemetry.tap_live.load(Ordering::Acquire));
+        assert!(!telemetry.mouse_live.load(Ordering::Acquire));
         let mut prev = [false; 2];
         let not_scrawl = |_: f64, _: f64| false;
         let composer = (778.0, 1050.0);
@@ -1345,8 +1365,8 @@ mod tests {
             false,
             |_, _| true,
         );
-        // While the tap is live it reports clicks itself.
-        telemetry.tap_live.store(true, Ordering::Release);
+        // While the mouse monitor is installed it reports clicks itself.
+        telemetry.mouse_live.store(true, Ordering::Release);
         poll_clicks(
             &telemetry,
             &mut prev,

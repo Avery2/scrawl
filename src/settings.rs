@@ -669,7 +669,7 @@ fn retention_note(policy: &crate::retention::Policy) -> String {
         "Trash"
     };
     match (policy.media_days, policy.bundle_days) {
-        (None, None) => "Scrawl keeps every recording.".to_owned(),
+        (None, None) => String::new(),
         (Some(media), Some(bundle)) => format!(
             "Video and audio go to the {bin} after {}, the rest of each capture after {}.",
             days(media),
@@ -958,14 +958,13 @@ impl Panel {
         let menu = crate::transcribe::menu_state(engine, hex.as_ref(), config.hex_model.as_deref());
         let policy = crate::retention::Policy::load_from(&host.config_path());
         let login = login_item();
-        // Windows asks for no screen, input or accessibility grant, and has no cabled iPhone.
+        // Windows asks for no screen or accessibility grant, and has no cabled iPhone.
         let order: &[Permission] = if cfg!(target_os = "windows") {
             &[Permission::Microphone]
         } else {
             &[
                 Permission::ScreenRecording,
                 Permission::Microphone,
-                Permission::InputMonitoring,
                 Permission::Accessibility,
                 Permission::Camera,
             ]
@@ -1240,13 +1239,9 @@ impl Session {
             }
         };
         let result = match effect {
-            // These two are attributed to whichever process asks, so Scrawl itself asks.
+            // Attributed to whichever process asks, so Scrawl itself asks.
             Effect::Request(Permission::ScreenRecording) => {
                 crate::capture::request_screen_capture();
-                Effect::None
-            }
-            Effect::Request(Permission::InputMonitoring) => {
-                crate::capture::request_listen_access();
                 Effect::None
             }
             Effect::Request(permission) => {
@@ -1813,10 +1808,8 @@ mod tests {
         set(&mut panel, &mut host, "hexModel", "parakeet".into());
         assert_eq!(read_json(&host.path)["hexModel"], "parakeet");
         set(&mut panel, &mut host, "retention", "forever".into());
-        assert_eq!(
-            panel.view(&host).retention.note,
-            "Scrawl keeps every recording."
-        );
+        // "Forever" says it all; no caption.
+        assert_eq!(panel.view(&host).retention.note, "");
     }
 
     #[test]
@@ -1855,8 +1848,19 @@ mod tests {
             assert_eq!(view.permissions.len(), 1);
             assert_eq!(view.permissions[0].permission, Permission::Microphone);
         } else {
-            assert_eq!(view.permissions.len(), 5);
+            let order: Vec<_> = view.permissions.iter().map(|p| p.permission).collect();
+            assert_eq!(
+                order,
+                [
+                    Permission::ScreenRecording,
+                    Permission::Microphone,
+                    Permission::Accessibility,
+                    Permission::Camera
+                ],
+                "no Input Monitoring"
+            );
             assert!(view.permissions[..3].iter().all(|p| p.required));
+            assert!(!view.permissions[3].required);
         }
         // Screen Recording granted but not yet usable: Reopen relaunches.
         assert_eq!(panel.on(Action::Reopen, &mut host), Effect::None);

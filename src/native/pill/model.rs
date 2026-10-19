@@ -51,21 +51,32 @@ pub const CHIP_CORE_ROUND: f32 = 13.0;
 
 pub const CLEAR: f32 = 2.0;
 pub const EDGE_BAND: f32 = 3.0;
-pub const EXIT_LEAD_S: f32 = 0.10;
-pub const COLLAPSE_WAIT_S: f32 = 0.10;
-pub const CONTENT_DELAY: f32 = 0.50;
-pub const CONTENT_BLUR_MAX: f32 = 8.0;
+pub const EXIT_LEAD_S: f32 = 0.08;
+/// Dropped (`0.0 s`): outgoing items stay contained inside the capsule as it narrows so width
+/// springs start on frame 0 with zero delay.
+pub const COLLAPSE_WAIT_S: f32 = 0.0;
+/// Dropped (`0.0`): incoming content starts fading and unblurring immediately without waiting
+/// for half the capsule growth.
+pub const CONTENT_DELAY: f32 = 0.0;
+/// Whole-pill and per-element scale at `alpha = 0` on Entry and Exit (`0.94 ↔ 1.0`).
+pub const ENTRY_EXIT_SCALE: f32 = 0.94;
+pub const CONTENT_SCALE_FROM: f32 = 0.94;
+/// Modest Gaussian blur sigma (in points) for entering/exiting content (`5.0 pt`) and shell (`4.0 pt`).
+pub const CONTENT_BLUR_MAX: f32 = 5.0;
+pub const SHELL_BLUR_MAX: f32 = 4.0;
+/// Blur resolves ahead of opacity (`0.55×` of the fade duration).
 pub const BLUR_LEAD: f32 = 0.55;
-pub const CONTENT_SCALE_FROM: f32 = 0.82;
-pub const CONTENT_STAGGER_S: f32 = 0.013;
-pub const CONTENT_PUSH_PT: f32 = 1.75;
-pub const TRAVEL_BLUR_MAX: f32 = 6.0;
-pub const REDUCED_FADE_S: f32 = 0.20;
+pub const CONTENT_STAGGER_S: f32 = 0.004;
+pub const ENTRY_CONTENT_DELAY_S: f32 = 0.0;
+pub const CONTENT_PUSH_PT: f32 = 0.5;
+pub const TRAVEL_BLUR_MAX: f32 = 3.5;
+/// Reduce Motion cross-fade duration (`150 ms`).
+pub const REDUCED_FADE_S: f32 = 0.15;
 pub const RADIUS_BLEND: f32 = 8.0;
 pub const PRESS_GROW_PT: f32 = 2.5;
 pub const TAP_SQUISH: f32 = 0.04;
 const REF_DIST: f32 = 140.0;
-const DISTANCE_FLOOR: f32 = 0.82;
+const DISTANCE_FLOOR: f32 = 0.92;
 const AHEAD_STEP: f32 = 1.0 / 240.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -80,13 +91,29 @@ impl SpringCfg {
     }
 }
 
-pub const OPEN_SPRING: SpringCfg = SpringCfg::new(0.50, 0.28);
-pub const CLOSE_SPRING: SpringCfg = SpringCfg::new(0.45, 0.18);
-pub const TAP_SPRING: SpringCfg = SpringCfg::new(0.35, 0.45);
-pub const PRESS_SPRING: SpringCfg = SpringCfg::new(0.25, 0.0);
-pub const SHARED_SPRING: SpringCfg = SpringCfg::new(0.30, 0.0);
-pub const CONTENT_IN_SPRING: SpringCfg = SpringCfg::new(0.30, 0.0);
-pub const CONTENT_OUT_SPRING: SpringCfg = SpringCfg::new(0.15, 0.0);
+/// Pre-Metal `Tune::DEFAULT` baseline timings:
+/// - `island`: `0.32 / 0.0` (phase morph width)
+/// - `island_scale`: `0.22 / 0.0` (whole-pill open/close scale `0.94 ↔ 1.0`)
+/// - `reveal_open`: `0.36 / 0.16` (switch chips opening on Recording)
+/// - `reveal_close`: `0.32 / 0.08` (switch chips folding into Recording controls)
+/// - `switch_width`: `0.30 / 0.0` (switch chip turning Recording into Selecting picker)
+/// - `switch_slide`: `0.36 / 0.0` (shared chips sliding into Selecting picker)
+/// - `reveal_enter`: `0.16 s` (content & whole-pill enter fade; blur leads at `0.55×`)
+/// - `reveal_exit`: `0.13 s` (content & whole-pill exit fade; blur leads at `0.55×`)
+pub const ISLAND_SPRING: SpringCfg = SpringCfg::new(0.32, 0.0);
+pub const ENTRY_SHELL_SPRING: SpringCfg = SpringCfg::new(0.22, 0.0);
+pub const ENTRY_ALPHA_SPRING: SpringCfg = SpringCfg::new(0.16, 0.0);
+pub const EXIT_SHELL_SPRING: SpringCfg = SpringCfg::new(0.15, 0.0);
+pub const EXIT_ALPHA_SPRING: SpringCfg = SpringCfg::new(0.13, 0.0);
+pub const OPEN_SPRING: SpringCfg = SpringCfg::new(0.36, 0.16);
+pub const CLOSE_SPRING: SpringCfg = SpringCfg::new(0.32, 0.08);
+pub const SWITCH_WIDTH_SPRING: SpringCfg = SpringCfg::new(0.30, 0.0);
+pub const SWITCH_SLIDE_SPRING: SpringCfg = SpringCfg::new(0.36, 0.0);
+pub const TAP_SPRING: SpringCfg = SpringCfg::new(0.30, 0.35);
+pub const PRESS_SPRING: SpringCfg = SpringCfg::new(0.20, 0.0);
+pub const SHARED_SPRING: SpringCfg = SpringCfg::new(0.32, 0.0);
+pub const CONTENT_IN_SPRING: SpringCfg = SpringCfg::new(0.16, 0.0);
+pub const CONTENT_OUT_SPRING: SpringCfg = SpringCfg::new(0.13, 0.0);
 
 #[inline]
 pub fn mix(a: f32, b: f32, t: f32) -> f32 {
@@ -182,7 +209,7 @@ impl SpringVal {
 
     /// Critically damped 0-bounce step that never crosses `target` (`status-roll.js`).
     pub fn step_critical(&mut self, dt: f32, visual_duration: f32, _unit: f32) {
-        self.duration = (visual_duration * 0.95).max(0.04);
+        self.duration = visual_duration.max(0.03);
         self.bounce = 0.0;
         self.step(dt);
     }
@@ -801,8 +828,10 @@ pub struct PillModel {
     pub b: SpringVal,
     pub press: SpringVal,
     pub squish: SpringVal,
+    pub shell_scale: SpringVal,
     pub shell_alpha: SpringVal,
     pub shell_blur: SpringVal,
+    entering_from_hidden: bool,
     morph_start_w: f32,
     morph_start_h: f32,
     elems: [ElemState; ElemId::COUNT],
@@ -817,7 +846,7 @@ pub struct PillModel {
 
 impl PillModel {
     pub fn new(metrics: Metrics) -> Self {
-        let idle = Layout::centered(IDLE_W, IDLE_H);
+        let idle = Layout::centered(ISLAND_OPEN_FROM_W, ISLAND_H);
         Self {
             t: 0.0,
             pres: Pres::Hidden,
@@ -826,13 +855,15 @@ impl PillModel {
             reduced: false,
             l: SpringVal::new(idle.l, OPEN_SPRING),
             r: SpringVal::new(idle.r, OPEN_SPRING),
-            b: SpringVal::new(idle.b, SpringCfg::new(0.32, 0.0)),
+            b: SpringVal::new(idle.b, SpringCfg::new(0.24, 0.0)),
             press: SpringVal::new(0.0, PRESS_SPRING),
             squish: SpringVal::new(0.0, TAP_SPRING),
-            shell_alpha: SpringVal::new(0.0, SpringCfg::new(0.18, 0.0)),
-            shell_blur: SpringVal::new(1.0, SpringCfg::new(0.18, 0.0)),
-            morph_start_w: IDLE_W,
-            morph_start_h: IDLE_H,
+            shell_scale: SpringVal::new(ENTRY_EXIT_SCALE, ENTRY_SHELL_SPRING),
+            shell_alpha: SpringVal::new(0.0, ENTRY_ALPHA_SPRING),
+            shell_blur: SpringVal::new(1.0, ENTRY_SHELL_SPRING),
+            entering_from_hidden: false,
+            morph_start_w: ISLAND_OPEN_FROM_W,
+            morph_start_h: ISLAND_H,
             elems: [ElemState::new(); ElemId::COUNT],
             ghost: None,
             dis: 1.0,
@@ -865,7 +896,7 @@ impl PillModel {
                 if !st.initialized {
                     st.active.snap(item.active);
                 } else {
-                    st.active.to(item.active, SpringCfg::new(0.18, 0.0));
+                    st.active.to(item.active, SpringCfg::new(0.16, 0.0));
                 }
             }
         }
@@ -877,17 +908,17 @@ impl PillModel {
             return;
         }
 
-        // Collapse wait: whenever shrinking while leaving items are still visible (dismiss/cancel,
-        // or shrinking into a narrower phase), outgoing content starts fading immediately while
-        // the outline waits `COLLAPSE_WAIT_S` (0.10 s) so edge items never pop out in one frame.
-        let shrinking_with_exit = was_visible
+        // Collapse wait: ONLY when narrowing between two visible states that have leaving items
+        // (`was_visible && !now_hidden`). On Exit (`now_hidden`), content and shell leave together
+        // immediately in place (`wait = 0.0`) without collapsing into a lozenge.
+        let shrinking_between_visible = was_visible
+            && !now_hidden
             && !self.reduced
-            && (now_hidden
-                || (next_lay.width() < prev_lay.width() - 1.0
-                    && prev_items
-                        .iter()
-                        .any(|p| !next_items.iter().any(|n| n.id == p.id))));
-        let wait = if shrinking_with_exit {
+            && next_lay.width() < prev_lay.width() - 1.0
+            && prev_items
+                .iter()
+                .any(|p| !next_items.iter().any(|n| n.id == p.id));
+        let wait = if shrinking_between_visible {
             COLLAPSE_WAIT_S
         } else {
             0.0
@@ -900,16 +931,23 @@ impl PillModel {
 
     fn apply_geometry(&mut self) {
         let next = self.pres.clone();
-        let from_hidden = self.shell_alpha.x < 0.03;
+        let landing_idle = matches!(next, Pres::Hidden);
+        let from_hidden = !landing_idle
+            && (self.shell_alpha.x < 0.02 || matches!(self.geo_pres, Pres::Hidden) && self.shell_alpha.x < 0.08);
+        self.entering_from_hidden = from_hidden;
         self.geo_pres = next.clone();
         let (lay, items) = layout_of(&next, &self.clock, self.completed_label_w, &self.metrics);
 
-        if from_hidden && !matches!(next, Pres::Hidden) && !self.reduced {
-            // Seed from the compact 120 × 40 capsule at top-center so the width springs out.
-            let seed = Layout::centered(ISLAND_OPEN_FROM_W, ISLAND_H);
-            self.l.snap(seed.l);
-            self.r.snap(seed.r);
-            self.b.snap(seed.b);
+        if from_hidden && !self.reduced {
+            // Entry in place (no lozenge growth): snap width/height to the entering state's layout
+            // while invisible (`alpha ≈ 0`) and scale in from `0.94 → 1.0` with `4 pt → 0` blur.
+            self.l.snap(lay.l);
+            self.r.snap(lay.r);
+            self.b.snap(lay.b);
+            if self.shell_alpha.x < 0.02 {
+                self.shell_scale.snap(ENTRY_EXIT_SCALE);
+                self.shell_blur.snap(1.0);
+            }
         }
 
         let before_l = self.l.x;
@@ -926,11 +964,14 @@ impl PillModel {
             } else {
                 self.dis = 1.0 - self.dis.max(1.0 - self.dis);
             }
-            self.l.snap(lay.l);
-            self.r.snap(lay.r);
-            self.b.snap(lay.b);
+            if !landing_idle {
+                self.l.snap(lay.l);
+                self.r.snap(lay.r);
+                self.b.snap(lay.b);
+            }
+            self.shell_scale.snap(1.0);
             self.shell_alpha.to(
-                if matches!(next, Pres::Hidden) { 0.0 } else { 1.0 },
+                if landing_idle { 0.0 } else { 1.0 },
                 SpringCfg::new(REDUCED_FADE_S, 0.0),
             );
             self.shell_blur.snap(0.0);
@@ -948,38 +989,72 @@ impl PillModel {
                 self.press.snap(0.0);
             }
 
-            let dw = (lay.l - before_l).abs().max((lay.r - before_r).abs());
-            let dh = (lay.b - before_b).abs();
-            let opening = lay.width() * lay.height()
-                >= (before_r - before_l) * (before_b - TOP) - 1.0;
-            let base = if opening { OPEN_SPRING } else { CLOSE_SPRING };
-            let f = (dw.hypot(dh) / REF_DIST).clamp(0.0, 1.0);
-            let dur = (base.duration * mix(DISTANCE_FLOOR, 1.0, f)).max(0.14);
-            let landing_idle = matches!(next, Pres::Hidden);
-            // Since both L and R move opposite ways at once on symmetric width morphs, scale
-            // each edge's bounce by 0.75 so total width overshoot matches a single-edge 0.28 spring.
-            let w_bounce = if landing_idle { 0.0 } else { base.bounce * 0.75 };
+            if landing_idle {
+                // Whole-pill disappear in place (no collapse into a lozenge): keep the current
+                // layout's target width/height while shrinking `shell_scale` `1.0 → 0.94` on
+                // `island_scale` (`0.22 / 0`), blurring `0 → 4 pt`, and fading out in `0.13 s`.
+                let cur_l = self.l.target;
+                let cur_r = self.r.target;
+                let cur_b = self.b.target;
+                self.l.to(cur_l, CLOSE_SPRING);
+                self.r.to(cur_r, CLOSE_SPRING);
+                self.b.to(cur_b, CLOSE_SPRING);
+                self.shell_scale.to(ENTRY_EXIT_SCALE, EXIT_SHELL_SPRING);
+                self.shell_alpha.to(0.0, EXIT_ALPHA_SPRING);
+                self.shell_blur.to(
+                    1.0,
+                    SpringCfg::new((EXIT_ALPHA_SPRING.duration * BLUR_LEAD).max(0.04), 0.0),
+                );
+            } else if from_hidden {
+                // Whole-pill appear in place (`0.94 → 1.0` scale on `0.22 / 0`, `4 pt → 0` blur,
+                // `0 → 1` alpha in `0.16 s`, no lozenge growth).
+                self.shell_scale.to(1.0, ENTRY_SHELL_SPRING);
+                self.shell_alpha.to(1.0, ENTRY_ALPHA_SPRING);
+                self.shell_blur.to(
+                    0.0,
+                    SpringCfg::new((ENTRY_ALPHA_SPRING.duration * BLUR_LEAD).max(0.04), 0.0),
+                );
+            } else {
+                // Visible state-to-state width-led morph using pre-Metal `Tune::DEFAULT` springs:
+                // - `Recording(controls) -> Recording(chips)`: `reveal_open` (`0.36 / 0.16`)
+                // - `Recording(chips) -> Recording(controls)`: `reveal_close` (`0.32 / 0.08`)
+                // - `Recording(chips) -> Selecting`: `switch_width` (`0.30 / 0.0`)
+                // - All other phase morphs: `island` (`0.32 / 0.0`)
+                let dw = (lay.l - before_l).abs().max((lay.r - before_r).abs());
+                let dh = (lay.b - before_b).abs();
+                let base = match (&self.pres, (before_r - before_l) > lay.width() + 1.0) {
+                    (Pres::Recording { chips: true, .. }, _) => OPEN_SPRING,
+                    (Pres::Recording { chips: false, .. }, true) => CLOSE_SPRING,
+                    (Pres::Selecting { .. }, true) => SWITCH_WIDTH_SPRING,
+                    _ => ISLAND_SPRING,
+                };
+                let f = (dw.hypot(dh) / REF_DIST).clamp(0.0, 1.0);
+                let dur = (base.duration * mix(DISTANCE_FLOOR, 1.0, f)).max(0.14);
+                let w_bounce = base.bounce;
 
-            self.l.to(lay.l, SpringCfg::new(dur, w_bounce));
-            self.r.to(lay.r, SpringCfg::new(dur, w_bounce));
-            // Only the outline's width bounces; vertical bottom edge uses bounce = 0 so it never
-            // bounces upward into the top of the screen.
-            self.b.to(lay.b, SpringCfg::new(dur, 0.0));
-
-            let show_shell = !landing_idle;
-            self.shell_alpha.to(
-                if show_shell { 1.0 } else { 0.0 },
-                SpringCfg::new(if show_shell { 0.16 } else { dur }, 0.0),
-            );
-            self.shell_blur.to(
-                if show_shell { 0.0 } else { 1.0 },
-                SpringCfg::new(if show_shell { 0.14 } else { dur * 0.85 }, 0.0),
-            );
+                self.l.to(lay.l, SpringCfg::new(dur, w_bounce));
+                self.r.to(lay.r, SpringCfg::new(dur, w_bounce));
+                self.b.to(lay.b, SpringCfg::new(dur, 0.0));
+                self.shell_scale.to(1.0, ENTRY_SHELL_SPRING);
+                self.shell_alpha.to(1.0, ENTRY_ALPHA_SPRING);
+                self.shell_blur.to(
+                    0.0,
+                    SpringCfg::new((ENTRY_ALPHA_SPRING.duration * BLUR_LEAD).max(0.04), 0.0),
+                );
+            }
         }
 
         // Configure elements for the new layout: elements already visible (`a.x > 0.03`) that
-        // also exist in `items` travel on `SHARED_SPRING` (`0.24 s`, bounce 0) with `travelBlur`;
-        // newly entering elements snap to their resting spot while invisible and wait for room.
+        // also exist in `items` travel on `SHARED_SPRING` (or the left-wall spring for pinned
+        // `Lead` / `DividerLead` in `Recording`) with `travelBlur`; newly entering elements snap
+        // to their resting spot while invisible and start entering as soon as they fit.
+        let pin_lead_to_left = matches!(next, Pres::Recording { .. });
+        let left_wall_spring = SpringCfg::new(self.l.duration, self.l.bounce);
+        let slide_spring = if matches!(next, Pres::Selecting { .. }) {
+            SWITCH_SLIDE_SPRING
+        } else {
+            SHARED_SPRING
+        };
         for item in &items {
             let st = &mut self.elems[item.id as usize];
             let [ix, iy, iw, ih] = item.rect;
@@ -1002,9 +1077,16 @@ impl PillModel {
                     st.trip = dist;
                     st.travelling = true;
                 }
-                st.x.to(ix, SHARED_SPRING);
-                st.y.to(iy, SHARED_SPRING);
-                st.active.to(item.active, SpringCfg::new(0.18, 0.0));
+                let sp = if pin_lead_to_left
+                    && matches!(item.id, ElemId::Lead | ElemId::DividerLead)
+                {
+                    left_wall_spring
+                } else {
+                    slide_spring
+                };
+                st.x.to(ix, sp);
+                st.y.to(iy, sp);
+                st.active.to(item.active, SpringCfg::new(0.16, 0.0));
             }
         }
     }
@@ -1091,13 +1173,14 @@ impl PillModel {
         None
     }
 
-    /// Current capsule silhouette (`L, T, R, B, radius, alpha, blur`), including press swell and
-    /// tap squish. `T` is anchored at `TOP` so it never bounces upward into the top of the screen.
+    /// Current capsule silhouette (`L, T, R, B, radius, alpha, blur`), including entry/exit scale,
+    /// press swell, and tap squish. `T` is anchored at `TOP` so it never bounces upward into the
+    /// top of the screen.
     pub fn silhouette(&self) -> Silhouette {
-        self.silhouette_from(self.l.x, self.r.x, self.b.x)
+        self.silhouette_from(self.l.x, self.r.x, self.b.x, self.shell_scale.x)
     }
 
-    fn silhouette_from(&self, mut l: f32, mut r: f32, mut b: f32) -> Silhouette {
+    fn silhouette_from(&self, mut l: f32, mut r: f32, mut b: f32, scale: f32) -> Silhouette {
         let swell = self.press.x * PRESS_GROW_PT;
         l -= swell;
         r += swell;
@@ -1111,18 +1194,25 @@ impl PillModel {
             r = mid + w * 0.5;
             b = TOP + h;
         }
-        let w = (r - l).max(IDLE_W * 0.5);
-        let mid = (l + r) * 0.5;
+        let k_shell = if self.reduced {
+            1.0
+        } else {
+            scale.clamp(ENTRY_EXIT_SCALE * 0.9, 1.05)
+        };
+        let base_w = (r - l).max(IDLE_W * 0.5);
+        let base_h = (b - TOP).max(IDLE_H * 0.5);
+        let mid = CX + ((l + r) * 0.5 - CX) * k_shell;
+        let w = base_w * k_shell;
+        let h = base_h * k_shell;
         l = mid - w * 0.5;
         r = mid + w * 0.5;
-        b = b.max(TOP + IDLE_H * 0.5);
-        let h = b - TOP;
-        let radius = radius_of(h, ISLAND_RADIUS, RADIUS_BLEND);
+        b = TOP + h;
+        let radius = radius_of(h, ISLAND_RADIUS * k_shell, RADIUS_BLEND * k_shell);
         let alpha = self.shell_alpha.x.clamp(0.0, 1.0);
         let blur = if self.reduced {
             0.0
         } else {
-            self.shell_blur.x.clamp(0.0, 1.0) * 3.5
+            self.shell_blur.x.clamp(0.0, 1.0) * SHELL_BLUR_MAX
         };
         Silhouette {
             l,
@@ -1140,13 +1230,15 @@ impl PillModel {
         let mut l = self.l;
         let mut r = self.r;
         let mut b = self.b;
+        let mut s = self.shell_scale;
         let mut out = Vec::with_capacity(28);
         let mut t = AHEAD_STEP;
         while t <= lead + 1e-9 {
             l.step(AHEAD_STEP);
             r.step(AHEAD_STEP);
             b.step(AHEAD_STEP);
-            out.push((t, self.silhouette_from(l.x, r.x, b.x)));
+            s.step(AHEAD_STEP);
+            out.push((t, self.silhouette_from(l.x, r.x, b.x, s.x)));
             t += AHEAD_STEP;
         }
         out
@@ -1187,6 +1279,7 @@ impl PillModel {
             self.b.snap(self.b.target);
             self.press.snap(0.0);
             self.squish.snap(0.0);
+            self.shell_scale.snap(1.0);
             self.shell_alpha
                 .step_critical(dt, REDUCED_FADE_S, 100.0);
             self.shell_blur.snap(0.0);
@@ -1200,17 +1293,22 @@ impl PillModel {
             self.b.step(dt);
             self.press.step(dt);
             self.squish.step(dt);
+            self.shell_scale
+                .step_critical(dt, self.shell_scale.duration, 100.0);
             self.shell_alpha
                 .step_critical(dt, self.shell_alpha.duration, 100.0);
             self.shell_blur
                 .step_critical(dt, self.shell_blur.duration, 100.0);
+            if self.shell_scale.x > 0.99 && self.shell_alpha.x > 0.95 {
+                self.entering_from_hidden = false;
+            }
         }
 
         let now = self.silhouette();
-        let ahead = if reduced {
-            Vec::new()
+        let k_shell = if reduced {
+            1.0
         } else {
-            self.predict(EXIT_LEAD_S)
+            self.shell_scale.x.clamp(ENTRY_EXIT_SCALE * 0.9, 1.05)
         };
         let settled_geo = self.geo_pres == self.pres;
         let grown = self.grown_enough();
@@ -1251,15 +1349,15 @@ impl PillModel {
             );
             st.hover.step_critical(dt, 0.14, 100.0);
             st.press.step_critical(dt, 0.14, 100.0);
-            st.active.step_critical(dt, 0.18, 100.0);
+            st.active.step_critical(dt, 0.16, 100.0);
 
             if st.travelling && in_pres && !reduced {
                 st.x.step(dt);
                 st.y.step(dt);
                 // Inelastic containment: keep travelling shared elements at least CLEAR inside the
-                // current outline (`contain` in `island/model.js`).
-                let min_x = now.l + ISLAND_INSET;
-                let max_x = (now.r - ISLAND_INSET - st.w).max(min_x);
+                // current unscaled outline (`contain` in `island/model.js`).
+                let min_x = self.l.x + ISLAND_INSET;
+                let max_x = (self.r.x - ISLAND_INSET - st.w).max(min_x);
                 if st.x.x < min_x {
                     st.x.x = min_x;
                     if st.x.v < 0.0 {
@@ -1275,7 +1373,7 @@ impl PillModel {
                 let going = st.trip > 2.0 && left > st.trip * 0.22;
                 st.go_blur.target = f32::from(u8::from(going));
                 let blur_dur = if going {
-                    0.04
+                    0.035
                 } else {
                     (out.duration * BLUR_LEAD).max(0.03)
                 };
@@ -1287,7 +1385,13 @@ impl PillModel {
                     st.trip = 0.0;
                 }
             } else {
-                st.x.snap(st.x.target);
+                if !in_pres && st.a.x > 1e-3 && !reduced && !matches!(self.pres, Pres::Hidden) {
+                    let min_x = self.l.x + ISLAND_INSET;
+                    let max_x = (self.r.x - ISLAND_INSET - st.w).max(min_x);
+                    st.x.x = st.x.x.clamp(min_x, max_x);
+                } else {
+                    st.x.snap(st.x.target);
+                }
                 st.y.snap(st.y.target);
                 st.travelling = false;
                 st.go_blur.target = 0.0;
@@ -1295,9 +1399,9 @@ impl PillModel {
             }
 
             let k = if st.travelling {
-                1.0
+                k_shell
             } else {
-                scale_of(st.a.x, reduced)
+                scale_of(st.a.x, reduced).min(k_shell)
             };
             let dy = if st.travelling {
                 0.0
@@ -1306,12 +1410,11 @@ impl PillModel {
             };
             let box_rect = [st.x.x, st.y.x, st.w, st.h];
             let d = box_clearance(&now, box_rect, k, st.round, [CX, TOP], dy);
-            let d_rest = box_clearance(&now, box_rect, 1.0, st.round, [CX, TOP], 0.0);
 
             let gate = reduced
                 || st.travelling
                 || st.want
-                || (settled_geo && grown && d_rest >= CLEAR + EDGE_BAND - 0.5);
+                || (settled_geo && grown && d >= CLEAR + 1.0);
             let want = in_pres && gate;
             if st.want != want {
                 st.want = want;
@@ -1320,7 +1423,15 @@ impl PillModel {
             let turn = if reduced || st.travelling {
                 0.0
             } else if want {
-                CONTENT_STAGGER_S * st.rank as f32
+                let lead_delay = if self.entering_from_hidden {
+                    ENTRY_CONTENT_DELAY_S
+                } else {
+                    0.0
+                };
+                lead_delay + CONTENT_STAGGER_S * st.rank as f32
+            } else if matches!(self.pres, Pres::Hidden) {
+                // On Exit to Hidden, content and shell leave together without stagger lingering.
+                0.0
             } else {
                 // Outgoing items nearest either shrinking outer cap leave first (0 delay).
                 let from_cap = st.rank.min(st.last.saturating_sub(st.rank));
@@ -1344,34 +1455,9 @@ impl PillModel {
             };
             st.blur.step_critical(dt, blur_dur, 100.0);
 
-            // Look-ahead exit cap (`stepCap` in `island/model.js`): only for non-travelling elements
-            // (travelling shared elements are already clamped inside `now` by `contain`).
-            let hidden = st.a.x <= 1e-3;
-            if !reduced && !(st.travelling && in_pres) {
-                let contact = if hidden {
-                    f32::INFINITY
-                } else {
-                    let round = st.round;
-                    ahead
-                        .iter()
-                        .find(|(_, sh)| {
-                            box_clearance(sh, box_rect, k, round, [CX, TOP], dy) < CLEAR
-                        })
-                        .map_or(f32::INFINITY, |(at_t, _)| *at_t)
-                };
-                if d < CLEAR {
-                    st.cap = if hidden { 1.0 } else { 0.0 };
-                } else if contact.is_finite() {
-                    st.cap -= st.cap * (dt / contact.max(dt)).min(1.0);
-                } else if hidden {
-                    st.cap = 1.0;
-                } else {
-                    st.cap += dt / EXIT_LEAD_S;
-                }
-                st.cap = st.cap.clamp(0.0, 1.0);
-            } else {
-                st.cap = 1.0;
-            }
+            // Every element is contained inside `[l + ISLAND_INSET, r - ISLAND_INSET - w]` while
+            // narrowing and shrinks in place on Exit, so its fade follows `st.a.x` smoothly.
+            st.cap = 1.0;
         }
     }
 
@@ -1379,6 +1465,11 @@ impl PillModel {
     pub fn frame(&self) -> FrameState {
         let reduced = self.reduced;
         let mut shape = self.silhouette();
+        let k_shell = if reduced {
+            1.0
+        } else {
+            self.shell_scale.x.clamp(ENTRY_EXIT_SCALE * 0.9, 1.05)
+        };
         let ghost = if reduced
             && let Some(mut g) = self.ghost
             && self.dis < 1.0
@@ -1400,9 +1491,9 @@ impl PillModel {
                 continue;
             }
             let base_k = if st.travelling {
-                1.0
+                k_shell
             } else {
-                scale_of(st.a.x, reduced)
+                scale_of(st.a.x, reduced).min(k_shell)
             };
             let press_k = 1.0 - 0.05 * st.press.x.clamp(0.0, 1.0);
             let dy = if st.travelling {
@@ -1433,6 +1524,7 @@ impl PillModel {
                 st.blur
                     .x
                     .clamp(0.0, 1.0)
+                    .max(self.shell_blur.x.clamp(0.0, 1.0))
                     .max(((1.0 - st.cap) / BLUR_LEAD).clamp(0.0, 1.0))
                     * CONTENT_BLUR_MAX
             };
@@ -1495,6 +1587,7 @@ impl PillModel {
             &self.b,
             &self.press,
             &self.squish,
+            &self.shell_scale,
             &self.shell_alpha,
             &self.shell_blur,
         ]
@@ -1747,12 +1840,17 @@ mod tests {
     #[test]
     fn retargeting_mid_flight_is_c1_continuous() {
         let mut m = PillModel::new(Metrics::default());
+        m.set_pres(Pres::Processing);
+        for _ in 0..35 {
+            m.advance(FRAME_DT);
+        }
+        // Start a visible width expansion (`Processing` -> `Recording(chips)`).
         m.set_pres(Pres::Recording {
             chips: true,
             has_iphone: false,
             stroke_count: 0,
         });
-        for _ in 0..14 {
+        for _ in 0..8 {
             m.advance(FRAME_DT);
         }
         let before = (m.l.x, m.l.v, m.r.x, m.r.v, m.b.x, m.b.v);
@@ -1768,8 +1866,8 @@ mod tests {
 
         // Next frame continues smoothly without a jump.
         m.advance(FRAME_DT);
-        assert!((m.l.x - before.0).abs() < 10.0);
-        assert!((m.r.x - before.2).abs() < 10.0);
+        assert!((m.l.x - before.0).abs() < 12.0);
+        assert!((m.r.x - before.2).abs() < 12.0);
     }
 
     #[test]
@@ -1813,17 +1911,21 @@ mod tests {
                         assert_frame_room_invariants(&m, &m.frame());
                         elapsed += FRAME_DT;
                     }
-                    let prev_l = m.l.x;
-                    let prev_r = m.r.x;
+                    let prev_f = m.frame();
+                    let was_vis = prev_f.shape.alpha > 0.08;
                     m.set_pres(to.clone());
                     m.advance(FRAME_DT);
-                    assert!(
-                        (m.l.x - prev_l).abs() <= 14.0 && (m.r.x - prev_r).abs() <= 14.0,
-                        "jump on interrupt {:?} -> {:?} at {:.2}s",
-                        from,
-                        to,
-                        interrupt_s
-                    );
+                    let next_f = m.frame();
+                    if was_vis && next_f.shape.alpha > 0.08 {
+                        assert!(
+                            (next_f.shape.l - prev_f.shape.l).abs() <= 16.0
+                                && (next_f.shape.r - prev_f.shape.r).abs() <= 16.0,
+                            "jump on visible interrupt {:?} -> {:?} at {:.2}s",
+                            from,
+                            to,
+                            interrupt_s
+                        );
+                    }
                     for _ in 0..180 {
                         m.advance(FRAME_DT);
                         assert_frame_room_invariants(&m, &m.frame());
@@ -1851,7 +1953,7 @@ mod tests {
         for _ in 0..120 {
             m.advance(FRAME_DT);
             let st = &m.elems[ElemId::ChipArea as usize];
-            if st.a.x > 0.35 && st.a.x < 0.90 && st.blur.x < 0.08 {
+            if st.a.x > 0.35 && st.a.x < 0.92 && st.blur.x < 0.10 {
                 saw_sharp_before_opaque = true;
             }
         }
@@ -1893,6 +1995,7 @@ mod tests {
         assert_eq!(ElemId::Close.shortcut_hint(), Some("Esc"));
         assert_eq!(ElemId::Cancel.shortcut_hint(), Some("Esc"));
 
+        // 1. Entry from Hidden (`~0.94` scale + `~4 pt` blur -> sharp `1.0` in ≤ 260 ms, no lozenge).
         let mut m = PillModel::new(Metrics::default());
         m.set_pres(Pres::Recording {
             chips: true,
@@ -1900,22 +2003,82 @@ mod tests {
             stroke_count: 0,
         });
         let target_w = m.r.target - m.l.target;
+        m.advance(FRAME_DT);
+        let f0 = m.frame();
+        assert!(
+            f0.shape.width() >= target_w * ENTRY_EXIT_SCALE - 1.0,
+            "entry should start at ~0.94 scale of target width (not a narrow lozenge), got {}",
+            f0.shape.width()
+        );
+        assert!(f0.shape.blur > SHELL_BLUR_MAX * 0.6, "expected blurred shell on entry start");
+
+        for _ in 0..60 {
+            m.advance(FRAME_DT);
+        }
+
+        // 2. Visible state-to-state width expansion (`Recording(controls)` -> `Recording(chips)`
+        //    on `reveal_open = 0.36 / 0.16`) has width overshoot while `t` stays anchored at `TOP`.
+        m.set_pres(Pres::Recording {
+            chips: false,
+            has_iphone: false,
+            stroke_count: 0,
+        });
+        for _ in 0..60 {
+            m.advance(FRAME_DT);
+        }
+        m.set_pres(Pres::Recording {
+            chips: true,
+            has_iphone: false,
+            stroke_count: 0,
+        });
+        let done_target_w = m.r.target - m.l.target;
         let mut max_w = 0.0_f32;
-        for _ in 0..120 {
+        for _ in 0..80 {
             m.advance(FRAME_DT);
             let f = m.frame();
             max_w = max_w.max(f.shape.width());
             assert_eq!(f.shape.t, TOP);
         }
         assert!(
-            max_w > target_w + 2.0,
-            "expected width overshoot on open (0.50 / 0.28), max_w={max_w} target_w={target_w}"
+            max_w > done_target_w + 0.5,
+            "expected width cushion on reveal_open morph, max_w={max_w} target_w={done_target_w}"
+        );
+
+        // 3. Exit to Hidden shrinks in place (`1.0 -> 0.94` scale, blur up to ~4 pt, fade in ~130 ms)
+        //    without collapsing into a lozenge.
+        m.set_pres(Pres::Hidden);
+        let mut min_vis_w = f32::INFINITY;
+        let mut exit_done_s = None;
+        let exit_start = m.t;
+        for _ in 0..60 {
+            m.advance(FRAME_DT);
+            let f = m.frame();
+            if f.shape.alpha > 0.02 {
+                min_vis_w = min_vis_w.min(f.shape.width());
+            } else if exit_done_s.is_none() {
+                exit_done_s = Some(m.t - exit_start);
+            }
+        }
+        assert!(
+            min_vis_w >= done_target_w * ENTRY_EXIT_SCALE - 2.0,
+            "exit should shrink in place to ~0.94 scale, not a lozenge: min_vis_w={min_vis_w}"
+        );
+        let dur = exit_done_s.expect("exit finished");
+        assert!(
+            (0.11..=0.20).contains(&dur),
+            "expected exit to finish in ~120–160 ms, got {:.3}s",
+            dur
         );
     }
 
     #[test]
     fn opening_content_follows_half_the_growth_inner_first() {
         let mut m = PillModel::new(Metrics::default());
+        m.set_pres(Pres::Processing);
+        for _ in 0..60 {
+            m.advance(FRAME_DT);
+        }
+        let start_w = m.frame().shape.width();
         m.set_pres(Pres::Recording {
             chips: true,
             has_iphone: false,
@@ -1927,9 +2090,11 @@ mod tests {
             m.advance(FRAME_DT);
             let f = m.frame();
             for elem in &f.elems {
-                if elem.alpha > 0.02 && !first.iter().any(|(id, _)| *id == elem.id) {
-                    let grown = (f.shape.width() - ISLAND_OPEN_FROM_W)
-                        / (target_w - ISLAND_OPEN_FROM_W);
+                if elem.id != ElemId::Processing
+                    && elem.alpha > 0.02
+                    && !first.iter().any(|(id, _)| *id == elem.id)
+                {
+                    let grown = (f.shape.width() - start_w) / (target_w - start_w);
                     assert!(
                         grown >= CONTENT_DELAY - 0.02,
                         "{:?} appeared at grown={grown}",

@@ -42,6 +42,11 @@ use crate::win;
 /// Frames are pixels already: a recording keeps at most the screen's own resolution.
 pub const MAX_CAPTURE_SCALE: f64 = 1.0;
 
+/// Where a session's clicks and keys come from, for the log.
+pub(super) const MOUSE_SOURCE: &str = "the mouse hook";
+pub(super) const KEY_SOURCE: &str = "the keyboard hook";
+pub(super) const NO_KEY_SOURCE: &str = "polled key state (keyboard hook off)";
+
 /// `VK_S`. Windows maps virtual keys through the active layout, so the key that types S is
 /// `VK_S` on Dvorak too.
 pub const KEY_S: u16 = 0x53;
@@ -81,14 +86,23 @@ pub fn screen_capture_granted() -> bool {
     true
 }
 
+/// Screen capture always works on Windows: no grant to wait for, no relaunch.
+pub fn screen_capture_usable(_probe: bool) -> bool {
+    true
+}
+
+/// The primary display's size (`scrawl sck-probe`); Windows.Graphics.Capture needs no grant.
+pub fn screen_capture_probe() -> Result<(u32, u32), String> {
+    let monitor = win::primary_monitor().ok_or("no display")?;
+    Ok((monitor.rect[2] as u32, monitor.rect[3] as u32))
+}
+
 pub fn request_screen_capture() {}
 
 /// Sending Ctrl+V needs no permission on Windows (only an elevated app in front refuses it).
 pub fn accessibility_granted() -> bool {
     true
 }
-
-pub fn request_listen_access() {}
 
 fn key_down(vk: u16) -> bool {
     let state = unsafe { GetAsyncKeyState(i32::from(vk)) };
@@ -137,11 +151,6 @@ impl Modifiers {
 /// The Win, Ctrl, Alt and Shift keys held right now, as a bit mask.
 pub fn modifier_flags() -> u64 {
     Modifiers::now().bits()
-}
-
-/// Whether Esc is down right now, whichever app has focus.
-pub fn escape_down() -> bool {
-    key_down(VK_ESCAPE.0)
 }
 
 /// The virtual key and label for a key GPUI names (`a`, `f5`, `space`).
@@ -717,7 +726,8 @@ enum HookEvent {
 }
 
 static HOOK_SENDER: OnceLock<flume::Sender<HookEvent>> = OnceLock::new();
-static HOOKS_LIVE: AtomicBool = AtomicBool::new(false);
+static KEYBOARD_HOOK_LIVE: AtomicBool = AtomicBool::new(false);
+static MOUSE_HOOK_LIVE: AtomicBool = AtomicBool::new(false);
 
 static KEYS_DOWN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
 
@@ -819,6 +829,9 @@ fn handle_hook_event(telemetry: &SharedCaptureTelemetry, event: HookEvent) {
                 }
                 return;
             }
+            if vk == VK_ESCAPE.0 && !repeat && !mods.win && !mods.ctrl {
+                telemetry.escape_pressed.store(true, Ordering::Release);
+            }
             if !telemetry.active.load(Ordering::Acquire) || repeat {
                 return;
             }
@@ -893,17 +906,21 @@ fn handle_hook_event(telemetry: &SharedCaptureTelemetry, event: HookEvent) {
     }
 }
 
-/// Whether the hooks are installed. Windows needs no permission for them.
-pub(super) fn check_tap(telemetry: &SharedCaptureTelemetry) -> bool {
-    let live = HOOKS_LIVE.load(Ordering::Acquire);
-    if telemetry.tap_live.swap(live, Ordering::AcqRel) != live {
-        scrawl_log(if live {
-            "input hooks live"
-        } else {
-            "input hooks off; clicks come from polling the mouse buttons"
-        });
+/// Notes which hooks are installed: the keyboard hook brings keys (`tap_live`), the mouse hook
+/// clicks (`mouse_live`). Windows needs no permission for either.
+fn check_tap(telemetry: &SharedCaptureTelemetry) -> bool {
+    let keys = KEYBOARD_HOOK_LIVE.load(Ordering::Acquire);
+    let mouse = MOUSE_HOOK_LIVE.load(Ordering::Acquire);
+    let was_keys = telemetry.tap_live.swap(keys, Ordering::AcqRel);
+    let was_mouse = telemetry.mouse_live.swap(mouse, Ordering::AcqRel);
+    if (was_keys, was_mouse) != (keys, mouse) {
+        scrawl_log(format!(
+            "input hooks: keyboard {}, mouse {}",
+            if keys { "live" } else { "off (polling keys)" },
+            if mouse { "live" } else { "off (polling the mouse buttons)" },
+        ));
     }
-    live
+    keys && mouse
 }
 
 pub fn start_global_input_tap(telemetry: Arc<SharedCaptureTelemetry>) {
@@ -931,19 +948,18 @@ pub fn start_global_input_tap(telemetry: Arc<SharedCaptureTelemetry>) {
                 if keyboard.is_ok() { "ok" } else { "failed" },
                 if mouse.is_ok() { "ok" } else { "failed" }
             ));
-            HOOKS_LIVE.store(keyboard.is_ok() && mouse.is_ok(), Ordering::Release);
+            KEYBOARD_HOOK_LIVE.store(keyboard.is_ok(), Ordering::Release);
+            MOUSE_HOOK_LIVE.store(mouse.is_ok(), Ordering::Release);
             let mut msg = MSG::default();
             while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {}
-            HOOKS_LIVE.store(false, Ordering::Release);
+            KEYBOARD_HOOK_LIVE.store(false, Ordering::Release);
+            MOUSE_HOOK_LIVE.store(false, Ordering::Release);
         });
     let poller_telemetry = Arc::clone(&telemetry);
     let _ = thread::Builder::new()
         .name("scrawl-key-poller".into())
         .spawn(move || run_key_poller(poller_telemetry));
 }
-
-/// Input hooks need no permission on Windows, so there is nothing to make again.
-pub fn restart_input_tap(_telemetry: &Arc<SharedCaptureTelemetry>) {}
 
 /// 125 Hz key state poller: the shortcut and paste chords (when the hooks miss them), Ctrl+Z,
 /// the pointer for the overlay, clicks while the hooks are off, and Shift ink.
@@ -952,13 +968,14 @@ fn run_key_poller(telemetry: Arc<SharedCaptureTelemetry>) {
     let mut prev_paste = false;
     let mut prev_shift_ink = false;
     let mut prev_undo = false;
+    let mut prev_escape = false;
     let mut await_shift_release = false;
     let mut prev_buttons = [false; 2];
     let mut last_tap_check = Instant::now();
     loop {
         thread::sleep(Duration::from_millis(8));
         if last_tap_check.elapsed() >= Duration::from_millis(500) {
-            telemetry.check_tap();
+            check_tap(&telemetry);
             last_tap_check = Instant::now();
         }
         let mods = Modifiers::now();
@@ -973,6 +990,13 @@ fn run_key_poller(telemetry: Arc<SharedCaptureTelemetry>) {
         } else if win || ctrl || alt {
             await_shift_release = true;
         }
+
+        // Esc for the switcher, from key state while the keyboard hook is off.
+        let escape_now = key_down(VK_ESCAPE.0);
+        if escape_now && !prev_escape && !KEYBOARD_HOOK_LIVE.load(Ordering::Acquire) {
+            telemetry.escape_pressed.store(true, Ordering::Release);
+        }
+        prev_escape = escape_now;
 
         let (record_cfg, paste_cfg) = telemetry.shortcuts();
         // Whether `kind`'s shortcut is down: its own key, or for a default its alias keys.
@@ -1012,7 +1036,7 @@ fn run_key_poller(telemetry: Arc<SharedCaptureTelemetry>) {
         }
 
         let undo_now = ctrl && !win && !alt && !shift && key_down(KEY_Z);
-        if undo_now && !prev_undo && !HOOKS_LIVE.load(Ordering::Acquire) {
+        if undo_now && !prev_undo && !KEYBOARD_HOOK_LIVE.load(Ordering::Acquire) {
             let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::UndoStroke);
         }
         prev_undo = undo_now;

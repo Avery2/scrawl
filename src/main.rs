@@ -209,6 +209,15 @@ enum Command {
     },
     /// List cabled iPhones and iPads that can be captured.
     Devices,
+    /// Try a one-frame ScreenCaptureKit capture in this process and print the result as JSON,
+    /// once or (with `--watch`) every second, to see whether a Screen Recording grant reaches a
+    /// running process. Asks for Screen Recording if it was never decided.
+    #[command(hide = true)]
+    SckProbe {
+        /// Keep trying for this many seconds without restarting.
+        #[arg(long)]
+        watch: Option<u64>,
+    },
     /// Rebuild a bundle from its own video, audio, and input log with the current transcriber
     /// and keyframe rules.
     Reprocess {
@@ -1761,6 +1770,30 @@ fn main() -> Result<()> {
         Command::Devices => {
             for device in helper::devices()? {
                 println!("{}\t{}", device.name, device.id);
+            }
+            Ok(())
+        }
+        Command::SckProbe { watch } => {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(watch.unwrap_or(0));
+            loop {
+                let started = std::time::Instant::now();
+                let preflight = capture::screen_capture_granted();
+                let result = capture::screen_capture_probe();
+                let mut line = serde_json::json!({
+                    "pid": std::process::id(),
+                    "preflight": preflight,
+                    "ok": result.is_ok(),
+                    "ms": started.elapsed().as_millis() as u64,
+                });
+                match result {
+                    Ok((w, h)) => line["screenshot"] = format!("{w}x{h}").into(),
+                    Err(error) => line["error"] = error.into(),
+                }
+                println!("{line}");
+                if std::time::Instant::now() >= end {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
             }
             Ok(())
         }

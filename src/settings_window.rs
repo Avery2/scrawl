@@ -1139,7 +1139,7 @@ impl SettingsWindow {
                     .into_any_element(),
                 ],
             ))
-            .child(caption(theme, &r.note, false))
+            .when(!r.note.is_empty(), |d| d.child(caption(theme, &r.note, false)))
             .child(header(theme, "Captures"))
             .child(group(
                 theme,
