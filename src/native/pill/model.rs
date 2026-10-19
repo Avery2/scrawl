@@ -56,20 +56,20 @@ pub const EXIT_LEAD_S: f32 = 0.08;
 /// the capsule wall moves across them. Never used on Entry or Exit (`Pres::Hidden`).
 pub const COLLAPSE_WAIT_S: f32 = 0.04;
 /// Fraction of a visible width expansion before incoming items begin fading in.
-pub const CONTENT_DELAY: f32 = 0.35;
-/// Whole-pill and per-element scale at `alpha = 0` on Entry and Exit (`0.90 ↔ 1.0`).
-pub const ENTRY_EXIT_SCALE: f32 = 0.90;
-pub const CONTENT_SCALE_FROM: f32 = 0.90;
-/// Maximum Gaussian blur sigma (in points) for entering/exiting content and shell (`~8.5–9 pt`).
-pub const CONTENT_BLUR_MAX: f32 = 8.5;
-pub const SHELL_BLUR_MAX: f32 = 9.0;
+pub const CONTENT_DELAY: f32 = 0.2;
+/// Whole-pill and per-element scale at `alpha = 0` on Entry and Exit (`0.94 ↔ 1.0`).
+pub const ENTRY_EXIT_SCALE: f32 = 0.94;
+pub const CONTENT_SCALE_FROM: f32 = 0.94;
+/// Maximum Gaussian blur sigma (in points) for entering/exiting content and shell.
+pub const CONTENT_BLUR_MAX: f32 = 5.0;
+pub const SHELL_BLUR_MAX: f32 = 4.0;
 /// Blur resolves ahead of opacity (`0.55×` of the fade duration).
 pub const BLUR_LEAD: f32 = 0.55;
 pub const CONTENT_STAGGER_S: f32 = 0.008;
 /// Slight lead (`16 ms`) of the capsule shell ahead of content on initial Entry from Hidden.
 pub const ENTRY_CONTENT_DELAY_S: f32 = 0.016;
 pub const CONTENT_PUSH_PT: f32 = 0.5;
-pub const TRAVEL_BLUR_MAX: f32 = 6.5;
+pub const TRAVEL_BLUR_MAX: f32 = 3.5;
 /// Reduce Motion cross-fade duration (`150 ms`).
 pub const REDUCED_FADE_S: f32 = 0.15;
 pub const RADIUS_BLEND: f32 = 8.0;
@@ -91,10 +91,10 @@ impl SpringCfg {
     }
 }
 
-/// Entry from Hidden: `~235–250 ms` critically damped (`0.90 → 1.0` scale, `9 pt → 0` blur, `0 → 1` alpha).
+/// Entry from Hidden: `~235–250 ms` critically damped (`0.94 → 1.0` scale, `4 pt → 0` blur, `0 → 1` alpha).
 pub const ENTRY_SHELL_SPRING: SpringCfg = SpringCfg::new(0.25, 0.0);
 pub const ENTRY_ALPHA_SPRING: SpringCfg = SpringCfg::new(0.22, 0.0);
-/// Exit to Hidden: `~195 ms` critically damped (`1.0 → 0.90` scale, `0 → 9 pt` blur, `1 → 0` alpha).
+/// Exit to Hidden: `~195 ms` critically damped (`1.0 → 0.94` scale, `0 → 4 pt` blur, `1 → 0` alpha).
 pub const EXIT_SHELL_SPRING: SpringCfg = SpringCfg::new(0.21, 0.0);
 /// Visible state-to-state width expansion (`≤ 340 ms` settled, `0.14` width-only morph bounce per `kit-motion`).
 pub const OPEN_SPRING: SpringCfg = SpringCfg::new(0.30, 0.14);
@@ -932,7 +932,7 @@ impl PillModel {
 
         if from_hidden && !self.reduced {
             // Entry in place (no lozenge growth): snap width/height to the entering state's layout
-            // while invisible (`alpha ≈ 0`) and scale in from `0.90 → 1.0` with `9 pt → 0` blur.
+            // while invisible (`alpha ≈ 0`) and scale in from `0.94 → 1.0` with `4 pt → 0` blur.
             self.l.snap(lay.l);
             self.r.snap(lay.r);
             self.b.snap(lay.b);
@@ -983,7 +983,7 @@ impl PillModel {
 
             if landing_idle {
                 // Exit in place (no collapse into a 64×28 / 96×24 lozenge): keep the current
-                // layout's target width/height while shrinking `shell_scale` `1.0 → 0.90`,
+                // layout's target width/height while shrinking `shell_scale` `1.0 → 0.94`,
                 // blurring `0 → 9 pt` (leading opacity), and fading `1.0 → 0.0` in `~190–200 ms`.
                 let cur_l = self.l.target;
                 let cur_r = self.r.target;
@@ -998,7 +998,7 @@ impl PillModel {
                     SpringCfg::new((EXIT_SHELL_SPRING.duration * BLUR_LEAD).max(0.04), 0.0),
                 );
             } else if from_hidden {
-                // Entry from Hidden: `0.90 → 1.0` scale, `9 pt → 0` blur, `0 → 1` alpha in `~230–250 ms`.
+                // Entry from Hidden: `0.94 → 1.0` scale, `4 pt → 0` blur, `0 → 1` alpha in `~230–250 ms`.
                 self.shell_scale.to(1.0, ENTRY_SHELL_SPRING);
                 self.shell_alpha.to(1.0, ENTRY_ALPHA_SPRING);
                 self.shell_blur.to(
@@ -1989,7 +1989,7 @@ mod tests {
         assert_eq!(ElemId::Close.shortcut_hint(), Some("Esc"));
         assert_eq!(ElemId::Cancel.shortcut_hint(), Some("Esc"));
 
-        // 1. Entry from Hidden (`~0.90` scale + `~9 pt` blur -> sharp `1.0` in ≤ 260 ms, no lozenge).
+        // 1. Entry from Hidden (`~0.94` scale + `~4 pt` blur -> sharp `1.0` in ≤ 260 ms, no lozenge).
         let mut m = PillModel::new(Metrics::default());
         m.set_pres(Pres::Recording {
             chips: true,
@@ -2001,10 +2001,10 @@ mod tests {
         let f0 = m.frame();
         assert!(
             f0.shape.width() >= target_w * ENTRY_EXIT_SCALE - 1.0,
-            "entry should start at ~0.90 scale of target width (not a narrow lozenge), got {}",
+            "entry should start at ~0.94 scale of target width (not a narrow lozenge), got {}",
             f0.shape.width()
         );
-        assert!(f0.shape.blur > 6.0, "expected blurred shell on entry start");
+        assert!(f0.shape.blur > SHELL_BLUR_MAX * 0.6, "expected blurred shell on entry start");
 
         for _ in 0..60 {
             m.advance(FRAME_DT);
@@ -2032,7 +2032,7 @@ mod tests {
             "expected width cushion on visible widening morph, max_w={max_w} target_w={done_target_w}"
         );
 
-        // 3. Exit to Hidden shrinks in place (`1.0 -> 0.90` scale, blur up to ~9 pt, fade in ~200 ms)
+        // 3. Exit to Hidden shrinks in place (`1.0 -> 0.94` scale, blur up to ~4 pt, fade in ~200 ms)
         //    without collapsing into a lozenge.
         m.set_pres(Pres::Hidden);
         let mut min_vis_w = f32::INFINITY;
@@ -2049,7 +2049,7 @@ mod tests {
         }
         assert!(
             min_vis_w >= done_target_w * ENTRY_EXIT_SCALE - 2.0,
-            "exit should shrink in place to ~0.90 scale, not a lozenge: min_vis_w={min_vis_w}"
+            "exit should shrink in place to ~0.94 scale, not a lozenge: min_vis_w={min_vis_w}"
         );
         let dur = exit_done_s.expect("exit finished");
         assert!(
