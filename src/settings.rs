@@ -465,6 +465,7 @@ pub enum Pane {
     General,
     Recording,
     Storage,
+    Remote,
     Permissions,
     About,
 }
@@ -483,6 +484,52 @@ pub struct View {
     pub captures_size: Option<String>,
     pub permissions: Vec<PermissionView>,
     pub updates: bool,
+    pub remotes: RemotesView,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotesView {
+    pub hosts: Vec<RemoteRowView>,
+    pub sheet: Option<RemoteSheetView>,
+    /// `~/.ssh/config`, as shown.
+    pub config_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteRowView {
+    pub host: String,
+    /// The dot: "ok", "off" (not reachable), "key" (needs key-based login or a trusted host
+    /// key), "unknown" (not checked yet).
+    pub status: &'static str,
+    /// "Reachable · last copy 2 min ago".
+    pub detail: String,
+    pub copy: bool,
+    pub zoom: bool,
+    /// Setting zoom up or taking it down.
+    pub busy: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSheetView {
+    /// "add", "zoom" or "remove".
+    pub kind: &'static str,
+    pub host: String,
+    /// Add: hosts from `~/.ssh/config` not added yet.
+    pub suggestions: Vec<String>,
+    /// Add: "idle", "running", "ok" or "failed".
+    pub test: &'static str,
+    pub test_text: String,
+    /// Zoom: how many lines the ssh config gains, the whole block it will hold, the script.
+    pub lines_added: usize,
+    pub config_block: String,
+    pub script: String,
+    pub viewing: bool,
+    /// Remove: whether the host has zoom, so the script and forward go too.
+    pub zoom: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -641,6 +688,40 @@ pub enum Action {
     /// "Show Welcome Tour" on About.
     Tour,
     Close,
+    /// "+ Add machine".
+    RemoteAdd,
+    /// A host typed or picked in the Add sheet.
+    RemoteHost {
+        host: String,
+    },
+    RemoteTest {
+        host: String,
+    },
+    /// "Add" after a test that passed.
+    RemoteSave {
+        host: String,
+    },
+    /// Cancel or Done in any remote sheet.
+    RemoteDismiss,
+    /// A host's switch: `copy` or `zoom`. Turning zoom on asks first.
+    RemoteSet {
+        host: String,
+        key: String,
+        value: bool,
+    },
+    /// "View" in the zoom sheet: shows or hides the config block and the script.
+    RemoteView,
+    RemoteAllowZoom {
+        host: String,
+    },
+    RemoteRemove {
+        host: String,
+    },
+    RemoteConfirmRemove {
+        host: String,
+        #[serde(rename = "deleteCopies", default)]
+        delete_copies: bool,
+    },
 }
 
 /// What the app does with an action.
@@ -659,6 +740,46 @@ pub enum Effect {
     Relaunch,
     Tour,
     Close,
+    /// Run the Add sheet's SSH check on a host.
+    RemoteTest(String),
+    /// Turn zoom on or off for a host (ssh config block, script and key on the host).
+    RemoteZoom(String, bool),
+    /// Remove a host, deleting its copies too when asked.
+    RemoteRemove(String, bool),
+}
+
+/// What a remote job reports when it's done.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoteEvent {
+    /// `Ok((what it found, the host's home))` or why it failed.
+    Tested {
+        host: String,
+        result: Result<(String, String), String>,
+    },
+    ZoomDone {
+        host: String,
+        on: bool,
+        error: Option<String>,
+    },
+    Removed {
+        host: String,
+        error: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TestState {
+    Idle,
+    Running,
+    Ok { text: String, home: String },
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RemoteSheet {
+    Add { host: String, test: TestState },
+    Zoom { host: String, viewing: bool },
+    Remove { host: String },
 }
 
 /// The outside world the window changes: Scrawl's hotkeys and the config file.
@@ -679,6 +800,9 @@ pub struct Panel {
     requested: BTreeSet<Permission>,
     grants: Option<Grants>,
     captures_size: Option<u64>,
+    remote_sheet: Option<RemoteSheet>,
+    remote_busy: std::collections::BTreeMap<String, String>,
+    remote_errors: std::collections::BTreeMap<String, String>,
 }
 
 impl Panel {
@@ -746,6 +870,203 @@ impl Panel {
                 self.stop_recording(host);
                 Effect::Close
             }
+            action => self.remote(action, host),
+        }
+    }
+
+    fn remote(&mut self, action: Action, host: &mut dyn Host) -> Effect {
+        let config = host.config_path();
+        match action {
+            Action::RemoteAdd => {
+                self.remote_sheet = Some(RemoteSheet::Add {
+                    host: String::new(),
+                    test: TestState::Idle,
+                });
+            }
+            Action::RemoteHost { host: name } => {
+                if let Some(RemoteSheet::Add { host, test }) = &mut self.remote_sheet
+                    && *host != name.trim()
+                {
+                    *host = name.trim().to_owned();
+                    *test = TestState::Idle;
+                }
+            }
+            Action::RemoteTest { host: name } => {
+                let name = name.trim().to_owned();
+                if !crate::remote::safe_host(&name) {
+                    self.remote_sheet = Some(RemoteSheet::Add {
+                        test: TestState::Failed(if name.is_empty() {
+                            "Pick a machine or type its SSH host name.".to_owned()
+                        } else {
+                            format!("“{name}” isn't an SSH host name.")
+                        }),
+                        host: name,
+                    });
+                    return Effect::None;
+                }
+                self.remote_sheet = Some(RemoteSheet::Add {
+                    host: name.clone(),
+                    test: TestState::Running,
+                });
+                return Effect::RemoteTest(name);
+            }
+            Action::RemoteSave { host: name } => {
+                if let Some(RemoteSheet::Add {
+                    host,
+                    test: TestState::Ok { home, .. },
+                }) = &self.remote_sheet
+                    && *host == name
+                {
+                    let home = home.clone();
+                    if let Err(error) = crate::remote::update_remote_in(&config, &name, true, |r| {
+                        r.home = Some(home).filter(|h| !h.is_empty());
+                    }) {
+                        crate::capture::scrawl_log(format!("Adding {name} failed: {error:#}"));
+                    }
+                    crate::remote::ensure_local_links(false);
+                    self.remote_sheet = None;
+                }
+            }
+            Action::RemoteDismiss => self.remote_sheet = None,
+            Action::RemoteSet {
+                host: name,
+                key,
+                value,
+            } => match key.as_str() {
+                "copy" => {
+                    let _ = crate::remote::update_remote_in(&config, &name, false, |r| r.copy = value);
+                }
+                "zoom" if value => {
+                    self.remote_errors.remove(&name);
+                    self.remote_sheet = Some(RemoteSheet::Zoom {
+                        host: name,
+                        viewing: false,
+                    });
+                }
+                "zoom" => {
+                    self.remote_errors.remove(&name);
+                    self.remote_busy
+                        .insert(name.clone(), "Turning off…".to_owned());
+                    return Effect::RemoteZoom(name, false);
+                }
+                _ => {}
+            },
+            Action::RemoteView => {
+                if let Some(RemoteSheet::Zoom { viewing, .. }) = &mut self.remote_sheet {
+                    *viewing = !*viewing;
+                }
+            }
+            Action::RemoteAllowZoom { host: name } => {
+                self.remote_sheet = None;
+                self.remote_busy
+                    .insert(name.clone(), "Setting up…".to_owned());
+                return Effect::RemoteZoom(name, true);
+            }
+            Action::RemoteRemove { host: name } => {
+                self.remote_sheet = Some(RemoteSheet::Remove { host: name });
+            }
+            Action::RemoteConfirmRemove {
+                host: name,
+                delete_copies,
+            } => {
+                self.remote_sheet = None;
+                self.remote_busy.insert(name.clone(), "Removing…".to_owned());
+                return Effect::RemoteRemove(name, delete_copies);
+            }
+            _ => {}
+        }
+        Effect::None
+    }
+
+    /// A remote job finished.
+    pub fn on_remote(&mut self, event: RemoteEvent) {
+        match event {
+            RemoteEvent::Tested { host: name, result } => {
+                if let Some(RemoteSheet::Add { host, test }) = &mut self.remote_sheet
+                    && *host == name
+                {
+                    *test = match result {
+                        Ok((text, home)) => TestState::Ok { text, home },
+                        Err(why) => TestState::Failed(why),
+                    };
+                }
+            }
+            RemoteEvent::ZoomDone { host, error, .. } | RemoteEvent::Removed { host, error } => {
+                self.remote_busy.remove(&host);
+                match error {
+                    Some(error) => self.remote_errors.insert(host, error),
+                    None => self.remote_errors.remove(&host),
+                };
+            }
+        }
+    }
+
+    fn remotes_view(&self, config: &Path) -> RemotesView {
+        let list = crate::remote::remotes_in(config);
+        let statuses = crate::remote::statuses();
+        let now = crate::now_epoch_ms();
+        let hosts = list
+            .iter()
+            .map(|r| {
+                let status = statuses.get(&r.host).cloned().unwrap_or_default();
+                let (dot, detail) = remote_status(&status, now);
+                RemoteRowView {
+                    host: r.host.clone(),
+                    status: dot,
+                    detail,
+                    copy: r.copy,
+                    zoom: r.zoom,
+                    busy: self.remote_busy.get(&r.host).cloned(),
+                    error: self.remote_errors.get(&r.host).cloned(),
+                }
+            })
+            .collect();
+        let sheet = self.remote_sheet.as_ref().map(|sheet| match sheet {
+            RemoteSheet::Add { host, test } => {
+                let (state, text) = match test {
+                    TestState::Idle => ("idle", String::new()),
+                    TestState::Running => ("running", format!("Connecting to {host}…")),
+                    TestState::Ok { text, .. } => ("ok", text.clone()),
+                    TestState::Failed(why) => ("failed", why.clone()),
+                };
+                RemoteSheetView {
+                    kind: "add",
+                    host: host.clone(),
+                    suggestions: crate::remote::suggested_hosts()
+                        .into_iter()
+                        .filter(|h| !list.iter().any(|r| &r.host == h))
+                        .collect(),
+                    test: state,
+                    test_text: text,
+                    ..RemoteSheetView::default()
+                }
+            }
+            RemoteSheet::Zoom { host, viewing } => {
+                let home = list
+                    .iter()
+                    .find(|r| &r.host == host)
+                    .and_then(|r| r.home.clone());
+                RemoteSheetView {
+                    kind: "zoom",
+                    host: host.clone(),
+                    lines_added: crate::remote::lines_added(config),
+                    config_block: crate::remote::zoom_preview(config, host, home.as_deref()),
+                    script: crate::remote::SCRIPT.to_owned(),
+                    viewing: *viewing,
+                    ..RemoteSheetView::default()
+                }
+            }
+            RemoteSheet::Remove { host } => RemoteSheetView {
+                kind: "remove",
+                host: host.clone(),
+                zoom: list.iter().any(|r| &r.host == host && r.zoom),
+                ..RemoteSheetView::default()
+            },
+        });
+        RemotesView {
+            hosts,
+            sheet,
+            config_path: crate::remote::ssh_config_label(),
         }
     }
 
@@ -923,7 +1244,45 @@ impl Panel {
                 })
                 .collect(),
             updates: crate::sparkle::available(),
+            remotes: self.remotes_view(&host.config_path()),
         }
+    }
+}
+
+/// A host's dot and its line: "Reachable · last copy 2 min ago", "Not reachable", "Needs
+/// key-based login".
+pub fn remote_status(status: &crate::remote::Status, now: u64) -> (&'static str, String) {
+    use crate::remote::Reach;
+    let copied = (status.last_copy_at > 0)
+        .then(|| format!("last copy {}", crate::remote::ago(now.saturating_sub(status.last_copy_at))));
+    match &status.reach {
+        None => ("unknown", "Not checked yet".to_owned()),
+        Some(Reach::Reachable) => match (&status.last_error, copied) {
+            (Some(_), _) => ("key", "Reachable · last copy failed".to_owned()),
+            (None, Some(copied)) => ("ok", format!("Reachable · {copied}")),
+            (None, None) => ("ok", "Reachable".to_owned()),
+        },
+        Some(Reach::NeedsKey) => ("key", "Needs key-based login".to_owned()),
+        Some(Reach::HostKey) => ("key", "Host key not trusted yet".to_owned()),
+        Some(Reach::Unreachable(_)) => match copied {
+            Some(copied) => ("off", format!("Not reachable · {copied}")),
+            None => ("off", "Not reachable".to_owned()),
+        },
+    }
+}
+
+/// Why a host failed the Add sheet's test, as the sheet says it.
+fn remote_failure(host: &str, reach: &crate::remote::Reach) -> String {
+    use crate::remote::Reach;
+    match reach {
+        Reach::NeedsKey => format!(
+            "{host} asked for a password. Scrawl copies with key-based login only: run ssh-copy-id {host}, then test again."
+        ),
+        Reach::HostKey => format!(
+            "{host}'s host key isn't trusted yet. Connect once in Terminal (ssh {host}), then test again."
+        ),
+        Reach::Unreachable(why) => format!("Couldn't reach {host}: {why}"),
+        Reach::Reachable => format!("{host} answered, but the check failed."),
     }
 }
 
@@ -969,6 +1328,7 @@ pub enum Event {
     Action(Action),
     Grants(Grants),
     CapturesSize(u64),
+    Remote(RemoteEvent),
     /// Something outside the window may have changed (Hex, the login item): redraw.
     Tick,
     Exited,
@@ -1038,6 +1398,13 @@ impl Session {
             while alive.load(Ordering::Acquire) {
                 // Hex and the size on open (`hex::watch` keeps Hex fresh) and every 30 s; the
                 // grants and the login item every second.
+                if n % 60 == 0 {
+                    std::thread::spawn(|| {
+                        for remote in crate::remote::remotes() {
+                            crate::remote::check(&remote.host);
+                        }
+                    });
+                }
                 if n % 30 == 0 {
                     crate::hex::refresh_in_background();
                     let size =
@@ -1086,6 +1453,10 @@ impl Session {
                 self.panel.set_captures_size(bytes);
                 Effect::None
             }
+            Event::Remote(event) => {
+                self.panel.on_remote(event);
+                Effect::None
+            }
             Event::Tick => Effect::None,
             Event::Exited => {
                 self.panel.on(Action::Close, host);
@@ -1118,6 +1489,55 @@ impl Session {
             }
             Effect::CheckForUpdates => {
                 crate::sparkle::check_for_updates();
+                Effect::None
+            }
+            Effect::RemoteTest(name) => {
+                let events = std::sync::Arc::clone(&self.events);
+                std::thread::spawn(move || {
+                    let result = crate::remote::probe(&name)
+                        .map(|probe| {
+                            let mut text = format!(
+                                "Connected · {} · captures go to ~/{} there",
+                                probe.system,
+                                crate::remote::REMOTE_CAPTURES
+                            );
+                            if !probe.curl {
+                                text.push_str(". It has no curl, so zoom won't work.");
+                            }
+                            (text, probe.home)
+                        })
+                        .map_err(|reach| remote_failure(&name, &reach));
+                    events(Event::Remote(RemoteEvent::Tested { host: name, result }));
+                });
+                Effect::None
+            }
+            Effect::RemoteZoom(name, on) => {
+                let events = std::sync::Arc::clone(&self.events);
+                let config = host.config_path();
+                std::thread::spawn(move || {
+                    let result = if on {
+                        crate::remote::enable_zoom(&config, &name)
+                    } else {
+                        crate::remote::disable_zoom(&config, &name)
+                    };
+                    events(Event::Remote(RemoteEvent::ZoomDone {
+                        host: name,
+                        on,
+                        error: result.err().map(|e| format!("{e:#}")),
+                    }));
+                });
+                Effect::None
+            }
+            Effect::RemoteRemove(name, delete_copies) => {
+                let events = std::sync::Arc::clone(&self.events);
+                let config = host.config_path();
+                std::thread::spawn(move || {
+                    let result = crate::remote::remove_host(&config, &name, delete_copies);
+                    events(Event::Remote(RemoteEvent::Removed {
+                        host: name,
+                        error: result.err().map(|e| format!("{e:#}")),
+                    }));
+                });
                 Effect::None
             }
             Effect::Measure => {
@@ -1658,4 +2078,142 @@ mod tests {
             Action::CheckForUpdates
         );
     }
+
+    #[test]
+    fn adding_a_machine_tests_it_first_and_zoom_asks_before_writing() {
+        let dir = TempDir::new("remote");
+        let mut host = fake(&dir);
+        let mut panel = Panel::default();
+        let parse = |json: &str| serde_json::from_str::<Action>(json).unwrap();
+
+        assert_eq!(panel.on(parse(r#"{"action":"remote-add"}"#), &mut host), Effect::None);
+        assert_eq!(panel.view(&host).remotes.sheet.unwrap().kind, "add");
+        // Saving before a passing test does nothing.
+        panel.on(parse(r#"{"action":"remote-save","host":"mini"}"#), &mut host);
+        assert!(crate::remote::remotes_in(&host.path).is_empty());
+        assert_eq!(
+            panel.on(parse(r#"{"action":"remote-test","host":"mini"}"#), &mut host),
+            Effect::RemoteTest("mini".into())
+        );
+        assert_eq!(panel.view(&host).remotes.sheet.unwrap().test, "running");
+        panel.on_remote(RemoteEvent::Tested {
+            host: "mini".into(),
+            result: Err("mini asked for a password.".into()),
+        });
+        let sheet = panel.view(&host).remotes.sheet.unwrap();
+        assert_eq!((sheet.test, sheet.test_text.as_str()), ("failed", "mini asked for a password."));
+        panel.on(parse(r#"{"action":"remote-test","host":"mini"}"#), &mut host);
+        panel.on_remote(RemoteEvent::Tested {
+            host: "mini".into(),
+            result: Ok(("Connected".into(), "/Users/a".into())),
+        });
+        panel.on(parse(r#"{"action":"remote-save","host":"mini"}"#), &mut host);
+        let view = panel.view(&host).remotes;
+        assert!(view.sheet.is_none());
+        assert_eq!(view.hosts.len(), 1);
+        assert!(view.hosts[0].copy && !view.hosts[0].zoom);
+        assert_eq!(crate::remote::remotes_in(&host.path)[0].home.as_deref(), Some("/Users/a"));
+
+        // Zoom on opens the explainer and writes nothing yet.
+        assert_eq!(
+            panel.on(parse(r#"{"action":"remote-set","host":"mini","key":"zoom","value":true}"#), &mut host),
+            Effect::None
+        );
+        let sheet = panel.view(&host).remotes.sheet.unwrap();
+        assert_eq!((sheet.kind, sheet.lines_added, sheet.viewing), ("zoom", 4, false));
+        assert!(sheet.config_block.contains("Host mini\n    RemoteForward /Users/a/.scrawl/scrawl.sock 127.0.0.1:"));
+        assert_eq!(sheet.script, crate::remote::SCRIPT);
+        assert!(!crate::remote::remotes_in(&host.path)[0].zoom);
+        panel.on(parse(r#"{"action":"remote-view"}"#), &mut host);
+        assert!(panel.view(&host).remotes.sheet.unwrap().viewing);
+        assert_eq!(
+            panel.on(parse(r#"{"action":"remote-allow-zoom","host":"mini"}"#), &mut host),
+            Effect::RemoteZoom("mini".into(), true)
+        );
+        assert_eq!(panel.view(&host).remotes.hosts[0].busy.as_deref(), Some("Setting up…"));
+        panel.on_remote(RemoteEvent::ZoomDone {
+            host: "mini".into(),
+            on: true,
+            error: Some("Zoom needs curl on mini, and it has none".into()),
+        });
+        let row = &panel.view(&host).remotes.hosts[0];
+        assert!(row.busy.is_none());
+        assert_eq!(row.error.as_deref(), Some("Zoom needs curl on mini, and it has none"));
+
+        panel.on(parse(r#"{"action":"remote-set","host":"mini","key":"copy","value":false}"#), &mut host);
+        assert!(!crate::remote::remotes_in(&host.path)[0].copy);
+        panel.on(parse(r#"{"action":"remote-remove","host":"mini"}"#), &mut host);
+        assert_eq!(panel.view(&host).remotes.sheet.unwrap().kind, "remove");
+        assert_eq!(
+            panel.on(
+                parse(r#"{"action":"remote-confirm-remove","host":"mini","deleteCopies":true}"#),
+                &mut host
+            ),
+            Effect::RemoteRemove("mini".into(), true)
+        );
+        assert!(panel.view(&host).remotes.sheet.is_none());
+    }
+
+    #[test]
+    fn remote_status_lines() {
+        use crate::remote::{Reach, Status};
+        let now = 10 * 60_000;
+        let status = |reach, last_copy_at| Status {
+            reach,
+            last_copy_at,
+            ..Status::default()
+        };
+        assert_eq!(
+            remote_status(&status(Some(Reach::Reachable), now - 2 * 60_000), now),
+            ("ok", "Reachable · last copy 2 min ago".to_owned())
+        );
+        assert_eq!(remote_status(&status(Some(Reach::Reachable), 0), now).1, "Reachable");
+        assert_eq!(
+            remote_status(&status(Some(Reach::Unreachable("timeout".into())), 0), now),
+            ("off", "Not reachable".to_owned())
+        );
+        assert_eq!(
+            remote_status(&status(Some(Reach::NeedsKey), 0), now),
+            ("key", "Needs key-based login".to_owned())
+        );
+        assert_eq!(remote_status(&status(None, 0), now).0, "unknown");
+    }
+
+
+    #[test]
+    fn remote_view_keys_match_the_swift_structs() {
+        let view = RemotesView {
+            hosts: vec![RemoteRowView {
+                host: "mini".into(),
+                status: "ok",
+                detail: "Reachable".into(),
+                copy: true,
+                zoom: false,
+                busy: None,
+                error: None,
+            }],
+            sheet: Some(RemoteSheetView {
+                kind: "zoom",
+                ..RemoteSheetView::default()
+            }),
+            config_path: "~/.ssh/config".into(),
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        let keys = |v: &serde_json::Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        // SettingsRemotes, SettingsRemoteHost and SettingsRemoteSheet in helper/RemoteSettings.swift.
+        assert_eq!(keys(&json), ["configPath", "hosts", "sheet"]);
+        assert_eq!(
+            keys(&json["hosts"][0]),
+            ["busy", "copy", "detail", "error", "host", "status", "zoom"]
+        );
+        assert_eq!(
+            keys(&json["sheet"]),
+            ["configBlock", "host", "kind", "linesAdded", "script", "suggestions", "test", "testText", "viewing", "zoom"]
+        );
+    }
+
 }

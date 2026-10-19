@@ -16,6 +16,7 @@ mod model;
 mod native;
 mod onboarding;
 mod phone;
+mod remote;
 mod render;
 mod retention;
 mod routing;
@@ -44,7 +45,7 @@ use crate::model::{
     keyframe_budget, parse_clock_ms,
 };
 use crate::render::{render_contact_sheet, render_synthetic_demo_frame};
-use crate::sketch::{marks_of, summary_markdown};
+use crate::sketch::marks_of;
 
 #[derive(Parser)]
 #[command(
@@ -106,6 +107,48 @@ fn hex_status() {
 enum HexCommand {
     /// Whether Hex is connected, its version, ready models and the transcriber Scrawl will use.
     Status,
+}
+
+#[derive(Subcommand)]
+enum RemoteCommand {
+    /// The remote machines, their status and what each one gets.
+    List,
+    /// Hosts in ~/.ssh/config that could be added.
+    Suggest,
+    /// Check that a host answers over SSH with key-based login, then add it (copying on).
+    Add { host: String },
+    /// Check whether hosts answer (all of them by default).
+    Check { host: Option<String> },
+    /// Copy a capture's frames, contact sheet, summary and manifest to the remote machines.
+    Push {
+        /// Path to `.scrawl` bundle directory or `latest`.
+        #[arg(default_value = "latest")]
+        bundle: PathBuf,
+        /// Only this host (default: every host with copying on).
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Turn copying after each capture on or off for a host.
+    Copy {
+        host: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// Print what turning zoom on for a host writes: the ~/.ssh/config block and the script.
+    Show { host: String },
+    /// Turn zoom on or off for a host (on edits ~/.ssh/config and installs ~/.scrawl/bin/scrawl
+    /// there; run `scrawl remote show <host>` first to see both).
+    Zoom {
+        host: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// Remove a host: its zoom forward and script, and with --delete-copies its copied captures.
+    Remove {
+        host: String,
+        #[arg(long)]
+        delete_copies: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -463,6 +506,11 @@ enum Command {
         /// Ingest port used when discovering default Tailscale / LAN URLs.
         #[arg(long, default_value_t = phone::DEFAULT_INGEST_PORT)]
         port: u16,
+    },
+    /// Remote machines: copy captures to SSH hosts where agents run and let them zoom.
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
     },
     /// Run the headless ScrawlKit ingest server (HTTP + optional USB watcher, no GUI or clipboard).
     Serve {
@@ -933,7 +981,7 @@ pub fn build_bundle_from_parts(
             autocrop: prep.autocrop,
             destination: None,
         };
-        let summary = summary_markdown(&bundle, bundle_dir);
+        let summary = handoff::summary_text(&bundle, bundle_dir);
         std::fs::create_dir_all(bundle_dir.join("frames"))
             .with_context(|| format!("could not create {}", bundle_dir.display()))?;
         #[cfg(unix)]
@@ -1097,7 +1145,7 @@ pub fn build_bundle_from_parts(
         render::stamp_keyframe_badges(full);
     }
     let rendered_at = std::time::Instant::now();
-    let summary = summary_markdown(&bundle, bundle_dir);
+    let summary = handoff::summary_text(&bundle, bundle_dir);
     std::thread::scope(|scope| -> Result<()> {
         let full_write = match (&cropped, &full_sheet) {
             (Some((info, full)), Some(sheet)) => {
@@ -1788,7 +1836,7 @@ fn main() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&loaded)?);
             } else {
-                print!("{}", summary_markdown(&loaded, &dir));
+                print!("{}", handoff::summary_text(&loaded, &dir));
             }
             Ok(())
         }
@@ -1900,18 +1948,7 @@ fn main() -> Result<()> {
             ensure!(span.is_finite() && span > 0.0, "--span must be positive");
             let sheet = zoom::zoom(&dir, &loaded, &at, (span * 1_000.0) as u64, frames, !full)?;
             println!("{}", sheet.path.display());
-            println!(
-                "{} → {}, {} frames: {}",
-                zoom::clock(sheet.from_ms),
-                zoom::clock(sheet.to_ms),
-                sheet.cells.len(),
-                sheet
-                    .cells
-                    .iter()
-                    .map(|(i, t)| format!("#{i} {}", zoom::clock(*t)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            println!("{}", zoom::cells_line(&sheet));
             if !sheet.said.is_empty() {
                 println!("Said: “{}”", sheet.said);
             }
@@ -2109,6 +2146,155 @@ fn main() -> Result<()> {
             usb,
             no_opencode,
         } => phone::run_ingest_server(port, usb, no_opencode),
+        Command::Remote { command } => remote_command(command),
+    }
+}
+
+fn describe_reach(reach: &remote::Reach) -> String {
+    match reach {
+        remote::Reach::Reachable => "reachable".to_owned(),
+        remote::Reach::NeedsKey => "needs key-based login".to_owned(),
+        remote::Reach::HostKey => "host key not trusted yet (connect once in Terminal)".to_owned(),
+        remote::Reach::Unreachable(why) => format!("not reachable ({why})"),
+    }
+}
+
+fn remote_command(command: RemoteCommand) -> Result<()> {
+    let config = handoff::default_config_path();
+    match command {
+        RemoteCommand::List => {
+            let statuses = remote::statuses();
+            let list = remote::remotes_in(&config);
+            if list.is_empty() {
+                println!("No remote machines. Add one with `scrawl remote add <host>`.");
+            }
+            let now = now_epoch_ms();
+            for r in list {
+                let status = statuses.get(&r.host).cloned().unwrap_or_default();
+                let reach = status.reach.as_ref().map_or("not checked".to_owned(), describe_reach);
+                let copied = if status.last_copy_at > 0 {
+                    format!(", last copy {}", remote::ago(now.saturating_sub(status.last_copy_at)))
+                } else {
+                    String::new()
+                };
+                println!(
+                    "{}\tcopy {}\tzoom {}\t{reach}{copied}",
+                    r.host,
+                    if r.copy { "on" } else { "off" },
+                    if r.zoom { "on" } else { "off" },
+                );
+            }
+            Ok(())
+        }
+        RemoteCommand::Suggest => {
+            for host in remote::suggested_hosts() {
+                println!("{host}");
+            }
+            Ok(())
+        }
+        RemoteCommand::Add { host } => {
+            ensure!(remote::safe_host(&host), "“{host}” isn't a host name Scrawl can use");
+            match remote::probe(&host) {
+                Ok(probe) => {
+                    remote::update_remote_in(&config, &host, true, |_| {})?;
+                    remote::ensure_local_links(false);
+                    println!(
+                        "Added {host} ({}, home {}). Captures will be copied to ~/{} there.",
+                        probe.system,
+                        probe.home,
+                        remote::REMOTE_CAPTURES
+                    );
+                    if !probe.curl {
+                        println!("{host} has no curl, so zoom won't work there.");
+                    }
+                    Ok(())
+                }
+                Err(reach) => anyhow::bail!("{host}: {}", describe_reach(&reach)),
+            }
+        }
+        RemoteCommand::Check { host } => {
+            let hosts: Vec<String> = match host {
+                Some(h) => vec![h],
+                None => remote::remotes_in(&config).into_iter().map(|r| r.host).collect(),
+            };
+            for host in hosts {
+                println!("{host}: {}", describe_reach(&remote::check(&host)));
+            }
+            Ok(())
+        }
+        RemoteCommand::Push { bundle, host } => {
+            let dir = handoff::resolve_bundle_dir(&bundle)?;
+            let hosts: Vec<String> = match host {
+                Some(h) => vec![h],
+                None => remote::remotes_in(&config)
+                    .into_iter()
+                    .filter(|r| r.copy)
+                    .map(|r| r.host)
+                    .collect(),
+            };
+            ensure!(!hosts.is_empty(), "No remote machines have copying on");
+            let name = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let results: Vec<(String, Result<()>, u128)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = hosts
+                    .iter()
+                    .map(|host| {
+                        let dir = &dir;
+                        scope.spawn(move || {
+                            let started = std::time::Instant::now();
+                            let result = remote::push_and_record(host, dir);
+                            (host.clone(), result, started.elapsed().as_millis())
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let mut failed = 0;
+            for (host, result, ms) in results {
+                match result {
+                    Ok(()) => println!("{host}: copied to ~/{}/{name} ({ms} ms)", remote::REMOTE_CAPTURES),
+                    Err(error) => {
+                        failed += 1;
+                        println!("{host}: {error:#}");
+                    }
+                }
+            }
+            ensure!(failed == 0, "{failed} host(s) failed");
+            Ok(())
+        }
+        RemoteCommand::Copy { host, state } => {
+            remote::update_remote_in(&config, &host, false, |r| r.copy = state == "on")?;
+            println!("Copying to {host}: {state}");
+            Ok(())
+        }
+        RemoteCommand::Show { host } => {
+            let home = remote::remotes_in(&config)
+                .into_iter()
+                .find(|r| r.host == host)
+                .and_then(|r| r.home)
+                .or_else(|| remote::probe(&host).ok().map(|p| p.home));
+            println!(
+                "{} would contain:\n\n{}",
+                remote::ssh_config_label(),
+                remote::zoom_preview(&config, &host, home.as_deref())
+            );
+            println!("{host}:~/{} would be:\n\n{}", remote::REMOTE_SCRIPT, remote::SCRIPT);
+            Ok(())
+        }
+        RemoteCommand::Zoom { host, state } => {
+            if state == "on" {
+                remote::enable_zoom(&config, &host)?;
+                println!("Zoom is on for {host}. It works while you're connected over SSH (`ssh {host}`).");
+            } else {
+                remote::disable_zoom(&config, &host)?;
+                println!("Zoom is off for {host}.");
+            }
+            Ok(())
+        }
+        RemoteCommand::Remove { host, delete_copies } => {
+            remote::remove_host(&config, &host, delete_copies)?;
+            println!("Removed {host}.");
+            Ok(())
+        }
     }
 }
 

@@ -18,8 +18,13 @@ pub fn default_captures_dir() -> PathBuf {
 }
 
 pub fn resolve_bundle_dir(path_or_id: &Path) -> Result<PathBuf> {
+    resolve_bundle_dir_in(&default_captures_dir(), path_or_id)
+}
+
+/// [`resolve_bundle_dir`] against another captures folder.
+pub fn resolve_bundle_dir_in(captures: &Path, path_or_id: &Path) -> Result<PathBuf> {
     if path_or_id == Path::new("latest") {
-        return newest_bundle(&default_captures_dir());
+        return newest_bundle(captures);
     }
     let mut path = path_or_id.to_owned();
     if path.file_name().is_some_and(|name| name == "scrawl.json") {
@@ -32,7 +37,7 @@ pub fn resolve_bundle_dir(path_or_id: &Path) -> Result<PathBuf> {
         }
     }
     if !path.exists() && path.components().count() == 1 {
-        path = default_captures_dir().join(&path);
+        path = captures.join(&path);
         if path.extension().is_none() {
             path.set_extension("scrawl");
         }
@@ -134,11 +139,22 @@ pub fn copy_png_to_clipboard(png_bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The summary as written to `summary.md` and pasted: with a remote machine set up, it names
+/// the bundle by the path it has on every host (`~/.scrawl/captures/…`) and, when a host can
+/// zoom, says how.
+pub fn summary_text(bundle: &ScrawlBundle, bundle_dir: &Path) -> String {
+    let mut text = crate::sketch::summary_markdown(bundle, &crate::remote::shown_dir(bundle_dir));
+    if let Some(line) = crate::remote::zoom_line(bundle_dir) {
+        text.push_str(&line);
+        text.push('\n');
+    }
+    text
+}
+
 #[cfg(target_os = "macos")]
 pub fn copy_bundle_to_clipboard(bundle_dir: &Path) -> Result<()> {
     let (directory, bundle) = load_bundle(bundle_dir)?;
-    let summary = crate::sketch::summary_markdown(&bundle, &directory);
-    copy_string_to_clipboard(&summary)
+    copy_string_to_clipboard(&summary_text(&bundle, &directory))
 }
 
 /// Pastes both the contact-sheet image and the transcript/keyframe text into the active app
@@ -160,14 +176,15 @@ pub fn paste_bundle_image_and_text(bundle_dir: &Path) -> Result<()> {
     let (directory, bundle) = load_bundle(bundle_dir)?;
     let sheet_path = directory.join(&bundle.contact_sheet);
     let image = fs::read(&sheet_path).context("Could not read contact sheet")?;
-    let summary = crate::sketch::summary_markdown(&bundle, &directory);
+    let summary = summary_text(&bundle, &directory);
+    let shown_sheet = crate::remote::shown_dir(&directory).join(&bundle.contact_sheet);
 
     crate::capture::wait_for_modifiers_released(350);
 
     if crate::capture::is_frontmost_terminal() {
         // In terminals (Ghostty / OpenCode TUI / Claude Code), pasting the image path first
         // resolves and attaches `[Image 1]`, and the second paste inserts the text summary.
-        copy_string_to_clipboard(&sheet_path.display().to_string())?;
+        copy_string_to_clipboard(&shown_sheet.display().to_string())?;
     } else {
         // In GUI apps (OpenCode Desktop, Slack, Linear, browsers), PNG-only attaches the image.
         copy_png_to_clipboard(&image)?;
@@ -353,7 +370,7 @@ fn config() -> Config {
     load_config_from(&default_config_path())
 }
 
-fn random_hex_token_32() -> Result<String> {
+pub(crate) fn random_hex_token_32() -> Result<String> {
     use std::fmt::Write as _;
     use std::io::Read as _;
     let mut file = fs::File::open("/dev/urandom").context("Could not open /dev/urandom")?;

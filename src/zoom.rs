@@ -143,6 +143,22 @@ fn events_at(events: &[InteractionEvent], t: u64) -> Vec<InteractionEvent> {
         .collect()
 }
 
+/// "0:01.500 → 0:03.500, 12 frames: #1 0:01.500, …", as `scrawl zoom` prints it.
+pub fn cells_line(sheet: &ZoomSheet) -> String {
+    format!(
+        "{} → {}, {} frames: {}",
+        clock(sheet.from_ms),
+        clock(sheet.to_ms),
+        sheet.cells.len(),
+        sheet
+            .cells
+            .iter()
+            .map(|(i, t)| format!("#{i} {}", clock(*t)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 pub fn clock(ms: u64) -> String {
     format!("{}:{:02}.{:03}", ms / 60_000, ms / 1_000 % 60, ms % 1_000)
 }

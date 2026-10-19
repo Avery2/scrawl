@@ -1498,6 +1498,7 @@ fn build_ingested(
     if config.copy_clipboard {
         let _ = crate::handoff::copy_bundle_to_clipboard(&dir);
     }
+    crate::remote::push_all_in_background(&dir);
     let delivery = match session {
         Some(session) if config.route_opencode => {
             crate::delivery::deliver(&dir, session, title, Some(key), config.hooks.forward)
@@ -1574,6 +1575,10 @@ fn handle_ingest_connection_with_token(
     // The dev-page SDK's routes check their own access (loopback pages, or the token).
     if crate::web::handle(&mut stream, &header, expected_token)? {
         return Ok(());
+    }
+    // Remote machines' zoom script: its own per-host keys, not the ingest token.
+    if crate::remote::is_zoom_request(&header) {
+        return crate::remote::serve_zoom(&mut stream, &header);
     }
     let authorized = bearer_token(&header)
         .is_some_and(|provided| constant_time_eq(provided, expected_token));

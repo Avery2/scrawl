@@ -3472,6 +3472,7 @@ impl ScrawlCoordinator {
                 if let Ok((dir, bundle, _)) = finalized {
                     frame_count = bundle.keyframes.len();
                     let _ = crate::handoff::copy_bundle_to_clipboard(&dir);
+                    crate::remote::push_all_in_background(&dir);
                     coord.completed_dir = Some(dir.clone());
                     coord.last_local_capture_ms = crate::now_epoch_ms();
                     if let Some(dest) = bundle.destination.clone() {

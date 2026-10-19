@@ -98,19 +98,21 @@ struct SettingsState: Decodable, Equatable {
   var permissions: [SettingsPermission] = ["screen-recording", "microphone", "accessibility", "camera"]
     .map { SettingsPermission(permission: $0, required: ["screen-recording", "microphone", "accessibility"].contains($0)) }
   var updates = true
+  var remotes = SettingsRemotes()
 
   var pasteLabel: String { shortcuts.first { $0.kind == "paste" }?.label ?? "⌥⇧V" }
   var recording: String? { shortcuts.first(where: \.recording)?.kind }
 }
 
 enum SettingsPane: String, CaseIterable {
-  case general, recording, storage, permissions, about
+  case general, recording, storage, remote, permissions, about
 
   var title: String {
     switch self {
     case .general: "General"
     case .recording: "Recording"
     case .storage: "Storage"
+    case .remote: "Remote Machines"
     case .permissions: "Permissions"
     case .about: "About"
     }
@@ -121,6 +123,7 @@ enum SettingsPane: String, CaseIterable {
     case .general: "gearshape.fill"
     case .recording: "record.circle"
     case .storage: "internaldrive.fill"
+    case .remote: "server.rack"
     case .permissions: "hand.raised.fill"
     case .about: "info"
     }
@@ -132,6 +135,7 @@ enum SettingsPane: String, CaseIterable {
     case .general, .about: (Color(white: 0.62), Color(white: 0.45))
     case .recording: (Color(red: 1, green: 0.42, blue: 0.38), Color(red: 0.92, green: 0.2, blue: 0.17))
     case .storage: (Color(red: 0.36, green: 0.66, blue: 1), Color(red: 0.16, green: 0.45, blue: 0.95))
+    case .remote: (Color(red: 0.32, green: 0.78, blue: 0.84), Color(red: 0.1, green: 0.58, blue: 0.68))
     case .permissions: (Color(red: 0.36, green: 0.82, blue: 0.56), Color(red: 0.16, green: 0.66, blue: 0.4))
     }
   }
@@ -379,6 +383,7 @@ struct SettingsRow<Trailing: View>: View {
       Text(title)
         .font(.system(size: 14))
         .foregroundStyle(enabled ? theme.text : theme.secondary)
+        .lineLimit(1)
       Spacer(minLength: 8)
       trailing()
     }
@@ -566,6 +571,15 @@ struct SettingsView: View {
         if model.state.recording != nil { model.act("cancel-shortcut") }
       }
     }
+    .overlay {
+      ZStack {
+        if model.pane == .remote, let sheet = model.state.remotes.sheet {
+          RemoteSheetLayer(model: model, sheet: sheet)
+            .transition(RemoteMotion.sheet)
+        }
+      }
+      .animation(model.state.remotes.sheet == nil ? RemoteMotion.sheetOut : RemoteMotion.sheetIn, value: model.state.remotes.sheet?.kind)
+    }
     .frame(width: SettingsMetrics.width, height: SettingsMetrics.height)
     .environment(\.settingsTheme, theme)
   }
@@ -580,6 +594,7 @@ struct SettingsView: View {
       VStack(spacing: 2) {
         item(.recording)
         item(.storage)
+        item(.remote)
         item(.permissions)
       }
       section("Scrawl")
@@ -646,6 +661,7 @@ struct SettingsView: View {
       case .general: general
       case .recording: recording
       case .storage: storage
+      case .remote: RemotePane(model: model)
       case .permissions: permissions
       case .about: about
       }
@@ -1076,6 +1092,37 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
     missing.permissions[2].requested = true
     var noUpdates = base
     noUpdates.updates = false
+    let script = (try? String(contentsOfFile: option("--script", in: CommandLine.arguments) ?? "", encoding: .utf8)) ?? "#!/bin/sh\n# scrawl: installed by Scrawl on your Mac\n"
+    let block = "# >>> scrawl (remove to undo) >>>\nHost mini\n    RemoteForward /Users/kit/.scrawl/scrawl.sock 127.0.0.1:47777\n# <<< scrawl <<<"
+    func remote(_ hosts: [SettingsRemoteHost], _ sheet: SettingsRemoteSheet? = nil) -> SettingsState {
+      var state = base
+      state.remotes = SettingsRemotes(hosts: hosts, sheet: sheet)
+      return state
+    }
+    let mini = SettingsRemoteHost(host: "mini", status: "ok", detail: "Reachable · last copy 2 min ago", copy: true, zoom: false)
+    let suggestions = ["pro", "ios-devbox", "mini", "air", "kitbox.exe.xyz"]
+    let remoteSamples: [(String, SettingsState)] = [
+      ("remote-empty", remote([])),
+      ("remote-one-reachable", remote([mini])),
+      ("remote-unreachable-and-needs-key", remote([
+        SettingsRemoteHost(host: "kitbox.exe.xyz", status: "off", detail: "Not reachable · last copy 3 h ago", copy: true, zoom: true),
+        SettingsRemoteHost(host: "devbox", status: "key", detail: "Needs key-based login", copy: true, zoom: false),
+      ])),
+      ("remote-zoom-on", remote([
+        SettingsRemoteHost(host: "mini", status: "ok", detail: "Reachable · last copy just now", copy: true, zoom: true),
+        SettingsRemoteHost(host: "kitbox.exe.xyz", status: "ok", detail: "Reachable · last copy 2 min ago", copy: true, zoom: false, busy: "Setting up…"),
+      ])),
+      ("remote-zoom-failed", remote([
+        SettingsRemoteHost(host: "mini", status: "ok", detail: "Reachable · last copy 2 min ago", copy: true, zoom: false, error: "Zoom needs curl on mini, and it has none"),
+      ])),
+      ("remote-zoom-explainer", remote([mini], SettingsRemoteSheet(kind: "zoom", host: "mini", linesAdded: 4, configBlock: block, script: script))),
+      ("remote-zoom-view", remote([mini], SettingsRemoteSheet(kind: "zoom", host: "mini", linesAdded: 4, configBlock: block, script: script, viewing: true))),
+      ("remote-add", remote([], SettingsRemoteSheet(kind: "add", suggestions: suggestions))),
+      ("remote-add-test-running", remote([], SettingsRemoteSheet(kind: "add", host: "mini", suggestions: suggestions, test: "running", testText: "Connecting to mini…"))),
+      ("remote-add-test-ok", remote([], SettingsRemoteSheet(kind: "add", host: "mini", suggestions: suggestions, test: "ok", testText: "Connected · Darwin · captures go to ~/.scrawl/captures there"))),
+      ("remote-add-test-failed", remote([], SettingsRemoteSheet(kind: "add", host: "devbox", suggestions: suggestions, test: "failed", testText: "devbox asked for a password. Scrawl copies with key-based login only: run ssh-copy-id devbox, then test again."))),
+      ("remote-remove", remote([SettingsRemoteHost(host: "mini", status: "ok", detail: "Reachable · last copy 2 min ago", copy: true, zoom: true)], SettingsRemoteSheet(kind: "remove", host: "mini", zoom: true))),
+    ]
     let samples: [(String, SettingsPane, SettingsState, NSEvent.ModifierFlags)] = [
       ("general", .general, base, []),
       ("general-custom", .general, custom, []),
@@ -1088,11 +1135,12 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
       ("permissions-missing", .permissions, missing, []),
       ("about", .about, base, []),
       ("about-dev", .about, noUpdates, []),
-    ]
+    ] + remoteSamples.map { ($0.0, SettingsPane.remote, $0.1, NSEvent.ModifierFlags()) }
     var index = 0
     for scheme in [ColorScheme.dark, .light] {
       for (name, pane, state, live) in samples {
-        if scheme == .light && name.contains("-") && name != "general-recording-shortcut" { continue }
+        if scheme == .light && name.contains("-") && name != "general-recording-shortcut" && !name.hasPrefix("remote") { continue }
+        if let only = option("--only", in: CommandLine.arguments), !name.hasPrefix(only) { continue }
         index += 1
         model.state = state
         model.pane = pane

@@ -725,6 +725,7 @@ fn worker(jobs: &flume::Receiver<Job>) {
                 format_bytes(captures_size(&captures)),
             ));
             let _ = report;
+            crate::remote::prune(policy.bundle_days);
             last_pass = Some(SystemTime::now());
             next_pass = Instant::now() + Duration::from_secs(24 * 3600);
         }
