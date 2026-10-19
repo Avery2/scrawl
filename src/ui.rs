@@ -5425,7 +5425,10 @@ mod tests {
     #[test]
     fn clock_template_is_width_stable() {
         assert_eq!(clock_template("12:34"), "00:00");
-        assert_eq!(completed_meta(8_000, 1), "· 1 frame · ⌥⇧V");
+        assert_eq!(
+            completed_meta(8_000, 1),
+            format!("· 1 frame · {}", crate::settings::paste_label())
+        );
         assert_eq!(completed_label(0, None), "Copied");
         assert_eq!(completed_label(0, Some("Sent to SCRAWL")), "Sent to SCRAWL");
         assert_eq!(completed_label(1, Some("Sent to SCRAWL")), "From iPhone");

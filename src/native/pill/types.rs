@@ -42,8 +42,10 @@ impl PillStyle {
     }
 }
 
-/// User actions emitted by clicking or pressing keys on the native pill.
+/// User actions emitted by clicking or pressing keys on the native pill (macOS only, so
+/// elsewhere nothing makes them).
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum PillAction {
     SelectMode(SelectionMode),
     SwitchRecording(SelectionMode),
