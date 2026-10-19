@@ -31,7 +31,7 @@ fn compile_laser_shader() {
     println!("cargo:rerun-if-changed={}", source.display());
 
     let metal = Command::new("xcrun")
-        .args(["--sdk", "macosx", "metal", "-c"])
+        .args(["--sdk", "macosx", "metal", "-c", "-mmacosx-version-min=26.0"])
         .arg(&source)
         .arg("-o")
         .arg(&air)

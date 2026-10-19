@@ -543,3 +543,23 @@ impl SharedMetalOverlay {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// The shader must load on the oldest macOS Scrawl supports (`LSMinimumSystemVersion` 26.0).
+    /// Without `-mmacosx-version-min`, `xcrun metal` targets the build machine's macOS and the
+    /// overlay (ink, laser, edge glow) silently fails to open on older systems.
+    #[test]
+    fn shader_targets_the_minimum_supported_macos() {
+        let library = include_bytes!(concat!(env!("OUT_DIR"), "/laser_overlay.metallib"));
+        let text = String::from_utf8_lossy(library);
+        let marker = "-apple-macosx";
+        let at = text.find(marker).expect("metallib names its target");
+        let major: u32 = text[at + marker.len()..]
+            .split('.')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .expect("target has a major version");
+        assert!(major <= 26, "laser shader targets macOS {major}, newer than 26.0");
+    }
+}
