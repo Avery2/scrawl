@@ -1,29 +1,28 @@
-use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use screencapturekit::prelude::*;
-use screencapturekit::recording_output::{
-    SCRecordingOutput, SCRecordingOutputCodec, SCRecordingOutputConfiguration,
-    SCRecordingOutputFileType,
-};
-use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
 
 use crate::model::{
     CaptureMode, InteractionEvent, RgbaFrame, SCALE, Stroke, TargetFrame, TargetInfo,
 };
+
+// The operating system side of capture: global shortcuts, input monitoring, the frontmost app,
+// displays and windows, and the screen recorder. Each platform module provides the same items.
+#[cfg_attr(target_os = "macos", path = "capture/macos.rs")]
+#[cfg_attr(target_os = "windows", path = "capture/windows.rs")]
+mod platform;
+pub use platform::*;
 
 pub const FRAME_SAMPLE_INTERVAL: Duration = Duration::from_millis(220);
 /// Candidate frames only feed scene diffs and keyframe selection; the keyframes themselves are
 /// decoded from `recording.mp4` at full size afterwards.
 pub const CANDIDATE_EDGE: f64 = 480.0;
 /// Without a recording to decode from, the candidates are the keyframes, so keep them sharper.
-const CANDIDATE_EDGE_NO_VIDEO: f64 = 1280.0;
+pub(crate) const CANDIDATE_EDGE_NO_VIDEO: f64 = 1280.0;
 /// The candidates' memory ceiling, however long the capture runs.
 pub const CANDIDATE_BUDGET_BYTES: usize = 384 << 20;
 
@@ -109,190 +108,6 @@ pub struct ScreenRecording {
     pub video_offset_ms: u64,
 }
 
-type CfTypeRef = *const c_void;
-type EventRef = *mut c_void;
-
-const EVENT_LEFT_MOUSE_DOWN: u32 = 1;
-const EVENT_LEFT_MOUSE_UP: u32 = 2;
-const EVENT_RIGHT_MOUSE_DOWN: u32 = 3;
-const EVENT_RIGHT_MOUSE_UP: u32 = 4;
-const EVENT_KEY_DOWN: u32 = 10;
-const EVENT_SCROLL_WHEEL: u32 = 22;
-const EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = u32::MAX - 1;
-const EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = u32::MAX;
-
-const KEYBOARD_EVENT_KEYCODE: u32 = 9;
-const KEYBOARD_EVENT_AUTOREPEAT: u32 = 8;
-/// `kCGEventTargetUnixProcessID`: the process an annotated session event is going to.
-const EVENT_TARGET_UNIX_PROCESS_ID: u32 = 40;
-const SCROLL_WHEEL_DELTA_AXIS_1: u32 = 11;
-const SCROLL_WHEEL_DELTA_AXIS_2: u32 = 12;
-
-const FLAG_SHIFT: u64 = 1 << 17;
-const FLAG_CONTROL: u64 = 1 << 18;
-const FLAG_ALTERNATE: u64 = 1 << 19;
-const FLAG_COMMAND: u64 = 1 << 20;
-
-const KEY_S: u16 = 1;
-const KEY_ESCAPE: u16 = 53;
-const KEY_Z: u16 = 6;
-const KEY_V: u16 = 9;
-
-// Carbon HIToolbox global hotkey constants (requires zero TCC permissions).
-pub const CARBON_CMD_KEY: u32 = 1 << 8;
-pub const CARBON_SHIFT_KEY: u32 = 1 << 9;
-pub const CARBON_OPTION_KEY: u32 = 1 << 11;
-pub const CARBON_CONTROL_KEY: u32 = 1 << 12;
-const K_EVENT_CLASS_KEYBOARD: u32 = u32::from_be_bytes(*b"keyb");
-const K_EVENT_HOT_KEY_PRESSED: u32 = 5;
-const K_EVENT_PARAM_DIRECT_OBJECT: u32 = u32::from_be_bytes(*b"----");
-const TYPE_EVENT_HOT_KEY_ID: u32 = u32::from_be_bytes(*b"hkid");
-const HOTKEY_SIG: u32 = u32::from_be_bytes(*b"SCRW");
-const HOTKEY_ID_TOGGLE: u32 = 1;
-const HOTKEY_ID_ESCAPE: u32 = 2;
-const HOTKEY_ID_ALT1: u32 = 3;
-const HOTKEY_ID_PASTE_BASE: u32 = 100;
-
-#[repr(C, packed(2))]
-#[derive(Clone, Copy)]
-struct EventTypeSpec {
-    event_class: u32,
-    event_kind: u32,
-}
-
-#[repr(C, packed(2))]
-#[derive(Clone, Copy)]
-struct EventHotKeyID {
-    signature: u32,
-    id: u32,
-}
-
-#[link(name = "Carbon", kind = "framework")]
-unsafe extern "C" {
-    fn GetApplicationEventTarget() -> *mut c_void;
-    fn GetEventDispatcherTarget() -> *mut c_void;
-    fn InstallEventHandler(
-        target: *mut c_void,
-        handler: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32,
-        num_types: usize,
-        list: *const EventTypeSpec,
-        user_data: *mut c_void,
-        out_ref: *mut *mut c_void,
-    ) -> i32;
-    fn RegisterEventHotKey(
-        hot_key_code: u32,
-        hot_key_modifiers: u32,
-        hot_key_id: EventHotKeyID,
-        target: *mut c_void,
-        options: u32,
-        out_ref: *mut *mut c_void,
-    ) -> i32;
-    fn UnregisterEventHotKey(hot_key: *mut c_void) -> i32;
-    fn GetEventParameter(
-        event: *mut c_void,
-        name: u32,
-        desired_type: u32,
-        actual_type: *mut u32,
-        buffer_size: usize,
-        actual_size: *mut usize,
-        data: *mut c_void,
-    ) -> i32;
-    fn TISCopyCurrentKeyboardLayoutInputSource() -> *const c_void;
-    fn TISCopyCurrentASCIICapableKeyboardLayoutInputSource() -> *const c_void;
-    static kTISPropertyUnicodeKeyLayoutData: *const c_void;
-    fn TISGetInputSourceProperty(
-        input_source: *const c_void,
-        property_key: *const c_void,
-    ) -> *const c_void;
-    fn UCKeyTranslate(
-        layout: *const u8,
-        key_code: u16,
-        key_action: u16,
-        modifier_state: u32,
-        keyboard_type: u32,
-        options: isize,
-        dead_key_state: *mut u32,
-        max_length: isize,
-        actual_length: *mut isize,
-        output: *mut u16,
-    ) -> i32;
-    fn LMGetKbdType() -> u8;
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct CGPoint {
-    x: f64,
-    y: f64,
-}
-
-type EventTapCallback = unsafe extern "C" fn(
-    proxy: *mut c_void,
-    event_type: u32,
-    event: EventRef,
-    user_info: *mut c_void,
-) -> EventRef;
-
-#[link(name = "ApplicationServices", kind = "framework")]
-unsafe extern "C" {
-    fn CGEventTapCreate(
-        tap: u32,
-        place: u32,
-        options: u32,
-        events_of_interest: u64,
-        callback: EventTapCallback,
-        user_info: *mut c_void,
-    ) -> *mut c_void;
-    fn CGEventTapEnable(tap: *mut c_void, enable: bool);
-    fn CGEventTapIsEnabled(tap: *mut c_void) -> bool;
-    fn CGEventSourceButtonState(state_id: u32, button: u32) -> bool;
-    fn CGPreflightListenEventAccess() -> bool;
-    fn CGRequestListenEventAccess() -> bool;
-    fn CGEventCreate(source: *const c_void) -> EventRef;
-    fn CGEventCreateMouseEvent(
-        source: *const c_void,
-        mouse_type: u32,
-        mouse_cursor_position: CGPoint,
-        mouse_button: u32,
-    ) -> EventRef;
-    fn CGEventCreateKeyboardEvent(
-        source: *const c_void,
-        virtual_key: u16,
-        key_down: bool,
-    ) -> EventRef;
-    fn CGEventSetFlags(event: EventRef, flags: u64);
-    fn CGEventPost(tap: u32, event: EventRef);
-    fn CGEventSourceFlagsState(state_id: u32) -> u64;
-    fn CGEventSourceKeyState(state_id: u32, key: u16) -> bool;
-    fn CGEventGetFlags(event: EventRef) -> u64;
-    fn CGEventGetLocation(event: EventRef) -> CGPoint;
-    fn CGEventGetIntegerValueField(event: EventRef, field: u32) -> i64;
-    fn CGMainDisplayID() -> u32;
-    fn CGDisplayPixelsWide(display: u32) -> usize;
-    fn CGDisplayPixelsHigh(display: u32) -> usize;
-    fn CGPreflightScreenCaptureAccess() -> bool;
-    fn CGRequestScreenCaptureAccess() -> bool;
-    fn AXIsProcessTrusted() -> bool;
-}
-
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
-    fn CFMachPortCreateRunLoopSource(
-        allocator: *const c_void,
-        port: *mut c_void,
-        order: isize,
-    ) -> *mut c_void;
-    fn CFRunLoopAddSource(run_loop: *mut c_void, source: *mut c_void, mode: *const c_void);
-    fn CFRunLoopRemoveSource(run_loop: *mut c_void, source: *mut c_void, mode: *const c_void);
-    fn CFRunLoopGetCurrent() -> *mut c_void;
-    fn CFRunLoopRun();
-    fn CFRunLoopStop(run_loop: *mut c_void);
-    fn CFRetain(value: CfTypeRef) -> CfTypeRef;
-    fn CFRelease(value: CfTypeRef);
-    static kCFRunLoopCommonModes: *const c_void;
-}
-
 /// Live UI events emitted by the global input monitor to drive Scrawl's HUD & Review windows.
 #[derive(Clone, Debug)]
 pub enum LiveOverlayEvent {
@@ -300,6 +115,8 @@ pub enum LiveOverlayEvent {
     CaptureShortcut,
     PasteLatestShortcut,
     UndoStroke,
+    /// macOS's Esc hotkey; Windows polls Esc while the switcher is held.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     CancelCapture,
     RequestSnapshot,
     /// The iPhone mirror ended on its own (unplugged, never found, or access denied).
@@ -314,93 +131,11 @@ pub enum LiveOverlayEvent {
     },
 }
 
-static LAYOUT_KEY_CODES: std::sync::OnceLock<std::collections::HashMap<char, u16>> =
-    std::sync::OnceLock::new();
-
-fn translate_keycode(layout: *const u8, key_code: u16) -> Option<char> {
-    if layout.is_null() {
-        return None;
-    }
-    let mut dead_key_state = 0_u32;
-    let mut output = [0_u16; 4];
-    let mut length = 0_isize;
-    let status = unsafe {
-        UCKeyTranslate(
-            layout,
-            key_code,
-            3, // kUCKeyActionDisplay
-            0,
-            u32::from(LMGetKbdType()),
-            0,
-            &raw mut dead_key_state,
-            output.len() as isize,
-            &raw mut length,
-            output.as_mut_ptr(),
-        )
-    };
-    if status == 0 && length > 0 {
-        String::from_utf16(&output[..length as usize])
-            .ok()?
-            .chars()
-            .next()
-            .map(|c| c.to_ascii_lowercase())
-    } else {
-        None
-    }
-}
-
-/// Builds the active keyboard layout character -> virtual keycode map (e.g. Dvorak `'s' -> 41`, `'z' -> 44`).
-/// Must be called on the main thread during startup before background threads query it.
-pub fn init_keyboard_layout_map() -> &'static std::collections::HashMap<char, u16> {
-    LAYOUT_KEY_CODES.get_or_init(|| {
-        let mut map = std::collections::HashMap::new();
-        for source in unsafe {
-            [
-                TISCopyCurrentKeyboardLayoutInputSource(),
-                TISCopyCurrentASCIICapableKeyboardLayoutInputSource(),
-            ]
-        } {
-            if source.is_null() {
-                continue;
-            }
-            let data =
-                unsafe { TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) };
-            if !data.is_null() {
-                let bytes = unsafe { CFDataGetBytePtr(data) };
-                for code in 0..128_u16 {
-                    if let Some(ch) = translate_keycode(bytes, code) {
-                        map.entry(ch).or_insert(code);
-                    }
-                }
-            }
-            unsafe { CFRelease(source) };
-        }
-        scrawl_log(format!(
-            "keyboard layout resolved: 's'={:?} 'z'={:?}",
-            map.get(&'s'),
-            map.get(&'z')
-        ));
-        map
-    })
-}
-
-pub fn key_code_for_char(ch: char) -> Option<u16> {
-    init_keyboard_layout_map()
-        .get(&ch.to_ascii_lowercase())
-        .copied()
-}
-
-pub fn layout_s_keycode() -> u16 {
-    key_code_for_char('s').unwrap_or(KEY_S)
-}
-
-pub fn layout_z_keycode() -> u16 {
-    key_code_for_char('z').unwrap_or(KEY_Z)
-}
-
-pub fn layout_v_keycode() -> u16 {
-    key_code_for_char('v').unwrap_or(KEY_V)
-}
+// Carbon HIToolbox modifier bits. The shortcut is stored with them on every platform.
+pub const CARBON_CMD_KEY: u32 = 1 << 8;
+pub const CARBON_SHIFT_KEY: u32 = 1 << 9;
+pub const CARBON_OPTION_KEY: u32 = 1 << 11;
+pub const CARBON_CONTROL_KEY: u32 = 1 << 12;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ShortcutConfig {
@@ -414,8 +149,75 @@ impl Default for ShortcutConfig {
         Self {
             key_code: u32::from(layout_s_keycode()),
             carbon_modifiers: CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
-            label: "⌥⇧S".into(),
+            label: shortcut_label(CARBON_OPTION_KEY | CARBON_SHIFT_KEY, "S"),
         }
+    }
+}
+
+/// A shortcut as this platform writes it: `⌥⇧S` on macOS, `Alt+Shift+S` on Windows.
+pub fn shortcut_label(carbon_modifiers: u32, key: &str) -> String {
+    let held = |bit: u32| carbon_modifiers & bit != 0;
+    if cfg!(target_os = "windows") {
+        let mut parts = Vec::new();
+        for (bit, name) in [
+            (CARBON_CONTROL_KEY, "Ctrl"),
+            (CARBON_CMD_KEY, "Win"),
+            (CARBON_OPTION_KEY, "Alt"),
+            (CARBON_SHIFT_KEY, "Shift"),
+        ] {
+            if held(bit) {
+                parts.push(name);
+            }
+        }
+        parts.push(key);
+        parts.join("+")
+    } else {
+        let mut label = String::new();
+        for (bit, glyph) in [
+            (CARBON_CONTROL_KEY, '⌃'),
+            (CARBON_OPTION_KEY, '⌥'),
+            (CARBON_SHIFT_KEY, '⇧'),
+            (CARBON_CMD_KEY, '⌘'),
+        ] {
+            if held(bit) {
+                label.push(glyph);
+            }
+        }
+        label.push_str(key);
+        label
+    }
+}
+
+/// The paste shortcut's label: `⌥⇧V` on macOS, `Alt+Shift+V` on Windows.
+pub fn paste_shortcut_label() -> String {
+    shortcut_label(CARBON_OPTION_KEY | CARBON_SHIFT_KEY, "V")
+}
+
+/// The system paste keystroke: `⌘V` on macOS, `Ctrl+V` on Windows.
+pub fn system_paste_label() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Ctrl+V"
+    } else {
+        "⌘V"
+    }
+}
+
+/// The keys of a shortcut label, one per keycap: `⌥⇧S` → `⌥`, `⇧`, `S`; `Alt+Shift+S` →
+/// `Alt`, `Shift`, `S`.
+pub fn shortcut_keys(label: &str) -> Vec<String> {
+    if label.contains('+') && label.len() > 1 {
+        let mut keys: Vec<String> = label
+            .split('+')
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+            .collect();
+        // `Ctrl++` binds the plus key itself.
+        if label.ends_with("++") {
+            keys.push("+".into());
+        }
+        keys
+    } else {
+        label.chars().map(String::from).collect()
     }
 }
 
@@ -432,7 +234,7 @@ impl ShortcutConfig {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        if cfg.label == "⌃⌥⇧S" {
+        if cfg.label == "⌃⌥⇧S" || cfg.label.is_empty() {
             cfg = Self::default();
         } else if cfg.label.ends_with('S') && cfg.key_code == u32::from(KEY_S) {
             cfg.key_code = u32::from(layout_s_keycode());
@@ -451,12 +253,6 @@ impl ShortcutConfig {
     }
 }
 
-struct CarbonHotKeyState {
-    toggle_ref: usize,
-}
-
-static CARBON_HOTKEYS: std::sync::OnceLock<Mutex<CarbonHotKeyState>> = std::sync::OnceLock::new();
-
 pub fn scrawl_log(msg: impl AsRef<str>) {
     use std::io::Write;
     let ts = std::time::SystemTime::now()
@@ -465,7 +261,7 @@ pub fn scrawl_log(msg: impl AsRef<str>) {
         .as_millis();
     let line = format!("[{ts}] {}\n", msg.as_ref());
     eprint!("{line}");
-    let Some(dir) = dirs::home_dir().map(|home| home.join("Library/Logs/Scrawl")) else {
+    let Some(dir) = log_dir() else {
         return;
     };
     let _ = std::fs::create_dir_all(&dir);
@@ -478,251 +274,15 @@ pub fn scrawl_log(msg: impl AsRef<str>) {
     }
 }
 
-unsafe extern "C" fn carbon_hotkey_handler(
-    _next_handler: *mut c_void,
-    event: *mut c_void,
-    user_data: *mut c_void,
-) -> i32 {
-    scrawl_log(format!(
-        "carbon_hotkey_handler entered: event={event:p} user_data={user_data:p}"
-    ));
-    if event.is_null() || user_data.is_null() {
-        return -1;
-    }
-    let mut hotkey_id = EventHotKeyID {
-        signature: 0,
-        id: 0,
-    };
-    let status = unsafe {
-        GetEventParameter(
-            event,
-            K_EVENT_PARAM_DIRECT_OBJECT,
-            TYPE_EVENT_HOT_KEY_ID,
-            ptr::null_mut(),
-            std::mem::size_of::<EventHotKeyID>(),
-            ptr::null_mut(),
-            (&raw mut hotkey_id).cast(),
-        )
-    };
-    let sig = hotkey_id.signature;
-    let id = hotkey_id.id;
-    scrawl_log(format!(
-        "carbon_hotkey_handler GetEventParameter status={status} sig={sig:#x} id={id}"
-    ));
-    if status == 0 && sig == HOTKEY_SIG {
-        let telemetry = unsafe { &*user_data.cast::<SharedCaptureTelemetry>() };
-        match id {
-            HOTKEY_ID_ESCAPE => {
-                let _ = telemetry
-                    .ui_sender
-                    .try_send(LiveOverlayEvent::CancelCapture);
-            }
-            id if id >= HOTKEY_ID_PASTE_BASE => {
-                telemetry.emit_paste_shortcut();
-            }
-            _ => {
-                telemetry.emit_capture_shortcut();
-            }
-        }
-    }
-    0
-}
-
-/// Installs Carbon `RegisterEventHotKey` on both `GetEventDispatcherTarget()` and
-/// `GetApplicationEventTarget()`. Works system-wide across all apps with zero TCC permissions.
-pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
-    let _ = init_keyboard_layout_map();
-    let s_code = u32::from(layout_s_keycode());
-    let state_mutex = CARBON_HOTKEYS.get_or_init(|| {
-        let spec = EventTypeSpec {
-            event_class: K_EVENT_CLASS_KEYBOARD,
-            event_kind: K_EVENT_HOT_KEY_PRESSED,
-        };
-        let user_data = Arc::into_raw(Arc::clone(telemetry))
-            .cast_mut()
-            .cast::<c_void>();
-        unsafe {
-            let mut handler_ref: *mut c_void = ptr::null_mut();
-            let dispatcher = GetEventDispatcherTarget();
-            let app_target = GetApplicationEventTarget();
-            scrawl_log(format!(
-                "install_global_hotkeys: dispatcher={dispatcher:p} app_target={app_target:p} s_code={s_code}"
-            ));
-            if !dispatcher.is_null() {
-                let rc = InstallEventHandler(
-                    dispatcher,
-                    carbon_hotkey_handler,
-                    1,
-                    &raw const spec,
-                    user_data,
-                    &raw mut handler_ref,
-                );
-                scrawl_log(format!(
-                    "InstallEventHandler(dispatcher) -> rc={rc} handler_ref={handler_ref:p}"
-                ));
-            }
-            if !app_target.is_null() && app_target != dispatcher {
-                let mut app_handler_ref: *mut c_void = ptr::null_mut();
-                let rc = InstallEventHandler(
-                    app_target,
-                    carbon_hotkey_handler,
-                    1,
-                    &raw const spec,
-                    user_data,
-                    &raw mut app_handler_ref,
-                );
-                scrawl_log(format!(
-                    "InstallEventHandler(app_target) -> rc={rc} handler_ref={app_handler_ref:p}"
-                ));
-            }
-            let target = if !app_target.is_null() {
-                app_target
-            } else {
-                dispatcher
-            };
-            let mut next_alt_id = HOTKEY_ID_ALT1;
-            let mut codes = vec![s_code];
-            if s_code != u32::from(KEY_S) {
-                codes.push(u32::from(KEY_S));
-            }
-            for &code in &codes {
-                for (mods, name) in [
-                    (CARBON_OPTION_KEY | CARBON_SHIFT_KEY, "⌥⇧S"),
-                    (
-                        CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
-                        "⌃⌥⇧S",
-                    ),
-                    (
-                        CARBON_CMD_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
-                        "⌘⌥⇧S",
-                    ),
-                    (
-                        CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_CMD_KEY,
-                        "⌃⌥⌘S",
-                    ),
-                ] {
-                    let id = next_alt_id;
-                    next_alt_id += 1;
-                    let mut r: *mut c_void = ptr::null_mut();
-                    let rc = RegisterEventHotKey(
-                        code,
-                        mods,
-                        EventHotKeyID {
-                            signature: HOTKEY_SIG,
-                            id,
-                        },
-                        target,
-                        0,
-                        &raw mut r,
-                    );
-                    scrawl_log(format!(
-                        "RegisterEventHotKey({name}, code={code}, mods={mods}) -> rc={rc} ref={r:p}"
-                    ));
-                }
-            }
-            // Register ⌥⇧V (plus ⌃⌥⇧V, ⌘⌥⇧V, ⌃⌥⌘V) for pasting both Image + Text of the latest capture.
-            let v_code = u32::from(layout_v_keycode());
-            let mut v_codes = vec![v_code];
-            if v_code != u32::from(KEY_V) {
-                v_codes.push(u32::from(KEY_V));
-            }
-            let mut paste_id = HOTKEY_ID_PASTE_BASE;
-            for &code in &v_codes {
-                for (mods, name) in [
-                    (CARBON_OPTION_KEY | CARBON_SHIFT_KEY, "⌥⇧V"),
-                    (
-                        CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
-                        "⌃⌥⇧V",
-                    ),
-                    (
-                        CARBON_CMD_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
-                        "⌘⌥⇧V",
-                    ),
-                    (
-                        CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_CMD_KEY,
-                        "⌃⌥⌘V",
-                    ),
-                ] {
-                    let mut r: *mut c_void = ptr::null_mut();
-                    let rc = RegisterEventHotKey(
-                        code,
-                        mods,
-                        EventHotKeyID {
-                            signature: HOTKEY_SIG,
-                            id: paste_id,
-                        },
-                        target,
-                        0,
-                        &raw mut r,
-                    );
-                    scrawl_log(format!(
-                        "RegisterEventHotKey({name}, code={code}, mods={mods}) -> rc={rc} ref={r:p}"
-                    ));
-                    paste_id += 1;
-                }
-            }
-        }
-        Mutex::new(CarbonHotKeyState { toggle_ref: 0 })
-    });
-    let shortcut = telemetry
-        .shortcut
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    let _ = state_mutex;
-    update_global_shortcut(telemetry, shortcut);
-}
-
-pub fn update_global_shortcut(telemetry: &SharedCaptureTelemetry, config: ShortcutConfig) {
-    config.save();
-    *telemetry
-        .shortcut
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = config.clone();
-
-    let Some(state_mutex) = CARBON_HOTKEYS.get() else {
-        return;
-    };
-    let mut state = state_mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if state.toggle_ref != 0 {
-        unsafe { UnregisterEventHotKey(state.toggle_ref as *mut c_void) };
-        state.toggle_ref = 0;
-    }
-    let mut new_ref: *mut c_void = ptr::null_mut();
-    let target = unsafe {
-        let a = GetApplicationEventTarget();
-        if !a.is_null() {
-            a
-        } else {
-            GetEventDispatcherTarget()
-        }
-    };
-    let status = unsafe {
-        RegisterEventHotKey(
-            config.key_code,
-            config.carbon_modifiers,
-            EventHotKeyID {
-                signature: HOTKEY_SIG,
-                id: HOTKEY_ID_TOGGLE,
-            },
-            target,
-            0,
-            &raw mut new_ref,
-        )
-    };
-    scrawl_log(format!(
-        "update_global_shortcut({}, key={}, mods={}) -> status={status} ref={new_ref:p}",
-        config.label, config.key_code, config.carbon_modifiers
-    ));
-    if status == 0 && !new_ref.is_null() {
-        state.toggle_ref = new_ref as usize;
-    }
-}
-
-/// A shortcut label split into its modifiers and key: `⌥⇧S` → (`⌥⇧`, `S`).
+/// A shortcut label split into its modifiers and key: `⌥⇧S` → (`⌥⇧`, `S`), and on Windows
+/// `Alt+Shift+S` → (`Alt+Shift`, `S`).
 pub fn shortcut_parts(label: &str) -> (&str, &str) {
+    if let Some(plus) = label
+        .get(..label.len().saturating_sub(1))
+        .and_then(|l| l.rfind('+'))
+    {
+        return (&label[..plus], &label[plus + 1..]);
+    }
     let split = label
         .char_indices()
         .find(|(_, c)| !matches!(c, '⌃' | '⌥' | '⇧' | '⌘'))
@@ -754,145 +314,9 @@ pub fn is_capture_shortcut(
     custom || (is_s_key && alt && (shift || (ctrl && cmd)))
 }
 
-/// Whether this running copy of Scrawl may record the screen. A grant made while it runs may
-/// only show up here after a relaunch.
-pub fn screen_capture_granted() -> bool {
-    unsafe { CGPreflightScreenCaptureAccess() }
-}
-
-/// The system prompt for Screen Recording (once; later calls do nothing).
-pub fn request_screen_capture() {
-    unsafe {
-        let _ = CGRequestScreenCaptureAccess();
-    }
-}
-
-/// Whether ⌥⇧V may post ⌘V into the app in front (System Settings › Accessibility). Unlike
-/// Screen Recording, a grant shows up here while Scrawl runs.
-pub fn accessibility_granted() -> bool {
-    unsafe { AXIsProcessTrusted() }
-}
-
-/// The system prompt for Input Monitoring (once; later calls do nothing).
-pub fn request_listen_access() {
-    unsafe {
-        let _ = CGRequestListenEventAccess();
-    }
-}
-
-/// The ⌃⌥⇧⌘ modifier flags held right now (as `CGEventFlags` bits).
-pub fn modifier_flags() -> u64 {
-    let flags = unsafe { CGEventSourceFlagsState(0) | CGEventSourceFlagsState(1) };
-    flags & (FLAG_COMMAND | FLAG_CONTROL | FLAG_ALTERNATE | FLAG_SHIFT)
-}
-
-/// Whether Esc is down right now, whichever app has focus.
-pub fn escape_down() -> bool {
-    unsafe { CGEventSourceKeyState(0, KEY_ESCAPE) || CGEventSourceKeyState(1, KEY_ESCAPE) }
-}
-
 /// No-op: do not register a global Escape hotkey because Karabiner maps CapsLock (Control)
 /// with `to_if_alone: escape`, which would cancel recordings when releasing Control.
 pub fn set_escape_hotkey_enabled(_enabled: bool) {}
-
-pub fn shortcut_from_key_and_mods(
-    key: &str,
-    cmd: bool,
-    ctrl: bool,
-    alt: bool,
-    shift: bool,
-) -> Option<ShortcutConfig> {
-    let lower = key.to_ascii_lowercase();
-    let (key_code, key_label): (u32, String) = if lower.chars().count() == 1
-        && let Some(ch) = lower.chars().next()
-        && ch.is_ascii_alphanumeric()
-        && let Some(code) = key_code_for_char(ch)
-    {
-        (u32::from(code), ch.to_ascii_uppercase().to_string())
-    } else {
-        let (code, lbl) = match lower.as_str() {
-            "a" => (0, "A"),
-            "s" => (u32::from(layout_s_keycode()), "S"),
-            "d" => (2, "D"),
-            "f" => (3, "F"),
-            "h" => (4, "H"),
-            "g" => (5, "G"),
-            "z" => (u32::from(layout_z_keycode()), "Z"),
-            "x" => (7, "X"),
-            "c" => (8, "C"),
-            "v" => (9, "V"),
-            "b" => (11, "B"),
-            "q" => (12, "Q"),
-            "w" => (13, "W"),
-            "e" => (14, "E"),
-            "r" => (15, "R"),
-            "y" => (16, "Y"),
-            "t" => (17, "T"),
-            "1" => (18, "1"),
-            "2" => (19, "2"),
-            "3" => (20, "3"),
-            "4" => (21, "4"),
-            "6" => (22, "6"),
-            "5" => (23, "5"),
-            "9" => (25, "9"),
-            "7" => (26, "7"),
-            "8" => (28, "8"),
-            "0" => (29, "0"),
-            "o" => (31, "O"),
-            "u" => (32, "U"),
-            "i" => (34, "I"),
-            "p" => (35, "P"),
-            "l" => (37, "L"),
-            "j" => (38, "J"),
-            "k" => (40, "K"),
-            "n" => (45, "N"),
-            "m" => (46, "M"),
-            "space" | " " => (49, "Space"),
-            "f1" => (122, "F1"),
-            "f2" => (120, "F2"),
-            "f3" => (99, "F3"),
-            "f4" => (118, "F4"),
-            "f5" => (96, "F5"),
-            "f6" => (97, "F6"),
-            "f7" => (98, "F7"),
-            "f8" => (100, "F8"),
-            "f9" => (101, "F9"),
-            "f10" => (109, "F10"),
-            "f11" => (103, "F11"),
-            "f12" => (111, "F12"),
-            _ => return None,
-        };
-        (code, lbl.to_string())
-    };
-    let is_fn_key = key_label.starts_with('F') && key_label.len() >= 2;
-    if !cmd && !ctrl && !alt && !is_fn_key {
-        return None;
-    }
-    let mut carbon_modifiers = 0_u32;
-    let mut label = String::new();
-    if ctrl {
-        carbon_modifiers |= CARBON_CONTROL_KEY;
-        label.push('⌃');
-    }
-    if alt {
-        carbon_modifiers |= CARBON_OPTION_KEY;
-        label.push('⌥');
-    }
-    if shift {
-        carbon_modifiers |= CARBON_SHIFT_KEY;
-        label.push('⇧');
-    }
-    if cmd {
-        carbon_modifiers |= CARBON_CMD_KEY;
-        label.push('⌘');
-    }
-    label.push_str(&key_label);
-    Some(ShortcutConfig {
-        key_code,
-        carbon_modifiers,
-        label,
-    })
-}
 
 fn clean_label(input: &str) -> String {
     let squashed = input.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -903,11 +327,6 @@ fn clean_label(input: &str) -> String {
     } else {
         trimmed.to_string()
     }
-}
-
-/// Discovers the current capture target (either a specific window/app or the main display).
-pub fn discover_target(window_query: Option<&str>) -> TargetInfo {
-    discover_target_at(window_query, current_mouse_location().map(|p| [p.x, p.y]))
 }
 
 /// Which display to record: the one under `point`, else the one holding the focused window's
@@ -928,468 +347,11 @@ pub fn pick_display(
         .unwrap_or(0)
 }
 
-/// Like `discover_target`, recording the display under `point` (see `pick_display`).
-pub fn discover_target_at(window_query: Option<&str>, point: Option<[f64; 2]>) -> TargetInfo {
-    let frontmost = frontmost_app_info();
-    if let Ok(content) = SCShareableContent::get() {
-        let our_pid = std::process::id() as i32;
-        if let Some(query) = window_query {
-            let q = query.to_lowercase();
-            if let Some(win) = content.windows().into_iter().find(|w| {
-                w.is_on_screen()
-                    && w.window_layer() == 0
-                    && w.owning_application()
-                        .as_ref()
-                        .is_none_or(|a| a.process_id() != our_pid)
-                    && (w
-                        .title()
-                        .as_deref()
-                        .is_some_and(|t| t.to_lowercase().contains(&q))
-                        || w.owning_application()
-                            .as_ref()
-                            .is_some_and(|a| a.application_name().to_lowercase().contains(&q)))
-            }) {
-                let frame = win.frame();
-                let owner = win.owning_application();
-                let display_id = content
-                    .displays()
-                    .first()
-                    .map(|d| d.display_id())
-                    .unwrap_or_else(|| unsafe { CGMainDisplayID() });
-                return TargetInfo {
-                    mode: CaptureMode::Window,
-                    app: owner.as_ref().map(|a| a.application_name()),
-                    bundle_id: owner.as_ref().map(|a| a.bundle_identifier()),
-                    window_title: win.title(),
-                    window_id: Some(win.window_id()),
-                    display_id,
-                    frame: TargetFrame {
-                        x: frame.origin.x,
-                        y: frame.origin.y,
-                        width: frame.size.width.max(1.0),
-                        height: frame.size.height.max(1.0),
-                        scale: 2.0,
-                    },
-                };
-            }
-        }
-
-        let displays = content.displays();
-        let front_window = frontmost.as_ref().and_then(|(pid, _, _)| {
-            content.windows().into_iter().find(|w| {
-                w.is_on_screen()
-                    && w.window_layer() == 0
-                    && w.owning_application()
-                        .as_ref()
-                        .is_some_and(|a| a.process_id() == *pid)
-            })
-        });
-        let rects: Vec<[f64; 4]> = displays
-            .iter()
-            .map(|d| {
-                let f = d.frame();
-                [f.origin.x, f.origin.y, f.size.width, f.size.height]
-            })
-            .collect();
-        let focused = front_window.as_ref().map(|w| {
-            let f = w.frame();
-            [f.origin.x, f.origin.y, f.size.width, f.size.height]
-        });
-        if let Some(display) = displays.get(pick_display(&rects, point, focused)) {
-            let frame = display.frame();
-            let window_title = front_window.as_ref().and_then(|w| w.title());
-            return TargetInfo {
-                mode: CaptureMode::Display,
-                app: frontmost.as_ref().map(|(_, name, _)| name.clone()),
-                bundle_id: frontmost.and_then(|(_, _, bid)| bid),
-                window_title,
-                window_id: None,
-                display_id: display.display_id(),
-                frame: TargetFrame {
-                    x: frame.origin.x,
-                    y: frame.origin.y,
-                    width: frame.size.width.max(1.0),
-                    height: frame.size.height.max(1.0),
-                    scale: 2.0,
-                },
-            };
-        }
-    }
-
-    let display_id = unsafe { CGMainDisplayID() };
-    let width = (unsafe { CGDisplayPixelsWide(display_id) } as f64).max(1440.0);
-    let height = (unsafe { CGDisplayPixelsHigh(display_id) } as f64).max(900.0);
-    TargetInfo {
-        mode: CaptureMode::Display,
-        app: frontmost.as_ref().map(|(_, name, _)| name.clone()),
-        bundle_id: frontmost.and_then(|(_, _, bid)| bid),
-        window_title: None,
-        window_id: None,
-        display_id,
-        frame: TargetFrame {
-            x: 0.0,
-            y: 0.0,
-            width,
-            height,
-            scale: 2.0,
-        },
-    }
-}
-
-/// Lists all on-screen normal (`window_layer == 0`) windows in front-to-back order for the Window picker.
-pub fn list_selectable_windows() -> Vec<TargetInfo> {
-    let Ok(content) = SCShareableContent::get() else {
-        return Vec::new();
-    };
-    let our_pid = std::process::id() as i32;
-    let display_id = content
-        .displays()
-        .first()
-        .map(|d| d.display_id())
-        .unwrap_or_else(|| unsafe { CGMainDisplayID() });
-
-    content
-        .windows()
-        .into_iter()
-        .filter(|w| {
-            let f = w.frame();
-            w.is_on_screen()
-                && w.window_layer() == 0
-                && f.size.width >= 80.0
-                && f.size.height >= 80.0
-                && w.owning_application()
-                    .as_ref()
-                    .is_some_and(|a| a.process_id() != our_pid)
-        })
-        .map(|w| {
-            let f = w.frame();
-            let owner = w.owning_application();
-            TargetInfo {
-                mode: CaptureMode::Window,
-                app: owner
-                    .as_ref()
-                    .map(|a| clean_label(&a.application_name()))
-                    .filter(|s| !s.is_empty()),
-                bundle_id: owner.as_ref().map(|a| a.bundle_identifier()),
-                window_title: w.title().map(|t| clean_label(&t)).filter(|t| !t.is_empty()),
-                window_id: Some(w.window_id()),
-                display_id,
-                frame: TargetFrame {
-                    x: f.origin.x,
-                    y: f.origin.y,
-                    width: f.size.width.max(1.0),
-                    height: f.size.height.max(1.0),
-                    scale: 2.0,
-                },
-            }
-        })
-        .collect()
-}
-
 pub fn selectable_window_at(windows: &[TargetInfo], x: f64, y: f64) -> Option<&TargetInfo> {
     windows.iter().find(|window| {
         let f = window.frame;
         x >= f.x && x <= f.x + f.width && y >= f.y && y <= f.y + f.height
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn screen_stop_joins_worker_before_collecting_its_final_media() {
-        let stopping = Arc::new(AtomicBool::new(false));
-        let frames = Arc::new(Mutex::new(CandidateBuffer::new(1 << 20)));
-        let worker_stopping = Arc::clone(&stopping);
-        let worker_frames = Arc::clone(&frames);
-        let path = std::env::temp_dir().join(crate::make_bundle_id());
-        let worker_path = path.clone();
-        let worker = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !worker_stopping.load(Ordering::Acquire) && Instant::now() < deadline {
-                thread::yield_now();
-            }
-            assert!(worker_stopping.load(Ordering::Acquire));
-            worker_frames
-                .lock()
-                .unwrap()
-                .push(RgbaFrame::new(42, 1, 1, vec![1, 2, 3, 255]), false);
-            std::fs::write(&worker_path, b"finalized media").unwrap();
-            Some(worker_path)
-        });
-        let session = ScreenCaptureSession {
-            started_at: Instant::now(),
-            stopping,
-            urgent_snapshot: Arc::new(AtomicBool::new(false)),
-            frames,
-            video_offset_ms: Arc::new(AtomicU64::new(120)),
-            sampler_thread: Some(worker),
-            _recording: crate::retention::Recording::start(),
-        };
-        let recording = session.stop();
-        let frames = recording.frames;
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].t_ms, 42);
-        assert_eq!(frames[0].rgba, vec![1, 2, 3, 255]);
-        assert_eq!(recording.video.as_ref(), Some(&path));
-        assert_eq!(recording.video_offset_ms, 120);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    /// Kit's Screen capture on the Pro: the event tap was off (no Input Monitoring), so his
-    /// clicks on OpenCode's composer never reached the bundle. Polled button state stands in.
-    #[test]
-    fn clicks_are_recorded_from_polled_buttons_while_the_event_tap_is_off() {
-        let (sender, _receiver) = flume::unbounded();
-        let telemetry = SharedCaptureTelemetry::new(sender);
-        telemetry.reset_for_session(TargetFrame {
-            x: 0.0,
-            y: 0.0,
-            width: 1728.0,
-            height: 1117.0,
-            scale: 2.0,
-        });
-        assert!(!telemetry.tap_live.load(Ordering::Acquire));
-        let mut prev = [false; 2];
-        let not_scrawl = |_: f64, _: f64| false;
-        let composer = (778.0, 1050.0);
-        // A Shift-drag is ink, not a click.
-        poll_clicks(
-            &telemetry,
-            &mut prev,
-            [true, false],
-            composer,
-            true,
-            not_scrawl,
-        );
-        poll_clicks(
-            &telemetry,
-            &mut prev,
-            [false, false],
-            composer,
-            true,
-            not_scrawl,
-        );
-        // A click on the composer.
-        poll_clicks(
-            &telemetry,
-            &mut prev,
-            [true, false],
-            composer,
-            false,
-            not_scrawl,
-        );
-        poll_clicks(
-            &telemetry,
-            &mut prev,
-            [true, false],
-            composer,
-            false,
-            not_scrawl,
-        );
-        poll_clicks(
-            &telemetry,
-            &mut prev,
-            [false, false],
-            composer,
-            false,
-            not_scrawl,
-        );
-        // Then the stop button, which is Scrawl's own.
-        let stop = (860.0, 20.0);
-        poll_clicks(&telemetry, &mut prev, [true, false], stop, false, |_, _| {
-            true
-        });
-        poll_clicks(
-            &telemetry,
-            &mut prev,
-            [false, false],
-            stop,
-            false,
-            |_, _| true,
-        );
-        // While the tap is live it reports clicks itself.
-        telemetry.tap_live.store(true, Ordering::Release);
-        poll_clicks(
-            &telemetry,
-            &mut prev,
-            [true, false],
-            composer,
-            false,
-            not_scrawl,
-        );
-        poll_clicks(
-            &telemetry,
-            &mut prev,
-            [false, false],
-            composer,
-            false,
-            not_scrawl,
-        );
-
-        let (events, _) = telemetry.finish_session();
-        assert_eq!(events.len(), 1, "{events:?}");
-        let InteractionEvent::Click { x, y, button, .. } = &events[0] else {
-            panic!("{events:?}");
-        };
-        assert!(
-            (x - 0.45).abs() < 0.01 && (y - 0.94).abs() < 0.01,
-            "{x}, {y}"
-        );
-        assert_eq!(button.as_deref(), Some("left"));
-    }
-
-    #[test]
-    fn the_capture_shortcut_matches_its_aliases_and_a_custom_one() {
-        let s = 1_u16; // the S key on this layout
-        let default = ShortcutConfig {
-            key_code: u32::from(s),
-            carbon_modifiers: CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
-            label: "⌥⇧S".into(),
-        };
-        // (cmd, ctrl, alt, shift)
-        let hit = |cfg: &ShortcutConfig, key, (cmd, ctrl, alt, shift)| {
-            is_capture_shortcut(cfg, s, key, cmd, ctrl, alt, shift)
-        };
-        assert!(hit(&default, s, (false, false, true, true)), "⌥⇧S");
-        assert!(hit(&default, s, (true, false, true, true)), "⌥⇧⌘S");
-        assert!(hit(&default, s, (false, true, true, true)), "⌃⌥⇧S");
-        assert!(hit(&default, s, (true, true, true, false)), "⌃⌥⌘S");
-        assert!(hit(&default, s, (true, true, true, true)), "hyper S");
-        assert!(hit(&default, KEY_S, (false, false, true, true)), "ANSI S");
-        assert!(!hit(&default, s, (false, false, false, true)), "⇧S");
-        assert!(!hit(&default, s, (true, false, false, false)), "⌘S");
-        assert!(!hit(&default, 2, (false, false, true, true)), "⌥⇧D");
-
-        let custom = ShortcutConfig {
-            key_code: 15,
-            carbon_modifiers: CARBON_CONTROL_KEY | CARBON_OPTION_KEY,
-            label: "⌃⌥R".into(),
-        };
-        assert!(hit(&custom, 15, (false, true, true, false)));
-        assert!(!hit(&custom, 15, (true, true, true, false)));
-        assert!(!hit(&custom, 15, (false, false, true, false)));
-
-        assert_eq!(shortcut_parts("⌥⇧S"), ("⌥⇧", "S"));
-        assert_eq!(shortcut_parts("⌃⌥⌘R"), ("⌃⌥⌘", "R"));
-    }
-
-    #[test]
-    fn recordings_use_the_display_under_the_cursor() {
-        let displays = [[0.0, 0.0, 1728.0, 1117.0], [1728.0, -200.0, 2560.0, 1440.0]];
-        assert_eq!(pick_display(&displays, Some([2000.0, 300.0]), None), 1);
-        assert_eq!(pick_display(&displays, Some([100.0, 100.0]), None), 0);
-        // No cursor: the display holding the focused window's centre.
-        let focused = Some([1900.0, 0.0, 800.0, 600.0]);
-        assert_eq!(pick_display(&displays, None, focused), 1);
-        assert_eq!(pick_display(&displays, Some([-50.0, 0.0]), focused), 1);
-        assert_eq!(pick_display(&displays, None, None), 0);
-    }
-
-    #[test]
-    fn candidate_buffer_stays_bounded_and_keeps_the_whole_timeline() {
-        // A 1 MB budget of 4 KB frames: a 256-frame cap.
-        let mut buffer = CandidateBuffer::new(1 << 20);
-        let frame = |t| RgbaFrame::new(t, 32, 32, vec![0; 32 * 32 * 4]);
-        let mut t = 0;
-        let mut peak = 0;
-        // Three hours at the sampler's pace, with a click frame every 10 s.
-        while t < 3 * 3_600_000 {
-            buffer.push(frame(t), t % 10_000 == 0);
-            peak = peak.max(buffer.len());
-            t += buffer.interval().as_millis() as u64;
-        }
-        assert!(peak <= 256, "peak {peak}");
-        assert!(buffer.interval() >= FRAME_SAMPLE_INTERVAL * 64);
-        let frames = buffer.into_frames();
-        assert_eq!(frames[0].t_ms, 0, "the start is kept");
-        assert!(frames.windows(2).all(|w| w[0].t_ms < w[1].t_ms));
-        // Spread over the whole capture, not bunched at the end.
-        let first_half = frames.iter().filter(|f| f.t_ms < 3 * 1_800_000).count();
-        assert!(
-            first_half * 3 > frames.len(),
-            "{first_half} of {}",
-            frames.len()
-        );
-    }
-
-    #[test]
-    fn candidate_buffer_keeps_urgent_frames_when_thinning() {
-        let mut buffer = CandidateBuffer::new(40 * 4096);
-        let frame = |t| RgbaFrame::new(t, 32, 32, vec![0; 32 * 32 * 4]);
-        for t in 0..60 {
-            buffer.push(frame(t * 220), t == 33);
-        }
-        assert!(buffer.len() < 60);
-        assert_eq!(buffer.interval(), FRAME_SAMPLE_INTERVAL * 2);
-        assert!(buffer.into_frames().iter().any(|f| f.t_ms == 33 * 220));
-    }
-
-    #[test]
-    fn candidates_are_small_and_recordings_keep_full_size() {
-        let target = |mode, width, height| TargetInfo {
-            mode,
-            app: None,
-            bundle_id: None,
-            window_title: None,
-            window_id: None,
-            display_id: 1,
-            frame: TargetFrame {
-                x: 0.0,
-                y: 0.0,
-                width,
-                height,
-                scale: 2.0,
-            },
-        };
-        let display = target(CaptureMode::Display, 1728.0, 1117.0);
-        assert_eq!(capture_size(&display, CANDIDATE_EDGE), (480, 310));
-        assert_eq!(capture_size(&display, 2560.0), (2560, 1654));
-        let region = target(CaptureMode::Region, 480.0, 320.0);
-        assert_eq!(capture_size(&region, CANDIDATE_EDGE), (480, 320));
-        assert_eq!(capture_size(&region, 1280.0), (960, 640));
-    }
-
-    #[test]
-    fn cached_window_hit_preserves_front_to_back_order_and_screen_coordinates() {
-        let window = |id, x, y| TargetInfo {
-            mode: CaptureMode::Window,
-            app: Some(format!("App {id}")),
-            bundle_id: None,
-            window_title: Some(format!("Window {id}")),
-            window_id: Some(id),
-            display_id: 1,
-            frame: TargetFrame {
-                x,
-                y,
-                width: 200.0,
-                height: 100.0,
-                scale: 2.0,
-            },
-        };
-        let windows = [window(1, -100.0, 20.0), window(2, 0.0, 0.0)];
-        assert_eq!(
-            selectable_window_at(&windows, 50.0, 50.0)
-                .unwrap()
-                .window_id,
-            Some(1)
-        );
-        assert_eq!(
-            selectable_window_at(&windows, 150.0, 50.0)
-                .unwrap()
-                .window_id,
-            Some(2)
-        );
-        assert_eq!(
-            selectable_window_at(&windows, -100.0, 20.0)
-                .unwrap()
-                .window_id,
-            Some(1)
-        );
-        assert!(selectable_window_at(&windows, -101.0, 50.0).is_none());
-        assert!(selectable_window_at(&[], 0.0, 0.0).is_none());
-    }
 }
 
 /// Resolves region metadata from the picker's snapshot, without another SCK query.
@@ -1404,7 +366,7 @@ pub fn region_target(
     let mid_y = y + height * 0.5;
     let hit = selectable_window_at(windows, mid_x, mid_y);
     let frontmost = frontmost_app_info();
-    let display_id = unsafe { CGMainDisplayID() };
+    let display_id = main_display_id();
     TargetInfo {
         mode: CaptureMode::Region,
         app: hit
@@ -1426,91 +388,35 @@ pub fn region_target(
     }
 }
 
-static LAST_EXTERNAL_APP_PID: AtomicI32 = AtomicI32::new(0);
-
-pub fn record_external_frontmost_app() {
-    use objc2_app_kit::NSWorkspace;
-    let workspace = NSWorkspace::sharedWorkspace();
-    if let Some(app) = workspace.frontmostApplication() {
-        let pid = app.processIdentifier();
-        if pid > 0 && pid != std::process::id() as i32 {
-            LAST_EXTERNAL_APP_PID.store(pid, Ordering::Release);
-        }
-    }
+/// The capture size for `target` with its long edge at most `long_edge` px (and at most
+/// `MAX_CAPTURE_SCALE`× its size: 2× its points on macOS, its own pixels on Windows).
+pub fn capture_size(target: &TargetInfo, long_edge: f64) -> (u32, u32) {
+    let max_dim = target.frame.width.max(target.frame.height).max(1.0);
+    let scale = (long_edge / max_dim).min(MAX_CAPTURE_SCALE);
+    (
+        ((target.frame.width * scale).round() as u32).max(48) & !1,
+        ((target.frame.height * scale).round() as u32).max(48) & !1,
+    )
 }
 
-pub fn ensure_external_app_active() {
-    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
-    let our_pid = std::process::id() as i32;
-    let workspace = NSWorkspace::sharedWorkspace();
-    let front_pid = workspace
-        .frontmostApplication()
-        .map_or(0, |a| a.processIdentifier());
-    if front_pid != 0 && front_pid != our_pid {
-        LAST_EXTERNAL_APP_PID.store(front_pid, Ordering::Release);
-        return;
-    }
-    let target_pid = LAST_EXTERNAL_APP_PID.load(Ordering::Acquire);
-    if target_pid > 0
-        && target_pid != our_pid
-        && let Some(target_app) =
-            NSRunningApplication::runningApplicationWithProcessIdentifier(target_pid)
-    {
-        #[allow(deprecated)]
-        let _ = target_app
-            .activateWithOptions(NSApplicationActivationOptions::ActivateIgnoringOtherApps);
-        let deadline = Instant::now() + Duration::from_millis(220);
-        while Instant::now() < deadline {
-            if workspace
-                .frontmostApplication()
-                .is_some_and(|a| a.processIdentifier() == target_pid)
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
+/// What the platform's sampler thread records into. It runs until `stopping`, pushes candidate
+/// frames (at once when `urgent`), stores when the movie started into `video_offset_ms`, and
+/// returns the movie it wrote.
+pub(crate) struct Sampler {
+    pub target: TargetInfo,
+    pub video_output_path: Option<PathBuf>,
+    /// Scrawl's own windows to leave out of the recording.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub excluded_window_ids: Arc<Mutex<Vec<u32>>>,
+    pub started_at: Instant,
+    pub stopping: Arc<AtomicBool>,
+    pub urgent: Arc<AtomicBool>,
+    pub frames: Arc<Mutex<CandidateBuffer>>,
+    pub video_offset_ms: Arc<AtomicU64>,
 }
 
-/// The frontmost app's pid, or the last external one while Scrawl itself is in front.
-pub fn frontmost_external_pid() -> Option<i32> {
-    use objc2_app_kit::NSWorkspace;
-    let our_pid = std::process::id() as i32;
-    let pid = NSWorkspace::sharedWorkspace()
-        .frontmostApplication()
-        .map_or(0, |a| a.processIdentifier());
-    if pid > 0 && pid != our_pid {
-        return Some(pid);
-    }
-    let fallback = LAST_EXTERNAL_APP_PID.load(Ordering::Acquire);
-    (fallback > 0 && fallback != our_pid).then_some(fallback)
-}
-
-pub fn frontmost_app_info() -> Option<(i32, String, Option<String>)> {
-    use objc2_app_kit::{NSRunningApplication, NSWorkspace};
-    let our_pid = std::process::id() as i32;
-    let workspace = NSWorkspace::sharedWorkspace();
-    if let Some(app) = workspace.frontmostApplication() {
-        let pid = app.processIdentifier();
-        if pid != our_pid {
-            LAST_EXTERNAL_APP_PID.store(pid, Ordering::Release);
-            let name = app.localizedName()?.to_string();
-            let bundle_id = app.bundleIdentifier().map(|b| b.to_string());
-            return Some((pid, name, bundle_id));
-        }
-    }
-    let fallback_pid = LAST_EXTERNAL_APP_PID.load(Ordering::Acquire);
-    if fallback_pid > 0 && fallback_pid != our_pid {
-        let app = NSRunningApplication::runningApplicationWithProcessIdentifier(fallback_pid)?;
-        let name = app.localizedName()?.to_string();
-        let bundle_id = app.bundleIdentifier().map(|b| b.to_string());
-        return Some((fallback_pid, name, bundle_id));
-    }
-    None
-}
-
-/// Active screen + optional MP4 recorder using `ScreenCaptureKit`.
+/// Active screen + optional MP4 recorder (ScreenCaptureKit on macOS, Windows.Graphics.Capture
+/// and Media Foundation on Windows).
 pub struct ScreenCaptureSession {
     started_at: Instant,
     stopping: Arc<AtomicBool>,
@@ -1541,85 +447,16 @@ impl ScreenCaptureSession {
         let sampler_thread = thread::Builder::new()
             .name("scrawl-frame-sampler".into())
             .spawn(move || {
-                let initial_excluded = excluded_window_ids
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                // Keep SCK initialization, capture and teardown on the owning worker.
-                // stop() joins even if it arrives while setup is still in progress.
-                let (stream, recording_output, video_path, filter) = setup_sck_capture(
-                    &sampler_target,
+                platform::run_sampler(Sampler {
+                    target: sampler_target,
                     video_output_path,
-                    &initial_excluded,
+                    excluded_window_ids,
                     started_at,
-                    &thread_offset,
-                );
-                crate::ui::start_metric("sck_ready_ms", started_at);
-                let shot_edge = if video_path.is_some() {
-                    CANDIDATE_EDGE
-                } else {
-                    CANDIDATE_EDGE_NO_VIDEO
-                };
-                let shot_config = sck_config(&sampler_target, shot_edge);
-                let mut filter_and_config = filter.map(|f| (f, shot_config));
-                let mut last_sample = Instant::now()
-                    .checked_sub(FRAME_SAMPLE_INTERVAL)
-                    .unwrap_or_else(Instant::now);
-                let mut phase = 0_u32;
-                let mut last_excluded_len = initial_excluded.len();
-                while !thread_stopping.load(Ordering::Acquire) {
-                    let cur_excluded = excluded_window_ids
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
-                    if cur_excluded.len() != last_excluded_len {
-                        last_excluded_len = cur_excluded.len();
-                        if let Some((new_filter, _)) =
-                            build_sck_filter_and_config(&sampler_target, &cur_excluded)
-                        {
-                            // The recording must hide the same windows as the candidates, or
-                            // keyframes decoded from it could show Scrawl's own overlays.
-                            if let Some(ref stream) = stream
-                                && let Err(error) = stream.update_content_filter(&new_filter)
-                            {
-                                scrawl_log(format!("Recording filter update failed: {error:?}"));
-                            }
-                            filter_and_config =
-                                Some((new_filter, sck_config(&sampler_target, shot_edge)));
-                        }
-                    }
-                    let urgent = thread_urgent.swap(false, Ordering::AcqRel);
-                    let interval = thread_frames
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .interval();
-                    if urgent || last_sample.elapsed() >= interval {
-                        last_sample = Instant::now();
-                        let t_ms = started_at.elapsed().as_millis() as u64;
-                        if urgent {
-                            phase = phase.saturating_add(1);
-                        }
-                        let frame = if let Some((ref filter, ref config)) = filter_and_config {
-                            capture_sck_frame(filter, config, t_ms).unwrap_or_else(|| {
-                                crate::render::render_synthetic_demo_frame(1280, 800, t_ms, phase)
-                            })
-                        } else {
-                            crate::render::render_synthetic_demo_frame(1280, 800, t_ms, phase)
-                        };
-                        thread_frames
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(frame, urgent);
-                    }
-                    thread::park_timeout(Duration::from_millis(30));
-                }
-                if let Some(stream) = stream {
-                    let _ = stream.stop_capture();
-                    if let Some(ref output) = recording_output {
-                        let _ = stream.remove_recording_output(output);
-                    }
-                }
-                video_path
+                    stopping: thread_stopping,
+                    urgent: thread_urgent,
+                    frames: thread_frames,
+                    video_offset_ms: thread_offset,
+                })
             })
             .ok();
 
@@ -1688,163 +525,6 @@ impl Drop for ScreenCaptureSession {
     }
 }
 
-fn build_sck_filter_and_config(
-    target: &TargetInfo,
-    excluded_window_ids: &[u32],
-) -> Option<(SCContentFilter, SCStreamConfiguration)> {
-    let content = match SCShareableContent::get() {
-        Ok(c) => c,
-        Err(err) => {
-            // Screen Recording is asked for in onboarding, never mid-capture.
-            scrawl_log(format!(
-                "SCShareableContent::get() failed: {err:?} (screen recording granted: {})",
-                screen_capture_granted()
-            ));
-            return None;
-        }
-    };
-    let our_pid = std::process::id() as i32;
-
-    let filter = if let Some(window_id) = target.window_id
-        && let Some(window) = content
-            .windows()
-            .into_iter()
-            .find(|w| w.window_id() == window_id)
-    {
-        SCContentFilter::create().with_window(&window).build().ok()
-    } else if let Some(display) = content
-        .displays()
-        .into_iter()
-        .find(|d| d.display_id() == target.display_id)
-        .or_else(|| content.displays().into_iter().next())
-    {
-        // Exclude Scrawl's floating HUD pill and Metal overlay windows by explicit window ID
-        // (and any non-layer-0 Scrawl panels), while keeping Scrawl's normal Review window visible.
-        let excluded_overlays: Vec<SCWindow> = content
-            .windows()
-            .into_iter()
-            .filter(|w| {
-                excluded_window_ids.contains(&w.window_id())
-                    || (w
-                        .owning_application()
-                        .as_ref()
-                        .is_some_and(|a| a.process_id() == our_pid)
-                        && w.window_layer() != 0)
-            })
-            .collect();
-        let excluded_refs: Vec<&SCWindow> = excluded_overlays.iter().collect();
-        SCContentFilter::create()
-            .with_display(&display)
-            .with_excluding_windows(&excluded_refs)
-            .build()
-            .ok()
-    } else {
-        None
-    }?;
-
-    // Full-screen captures get auto-cropped to a window or region afterwards (`scrawl autocrop`),
-    // so they need enough pixels for a crop to a quarter of the screen to stay sharp.
-    let long_edge = if target.mode == CaptureMode::Display {
-        2560.0
-    } else {
-        1280.0
-    };
-    Some((filter, sck_config(target, long_edge)))
-}
-
-/// The capture size for `target` with its long edge at most `long_edge` px (and at most 2× its
-/// size in points).
-pub fn capture_size(target: &TargetInfo, long_edge: f64) -> (u32, u32) {
-    let max_dim = target.frame.width.max(target.frame.height).max(1.0);
-    let scale = (long_edge / max_dim).min(2.0);
-    (
-        ((target.frame.width * scale).round() as u32).max(48) & !1,
-        ((target.frame.height * scale).round() as u32).max(48) & !1,
-    )
-}
-
-fn sck_config(target: &TargetInfo, long_edge: f64) -> SCStreamConfiguration {
-    let (width, height) = capture_size(target, long_edge);
-    let mut config = SCStreamConfiguration::new()
-        .with_width(width)
-        .with_height(height)
-        .with_shows_cursor(true);
-    if target.mode == CaptureMode::Region {
-        config.set_source_rect(CGRect::new(
-            target.frame.x,
-            target.frame.y,
-            target.frame.width.max(32.0),
-            target.frame.height.max(32.0),
-        ));
-    }
-    config
-}
-
-/// Starts the recording stream; returns it with the filter for candidate screenshots. Stores
-/// when the recording started (ms since `started_at`) into `video_offset_ms`.
-fn setup_sck_capture(
-    target: &TargetInfo,
-    video_output_path: Option<PathBuf>,
-    excluded_window_ids: &[u32],
-    started_at: Instant,
-    video_offset_ms: &AtomicU64,
-) -> (
-    Option<SCStream>,
-    Option<SCRecordingOutput>,
-    Option<PathBuf>,
-    Option<SCContentFilter>,
-) {
-    let Some((filter, config)) = build_sck_filter_and_config(target, excluded_window_ids) else {
-        return (None, None, None, None);
-    };
-
-    if let Some(video_path) = video_output_path {
-        if let Ok(rec_cfg_builder) = SCRecordingOutputConfiguration::new()
-            && let Ok(rec_cfg) = rec_cfg_builder.with_output_url(&video_path).map(|c| {
-                c.with_video_codec(SCRecordingOutputCodec::H264)
-                    .with_output_file_type(SCRecordingOutputFileType::MP4)
-            })
-            && let Some(rec_output) = SCRecordingOutput::new(&rec_cfg)
-            && let Ok(stream) = SCStream::new(&filter, &config)
-            && stream.add_recording_output(&rec_output).is_ok()
-        {
-            // The movie's clock starts while `start_capture` runs; its midpoint is the closest
-            // estimate this side of the recording delegate.
-            let before = started_at.elapsed();
-            if stream.start_capture().is_ok() {
-                let after = started_at.elapsed();
-                video_offset_ms.store(((before + after) / 2).as_millis() as u64, Ordering::Release);
-                return (
-                    Some(stream),
-                    Some(rec_output),
-                    Some(video_path),
-                    Some(filter),
-                );
-            }
-        }
-    }
-
-    (None, None, None, Some(filter))
-}
-
-fn capture_sck_frame(
-    filter: &SCContentFilter,
-    config: &SCStreamConfiguration,
-    t_ms: u64,
-) -> Option<RgbaFrame> {
-    let image = SCScreenshotManager::capture_image(filter, config).ok()?;
-    let width = u32::try_from(image.width()).ok()?;
-    let height = u32::try_from(image.height()).ok()?;
-    if width == 0 || height == 0 {
-        return None;
-    }
-    let rgba = image.rgba_data().ok()?;
-    if rgba.len() != (width as usize) * (height as usize) * 4 {
-        return None;
-    }
-    Some(RgbaFrame::new(t_ms, width, height, rgba))
-}
-
 /// Shared state collected by the global input monitor during an active capture session.
 pub struct SharedCaptureTelemetry {
     pub active: AtomicBool,
@@ -1869,8 +549,10 @@ pub struct SharedCaptureTelemetry {
     /// Scrawl's windows that let clicks through (the ink overlay), skipped when deciding whether
     /// a click landed on Scrawl itself.
     pub passthrough_window_ids: Mutex<Vec<u32>>,
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     tap_port: AtomicU64,
     /// The event tap thread's run loop (retained), so `restart_input_tap` can stop it.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     tap_run_loop: AtomicU64,
     /// A Screen recording started straight from the shortcut: the overlay flashes an edge glow.
     pub start_glow: AtomicBool,
@@ -2146,36 +828,14 @@ impl SharedCaptureTelemetry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let windows = objc2::rc::autoreleasepool(|_| crate::windows::raw_windows());
+        let windows = platform::raw_windows_now();
         crate::windows::owned_window_at(&windows, x, y, std::process::id() as i32, &passthrough)
     }
 
-    /// Re-enables the event tap if macOS turned it off, and notes whether it is delivering.
+    /// Re-enables the input monitor if the system turned it off, and notes whether it is
+    /// delivering.
     fn check_tap(&self) -> bool {
-        let tap = self.tap_port.load(Ordering::Acquire) as *mut c_void;
-        let live = !tap.is_null()
-            && unsafe {
-                CGEventTapIsEnabled(tap) || {
-                    CGEventTapEnable(tap, true);
-                    CGEventTapIsEnabled(tap)
-                }
-            };
-        if self.tap_live.swap(live, Ordering::AcqRel) != live {
-            scrawl_log(if live {
-                "event tap live".to_string()
-            } else {
-                format!(
-                    "event tap off (Input Monitoring {}, or Secure Input is on); clicks come from \
-                     polling the mouse buttons",
-                    if unsafe { CGPreflightListenEventAccess() } {
-                        "granted"
-                    } else {
-                        "not granted"
-                    }
-                )
-            });
-        }
-        live
+        platform::check_tap(self)
     }
 
     pub fn normalize_point(&self, screen_x: f64, screen_y: f64) -> (f32, f32, u32, u32) {
@@ -2258,86 +918,6 @@ impl SharedCaptureTelemetry {
     }
 }
 
-pub fn start_global_input_tap(telemetry: Arc<SharedCaptureTelemetry>) {
-    let hid_telemetry = Arc::clone(&telemetry);
-    let _ = thread::Builder::new()
-        .name("scrawl-hid-poller".into())
-        .spawn(move || run_global_hid_poller(hid_telemetry));
-    spawn_event_tap(telemetry);
-}
-
-/// Makes the event tap again after Input Monitoring is granted while Scrawl runs, instead of
-/// asking for a relaunch: a tap made without the grant never gets key events, and macOS doesn't
-/// upgrade it.
-pub fn restart_input_tap(telemetry: &Arc<SharedCaptureTelemetry>) {
-    scrawl_log("Input Monitoring granted; making the event tap again");
-    telemetry.tap_port.store(0, Ordering::Release);
-    let old = telemetry.tap_run_loop.swap(0, Ordering::AcqRel) as *mut c_void;
-    if !old.is_null() {
-        unsafe {
-            CFRunLoopStop(old);
-            CFRelease(old.cast_const());
-        }
-    }
-    spawn_event_tap(Arc::clone(telemetry));
-}
-
-fn spawn_event_tap(telemetry: Arc<SharedCaptureTelemetry>) {
-    let _ = thread::Builder::new()
-        .name("scrawl-event-tap".into())
-        .spawn(move || {
-            let mask = (1_u64 << EVENT_LEFT_MOUSE_DOWN)
-                | (1_u64 << EVENT_LEFT_MOUSE_UP)
-                | (1_u64 << EVENT_RIGHT_MOUSE_DOWN)
-                | (1_u64 << EVENT_RIGHT_MOUSE_UP)
-                | (1_u64 << EVENT_KEY_DOWN)
-                | (1_u64 << EVENT_SCROLL_WHEEL);
-
-            let user_info = Arc::into_raw(Arc::clone(&telemetry))
-                .cast_mut()
-                .cast::<c_void>();
-            // tap = 2 (kCGAnnotatedSessionEventTap), options = 1 (kCGEventTapOptionListenOnly)
-            let tap = unsafe { CGEventTapCreate(2, 0, 1, mask, tap_callback, user_info) };
-            scrawl_log(format!(
-                "CGEventTapCreate -> tap={tap:p} (Input Monitoring {})",
-                if unsafe { CGPreflightListenEventAccess() } {
-                    "granted"
-                } else {
-                    "not granted"
-                }
-            ));
-            if tap.is_null() {
-                let _ = unsafe { Arc::from_raw(user_info.cast::<SharedCaptureTelemetry>()) };
-                return;
-            }
-            telemetry.tap_port.store(tap as u64, Ordering::Release);
-            let source = unsafe { CFMachPortCreateRunLoopSource(ptr::null(), tap, 0) };
-            if source.is_null() {
-                return;
-            }
-            let run_loop = unsafe { CFRunLoopGetCurrent() };
-            let retained = unsafe { CFRetain(run_loop.cast_const()) } as u64;
-            telemetry.tap_run_loop.store(retained, Ordering::Release);
-            unsafe {
-                CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
-                CGEventTapEnable(tap, true);
-                CFRunLoopRun();
-                // Stopped by `restart_input_tap`. The port and its callback's Arc are left
-                // alive: `check_tap` may still be holding the old pointer.
-                CGEventTapEnable(tap, false);
-                CFRunLoopRemoveSource(run_loop, source, kCFRunLoopCommonModes);
-                CFRelease(source);
-            }
-            if telemetry
-                .tap_run_loop
-                .compare_exchange(retained, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                unsafe { CFRelease(retained as CfTypeRef) };
-            }
-        });
-}
-
 /// Clicks from the mouse buttons' polled state, while the event tap is off: a press starts a
 /// click like the tap's mouse-down (unless it lands on Scrawl's own window), a release ends it.
 fn poll_clicks(
@@ -2368,142 +948,81 @@ fn same_target_frame(a: TargetFrame, b: TargetFrame) -> bool {
         && (a.height - b.height).abs() <= 0.5
 }
 
-unsafe extern "C" fn tap_callback(
-    _proxy: *mut c_void,
-    event_type: u32,
-    event: EventRef,
-    user_info: *mut c_void,
-) -> EventRef {
-    if user_info.is_null() || event.is_null() {
-        return event;
-    }
-    let telemetry = unsafe { &*user_info.cast::<SharedCaptureTelemetry>() };
-    if event_type == EVENT_TAP_DISABLED_BY_TIMEOUT || event_type == EVENT_TAP_DISABLED_BY_USER_INPUT
-    {
-        let tap = telemetry.tap_port.load(Ordering::Acquire) as *mut c_void;
-        if !tap.is_null() {
-            unsafe { CGEventTapEnable(tap, true) };
+/// One poll of the Shift ink: holding Shift alone and moving the cursor inside the capture
+/// target draws a persistent stroke; letting go of Shift commits it. `pure_shift` is Shift
+/// without other modifiers (and not left over from a chord such as the capture shortcut).
+fn track_shift_ink(
+    telemetry: &SharedCaptureTelemetry,
+    (x, y): (f64, f64),
+    pure_shift: bool,
+    prev_shift_ink: bool,
+) {
+    let inside_target = telemetry.contains_screen_point(x, y);
+    if pure_shift && inside_target {
+        telemetry.shift_held.store(true, Ordering::Release);
+        let t_ms = telemetry.elapsed_ms();
+        let (nx, ny, fw, fh) = telemetry.normalize_point(x, y);
+        let sx = (nx * SCALE as f32).round() as i32;
+        let sy = (ny * SCALE as f32).round() as i32;
+        let mut guard = telemetry
+            .live_ink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_none() {
+            telemetry.window_log_request.store(true, Ordering::Release);
         }
-        return event;
-    }
-
-    let flags = unsafe { CGEventGetFlags(event) };
-    let cmd = (flags & FLAG_COMMAND) != 0;
-    let ctrl = (flags & FLAG_CONTROL) != 0;
-    let alt = (flags & FLAG_ALTERNATE) != 0;
-    let shift = (flags & FLAG_SHIFT) != 0;
-    let pure_shift = shift && !cmd && !ctrl && !alt;
-
-    if event_type == EVENT_KEY_DOWN {
-        let keycode = unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_KEYCODE) } as u16;
-        if telemetry.matches_shortcut(keycode, cmd, ctrl, alt, shift) {
-            // Holding S repeats the key; only a fresh press switches modes.
-            if unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_AUTOREPEAT) } == 0 {
-                telemetry.emit_capture_shortcut();
-            }
-            return event;
+        let stroke = guard.get_or_insert_with(|| Stroke {
+            t0: t_ms,
+            t1: t_ms,
+            fw,
+            fh,
+            on: None,
+            pin: None,
+            laser: false,
+            pts: Vec::new(),
+        });
+        let dt = t_ms.saturating_sub(stroke.t0) as i32;
+        let should_push = stroke.pts.chunks_exact(3).last().is_none_or(|prev| {
+            let dx = (sx - prev[0]) as f32 / SCALE as f32 * fw as f32;
+            let dy = (sy - prev[1]) as f32 / SCALE as f32 * fh as f32;
+            dx.hypot(dy) >= 1.5
+        });
+        if should_push && stroke.pts.len() / 3 < 2_400 {
+            stroke.pts.extend_from_slice(&[sx, sy, dt]);
+            stroke.t1 = t_ms;
         }
-    }
-
-    if !telemetry.active.load(Ordering::Acquire) {
-        return event;
-    }
-
-    let t_ms = telemetry.elapsed_ms();
-    let loc = unsafe { CGEventGetLocation(event) };
-    let (nx, ny, _, _) = telemetry.normalize_point(loc.x, loc.y);
-
-    // Scrawl's own controls (the stop button, the HUD) aren't part of what is being shown.
-    let on_scrawl = || {
-        let target = unsafe { CGEventGetIntegerValueField(event, EVENT_TARGET_UNIX_PROCESS_ID) };
-        target == i64::from(std::process::id())
-    };
-    match event_type {
-        EVENT_LEFT_MOUSE_DOWN | EVENT_RIGHT_MOUSE_DOWN => {
-            if pure_shift || on_scrawl() {
-                return event;
-            }
-            telemetry.pointer_down(t_ms, loc.x, loc.y);
-        }
-        EVENT_LEFT_MOUSE_UP | EVENT_RIGHT_MOUSE_UP => {
-            if pure_shift {
-                return event;
-            }
-            telemetry.pointer_up(t_ms, loc.x, loc.y, event_type == EVENT_RIGHT_MOUSE_UP);
-        }
-        EVENT_SCROLL_WHEEL if on_scrawl() => {}
-        EVENT_SCROLL_WHEEL => {
-            let dy =
-                unsafe { CGEventGetIntegerValueField(event, SCROLL_WHEEL_DELTA_AXIS_1) } as f32;
-            let dx =
-                unsafe { CGEventGetIntegerValueField(event, SCROLL_WHEEL_DELTA_AXIS_2) } as f32;
-            if dx.abs() > 0.0 || dy.abs() > 0.0 {
+    } else if !pure_shift && prev_shift_ink {
+        telemetry.shift_held.store(false, Ordering::Release);
+        if let Some(stroke) = telemetry
+            .live_ink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            && stroke.pts.len() >= 6
+        {
+            let first = &stroke.pts[0..2];
+            let max_span_px = stroke
+                .pts
+                .chunks_exact(3)
+                .map(|p| {
+                    let dx = (p[0] - first[0]) as f32 / SCALE as f32 * stroke.fw as f32;
+                    let dy = (p[1] - first[1]) as f32 / SCALE as f32 * stroke.fh as f32;
+                    dx.hypot(dy)
+                })
+                .fold(0.0_f32, f32::max);
+            // Ignore stationary Shift taps (e.g. typing a capital letter without moving the mouse).
+            if max_span_px >= 6.0 {
                 telemetry
-                    .events
+                    .strokes
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(InteractionEvent::Scroll {
-                        t: t_ms,
-                        x: nx,
-                        y: ny,
-                        dx,
-                        dy,
-                        label: None,
-                    });
+                    .push(stroke);
+                let _ = telemetry
+                    .ui_sender
+                    .try_send(LiveOverlayEvent::RequestSnapshot);
             }
         }
-        EVENT_KEY_DOWN => {
-            let keycode =
-                unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_KEYCODE) } as u16;
-            if cmd && (keycode == layout_z_keycode() || keycode == KEY_Z) {
-                let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::UndoStroke);
-            } else if cmd || ctrl {
-                // Only log modifier-chord shortcuts, never ordinary typing or secrets.
-                if let Some(key_name) = shortcut_key_name(keycode) {
-                    let mut chord = String::new();
-                    if ctrl {
-                        chord.push('⌃');
-                    }
-                    if alt {
-                        chord.push('⌥');
-                    }
-                    if shift {
-                        chord.push('⇧');
-                    }
-                    if cmd {
-                        chord.push('⌘');
-                    }
-                    chord.push_str(key_name);
-                    telemetry.window_log_request.store(true, Ordering::Release);
-                    telemetry
-                        .events
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(InteractionEvent::Key {
-                            t: t_ms,
-                            shortcut: chord,
-                        });
-                }
-            }
-        }
-        _ => {}
     }
-
-    event
-}
-
-fn current_mouse_location() -> Option<CGPoint> {
-    let ev = unsafe { CGEventCreate(ptr::null()) };
-    if ev.is_null() {
-        return None;
-    }
-    let loc = unsafe { CGEventGetLocation(ev) };
-    unsafe { CFRelease(ev.cast()) };
-    Some(loc)
-}
-
-pub fn current_mouse_screen() -> Option<[f32; 2]> {
-    current_mouse_location().map(|p| [p.x as f32, p.y as f32])
 }
 
 pub fn is_frontmost_terminal() -> bool {
@@ -2520,281 +1039,16 @@ pub fn is_frontmost_terminal() -> bool {
         "wezterm",
         "alacritty",
         "warp",
+        // Windows Terminal, the console host and the shells it runs.
+        "windowsterminal",
+        "conhost",
+        "powershell",
+        "pwsh",
+        "cmd.exe",
+        "mintty",
     ]
     .iter()
     .any(|needle| a.contains(needle) || b.contains(needle))
-}
-
-pub fn wait_for_modifiers_released(max_wait_ms: u64) {
-    let deadline = Instant::now() + Duration::from_millis(max_wait_ms);
-    while Instant::now() < deadline {
-        let flags = unsafe { CGEventSourceFlagsState(0) | CGEventSourceFlagsState(1) };
-        let any_mod = (flags & (FLAG_COMMAND | FLAG_CONTROL | FLAG_ALTERNATE | FLAG_SHIFT)) != 0;
-        if !any_mod {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-pub fn post_synthetic_cmd_v() {
-    let v_code = layout_v_keycode();
-    unsafe {
-        let down = CGEventCreateKeyboardEvent(ptr::null(), v_code, true);
-        if !down.is_null() {
-            CGEventSetFlags(down, FLAG_COMMAND);
-            CGEventPost(0, down);
-            CFRelease(down.cast());
-        }
-        thread::sleep(Duration::from_millis(12));
-        let up = CGEventCreateKeyboardEvent(ptr::null(), v_code, false);
-        if !up.is_null() {
-            CGEventSetFlags(up, FLAG_COMMAND);
-            CGEventPost(0, up);
-            CFRelease(up.cast());
-        }
-    }
-}
-
-pub fn post_synthetic_click(screen_x: f64, screen_y: f64) {
-    let pt = CGPoint {
-        x: screen_x,
-        y: screen_y,
-    };
-    unsafe {
-        let down = CGEventCreateMouseEvent(ptr::null(), EVENT_LEFT_MOUSE_DOWN, pt, 0);
-        if !down.is_null() {
-            CGEventPost(0, down);
-            CFRelease(down.cast());
-        }
-        thread::sleep(Duration::from_millis(14));
-        let up = CGEventCreateMouseEvent(ptr::null(), EVENT_LEFT_MOUSE_UP, pt, 0);
-        if !up.is_null() {
-            CGEventPost(0, up);
-            CFRelease(up.cast());
-        }
-    }
-}
-
-/// 120Hz global HID & session state poller so shortcuts, Shift-laser (`⇧` + move), and
-/// Shift-drag ink (`⇧` + drag) work across all apps (including Karabiner virtual HID).
-fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
-    let mut prev_shortcut = false;
-    let mut prev_paste = false;
-    let mut prev_shift_ink = false;
-    let mut prev_undo = false;
-    let mut await_shift_release = false;
-    let mut prev_mod_mask = (0_u8, false, false);
-    let mut prev_buttons = [false; 2];
-    let mut last_tap_check = Instant::now();
-    loop {
-        thread::sleep(Duration::from_millis(8));
-        if last_tap_check.elapsed() >= Duration::from_millis(500) {
-            telemetry.check_tap();
-            last_tap_check = Instant::now();
-        }
-
-        // Combine COMBINED_SESSION_STATE (0, includes Karabiner virtual HID) and HID_SYSTEM_STATE (1).
-        let flags = unsafe { CGEventSourceFlagsState(0) | CGEventSourceFlagsState(1) };
-        let cmd = (flags & FLAG_COMMAND) != 0;
-        let ctrl = (flags & FLAG_CONTROL) != 0;
-        let alt = (flags & FLAG_ALTERNATE) != 0;
-        let shift = (flags & FLAG_SHIFT) != 0;
-        if !shift {
-            await_shift_release = false;
-        } else if cmd || ctrl || alt {
-            await_shift_release = true;
-        }
-        let mod_mask =
-            (u8::from(cmd) << 3) | (u8::from(ctrl) << 2) | (u8::from(alt) << 1) | u8::from(shift);
-
-        let s_code = layout_s_keycode();
-        let z_code = layout_z_keycode();
-        let v_code = layout_v_keycode();
-        let cfg_keycode = telemetry
-            .shortcut
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .key_code as u16;
-        let key_s = unsafe {
-            CGEventSourceKeyState(1, s_code)
-                || CGEventSourceKeyState(0, s_code)
-                || CGEventSourceKeyState(1, KEY_S)
-        };
-        let key_v = unsafe {
-            CGEventSourceKeyState(1, v_code)
-                || CGEventSourceKeyState(0, v_code)
-                || CGEventSourceKeyState(1, KEY_V)
-        };
-        let key_cfg = if cfg_keycode == s_code {
-            key_s
-        } else {
-            unsafe {
-                CGEventSourceKeyState(1, cfg_keycode) || CGEventSourceKeyState(0, cfg_keycode)
-            }
-        };
-        let key_state = (mod_mask, key_s, key_cfg);
-        if key_state != prev_mod_mask {
-            scrawl_log(format!(
-                "hid_poller: cmd={cmd} ctrl={ctrl} alt={alt} shift={shift} key_s={key_s} key_cfg={key_cfg}"
-            ));
-            prev_mod_mask = key_state;
-        }
-        let shortcut_now = (key_cfg
-            && telemetry.matches_shortcut(cfg_keycode, cmd, ctrl, alt, shift))
-            || (key_s && telemetry.matches_shortcut(s_code, cmd, ctrl, alt, shift));
-        if shortcut_now && !prev_shortcut {
-            telemetry.emit_capture_shortcut();
-        }
-        prev_shortcut = shortcut_now;
-
-        let paste_now = key_v && alt && (shift || (ctrl && cmd));
-        if paste_now && !prev_paste && !telemetry.active.load(Ordering::Acquire) {
-            telemetry.emit_paste_shortcut();
-        }
-        prev_paste = paste_now;
-
-        let buttons = unsafe {
-            [
-                CGEventSourceButtonState(1, 0) || CGEventSourceButtonState(0, 0),
-                CGEventSourceButtonState(1, 1) || CGEventSourceButtonState(0, 1),
-            ]
-        };
-        if !telemetry.active.load(Ordering::Acquire) {
-            prev_shift_ink = false;
-            prev_undo = false;
-            prev_buttons = buttons;
-            continue;
-        }
-
-        let key_z = unsafe {
-            CGEventSourceKeyState(1, z_code)
-                || CGEventSourceKeyState(0, z_code)
-                || CGEventSourceKeyState(1, KEY_Z)
-        };
-        let undo_now = cmd && !ctrl && !alt && !shift && key_z;
-        if undo_now && !prev_undo {
-            let _ = telemetry.ui_sender.try_send(LiveOverlayEvent::UndoStroke);
-        }
-        prev_undo = undo_now;
-
-        let Some(loc) = current_mouse_location() else {
-            continue;
-        };
-        *telemetry
-            .pointer_screen
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = [loc.x as f32, loc.y as f32];
-
-        poll_clicks(
-            &telemetry,
-            &mut prev_buttons,
-            buttons,
-            (loc.x, loc.y),
-            shift && !cmd && !ctrl && !alt,
-            |x, y| telemetry.on_scrawl_window(x, y),
-        );
-
-        let inside_target = telemetry.contains_screen_point(loc.x, loc.y);
-        let pure_shift = shift && !cmd && !ctrl && !alt && !await_shift_release;
-
-        // Hold Shift + move cursor inside the capture target = draw a persistent stroke.
-        if pure_shift && inside_target {
-            telemetry.shift_held.store(true, Ordering::Release);
-            let t_ms = telemetry.elapsed_ms();
-            let (nx, ny, fw, fh) = telemetry.normalize_point(loc.x, loc.y);
-            let sx = (nx * SCALE as f32).round() as i32;
-            let sy = (ny * SCALE as f32).round() as i32;
-            let mut guard = telemetry
-                .live_ink
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.is_none() {
-                telemetry.window_log_request.store(true, Ordering::Release);
-            }
-            let stroke = guard.get_or_insert_with(|| Stroke {
-                t0: t_ms,
-                t1: t_ms,
-                fw,
-                fh,
-                on: None,
-                pin: None,
-                laser: false,
-                pts: Vec::new(),
-            });
-            let dt = t_ms.saturating_sub(stroke.t0) as i32;
-            let should_push = stroke.pts.chunks_exact(3).last().is_none_or(|prev| {
-                let dx = (sx - prev[0]) as f32 / SCALE as f32 * fw as f32;
-                let dy = (sy - prev[1]) as f32 / SCALE as f32 * fh as f32;
-                dx.hypot(dy) >= 1.5
-            });
-            if should_push && stroke.pts.len() / 3 < 2_400 {
-                stroke.pts.extend_from_slice(&[sx, sy, dt]);
-                stroke.t1 = t_ms;
-            }
-        } else if !pure_shift && prev_shift_ink {
-            telemetry.shift_held.store(false, Ordering::Release);
-            if let Some(stroke) = telemetry
-                .live_ink
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-                && stroke.pts.len() >= 6
-            {
-                let first = &stroke.pts[0..2];
-                let max_span_px = stroke
-                    .pts
-                    .chunks_exact(3)
-                    .map(|p| {
-                        let dx = (p[0] - first[0]) as f32 / SCALE as f32 * stroke.fw as f32;
-                        let dy = (p[1] - first[1]) as f32 / SCALE as f32 * stroke.fh as f32;
-                        dx.hypot(dy)
-                    })
-                    .fold(0.0_f32, f32::max);
-                // Ignore stationary Shift taps (e.g. typing a capital letter without moving the mouse).
-                if max_span_px >= 6.0 {
-                    telemetry
-                        .strokes
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(stroke);
-                    let _ = telemetry
-                        .ui_sender
-                        .try_send(LiveOverlayEvent::RequestSnapshot);
-                }
-            }
-        }
-
-        prev_shift_ink = pure_shift;
-    }
-}
-
-fn shortcut_key_name(keycode: u16) -> Option<&'static str> {
-    match keycode {
-        0 => Some("A"),
-        1 => Some("S"),
-        2 => Some("D"),
-        3 => Some("F"),
-        6 => Some("Z"),
-        7 => Some("X"),
-        8 => Some("C"),
-        9 => Some("V"),
-        11 => Some("B"),
-        12 => Some("Q"),
-        13 => Some("W"),
-        14 => Some("E"),
-        15 => Some("R"),
-        17 => Some("T"),
-        31 => Some("O"),
-        35 => Some("P"),
-        36 => Some("↩"),
-        40 => Some("K"),
-        45 => Some("N"),
-        48 => Some("⇥"),
-        49 => Some("Space"),
-        51 => Some("⌫"),
-        _ => None,
-    }
 }
 
 /// Writes all bundle artifacts (`scrawl.json`, `summary.md`, `contact-sheet.png`, `frames/frame-XX.png`)
@@ -2837,4 +1091,311 @@ pub fn write_bundle_artifacts(
     std::fs::write(out_dir.join("summary.md"), summary_md.as_bytes())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_stop_joins_worker_before_collecting_its_final_media() {
+        let stopping = Arc::new(AtomicBool::new(false));
+        let frames = Arc::new(Mutex::new(CandidateBuffer::new(1 << 20)));
+        let worker_stopping = Arc::clone(&stopping);
+        let worker_frames = Arc::clone(&frames);
+        let path = std::env::temp_dir().join(crate::make_bundle_id());
+        let worker_path = path.clone();
+        let worker = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !worker_stopping.load(Ordering::Acquire) && Instant::now() < deadline {
+                thread::yield_now();
+            }
+            assert!(worker_stopping.load(Ordering::Acquire));
+            worker_frames
+                .lock()
+                .unwrap()
+                .push(RgbaFrame::new(42, 1, 1, vec![1, 2, 3, 255]), false);
+            std::fs::write(&worker_path, b"finalized media").unwrap();
+            Some(worker_path)
+        });
+        let session = ScreenCaptureSession {
+            started_at: Instant::now(),
+            stopping,
+            urgent_snapshot: Arc::new(AtomicBool::new(false)),
+            frames,
+            video_offset_ms: Arc::new(AtomicU64::new(120)),
+            sampler_thread: Some(worker),
+            _recording: crate::retention::Recording::start(),
+        };
+        let recording = session.stop();
+        let frames = recording.frames;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].t_ms, 42);
+        assert_eq!(frames[0].rgba, vec![1, 2, 3, 255]);
+        assert_eq!(recording.video.as_ref(), Some(&path));
+        assert_eq!(recording.video_offset_ms, 120);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Kit's Screen capture on the Pro: the event tap was off (no Input Monitoring), so his
+    /// clicks on OpenCode's composer never reached the bundle. Polled button state stands in.
+    #[test]
+    fn clicks_are_recorded_from_polled_buttons_while_the_event_tap_is_off() {
+        let (sender, _receiver) = flume::unbounded();
+        let telemetry = SharedCaptureTelemetry::new(sender);
+        telemetry.reset_for_session(TargetFrame {
+            x: 0.0,
+            y: 0.0,
+            width: 1728.0,
+            height: 1117.0,
+            scale: 2.0,
+        });
+        assert!(!telemetry.tap_live.load(Ordering::Acquire));
+        let mut prev = [false; 2];
+        let not_scrawl = |_: f64, _: f64| false;
+        let composer = (778.0, 1050.0);
+        // A Shift-drag is ink, not a click.
+        poll_clicks(
+            &telemetry,
+            &mut prev,
+            [true, false],
+            composer,
+            true,
+            not_scrawl,
+        );
+        poll_clicks(
+            &telemetry,
+            &mut prev,
+            [false, false],
+            composer,
+            true,
+            not_scrawl,
+        );
+        // A click on the composer.
+        poll_clicks(
+            &telemetry,
+            &mut prev,
+            [true, false],
+            composer,
+            false,
+            not_scrawl,
+        );
+        poll_clicks(
+            &telemetry,
+            &mut prev,
+            [true, false],
+            composer,
+            false,
+            not_scrawl,
+        );
+        poll_clicks(
+            &telemetry,
+            &mut prev,
+            [false, false],
+            composer,
+            false,
+            not_scrawl,
+        );
+        // Then the stop button, which is Scrawl's own.
+        let stop = (860.0, 20.0);
+        poll_clicks(&telemetry, &mut prev, [true, false], stop, false, |_, _| {
+            true
+        });
+        poll_clicks(
+            &telemetry,
+            &mut prev,
+            [false, false],
+            stop,
+            false,
+            |_, _| true,
+        );
+        // While the tap is live it reports clicks itself.
+        telemetry.tap_live.store(true, Ordering::Release);
+        poll_clicks(
+            &telemetry,
+            &mut prev,
+            [true, false],
+            composer,
+            false,
+            not_scrawl,
+        );
+        poll_clicks(
+            &telemetry,
+            &mut prev,
+            [false, false],
+            composer,
+            false,
+            not_scrawl,
+        );
+
+        let (events, _) = telemetry.finish_session();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let InteractionEvent::Click { x, y, button, .. } = &events[0] else {
+            panic!("{events:?}");
+        };
+        assert!(
+            (x - 0.45).abs() < 0.01 && (y - 0.94).abs() < 0.01,
+            "{x}, {y}"
+        );
+        assert_eq!(button.as_deref(), Some("left"));
+    }
+
+    #[test]
+    fn the_capture_shortcut_matches_its_aliases_and_a_custom_one() {
+        let s = 1_u16; // the S key on this layout
+        let default = ShortcutConfig {
+            key_code: u32::from(s),
+            carbon_modifiers: CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
+            label: "⌥⇧S".into(),
+        };
+        // (cmd, ctrl, alt, shift)
+        let hit = |cfg: &ShortcutConfig, key, (cmd, ctrl, alt, shift)| {
+            is_capture_shortcut(cfg, s, key, cmd, ctrl, alt, shift)
+        };
+        assert!(hit(&default, s, (false, false, true, true)), "⌥⇧S");
+        assert!(hit(&default, s, (true, false, true, true)), "⌥⇧⌘S");
+        assert!(hit(&default, s, (false, true, true, true)), "⌃⌥⇧S");
+        assert!(hit(&default, s, (true, true, true, false)), "⌃⌥⌘S");
+        assert!(hit(&default, s, (true, true, true, true)), "hyper S");
+        assert!(hit(&default, KEY_S, (false, false, true, true)), "ANSI S");
+        assert!(!hit(&default, s, (false, false, false, true)), "⇧S");
+        assert!(!hit(&default, s, (true, false, false, false)), "⌘S");
+        assert!(!hit(&default, 2, (false, false, true, true)), "⌥⇧D");
+
+        let custom = ShortcutConfig {
+            key_code: 15,
+            carbon_modifiers: CARBON_CONTROL_KEY | CARBON_OPTION_KEY,
+            label: "⌃⌥R".into(),
+        };
+        assert!(hit(&custom, 15, (false, true, true, false)));
+        assert!(!hit(&custom, 15, (true, true, true, false)));
+        assert!(!hit(&custom, 15, (false, false, true, false)));
+
+        assert_eq!(shortcut_parts("⌥⇧S"), ("⌥⇧", "S"));
+        assert_eq!(shortcut_parts("⌃⌥⌘R"), ("⌃⌥⌘", "R"));
+    }
+
+    #[test]
+    fn recordings_use_the_display_under_the_cursor() {
+        let displays = [[0.0, 0.0, 1728.0, 1117.0], [1728.0, -200.0, 2560.0, 1440.0]];
+        assert_eq!(pick_display(&displays, Some([2000.0, 300.0]), None), 1);
+        assert_eq!(pick_display(&displays, Some([100.0, 100.0]), None), 0);
+        // No cursor: the display holding the focused window's centre.
+        let focused = Some([1900.0, 0.0, 800.0, 600.0]);
+        assert_eq!(pick_display(&displays, None, focused), 1);
+        assert_eq!(pick_display(&displays, Some([-50.0, 0.0]), focused), 1);
+        assert_eq!(pick_display(&displays, None, None), 0);
+    }
+
+    #[test]
+    fn candidate_buffer_stays_bounded_and_keeps_the_whole_timeline() {
+        // A 1 MB budget of 4 KB frames: a 256-frame cap.
+        let mut buffer = CandidateBuffer::new(1 << 20);
+        let frame = |t| RgbaFrame::new(t, 32, 32, vec![0; 32 * 32 * 4]);
+        let mut t = 0;
+        let mut peak = 0;
+        // Three hours at the sampler's pace, with a click frame every 10 s.
+        while t < 3 * 3_600_000 {
+            buffer.push(frame(t), t % 10_000 == 0);
+            peak = peak.max(buffer.len());
+            t += buffer.interval().as_millis() as u64;
+        }
+        assert!(peak <= 256, "peak {peak}");
+        assert!(buffer.interval() >= FRAME_SAMPLE_INTERVAL * 64);
+        let frames = buffer.into_frames();
+        assert_eq!(frames[0].t_ms, 0, "the start is kept");
+        assert!(frames.windows(2).all(|w| w[0].t_ms < w[1].t_ms));
+        // Spread over the whole capture, not bunched at the end.
+        let first_half = frames.iter().filter(|f| f.t_ms < 3 * 1_800_000).count();
+        assert!(
+            first_half * 3 > frames.len(),
+            "{first_half} of {}",
+            frames.len()
+        );
+    }
+
+    #[test]
+    fn candidate_buffer_keeps_urgent_frames_when_thinning() {
+        let mut buffer = CandidateBuffer::new(40 * 4096);
+        let frame = |t| RgbaFrame::new(t, 32, 32, vec![0; 32 * 32 * 4]);
+        for t in 0..60 {
+            buffer.push(frame(t * 220), t == 33);
+        }
+        assert!(buffer.len() < 60);
+        assert_eq!(buffer.interval(), FRAME_SAMPLE_INTERVAL * 2);
+        assert!(buffer.into_frames().iter().any(|f| f.t_ms == 33 * 220));
+    }
+
+    #[test]
+    fn candidates_are_small_and_recordings_keep_full_size() {
+        let target = |mode, width, height| TargetInfo {
+            mode,
+            app: None,
+            bundle_id: None,
+            window_title: None,
+            window_id: None,
+            display_id: 1,
+            frame: TargetFrame {
+                x: 0.0,
+                y: 0.0,
+                width,
+                height,
+                scale: 2.0,
+            },
+        };
+        let display = target(CaptureMode::Display, 1728.0, 1117.0);
+        assert_eq!(capture_size(&display, CANDIDATE_EDGE), (480, 310));
+        let region = target(CaptureMode::Region, 480.0, 320.0);
+        assert_eq!(capture_size(&region, CANDIDATE_EDGE), (480, 320));
+        if cfg!(target_os = "windows") {
+            // Frames are in pixels: never upscaled past the screen's own.
+            assert_eq!(capture_size(&display, 2560.0), (1728, 1116));
+            assert_eq!(capture_size(&region, 1280.0), (480, 320));
+            let wide = target(CaptureMode::Display, 3440.0, 1440.0);
+            assert_eq!(capture_size(&wide, 2560.0), (2560, 1072));
+        } else {
+            assert_eq!(capture_size(&display, 2560.0), (2560, 1654));
+            assert_eq!(capture_size(&region, 1280.0), (960, 640));
+        }
+    }
+
+    #[test]
+    fn cached_window_hit_preserves_front_to_back_order_and_screen_coordinates() {
+        let window = |id, x, y| TargetInfo {
+            mode: CaptureMode::Window,
+            app: Some(format!("App {id}")),
+            bundle_id: None,
+            window_title: Some(format!("Window {id}")),
+            window_id: Some(id),
+            display_id: 1,
+            frame: TargetFrame {
+                x,
+                y,
+                width: 200.0,
+                height: 100.0,
+                scale: 2.0,
+            },
+        };
+        let windows = [window(1, -100.0, 20.0), window(2, 0.0, 0.0)];
+        assert_eq!(
+            selectable_window_at(&windows, 50.0, 50.0)
+                .unwrap()
+                .window_id,
+            Some(1)
+        );
+        assert_eq!(
+            selectable_window_at(&windows, 150.0, 50.0)
+                .unwrap()
+                .window_id,
+            Some(2)
+        );
+        assert_eq!(
+            selectable_window_at(&windows, -100.0, 20.0)
+                .unwrap()
+                .window_id,
+            Some(1)
+        );
+        assert!(selectable_window_at(&windows, -101.0, 50.0).is_none());
+        assert!(selectable_window_at(&[], 0.0, 0.0).is_none());
+    }
 }

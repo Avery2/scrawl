@@ -598,12 +598,22 @@ pub fn read_grants() -> Option<Grants> {
     })
 }
 
-/// The open welcome window: the `Flow`, the helper drawing it, and a poller re-reading the
+/// What draws the welcome window: the SwiftUI `scrawl-helper onboarding` process on macOS, an
+/// in-process GPUI window (`crate::onboarding_window`) on Windows. Both take the same JSON
+/// messages and report the same button actions.
+enum Transport {
+    Helper {
+        child: std::process::Child,
+        stdin: Option<std::process::ChildStdin>,
+    },
+    InProcess(Option<flume::Sender<serde_json::Value>>),
+}
+
+/// The open welcome window: the `Flow`, the window drawing it, and a poller re-reading the
 /// grants every 0.5 s so each row's check appears by itself.
 pub struct Session {
     flow: Flow,
-    child: std::process::Child,
-    stdin: Option<std::process::ChildStdin>,
+    transport: Transport,
     polling: std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_view: String,
     saved_resume: Option<Step>,
@@ -616,46 +626,20 @@ impl Session {
         shortcut: &str,
         events: impl Fn(Event) + Send + Sync + Clone + 'static,
     ) -> anyhow::Result<Self> {
-        use std::io::BufRead;
-        use std::process::{Command, Stdio};
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let mut command = Command::new(crate::helper::path()?);
-        command
-            .args(["onboarding", "--shortcut", shortcut, "--paste", "⌥⇧V"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let dev_icon = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/app-icon.png");
-        if Path::new(dev_icon).is_file() {
-            command.args(["--icon", dev_icon]);
-        }
-        let mut child = command.spawn()?;
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-
-        let reader_events = events.clone();
-        std::thread::spawn(move || {
-            if let Some(stdout) = stdout {
-                for line in std::io::BufReader::new(stdout)
-                    .lines()
-                    .map_while(Result::ok)
-                {
-                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-                        continue;
-                    };
-                    let Some(action) = value.get("action").and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    let action = match value.get("permission").and_then(|v| v.as_str()) {
-                        Some(permission) => format!("{action}:{permission}"),
-                        None => action.to_owned(),
-                    };
-                    reader_events(Event::Action(action));
-                }
-            }
-            reader_events(Event::Exited);
-        });
+        let transport = if cfg!(target_os = "windows") {
+            let (sender, receiver) = flume::unbounded();
+            let window_events = events.clone();
+            crate::onboarding_window::request_open(
+                receiver,
+                shortcut.to_owned(),
+                std::sync::Arc::new(move |event| window_events(event)),
+            );
+            Transport::InProcess(Some(sender))
+        } else {
+            Self::spawn_helper(shortcut, events.clone())?
+        };
 
         let polling = std::sync::Arc::new(AtomicBool::new(true));
         let alive = std::sync::Arc::clone(&polling);
@@ -672,8 +656,7 @@ impl Session {
 
         let mut session = Self {
             flow,
-            child,
-            stdin,
+            transport,
             polling,
             last_view: String::new(),
             saved_resume: None,
@@ -681,6 +664,51 @@ impl Session {
         };
         session.sync();
         Ok(session)
+    }
+
+    fn spawn_helper(
+        shortcut: &str,
+        events: impl Fn(Event) + Send + Sync + Clone + 'static,
+    ) -> anyhow::Result<Transport> {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+
+        let mut command = Command::new(crate::helper::path()?);
+        command
+            .args(["onboarding", "--shortcut", shortcut, "--paste", "⌥⇧V"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let dev_icon = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/app-icon.png");
+        if Path::new(dev_icon).is_file() {
+            command.args(["--icon", dev_icon]);
+        }
+        let mut child = command.spawn()?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+
+        std::thread::spawn(move || {
+            if let Some(stdout) = stdout {
+                for line in std::io::BufReader::new(stdout)
+                    .lines()
+                    .map_while(Result::ok)
+                {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                        continue;
+                    };
+                    let Some(action) = value.get("action").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let action = match value.get("permission").and_then(|v| v.as_str()) {
+                        Some(permission) => format!("{action}:{permission}"),
+                        None => action.to_owned(),
+                    };
+                    events(Event::Action(action));
+                }
+            }
+            events(Event::Exited);
+        });
+        Ok(Transport::Helper { child, stdin })
     }
 
     pub fn mode(&self) -> Mode {
@@ -772,12 +800,24 @@ impl Session {
 
     fn send(&mut self, message: &serde_json::Value) {
         use std::io::Write;
-        if let Some(stdin) = self.stdin.as_mut()
-            && writeln!(stdin, "{message}")
-                .and_then(|()| stdin.flush())
-                .is_err()
-        {
-            self.stdin = None;
+        match &mut self.transport {
+            Transport::Helper { stdin, .. } => {
+                if let Some(pipe) = stdin.as_mut()
+                    && writeln!(pipe, "{message}")
+                        .and_then(|()| pipe.flush())
+                        .is_err()
+                {
+                    *stdin = None;
+                }
+            }
+            Transport::InProcess(sender) => {
+                if sender
+                    .as_ref()
+                    .is_some_and(|s| s.send(message.clone()).is_err())
+                {
+                    *sender = None;
+                }
+            }
         }
     }
 }
@@ -787,12 +827,33 @@ impl Drop for Session {
         self.polling
             .store(false, std::sync::atomic::Ordering::Release);
         self.send(&serde_json::json!({"type": "close"}));
-        self.stdin = None;
-        let _ = self.child.wait();
+        match &mut self.transport {
+            Transport::Helper { child, stdin } => {
+                *stdin = None;
+                let _ = child.wait();
+            }
+            Transport::InProcess(sender) => *sender = None,
+        }
     }
 }
 
+/// Starts Scrawl again a moment after this copy quits.
+#[cfg(windows)]
+pub fn relaunch() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "/C".into(),
+        "timeout /t 1 /nobreak >nul & start \"\"".into(),
+    ];
+    args.push(exe.into_os_string());
+    args.extend(std::env::args_os().skip(1));
+    let _ = std::process::Command::new("cmd.exe").args(args).spawn();
+}
+
 /// Starts Scrawl again a moment after this copy quits (after a Screen Recording grant).
+#[cfg(not(windows))]
 pub fn relaunch() {
     let Ok(exe) = std::env::current_exe() else {
         return;

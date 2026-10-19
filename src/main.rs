@@ -5,24 +5,30 @@ mod capture;
 mod delivery;
 mod export;
 mod handoff;
+#[cfg_attr(target_os = "windows", path = "win/helper.rs")]
 mod helper;
 mod hex;
 mod hold;
 mod icons;
 mod inbox;
 mod keyframes;
+#[cfg(target_os = "macos")]
 mod laser_overlay;
 mod model;
 mod onboarding;
+mod onboarding_window;
 mod phone;
 mod render;
 mod retention;
 mod routing;
 mod sketch;
+#[cfg(target_os = "macos")]
 mod sparkle;
 mod transcribe;
 mod ui;
 mod web;
+#[cfg(target_os = "windows")]
+mod win;
 mod windows;
 mod zoom;
 
@@ -32,13 +38,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 
-use crate::capture::{ScreenCaptureSession, discover_target, write_bundle_artifacts};
 use crate::audio::{AudioRecorder, RecordedAudio};
+use crate::capture::{ScreenCaptureSession, discover_target, write_bundle_artifacts};
 use crate::keyframes::select_keyframes;
 use crate::model::{
-    CaptureMode, DeviceInfo, InteractionEvent, Mark, RgbaFrame, SCALE, ScrawlBundle, Shape,
-    Stroke, TargetFrame, TargetInfo, TranscriptData, TranscriptSegment, WordTiming,
-    keyframe_budget, parse_clock_ms,
+    CaptureMode, DeviceInfo, InteractionEvent, Mark, RgbaFrame, SCALE, ScrawlBundle, Shape, Stroke,
+    TargetFrame, TargetInfo, TranscriptData, TranscriptSegment, WordTiming, keyframe_budget,
+    parse_clock_ms,
 };
 use crate::render::{render_contact_sheet, render_synthetic_demo_frame};
 use crate::sketch::{marks_of, summary_markdown};
@@ -72,7 +78,7 @@ fn hex_status() {
         Ok(status) => status,
         Err(error) => {
             println!("Hex: not connected ({error:#})");
-            println!("Next recording uses: Apple Speech");
+            println!("Next recording uses: {}", transcribe::LOCAL_ENGINE_TITLE);
             return;
         }
     };
@@ -94,7 +100,7 @@ fn hex_status() {
         "Next recording uses: {}",
         match (preferred, chosen) {
             (transcribe::Engine::Hex, Some(model)) => format!("Hex ({model})"),
-            _ => "Apple Speech".to_owned(),
+            _ => transcribe::LOCAL_ENGINE_TITLE.to_owned(),
         }
     );
 }
@@ -536,7 +542,10 @@ pub fn prepare_visuals(
                 scope.spawn(move || render::encode_png(frame).ok().map(|b| (kf.file.clone(), b)))
             })
             .collect();
-        workers.into_iter().map(|w| w.join().ok().flatten()).collect::<Option<Vec<_>>>()
+        workers
+            .into_iter()
+            .map(|w| w.join().ok().flatten())
+            .collect::<Option<Vec<_>>>()
     })?;
     let (autocrop, full_sheet_png, full_frame_pngs) = match (cropped, full_sheet) {
         (Some((info, full)), Some(sheet)) => {
@@ -667,7 +676,9 @@ pub fn finalize_capture_bundle(
     note: Option<String>,
     activity: windows::ActivityLog,
 ) -> Result<(PathBuf, ScrawlBundle, String)> {
-    let started_at = activity.stop_started.unwrap_or_else(std::time::Instant::now);
+    let started_at = activity
+        .stop_started
+        .unwrap_or_else(std::time::Instant::now);
     let stop_ms = activity.stop_ms;
     let capture::ScreenRecording {
         frames,
@@ -1288,6 +1299,8 @@ fn main() -> Result<()> {
         iphone: false,
     }) {
         Command::App { record, iphone } => {
+            #[cfg(target_os = "windows")]
+            win::shell::release_own_console();
             ui::run_app(None, record, iphone, None);
             Ok(())
         }
@@ -1523,9 +1536,7 @@ fn main() -> Result<()> {
                         };
                         let iter_wav = wav_bytes.clone();
                         let t0 = std::time::Instant::now();
-                        let recorded = iter_wav
-                            .map(audio::recorded_audio_from_wav)
-                            .transpose()?;
+                        let recorded = iter_wav.map(audio::recorded_audio_from_wav).transpose()?;
                         iter_activity.stop_started = Some(t0);
                         iter_activity.stop_ms = Some(t0.elapsed().as_millis() as u64);
                         finalize_capture_bundle(
@@ -1555,7 +1566,10 @@ fn main() -> Result<()> {
                 let median = sorted[sorted.len() / 2];
                 eprintln!(
                     "BENCH_FINISH runs_ms={:?} median_ms={:.1}",
-                    runs_ms.iter().map(|v| (*v * 10.0).round() / 10.0).collect::<Vec<_>>(),
+                    runs_ms
+                        .iter()
+                        .map(|v| (*v * 10.0).round() / 10.0)
+                        .collect::<Vec<_>>(),
                     median
                 );
                 return Ok(());
@@ -1818,7 +1832,7 @@ fn main() -> Result<()> {
             let page = autocrop_lab::export(&dir, &loaded)?;
             println!("{}", page.display());
             if open {
-                std::process::Command::new("open").arg(&page).status()?;
+                handoff::open_path(&page)?;
             }
             Ok(())
         }
@@ -1928,8 +1942,7 @@ fn main() -> Result<()> {
                 handoff::copy_bundle_to_clipboard(&dir)?;
                 println!("Copied {} to clipboard", dir.display());
             } else {
-                let target_session =
-                    handoff::send_to_opencode(&dir, session.as_deref(), reroute)?;
+                let target_session = handoff::send_to_opencode(&dir, session.as_deref(), reroute)?;
                 println!(
                     "Sent {} to OpenCode session {target_session}",
                     dir.display()

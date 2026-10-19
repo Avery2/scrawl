@@ -59,6 +59,12 @@ impl AudioRecorder {
             .context("No microphone is available")?;
         let supported = device.default_input_config()?;
         let config = supported.config();
+        crate::capture::scrawl_log(format!(
+            "Microphone: {} Hz, {} ch, {:?}",
+            config.sample_rate,
+            config.channels,
+            supported.sample_format()
+        ));
         ensure!(
             config.channels > 0 && config.sample_rate > 0,
             "Invalid microphone format"
@@ -107,6 +113,7 @@ impl AudioRecorder {
             .map_err(|_| anyhow!("Microphone error lock poisoned"))?
             .take()
         {
+            crate::capture::scrawl_log(format!("Microphone capture failed: {error}"));
             bail!("Microphone capture failed: {error}");
         }
         let samples_16k = std::mem::take(
@@ -176,6 +183,10 @@ where
             }
         },
         move |err| {
+            // A buffer under- or overrun drops a few samples; the recording goes on.
+            if err.kind() == cpal::ErrorKind::Xrun {
+                return;
+            }
             if let Ok(mut error) = error.lock() {
                 *error = Some(err.to_string());
             }
