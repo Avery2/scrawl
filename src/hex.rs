@@ -32,7 +32,23 @@ pub const PREFERRED_MODELS: [&str; 4] = [
     "whisper_large_v3_turbo",
 ];
 
-const LANGUAGE: &str = "en";
+/// Keep the previous English default; Hex, not Scrawl, validates model/language support.
+pub const DEFAULT_LANGUAGE: &str = "en";
+
+/// Accept language-code syntax without maintaining another list of Hex's languages.
+/// Blank resets to English; disallow query delimiters before constructing the API URL.
+pub fn language_code(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Some(DEFAULT_LANGUAGE.into());
+    }
+    (value.len() <= 35
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        && value.as_bytes()[0].is_ascii_alphabetic())
+    .then(|| value.to_ascii_lowercase())
+}
 const SAMPLE_RATE_KHZ: u64 = 16;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const QUICK_READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -326,11 +342,15 @@ impl Client {
     }
 
     /// One transcription request for a complete WAV.
-    pub fn transcribe(&self, wav: &[u8], model: &str) -> Result<String, Failure> {
+    pub fn transcribe(&self, wav: &[u8], model: &str, language: &str) -> Result<String, Failure> {
+        let language = language_code(language).ok_or_else(|| Failure::Rejected {
+            status: 400,
+            code: "invalid-language".into(),
+        })?;
         let response = request(
             &self.endpoint,
             "POST",
-            &format!("/transcriptions?model={model}&language={LANGUAGE}"),
+            &format!("/transcriptions?model={model}&language={language}"),
             wav,
             Timeouts {
                 read: TRANSCRIBE_READ_TIMEOUT,
@@ -353,10 +373,15 @@ impl Client {
         }
     }
 
-    fn transcribe_retrying(&self, wav: &[u8], model: &str) -> Result<String, Failure> {
+    fn transcribe_retrying(
+        &self,
+        wav: &[u8],
+        model: &str,
+        language: &str,
+    ) -> Result<String, Failure> {
         let mut delay = BUSY_BACKOFF;
         for _ in 0..BUSY_RETRIES {
-            match self.transcribe(wav, model) {
+            match self.transcribe(wav, model, language) {
                 Err(Failure::Busy) => {
                     std::thread::sleep(delay);
                     delay *= 2;
@@ -364,7 +389,7 @@ impl Client {
                 other => return other,
             }
         }
-        self.transcribe(wav, model)
+        self.transcribe(wav, model, language)
     }
 }
 
@@ -549,6 +574,7 @@ pub fn transcribe_clips(
 pub fn transcribe_audio(
     client: &Client,
     model: &str,
+    language: &str,
     audio: &RecordedAudio,
 ) -> Result<TranscriptData> {
     let samples = audio::decode_wav_16k(&audio.wav_bytes)?;
@@ -559,7 +585,7 @@ pub fn transcribe_audio(
         clips.push((0, duration_ms));
     }
     transcribe_clips(&samples, &clips, model, |wav| {
-        client.transcribe_retrying(wav, model)
+        client.transcribe_retrying(wav, model, language)
     })
 }
 
@@ -744,6 +770,50 @@ mod tests {
     }
 
     #[test]
+    fn language_is_sent_to_hex_without_injecting_query_parameters() {
+        let fake = fake_hex(|_, _, _| (200, r#"{"transcript":"tekst"}"#.into()));
+        for language in ["nl", "auto", "en"] {
+            client(fake.port)
+                .transcribe(b"RIFF", "m", language)
+                .unwrap();
+        }
+        let paths: Vec<_> = fake
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/transcriptions?model=m&language=nl",
+                "/transcriptions?model=m&language=auto",
+                "/transcriptions?model=m&language=en",
+            ]
+        );
+        assert!(
+            client(fake.port)
+                .transcribe(b"RIFF", "m", "nl&language=en")
+                .is_err()
+        );
+        assert_eq!(fake.requests.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn language_codes_allow_future_languages_but_not_url_syntax() {
+        assert_eq!(language_code("").as_deref(), Some("en"));
+        assert_eq!(language_code(" NL ").as_deref(), Some("nl"));
+        assert_eq!(
+            language_code("new-Language").as_deref(),
+            Some("new-language")
+        );
+        for invalid in ["nl&x=y", "nl?", "en\r\nInjected", "*", "1", "two words"] {
+            assert!(language_code(invalid).is_none(), "{invalid:?}");
+        }
+    }
+
+    #[test]
     fn busy_is_retried_and_other_refusals_are_not() {
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&calls);
@@ -757,22 +827,26 @@ mod tests {
                 )
             }
         });
-        let text = client(fake.port).transcribe_retrying(b"RIFF", "m").unwrap();
+        let text = client(fake.port)
+            .transcribe_retrying(b"RIFF", "m", "nl")
+            .unwrap();
         assert_eq!(text, "hello there");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         let (method, path, length) = fake.requests.lock().unwrap()[0].clone();
         assert_eq!(method, "POST");
-        assert_eq!(path, "/transcriptions?model=m&language=en");
+        assert_eq!(path, "/transcriptions?model=m&language=nl");
         assert_eq!(length, 4);
+        assert!(fake.requests.lock().unwrap().iter()
+            .all(|(_, path, _)| path == "/transcriptions?model=m&language=nl"));
 
         let refused = fake_hex(|_, _, _| (409, r#"{"code":"model-not-ready"}"#.into()));
         assert!(matches!(
-            client(refused.port).transcribe(b"x", "m"),
+            client(refused.port).transcribe(b"x", "m", "en"),
             Err(Failure::Unavailable(_))
         ));
         let bad = fake_hex(|_, _, _| (400, r#"{"code":"invalid-audio"}"#.into()));
         assert!(matches!(
-            client(bad.port).transcribe(b"x", "m"),
+            client(bad.port).transcribe(b"x", "m", "en"),
             Err(Failure::Rejected { status: 400, .. })
         ));
     }
@@ -904,7 +978,7 @@ mod tests {
             wav_bytes: audio::encode_wav_16k(&samples).unwrap(),
             live: Default::default(),
         };
-        let transcript = transcribe_audio(&client(fake.port), "parakeet_v3", &audio).unwrap();
+        let transcript = transcribe_audio(&client(fake.port), "parakeet_v3", "en", &audio).unwrap();
         assert_eq!(fake.requests.lock().unwrap().len(), 2);
         assert_eq!(transcript.words.len(), 6);
         assert!(

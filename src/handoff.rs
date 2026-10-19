@@ -324,6 +324,9 @@ pub struct Config {
     /// `hex::PREFERRED_MODELS`).
     #[serde(default)]
     pub hex_model: Option<String>,
+    /// Hex language code (`"en"` by default, `"auto"` for model language detection).
+    #[serde(default)]
+    pub hex_language: Option<String>,
     /// Whether to use the native Metal recording pill instead of GPUI's `HudPillWindow` (default `true`).
     #[serde(default)]
     pub native_pill: Option<bool>,
@@ -564,6 +567,19 @@ pub fn hex_model() -> Option<String> {
         .hex_model
         .map(|model| model.trim().to_owned())
         .filter(|model| !model.is_empty())
+}
+
+/// The configured Hex language, defaulting to the previous English behavior.
+pub fn hex_language() -> String {
+    hex_language_from(&config())
+}
+
+pub fn hex_language_from(config: &Config) -> String {
+    config
+        .hex_language
+        .as_deref()
+        .and_then(crate::hex::language_code)
+        .unwrap_or_else(|| crate::hex::DEFAULT_LANGUAGE.into())
 }
 
 /// Whether the native AppKit + Metal recording pill is enabled (`SCRAWL_NATIVE_PILL` or
@@ -1423,12 +1439,15 @@ mod tests {
         let path = fixture.0.join("config.json");
         fs::write(&path, br#"{"ingestToken":"abc","autoSend":false}"#).unwrap();
         let config = load_config_from(&path);
-        assert_eq!((config.transcriber, config.hex_model), (None, None));
+        assert_eq!((&config.transcriber, &config.hex_model), (&None, &None));
+        assert_eq!(hex_language_from(&config), "en");
         set_config_value_in(&path, "transcriber", "hex".into()).unwrap();
         set_config_value_in(&path, "hexModel", "parakeet_v3".into()).unwrap();
+        set_config_value_in(&path, "hexLanguage", "nl".into()).unwrap();
         let config = load_config_from(&path);
         assert_eq!(config.transcriber.as_deref(), Some("hex"));
         assert_eq!(config.hex_model.as_deref(), Some("parakeet_v3"));
+        assert_eq!(hex_language_from(&config), "nl");
         assert_eq!(config.ingest_token.as_deref(), Some("abc"));
         assert_eq!(config.auto_send, Some(false));
         #[cfg(unix)]

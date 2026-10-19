@@ -693,12 +693,21 @@ Or in
 `~/.config/scrawl/config.json`:
 
 ```json
-{ "transcriber": "hex", "hexModel": "parakeet_v3" }
+{ "transcriber": "hex", "hexModel": "whisper_large_v3_turbo", "hexLanguage": "nl" }
 ```
 
 `"transcriber"` is `"apple"` (default) or `"hex"`; `hexModel` defaults to the first ready one of
 `parakeet_unified_en`, `parakeet_v3`, `parakeet_v2`, `whisper_large_v3_turbo`. Scrawl never
 downloads or prepares a model: install it in Hex first.
+
+**Hex language** in Settings › Recording (or `"hexLanguage"` in config) sets the language
+code sent to Hex. It defaults to `en` to preserve existing behavior; use `nl` for Dutch or
+`auto` for automatic detection when the model supports it. Press Return or Apply to save;
+a blank field resets to `en`. Codes are not restricted to a list in Scrawl: Hex validates
+model/language support. If Hex rejects a language/model combination, Scrawl uses the existing
+Apple Speech fallback. This setting does not inherit Hex's dictation language. Whisper uses the selected
+language to guide recognition; models such as Parakeet v3 determine language from audio
+and ignore the hint.
 
 - Hex is optional. When it isn't running, **Hex** is greyed out as "Hex (not running)" and Scrawl
   uses Apple, whatever the saved preference. If Hex fails on a recording, that recording falls back

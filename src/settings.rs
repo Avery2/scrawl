@@ -685,6 +685,7 @@ pub struct TranscriberView {
     pub engine: &'static str,
     pub hex_title: &'static str,
     pub hex_enabled: bool,
+    pub language: String,
     pub models: Vec<ModelView>,
 }
 
@@ -776,9 +777,9 @@ fn shortcut_view(
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum Action {
-    /// A toggle or popup: `launchAtLogin`, `autoSend`, `videoExport` (bool), `microphone`
+    /// A settings control: `launchAtLogin`, `autoSend`, `videoExport` (bool), `microphone`
     /// ("default" or a device id), `transcriber` ("apple"/"hex"), `hexModel` (an id),
-    /// `retention` (a preset id).
+    /// `hexLanguage` (a code), `retention` (a preset id).
     Set {
         key: String,
         value: serde_json::Value,
@@ -1009,6 +1010,11 @@ impl Panel {
                 write("hexModel", model.trim().into());
                 write("transcriber", "hex".into());
             }
+            ("hexLanguage", serde_json::Value::String(language)) => {
+                if let Some(language) = crate::hex::language_code(language) {
+                    write("hexLanguage", language.into());
+                }
+            }
             ("retention", serde_json::Value::String(id)) => {
                 if let Some(preset) = crate::retention::Preset::ALL
                     .into_iter()
@@ -1102,6 +1108,7 @@ impl Panel {
                 engine: if menu.hex_checked { "hex" } else { "apple" },
                 hex_title: menu.hex_title,
                 hex_enabled: menu.hex_enabled,
+                language: crate::handoff::hex_language_from(&config),
                 models: menu
                     .models
                     .into_iter()
@@ -1800,6 +1807,20 @@ mod tests {
         assert_eq!(config["ingestToken"], "secret");
         set(&mut panel, &mut host, "hexModel", "parakeet".into());
         assert_eq!(read_json(&host.path)["hexModel"], "parakeet");
+        assert_eq!(panel.view(&host).transcriber.language, "en");
+        set(&mut panel, &mut host, "hexLanguage", " NL ".into());
+        assert_eq!(panel.view(&host).transcriber.language, "nl");
+        set(
+            &mut panel,
+            &mut host,
+            "hexLanguage",
+            "nl&language=en".into(),
+        );
+        assert_eq!(read_json(&host.path)["hexLanguage"], "nl");
+        set(&mut panel, &mut host, "hexLanguage", "auto".into());
+        assert_eq!(panel.view(&host).transcriber.language, "auto");
+        set(&mut panel, &mut host, "hexLanguage", "".into());
+        assert_eq!(panel.view(&host).transcriber.language, "en");
         set(&mut panel, &mut host, "retention", "forever".into());
         // "Forever" says it all; no caption.
         assert_eq!(panel.view(&host).retention.note, "");
