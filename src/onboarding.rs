@@ -810,7 +810,7 @@ impl Session {
     ) -> anyhow::Result<Self> {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let transport = if cfg!(target_os = "windows") {
+        let transport = if cfg!(not(target_os = "macos")) {
             let (sender, receiver) = flume::unbounded();
             let window_events = events.clone();
             crate::onboarding_window::request_open(

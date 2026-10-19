@@ -14,6 +14,7 @@ use gpui::{
 // window levels and styles, and the pill's native shell. Each module provides the same items.
 #[cfg_attr(target_os = "macos", path = "ui/macos.rs")]
 #[cfg_attr(target_os = "windows", path = "ui/windows.rs")]
+#[cfg_attr(target_os = "linux", path = "ui/linux.rs")]
 mod platform;
 use platform::{
     PillChrome, install_status_bar, pointer_on_hud_pill, reduce_motion, set_status_inbox_count,
@@ -21,6 +22,8 @@ use platform::{
 };
 #[cfg(target_os = "windows")]
 pub(crate) use platform::{gpui_display_for, hwnd_of, set_app_icon};
+#[cfg(target_os = "linux")]
+pub(crate) use platform::set_app_icon;
 
 use crate::audio::AudioRecorder;
 use crate::capture::{
@@ -38,6 +41,8 @@ use crate::phone::PhoneSession;
 use crate::sketch::timeline;
 #[cfg(target_os = "windows")]
 use crate::win::overlay::InkOverlay as LaserOverlay;
+#[cfg(target_os = "linux")]
+use crate::linux::overlay::InkOverlay as LaserOverlay;
 
 const SIDEBAR_BG: u32 = 0x111111;
 const CANVAS_BG: u32 = 0x161616;
@@ -5154,8 +5159,8 @@ fn open_review_window(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(gpui::TitlebarOptions {
-                // The taskbar and Alt+Tab show it on Windows; macOS draws no title here.
-                title: cfg!(target_os = "windows").then(|| "Scrawl".into()),
+                // The taskbar and Alt+Tab show it on Windows and Linux; macOS draws no title here.
+                title: cfg!(not(target_os = "macos")).then(|| "Scrawl".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(16.0), px(16.0))),
             }),

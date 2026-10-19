@@ -1623,24 +1623,62 @@ mod native_text {
     }
 }
 
-/// Arial (Windows' Helvetica) from the system fonts, through `ab_glyph`.
-#[cfg(target_os = "windows")]
+/// A Helvetica-like system font through `ab_glyph`: Arial on Windows; on Linux Liberation Sans
+/// (Arial's metrics), else DejaVu Sans or Noto Sans, else whatever fontconfig calls sans-serif.
+#[cfg(not(target_os = "macos"))]
 mod native_text {
     use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
     use std::sync::OnceLock;
 
+    #[cfg(target_os = "windows")]
+    fn load(bold: bool) -> Option<FontVec> {
+        let name = if bold { "arialbd.ttf" } else { "arial.ttf" };
+        let dir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
+        let bytes = std::fs::read(std::path::Path::new(&dir).join("Fonts").join(name)).ok()?;
+        FontVec::try_from_vec(bytes).ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn load(bold: bool) -> Option<FontVec> {
+        let (liberation, dejavu, noto) = if bold {
+            ("LiberationSans-Bold.ttf", "DejaVuSans-Bold.ttf", "NotoSans-Bold.ttf")
+        } else {
+            ("LiberationSans-Regular.ttf", "DejaVuSans.ttf", "NotoSans-Regular.ttf")
+        };
+        let candidates = [
+            format!("/usr/share/fonts/truetype/liberation/{liberation}"),
+            format!("/usr/share/fonts/liberation-sans/{liberation}"),
+            format!("/usr/share/fonts/liberation/{liberation}"),
+            format!("/usr/share/fonts/TTF/{liberation}"),
+            format!("/usr/share/fonts/truetype/dejavu/{dejavu}"),
+            format!("/usr/share/fonts/dejavu-sans-fonts/{dejavu}"),
+            format!("/usr/share/fonts/TTF/{dejavu}"),
+            format!("/usr/share/fonts/truetype/noto/{noto}"),
+            format!("/usr/share/fonts/noto/{noto}"),
+            format!("/usr/share/fonts/google-noto/{noto}"),
+        ];
+        let fc_match = || {
+            let pattern = if bold { "sans-serif:bold" } else { "sans-serif" };
+            let out = std::process::Command::new("fc-match")
+                .args(["-f", "%{file}", pattern])
+                .output()
+                .ok()?;
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        };
+        candidates
+            .into_iter()
+            .chain(fc_match())
+            .filter(|path| !path.is_empty())
+            .find_map(|path| FontVec::try_from_vec(std::fs::read(path).ok()?).ok())
+    }
+
     fn font(bold: bool) -> Option<&'static FontVec> {
         static REGULAR: OnceLock<Option<FontVec>> = OnceLock::new();
         static BOLD: OnceLock<Option<FontVec>> = OnceLock::new();
-        let load = |name: &str| {
-            let dir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
-            let bytes = std::fs::read(std::path::Path::new(&dir).join("Fonts").join(name)).ok()?;
-            FontVec::try_from_vec(bytes).ok()
-        };
         if bold {
-            BOLD.get_or_init(|| load("arialbd.ttf")).as_ref()
+            BOLD.get_or_init(|| load(true)).as_ref()
         } else {
-            REGULAR.get_or_init(|| load("arial.ttf")).as_ref()
+            REGULAR.get_or_init(|| load(false)).as_ref()
         }
     }
 
@@ -1700,7 +1738,7 @@ fn text_width(text: &str, size: f32, bold: bool) -> f32 {
     if let Some((_, line)) = native_text::line(text, size, bold) {
         return line.get_typographic_bounds().width as f32;
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_os = "macos"))]
     if let Some(width) = native_text::width(text, size, bold) {
         return width;
     }
@@ -1720,7 +1758,6 @@ fn draw_text(
     if text.is_empty() || size <= 0.0 {
         return;
     }
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
     if let Some((width, height, pixels)) = native_text::mask(text, size, bold) {
         for py in 0..height {
             for px in 0..width {

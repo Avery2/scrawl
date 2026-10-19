@@ -247,14 +247,25 @@ impl Rejection {
             Self::NoModifier if cfg!(target_os = "windows") => {
                 "Hold Ctrl, Alt or Win with the key.".to_owned()
             }
+            Self::NoModifier if cfg!(target_os = "linux") => {
+                "Hold Ctrl, Alt or Super with the key.".to_owned()
+            }
             Self::NoModifier => "Hold ⌘, ⌥ or ⌃ with the key.".to_owned(),
             Self::UnsupportedKey => "Scrawl can't use that key. Try a letter or number.".to_owned(),
-            Self::Reserved(label) if cfg!(target_os = "windows") => {
-                if label.starts_with("Ctrl+") && !label.contains("Alt+") && !label.contains("Win+")
+            Self::Reserved(label) if cfg!(not(target_os = "macos")) => {
+                let system = if cfg!(target_os = "windows") {
+                    "Windows"
+                } else {
+                    "Your desktop"
+                };
+                if label.starts_with("Ctrl+")
+                    && !label.contains("Alt+")
+                    && !label.contains("Win+")
+                    && !label.contains("Super+")
                 {
                     format!("Apps use {label}. Add Alt.")
                 } else {
-                    format!("Windows uses {label}.")
+                    format!("{system} uses {label}.")
                 }
             }
             Self::Reserved(label) if label.starts_with('⌘') && !label.contains(['⌃', '⌥']) => {
@@ -267,8 +278,9 @@ impl Rejection {
     }
 }
 
-/// Virtual-key codes: F1–F16, then the keys named rather than typed.
-#[cfg(target_os = "windows")]
+/// Virtual-key codes (Linux stores shortcuts as them too): F1–F16, then the keys named rather
+/// than typed.
+#[cfg(not(target_os = "macos"))]
 const FUNCTION_KEYS: [(u32, &str); 16] = [
     (0x70, "F1"),
     (0x71, "F2"),
@@ -288,7 +300,7 @@ const FUNCTION_KEYS: [(u32, &str); 16] = [
     (0x7F, "F16"),
 ];
 
-#[cfg(target_os = "windows")]
+#[cfg(not(target_os = "macos"))]
 const NAMED_KEYS: [(u32, &str); 8] = [
     (0x20, "Space"),
     (0x0D, "Enter"),
@@ -300,11 +312,11 @@ const NAMED_KEYS: [(u32, &str); 8] = [
     (0x26, "Up"),
 ];
 
-#[cfg(target_os = "windows")]
+#[cfg(not(target_os = "macos"))]
 const KEY_ESCAPE: u32 = 0x1B;
 
 /// macOS virtual key codes (`kVK_*`).
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
 const FUNCTION_KEYS: [(u32, &str); 16] = [
     (122, "F1"),
     (120, "F2"),
@@ -324,7 +336,7 @@ const FUNCTION_KEYS: [(u32, &str); 16] = [
     (106, "F16"),
 ];
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
 const NAMED_KEYS: [(u32, &str); 8] = [
     (49, "Space"),
     (36, "↩"),
@@ -336,7 +348,7 @@ const NAMED_KEYS: [(u32, &str); 8] = [
     (126, "↑"),
 ];
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
 const KEY_ESCAPE: u32 = 53;
 
 /// The name a key is shown with: a function key, a named key, or the typed character in capitals.
@@ -385,6 +397,28 @@ fn reserved(modifiers: u32, key: &str) -> bool {
                 (OPT, "Space"),
                 (CTRL | OPT, "Tab"),
                 (CTRL | CMD | OPT, "Space"),
+            ]
+            .contains(&(modifiers, key));
+    }
+    if cfg!(target_os = "linux") {
+        // Super (⌘'s bit) with a key, alone or with Shift, is the desktop's (Super+A, the
+        // workspaces…); Ctrl with one key is an app's. Then Alt+Tab, Alt+F2, Ctrl+Alt+T…
+        return modifiers & CMD != 0 && modifiers & (CTRL | OPT) == 0
+            || modifiers & (CTRL | CMD | OPT) == CTRL
+            || [
+                (OPT, "Tab"),
+                (OPT | SHIFT, "Tab"),
+                (OPT, "F2"),
+                (OPT, "F4"),
+                (OPT, "Space"),
+                (OPT, "F7"),
+                (OPT, "F8"),
+                (CTRL | OPT, "Tab"),
+                (CTRL | OPT, "T"),
+                (CTRL | OPT, "Left"),
+                (CTRL | OPT, "Right"),
+                (CTRL | OPT, "Up"),
+                (CTRL | OPT, "Down"),
             ]
             .contains(&(modifiers, key));
     }
@@ -567,6 +601,25 @@ pub fn set_login_item(on: bool) -> anyhow::Result<()> {
 #[cfg(target_os = "windows")]
 fn open_login_items_settings() {
     crate::win::login::open_startup_settings();
+}
+
+#[cfg(target_os = "linux")]
+pub fn login_item() -> LoginItem {
+    match crate::linux::login::status() {
+        (false, _) => LoginItem::Off,
+        (true, false) => LoginItem::On,
+        (true, true) => LoginItem::NeedsApproval,
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn set_login_item(on: bool) -> anyhow::Result<()> {
+    crate::linux::login::set(on)
+}
+
+#[cfg(target_os = "linux")]
+fn open_login_items_settings() {
+    crate::linux::login::open_startup_settings();
 }
 
 // MARK: What the window shows
@@ -798,6 +851,65 @@ pub struct TranscriberView {
     pub hex_enabled: bool,
     pub language: String,
     pub models: Vec<ModelView>,
+    /// Linux: the Parakeet model Scrawl downloads itself (there's no Hex to install one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speech_model: Option<SpeechModelView>,
+}
+
+/// The "Speech model" row: installed, downloading, or a Download button.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeechModelView {
+    pub installed: bool,
+    /// 0–1 while downloading.
+    pub progress: Option<f32>,
+    pub caption: String,
+    pub error: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn speech_model_view() -> Option<SpeechModelView> {
+    use crate::retention::format_bytes;
+    use crate::speech::{DEFAULT_MODEL, Download};
+    let size = format_bytes(DEFAULT_MODEL.bytes);
+    let state = crate::speech::download_state();
+    if let Download::Running { have, total } = state {
+        return Some(SpeechModelView {
+            installed: false,
+            progress: Some(have as f32 / total.max(1) as f32),
+            caption: format!("Downloading… {} of {size}.", format_bytes(have)),
+            error: false,
+        });
+    }
+    let installed = !crate::speech::installed_models().is_empty();
+    Some(match state {
+        Download::Failed(error) if !installed => SpeechModelView {
+            installed,
+            progress: None,
+            caption: format!("The download failed: {error}."),
+            error: true,
+        },
+        _ if installed => SpeechModelView {
+            installed,
+            progress: None,
+            caption: "Parakeet transcribes on this computer and times each word.".to_owned(),
+            error: false,
+        },
+        _ => SpeechModelView {
+            installed,
+            progress: None,
+            caption: format!(
+                "Captures need Parakeet ({size}, once) to turn your voice into text. It runs on \
+                 this computer."
+            ),
+            error: false,
+        },
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn speech_model_view() -> Option<SpeechModelView> {
+    None
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -928,6 +1040,8 @@ pub enum Action {
     /// Link `scrawl` into a folder on PATH, or remove that link.
     InstallCli,
     UninstallCli,
+    /// Linux: download the Parakeet speech model.
+    DownloadSpeechModel,
     Close,
 }
 
@@ -1048,6 +1162,11 @@ impl Panel {
             Action::UninstallCli => {
                 let result = crate::command_line::uninstall(&host.command_line());
                 self.note_cli("uninstall", result);
+                Effect::None
+            }
+            Action::DownloadSpeechModel => {
+                #[cfg(target_os = "linux")]
+                crate::speech::start_download();
                 Effect::None
             }
             Action::Close => {
@@ -1185,9 +1304,16 @@ impl Panel {
         let menu = crate::transcribe::menu_state(engine, hex.as_ref(), config.hex_model.as_deref());
         let policy = crate::retention::Policy::load_from(&host.config_path());
         let login = login_item();
-        // Windows asks for no screen or accessibility grant, and has no cabled iPhone.
+        // Windows asks for no screen or accessibility grant, and has no cabled iPhone. Linux
+        // asks for the input devices on Wayland only (the Accessibility row).
         let order: &[Permission] = if cfg!(target_os = "windows") {
             &[Permission::Microphone]
+        } else if cfg!(target_os = "linux") {
+            if wayland() {
+                &[Permission::Microphone, Permission::Accessibility]
+            } else {
+                &[Permission::Microphone]
+            }
         } else {
             &[
                 Permission::ScreenRecording,
@@ -1235,6 +1361,7 @@ impl Panel {
                     .into_iter()
                     .map(|(id, title, chosen)| ModelView { id, title, chosen })
                     .collect(),
+                speech_model: speech_model_view(),
             },
             video_export: config.video_export.unwrap_or(false),
             retention: RetentionView {
@@ -1267,6 +1394,16 @@ impl Panel {
             skill_command: SKILL_COMMAND,
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn wayland() -> bool {
+    crate::linux::wayland_session()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wayland() -> bool {
+    false
 }
 
 /// Whether this copy can check for updates: Sparkle in Scrawl.app; on Windows the releases
@@ -1369,7 +1506,7 @@ impl Session {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let events: std::sync::Arc<dyn Fn(Event) + Send + Sync> = std::sync::Arc::new(events);
-        let transport = if cfg!(target_os = "windows") {
+        let transport = if cfg!(not(target_os = "macos")) {
             let (sender, receiver) = flume::unbounded();
             crate::settings_window::request_open(receiver, pane, std::sync::Arc::clone(&events));
             Transport::InProcess(Some(sender))
@@ -1600,7 +1737,8 @@ mod tests {
     use super::*;
 
     // Key codes: macOS `kVK_*` (ANSI), Windows virtual keys.
-    const WIN: bool = cfg!(target_os = "windows");
+    /// Windows and Linux store virtual keys.
+    const WIN: bool = cfg!(not(target_os = "macos"));
     const R: u32 = if WIN { 0x52 } else { 15 };
     const V: u32 = if WIN { 0x56 } else { 9 };
     const F1: u32 = if WIN { 0x70 } else { 122 };
@@ -1718,7 +1856,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             ok.label,
-            if WIN {
+            if cfg!(target_os = "linux") {
+                "Ctrl+Super+Alt+Shift+R"
+            } else if WIN {
                 "Ctrl+Win+Alt+Shift+R"
             } else {
                 "⌃⌥⇧⌘R"
@@ -2069,7 +2209,7 @@ mod tests {
             view.retention.note,
             format!(
                 "Video and audio go to the {} after 30 days, the rest of each capture after 90 days.",
-                if WIN { "Recycle Bin" } else { "Trash" }
+                if cfg!(target_os = "windows") { "Recycle Bin" } else { "Trash" }
             )
         );
         let config = read_json(&host.path);
@@ -2225,7 +2365,8 @@ mod tests {
         );
         let view = panel.view(&host);
         if WIN {
-            // Only the microphone has a switch on Windows.
+            // Only the microphone has a switch on Windows (and on Linux under X11; the tests
+            // run without a Wayland session).
             assert_eq!(view.permissions.len(), 1);
             assert_eq!(view.permissions[0].permission, Permission::Microphone);
         } else {

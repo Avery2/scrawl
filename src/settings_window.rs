@@ -40,6 +40,7 @@ const INSET: f32 = 20.0;
 const ROW: f32 = 42.0;
 const RADIUS: f32 = 12.0;
 const WINDOWS: bool = cfg!(target_os = "windows");
+const LINUX: bool = cfg!(target_os = "linux");
 
 type Events = Arc<dyn Fn(Event) + Send + Sync>;
 
@@ -120,6 +121,7 @@ struct Transcriber {
     hex_enabled: bool,
     models: Vec<ModelOption>,
     speech: Speech,
+    speech_model: Option<SpeechModel>,
 }
 
 /// `speech_model::Status`: the local model's download.
@@ -129,6 +131,15 @@ struct Speech {
     state: String,
     progress: f64,
     error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct SpeechModel {
+    installed: bool,
+    progress: Option<f32>,
+    caption: String,
+    error: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -340,7 +351,7 @@ fn open(request: Request, cx: &mut App) {
             ..Default::default()
         },
         move |window, cx| {
-            #[cfg(target_os = "windows")]
+            #[cfg(not(target_os = "macos"))]
             crate::ui::set_app_icon(window);
             window.on_window_should_close(cx, move |_, _| {
                 close_events(Event::Exited);
@@ -505,7 +516,7 @@ impl SettingsWindow {
 
 /// The platform key code for a key GPUI names (`r`, `f5`, `space`), as the hotkeys register it.
 fn key_code(key: &str) -> Option<u32> {
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_os = "macos"))]
     let named: &[(&str, u32)] = &[
         ("space", 0x20),
         ("enter", 0x0D),
@@ -516,7 +527,7 @@ fn key_code(key: &str) -> Option<u32> {
         ("right", 0x27),
         ("down", 0x28),
     ];
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     let named: &[(&str, u32)] = &[
         ("space", 49),
         ("enter", 36),
@@ -533,9 +544,9 @@ fn key_code(key: &str) -> Option<u32> {
     if let Some(n) = key.strip_prefix('f').and_then(|n| n.parse::<u32>().ok())
         && (1..=16).contains(&n)
     {
-        #[cfg(target_os = "windows")]
+        #[cfg(not(target_os = "macos"))]
         return Some(0x6F + n);
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
         return Some([122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, 105, 107, 113, 106][n as usize - 1]);
     }
     let mut chars = key.chars();
@@ -551,7 +562,12 @@ fn open_privacy_settings(permission: Permission) {
     crate::win::privacy::open_settings(permission);
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+fn open_privacy_settings(permission: Permission) {
+    crate::linux::privacy::open_settings(permission);
+}
+
+#[cfg(target_os = "macos")]
 fn open_privacy_settings(_permission: Permission) {}
 
 // MARK: Building blocks
@@ -917,6 +933,8 @@ impl SettingsWindow {
                 theme,
                 if WINDOWS {
                     "Turn Scrawl on in Settings › Apps › Startup."
+                } else if LINUX {
+                    "Your desktop's startup settings turned Scrawl off. Turn it on there."
                 } else {
                     "Allow Scrawl in System Settings › General › Login Items."
                 },
@@ -955,14 +973,16 @@ impl SettingsWindow {
         } else {
             shortcut.key.clone()
         };
-        // macOS draws ⇧ ⌃ ⌥ ⌘; Windows names its keys, in the order they sit on the keyboard.
-        let caps = if WINDOWS {
+        // macOS draws ⇧ ⌃ ⌥ ⌘; Windows and Linux name their keys, in the order they sit on the
+        // keyboard.
+        let caps = if WINDOWS || LINUX {
+            let super_key = if LINUX { "Super" } else { "Win" };
             div()
                 .flex()
                 .gap(px(6.0))
                 .child(keycap(theme, "Shift", None, lit(shortcut.shift, live.shift), false))
                 .child(keycap(theme, "Ctrl", None, lit(shortcut.control, live.control), false))
-                .child(keycap(theme, "Win", None, lit(shortcut.command, live.platform), false))
+                .child(keycap(theme, super_key, None, lit(shortcut.command, live.platform), false))
                 .child(keycap(theme, "Alt", None, lit(shortcut.option, live.alt), false))
                 .child(keycap(theme, &key, None, !recording, true))
         } else {
@@ -1081,6 +1101,42 @@ impl SettingsWindow {
                 .into_any_element(),
             );
         }
+        if let Some(model) = &t.speech_model {
+            let trailing: AnyElement = if let Some(progress) = model.progress {
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.secondary())
+                    .child(format!("{:.0}%", progress * 100.0))
+                    .into_any_element()
+            } else if model.installed {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.secondary())
+                    .child(icon(crate::icons::CHECK_CIRCLE, 14.0, theme.positive()))
+                    .child("Installed")
+                    .into_any_element()
+            } else {
+                button(theme, "settings-download-model", "Download", true)
+                    .on_click(cx.listener(|view, _, _, _| view.act(Action::DownloadSpeechModel)))
+                    .into_any_element()
+            };
+            return div()
+                .flex()
+                .flex_col()
+                .child(group(
+                    theme,
+                    vec![
+                        row(theme, "Transcription", true, div().text_size(px(13.0)).text_color(theme.secondary()).child(local)).into_any_element(),
+                        row(theme, "Speech model", true, trailing).into_any_element(),
+                    ],
+                ))
+                .child(caption(theme, &model.caption, model.error))
+                .child(self.experimental(theme, state, cx));
+        }
         let note = match (WINDOWS, t.hex_enabled || hex) {
             (true, true) => {
                 "Parakeet runs on this PC and times each word. Hex uses a model you have in Hex, and its word times are estimates."
@@ -1117,7 +1173,6 @@ impl SettingsWindow {
             )),
             _ => None,
         };
-        let video = state.video_export;
         div()
             .flex()
             .flex_col()
@@ -1126,6 +1181,14 @@ impl SettingsWindow {
             .when_some(speech, |pane, (text, error)| {
                 pane.child(caption(theme, &text, error))
             })
+            .child(self.experimental(theme, state, cx))
+    }
+
+    fn experimental(&self, theme: Theme, state: &ViewState, cx: &mut Context<Self>) -> Div {
+        let video = state.video_export;
+        div()
+            .flex()
+            .flex_col()
             .child(header(theme, "Experimental"))
             .child(group(
                 theme,
@@ -1165,6 +1228,8 @@ impl SettingsWindow {
         let selected = r.preset.clone();
         let show = if WINDOWS {
             "Show in File Explorer"
+        } else if LINUX {
+            "Show in Files"
         } else {
             "Show in Finder"
         };
@@ -1237,6 +1302,10 @@ impl SettingsWindow {
                 theme,
                 if WINDOWS {
                     "Scrawl needs the microphone to hear you. Recording the screen, clicks and shortcuts need no permission on Windows."
+                } else if LINUX && required.len() > 1 {
+                    "Scrawl needs the microphone to hear you, and on Wayland the input devices to see ⇧ ink, clicks and Esc over other apps."
+                } else if LINUX {
+                    "Scrawl needs the microphone to hear you. On X11, the screen, clicks and shortcuts need no permission."
                 } else {
                     "Scrawl needs these three to record."
                 },
@@ -1290,6 +1359,12 @@ impl SettingsWindow {
                 "To see clicks and shortcuts".to_owned(),
                 crate::icons::CLICK,
                 GREY,
+            ),
+            Permission::Accessibility if LINUX => (
+                "Input devices",
+                "To see ⇧ ink, clicks and Esc (the input group)".to_owned(),
+                crate::icons::CLICK,
+                BLUE,
             ),
             Permission::Accessibility => (
                 "Accessibility",
