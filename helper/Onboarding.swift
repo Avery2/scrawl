@@ -58,18 +58,15 @@ enum Permissions {
     }
   }
 
-  /// The drag guides shown beside System Settings, so they go away once their row is granted.
-  static var guides: [String: Process] = [:]
+  /// The drag panels docked beside System Settings, told when their row is granted.
+  static var panels: [String: Process] = [:]
 
-  /// The System Settings pane; for lists an app can be dragged into, also the drag guide.
-  static func openSettings(_ permission: String) {
-    if GuidePermission(rawValue: permission) != nil {
-      guides[permission]?.terminate()
-      let guide = Process()
-      guide.executableURL = URL(filePath: CommandLine.arguments[0])
-      guide.arguments = ["guide", permission]
-      try? guide.run()
-      guides[permission] = guide
+  /// The System Settings pane; for lists an app can be dragged into, the drag panel flies there
+  /// from the row's button (`button`, screen coordinates).
+  static func openSettings(_ permission: String, from button: NSRect? = nil) {
+    if PermissionPanel.Kind(rawValue: permission) != nil {
+      if let old = panels[permission] { PermissionPanel.tell(old, "cancel") }
+      panels[permission] = PermissionPanel.launch(permission: permission, from: button) { _ in }
       return
     }
     let anchor = permission == "camera" ? "Privacy_Camera" : "Privacy_Microphone"
@@ -79,7 +76,7 @@ enum Permissions {
   }
 
   static func closeGuide(_ permission: String) {
-    guides.removeValue(forKey: permission)?.terminate()
+    if let panel = panels.removeValue(forKey: permission) { PermissionPanel.tell(panel, "granted") }
   }
 }
 
@@ -123,6 +120,9 @@ final class OnboardingModel: ObservableObject {
   let icon: NSImage?
   var send: (String) -> Void = { _ in }
   var grant: (String) -> Void = { _ in }
+  /// Each row button's frame in the window (SwiftUI global, top-left), where the drag panel
+  /// flies from.
+  var buttonFrames: [String: CGRect] = [:]
 
   init(shortcut: String, paste: String, icon: NSImage?) {
     self.shortcut = shortcut
@@ -408,6 +408,7 @@ struct PermissionRowView: View {
   let row: PermissionRow
   let paste: String
   let showOptional: Bool
+  var buttonFrame: (CGRect) -> Void = { _ in }
   let grant: () -> Void
 
   var body: some View {
@@ -466,6 +467,7 @@ struct PermissionRowView: View {
             Spinner()
           }
           RowButton(title: row.requested || row.status == "denied" ? "Open Settings" : "Allow", action: grant)
+            .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { buttonFrame($0) }
         }
         .transition(Motion.swap)
       }
@@ -623,9 +625,11 @@ struct OnboardingView: View {
       card {
         ForEach(Array(state.rows.enumerated()), id: \.element.id) { i, row in
           if i > 0 { divider }
-          PermissionRowView(row: row, paste: model.paste, showOptional: !state.fix) {
-            model.grant(row.permission)
-          }
+          PermissionRowView(
+            row: row, paste: model.paste, showOptional: !state.fix,
+            buttonFrame: { model.buttonFrames[row.permission] = $0 },
+            grant: { model.grant(row.permission) }
+          )
         }
       }
       .padding(.top, 22)
@@ -817,7 +821,7 @@ final class Onboarding: NSObject, NSApplicationDelegate, NSWindowDelegate {
               self.apply(state)
             }
           case "request": Permissions.request(permission)
-          case "open-settings": Permissions.openSettings(permission)
+          case "open-settings": Permissions.openSettings(permission, from: self.screenFrame(of: permission))
           case "hide": self.window?.orderOut(nil)
           case "show": self.present()
           case "close": exit(0)
@@ -830,6 +834,13 @@ final class Onboarding: NSObject, NSApplicationDelegate, NSWindowDelegate {
   }
 
   private var presented = false
+
+  /// A row button's frame on screen (AppKit coordinates).
+  private func screenFrame(of permission: String) -> NSRect? {
+    guard let frame = model.buttonFrames[permission], let window, let content = window.contentView else { return nil }
+    let local = NSRect(x: frame.minX, y: content.bounds.height - frame.maxY, width: frame.width, height: frame.height)
+    return window.convertToScreen(local)
+  }
 
   /// Every step as `NN-step.png`, for review without running the app.
   @MainActor static func render(model: OnboardingModel, to dir: URL) {

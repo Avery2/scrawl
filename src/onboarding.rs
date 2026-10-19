@@ -37,6 +37,15 @@ impl Permission {
     pub fn required(self) -> bool {
         Self::REQUIRED.contains(&self)
     }
+
+    /// Privacy lists the app can be dragged into: Grant flies the drag panel to System
+    /// Settings (`scrawl-helper permission-panel`) instead of raising Apple's prompt.
+    pub fn draggable(self) -> bool {
+        matches!(
+            self,
+            Permission::ScreenRecording | Permission::InputMonitoring | Permission::Accessibility
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -413,7 +422,10 @@ impl Flow {
         {
             return Effect::None;
         }
-        if self.requested.insert(permission) && self.status(permission) != Status::Denied {
+        if self.requested.insert(permission)
+            && self.status(permission) != Status::Denied
+            && !permission.draggable()
+        {
             Effect::Request(permission)
         } else {
             Effect::OpenSettings(permission)
@@ -861,9 +873,10 @@ mod tests {
     #[test]
     fn permissions_are_granted_in_any_order_then_continue_moves_on() {
         let mut flow = Flow::tour(Step::Permissions, Some(grants(&[])));
+        // A list the app can be dragged into goes straight to System Settings and the panel.
         assert_eq!(
             flow.on(Input::Grant(InputMonitoring)),
-            Effect::Request(InputMonitoring)
+            Effect::OpenSettings(InputMonitoring)
         );
         assert_eq!(
             flow.on(Input::Grant(Microphone)),
@@ -1009,7 +1022,7 @@ mod tests {
         assert_eq!(flow.step(), Step::Permissions);
         assert_eq!(
             flow.on(Input::Grant(ScreenRecording)),
-            Effect::Request(ScreenRecording)
+            Effect::OpenSettings(ScreenRecording)
         );
         // With everything on, the shortcut goes through.
         let all = grants(&[ScreenRecording, Microphone, InputMonitoring]);

@@ -6,10 +6,11 @@
 //   scrawl-helper permission-panel --check PERMISSION        {"granted":true|false} from a fresh process
 //
 // It opens the pane in System Settings, waits for its window to settle, flies a card from
-// `--from` (the Grant button, global top-left points like CGWindow bounds) and docks it inside
-// the bottom of the Settings window with its app row lined up under the Privacy list. The row
+// `--from` (the Grant button, global top-left points like CGWindow bounds) and docks it just
+// below the Settings window with its app row lined up under the Privacy list's column. The row
 // drags the real Scrawl.app, the bundle that holds the grant. stdin takes `cancel` (fade out;
-// EOF on a pipe does the same) and `back` (fly back to `--from`, as the card's back button does). Events go to stdout as JSON lines and the last one is either
+// EOF on a pipe does the same), `back` (fly back to `--from`, as the card's back button does) and
+// `granted` (the parent saw the grant first: show it, then fade). Events go to stdout as JSON lines and the last one is either
 //   {"event":"granted","permission":P}    or    {"event":"cancelled","permission":P,"reason":R}
 // with R one of back, settings-closed, no-settings-window, parent, timeout. Before that it may
 // print {"event":"docked"} and {"event":"dropped"}. A drop is only a hint: the grant is read from
@@ -30,10 +31,11 @@ enum PermissionPanel {
   // MARK: Tuning
 
   /// The flight from the Grant button to the dock. Duration and bounce, as everywhere in Scrawl:
-  /// critically damped, so the card decelerates into place without overshooting.
-  static let flightSpring = Spring(duration: 0.6, bounce: 0)
+  /// critically damped, so the card leaves fast and decelerates into place without overshooting.
+  /// A spring front-loads its travel, so a cross-screen hop needs a longer duration than a drawer.
+  static let flightSpring = Spring(duration: 0.85, bounce: 0)
   /// Back to the button on cancel: exits run shorter than entrances.
-  static let returnSpring = Spring(duration: 0.48, bounce: 0)
+  static let returnSpring = Spring(duration: 0.7, bounce: 0)
   /// Width leads height (and the path) by running on a shorter spring.
   static let widthLead = 0.78
   /// Peak height of the arc above the higher end, and its cap as a share of the distance.
@@ -134,6 +136,12 @@ enum PermissionPanel {
     return process
   }
 
+  /// Sends `cancel`, `back` or `granted` to a panel started with `launch`.
+  static func tell(_ process: Process, _ command: String) {
+    guard process.isRunning, let input = process.standardInput as? Pipe else { return }
+    try? input.fileHandleForWriting.write(contentsOf: Data((command + "\n").utf8))
+  }
+
   // MARK: Permissions
 
   enum Kind: String {
@@ -226,20 +234,30 @@ enum PermissionPanel {
     CGRect(x: r.minX, y: primaryHeight - r.minY - r.height, width: r.width, height: r.height)
   }
 
-  /// The docked card: inside the Settings window's bottom edge, its app row spanning the
-  /// Privacy list's column, kept on the visible screen.
+  /// Where the card docks: just below the Settings window, its app row lined up under the
+  /// Privacy list's column. It stays outside the window so it never covers a toggle or macOS's
+  /// "Quit & Reopen" sheet: below if there's room, else beside, else along the inside bottom.
   static func dockFrame(settingsQuartz: CGRect, layout: Layout) -> NSRect {
     let settings = appKit(fromQuartz: settingsQuartz)
     let size = layout.cardSize
-    let right = settings.maxX - layout.inset
-    var frame = NSRect(x: right - size.width, y: settings.minY + layout.inset, width: size.width, height: size.height)
     let screen = NSScreen.screens.first { $0.frame.contains(NSPoint(x: settings.midX, y: settings.midY)) }
       ?? NSScreen.screens.first { $0.frame.intersects(settings) } ?? NSScreen.main
-    if let visible = screen?.visibleFrame {
-      frame.origin.x = min(max(frame.minX, visible.minX + 8), visible.maxX - size.width - 8)
-      frame.origin.y = min(max(frame.minY, visible.minY + 8), visible.maxY - size.height - 8)
+    let visible = screen?.visibleFrame ?? settings
+    let gap = layout.dockGap
+    let clampX = { (x: CGFloat) in min(max(x, visible.minX + 8), visible.maxX - size.width - 8) }
+    let clampY = { (y: CGFloat) in min(max(y, visible.minY + 8), visible.maxY - size.height - 8) }
+    let column = settings.minX + settingsListLeading - layout.gutter
+    let origin: NSPoint
+    if settings.minY - gap - size.height >= visible.minY {
+      origin = NSPoint(x: clampX(column), y: settings.minY - gap - size.height)
+    } else if settings.maxX + gap + size.width <= visible.maxX {
+      origin = NSPoint(x: settings.maxX + gap, y: clampY(settings.minY))
+    } else if settings.minX - gap - size.width >= visible.minX {
+      origin = NSPoint(x: settings.minX - gap - size.width, y: clampY(settings.minY))
+    } else {
+      origin = NSPoint(x: clampX(settings.maxX - layout.inset - size.width), y: clampY(settings.minY + layout.inset))
     }
-    return frame
+    return NSRect(origin: origin, size: size)
   }
 
   /// Card metrics. The app row matches the Privacy list's column in the Settings window.
@@ -253,6 +271,7 @@ enum PermissionPanel {
     let rowHeight: CGFloat = 44
     let gap: CGFloat = 4
     let inset: CGFloat = 8
+    let dockGap: CGFloat = 10
     let radius: CGFloat = 18
     let rowRadius: CGFloat = 9
     let icon: CGFloat = 26
@@ -964,7 +983,10 @@ extension PermissionPanel {
       FileHandle.standardInput.readabilityHandler = { [weak self] handle in
         let data = handle.availableData
         let text = String(decoding: data, as: UTF8.self)
-        if text.contains("back") {
+        if text.contains("granted") {
+          handle.readabilityHandler = nil
+          DispatchQueue.main.async { self?.finish(granted: true, reason: nil, animated: true) }
+        } else if text.contains("back") {
           handle.readabilityHandler = nil
           DispatchQueue.main.async { self?.cancel(reason: "back") }
         } else if data.isEmpty || text.contains("cancel") {
@@ -1119,7 +1141,7 @@ extension PermissionPanel {
         width: source.width + (target.width - source.width) * w,
         height: source.height + (target.height - source.height) * h
       )
-      let startRadius = min(source.height / 2, 10)
+      let startRadius = source.height / 2
       let radius = startRadius + (18 - startRadius) * min(w, h)
       let origin = hostOrigin
       CATransaction.begin()
@@ -1128,7 +1150,7 @@ extension PermissionPanel {
       surface.apply(size: size, radius: radius, lift: 4 * p * (1 - p))
       // Lift off the button over the first stretch; land on it fading on the way back.
       surface.alphaValue = smoothstep(0, 0.14, p)
-      let resolve = smoothstep(reverse ? 0.62 : 0.55, reverse ? 0.92 : 0.95, min(w, h))
+      let resolve = smoothstep(reverse ? 0.5 : 0.3, reverse ? 0.9 : 0.85, min(w, h))
       var transaction = Transaction()
       transaction.disablesAnimations = true
       withTransaction(transaction) {

@@ -137,9 +137,6 @@ case "export":
 case "probe":
   guard arguments.count >= 2 else { fail("probe needs MOVIE") }
   runAsync { emit(try await Media.probe(URL(filePath: arguments[1]))) }
-case "guide":
-  let kind = (arguments.count >= 2 ? GuidePermission(rawValue: arguments[1]) : nil) ?? .accessibility
-  PermissionGuide.run(permission: kind, bundlePath: option("--bundle", in: arguments))
 case "permission-panel":
   PermissionPanel.run(arguments: arguments)
 case "permissions":
@@ -152,5 +149,5 @@ case "qr":
   }
   emit(["qr": qr])
 default:
-  fail("usage: scrawl-helper devices|mirror|transcribe|frames|audio|probe|export|shrink|guide|permission-panel|permissions|onboarding|qr …")
+  fail("usage: scrawl-helper devices|mirror|transcribe|frames|audio|probe|export|shrink|permission-panel|permissions|onboarding|qr …")
 }
