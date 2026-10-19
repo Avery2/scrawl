@@ -1870,6 +1870,7 @@ fn main() -> Result<()> {
                     captures.display(),
                     retention::format_bytes(retention::captures_size(&captures))
                 );
+                remote::prune(policy.bundle_days);
             }
             Ok(())
         }
