@@ -6,8 +6,8 @@
 //! - Only the outline's width (`L`, `R`) bounces (`0.50 / 0.28` open, `0.45 / 0.18` close,
 //!   `0.35 / 0.45` tap squish); the top edge `TOP` is anchored so it never bounces upward into the
 //!   top of the screen, and content / opacity / shared travel use `bounce = 0`.
-//! - Room gating (`CLEAR = 2 pt` + `EDGE_BAND = 3 pt` smoothstep), `0.10 s` look-ahead exit cap
-//!   sampled at 240 Hz, `0.10 s` collapse wait, `0.50` growth gate, `0.30 s` content-in fade from
+//! - Room gating (`CLEAR = 2 pt` + `EDGE_BAND = 3 pt` smoothstep), `0.08 s` look-ahead exit cap
+//!   sampled at 240 Hz, `0.06 s` collapse wait, `0.50` growth gate, `0.30 s` content-in fade from
 //!   `8 pt` blur and `0.82` scale with blur on its own critically damped clock at `0.55×` lead,
 //!   and `0.013 s` / `1.75 pt` directional stagger.
 //! - Persistent shared elements (`lead` dot + timer across recording states, and mode chips + `✕`
@@ -70,9 +70,10 @@ pub const CHIP_CORE_ROUND: f32 = 13.0;
 pub const CLEAR: f32 = 2.0;
 pub const EDGE_BAND: f32 = 3.0;
 pub const EXIT_LEAD_S: f32 = 0.08;
-/// Short pause before narrowing between two visible states so edge items start fading before
-/// the capsule wall moves across them. Never used on Entry or Exit (`Pres::Hidden`).
-pub const COLLAPSE_WAIT_S: f32 = 0.04;
+/// Short pause before narrowing between two visible states so edge items get about four 60 Hz
+/// frames to fade before the capsule wall moves across them. Never used on Entry or Exit
+/// (`Pres::Hidden`).
+pub const COLLAPSE_WAIT_S: f32 = 0.06;
 /// Fraction of a visible width expansion before incoming items begin fading in.
 pub const CONTENT_DELAY: f32 = 0.2;
 /// Whole-pill scale at `alpha = 0` on Entry and Exit with `Origin::Centre` (`0.94 ↔ 1.0`).
@@ -1606,7 +1607,8 @@ impl PillModel {
             // wall crosses fade out before it reaches them; they never blur.
             let hidden = st.a.x <= 1e-3;
             if !reduced && !(st.travelling && in_pres) {
-                let contact = if hidden {
+                // While a narrowing waits, items that stay will slide with the wall, not under it.
+                let contact = if hidden || (!settled_geo && in_pres) {
                     f32::INFINITY
                 } else {
                     let round = st.round * k;
@@ -2610,7 +2612,7 @@ mod tests {
     }
 
     #[test]
-    fn nothing_vanishes_from_visible_opacity_in_one_frame() {
+    fn nothing_vanishes_from_visible_opacity_in_one_frame_or_flickers() {
         let rec = |chips| Pres::Recording {
             chips,
             has_iphone: true,
@@ -2634,26 +2636,49 @@ mod tests {
                 Pres::Hidden,
             ],
         ];
-        for opts in all_opts() {
-            for steps in &scenes {
-                let mut m = PillModel::new(Metrics::default());
-                m.opts = opts;
-                let mut last: Vec<(ElemId, f32)> = Vec::new();
-                for pres in steps {
-                    m.set_pres(pres.clone());
-                    for _ in 0..90 {
-                        m.advance(FRAME_DT);
-                        let f = m.frame();
-                        for &(id, a) in &last {
-                            let now = f.elems.iter().find(|e| e.id == id).map_or(0.0, |e| e.alpha);
-                            // The collapse wait bounds a leaving item's fade to ~40 ms + the time
-                            // until the wall reaches it; it must ramp, never cut.
-                            assert!(
-                                a - now < 0.25,
-                                "{id:?} cut from {a:.2} to {now:.2} in one frame ({opts:?}, -> {pres:?})"
-                            );
+        for dt in [1.0 / 60.0, FRAME_DT] {
+            for opts in all_opts() {
+                for steps in &scenes {
+                    let mut m = PillModel::new(Metrics::default());
+                    m.opts = opts;
+                    let mut last: Vec<(ElemId, f32)> = Vec::new();
+                    for pres in steps {
+                        m.set_pres(pres.clone());
+                        // Per element: highest alpha so far, then the lowest after a dip.
+                        let mut seen: Vec<(ElemId, f32, f32)> = Vec::new();
+                        for _ in 0..(1.5 / dt) as usize {
+                            m.advance(dt);
+                            let f = m.frame();
+                            for &(id, a) in &last {
+                                let now = f.elems.iter().find(|e| e.id == id).map_or(0.0, |e| e.alpha);
+                                // The collapse wait gives a leaving item about four 60 Hz frames
+                                // before the wall reaches it; it must ramp to nothing, never cut.
+                                let max_cut = if dt > 0.01 { 0.35 } else { 0.25 };
+                                assert!(
+                                    now > 0.02 || a < max_cut,
+                                    "{id:?} cut from {a:.2} to {now:.2} in one frame ({opts:?}, -> {pres:?}, dt {dt:.4})"
+                                );
+                            }
+                            for e in &f.elems {
+                                match seen.iter_mut().find(|s| s.0 == e.id) {
+                                    None => seen.push((e.id, e.alpha, e.alpha)),
+                                    Some((id, peak, low)) => {
+                                        assert!(
+                                            *low > *peak - 0.2 || e.alpha < *low + 0.2,
+                                            "{id:?} dipped to {low:.2} and came back to {:.2} ({opts:?}, -> {pres:?})",
+                                            e.alpha
+                                        );
+                                        if e.alpha >= *peak {
+                                            *peak = e.alpha;
+                                            *low = e.alpha;
+                                        } else {
+                                            *low = low.min(e.alpha);
+                                        }
+                                    }
+                                }
+                            }
+                            last = f.elems.iter().map(|e| (e.id, e.alpha)).collect();
                         }
-                        last = f.elems.iter().map(|e| (e.id, e.alpha)).collect();
                     }
                 }
             }
@@ -2661,3 +2686,4 @@ mod tests {
     }
 
 }
+
