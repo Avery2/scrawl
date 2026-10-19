@@ -5,7 +5,8 @@
 //!
 //! Panes: General (launch at login, sending dev-site captures, the two shortcuts), Recording
 //! (transcriber, video export), Storage (how long recordings are kept), Permissions (the
-//! onboarding checklist, to fix things later) and About.
+//! onboarding checklist, to fix things later), Agents (`scrawl` on PATH, the skill's install
+//! command) and About.
 //!
 //! Shortcuts live under `"shortcuts"` (`{"record": {"keyCode", "modifiers", "label"}}`, Carbon
 //! modifier bits; absent means the default). While the window records one, Scrawl's hotkeys are
@@ -466,8 +467,12 @@ pub enum Pane {
     Recording,
     Storage,
     Permissions,
+    Agents,
     About,
 }
+
+/// What `bunx skills add` installs: `skills/scrawl/SKILL.md` from this repository.
+pub const SKILL_COMMAND: &str = "bunx skills add kitlangton/scrawl";
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -483,6 +488,93 @@ pub struct View {
     pub captures_size: Option<String>,
     pub permissions: Vec<PermissionView>,
     pub updates: bool,
+    pub command_line: CommandLineView,
+    pub skill_command: &'static str,
+}
+
+/// The "Command-line tool" row.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandLineView {
+    /// Where `scrawl` is linked, once it is.
+    pub path: Option<String>,
+    /// "install", "uninstall", or none.
+    pub button: Option<&'static str>,
+    pub enabled: bool,
+    pub caption: String,
+    pub error: bool,
+}
+
+impl CommandLineView {
+    fn new(state: &crate::command_line::State, error: Option<&str>) -> Self {
+        use crate::command_line::{State, tilde, usually_on_path};
+        let folder = |link: &std::path::Path| link.parent().map_or_else(String::new, tilde);
+        let mut view = Self {
+            path: None,
+            button: Some("install"),
+            enabled: true,
+            caption: String::new(),
+            error: false,
+        };
+        match state {
+            State::Installed { link, homebrew } => {
+                view.path = Some(tilde(link));
+                view.caption = "Agents and your terminal can run scrawl to read captures, zoom \
+                                into a moment and export video."
+                    .to_owned();
+                if *homebrew {
+                    view.button = None;
+                    view.caption = "Installed with Homebrew. Agents and your terminal can run \
+                                    scrawl to read captures, zoom into a moment and export video."
+                        .to_owned();
+                } else {
+                    view.button = Some("uninstall");
+                    if !usually_on_path(link) {
+                        view.caption = format!(
+                            "If your shell can't find scrawl, add {} to your PATH.",
+                            folder(link)
+                        );
+                    }
+                }
+            }
+            State::Missing { link } => {
+                view.caption = format!(
+                    "Links scrawl into {}, so agents and your terminal can run it.",
+                    folder(link)
+                );
+            }
+            State::Stale { link } => {
+                view.caption = format!(
+                    "{} points to another copy of Scrawl. Install links it to this one.",
+                    tilde(link)
+                );
+            }
+            State::Taken { link } => {
+                view.button = None;
+                view.error = true;
+                view.caption = format!(
+                    "{} is another program, so Scrawl leaves it alone.",
+                    tilde(link)
+                );
+            }
+            State::Nowhere => {
+                view.enabled = false;
+                view.error = true;
+                view.caption =
+                    "There's no folder on your PATH that Scrawl can write to.".to_owned();
+            }
+            State::Unavailable => {
+                view.enabled = false;
+                view.caption =
+                    "The command-line tool works in the installed Scrawl.app.".to_owned();
+            }
+        }
+        if let Some(error) = error {
+            view.error = true;
+            view.caption = error.to_owned();
+        }
+        view
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -640,6 +732,9 @@ pub enum Action {
     CheckForUpdates,
     /// "Show Welcome Tour" on About.
     Tour,
+    /// Link `scrawl` into a folder on PATH, or remove that link.
+    InstallCli,
+    UninstallCli,
     Close,
 }
 
@@ -669,6 +764,8 @@ pub trait Host {
     fn pause_shortcuts(&mut self, paused: bool);
     fn config_path(&self) -> PathBuf;
     fn set_login_item(&mut self, on: bool) -> anyhow::Result<()>;
+    /// Scrawl's binary and the folders `scrawl` may be linked into.
+    fn command_line(&self) -> crate::command_line::Places;
 }
 
 /// The window's own state: what it's recording, what failed, what was asked for.
@@ -676,6 +773,8 @@ pub trait Host {
 pub struct Panel {
     recording: Option<ShortcutKind>,
     error: Option<(ShortcutKind, String)>,
+    /// Why the last Install or Uninstall failed.
+    cli_error: Option<String>,
     requested: BTreeSet<Permission>,
     grants: Option<Grants>,
     captures_size: Option<u64>,
@@ -742,11 +841,28 @@ impl Panel {
             Action::ShowCaptures => Effect::ShowCaptures,
             Action::CheckForUpdates => Effect::CheckForUpdates,
             Action::Tour => Effect::Tour,
+            Action::InstallCli => {
+                let result = crate::command_line::install(&host.command_line());
+                self.note_cli("install", result.map(drop));
+                Effect::None
+            }
+            Action::UninstallCli => {
+                let result = crate::command_line::uninstall(&host.command_line());
+                self.note_cli("uninstall", result);
+                Effect::None
+            }
             Action::Close => {
                 self.stop_recording(host);
                 Effect::Close
             }
         }
+    }
+
+    fn note_cli(&mut self, verb: &str, result: anyhow::Result<()>) {
+        self.cli_error = result.err().map(|error| {
+            crate::capture::scrawl_log(format!("Command-line tool: {verb}: {error:#}"));
+            format!("Couldn't {verb} it: {error}.")
+        });
     }
 
     fn stop_recording(&mut self, host: &mut dyn Host) {
@@ -923,6 +1039,11 @@ impl Panel {
                 })
                 .collect(),
             updates: crate::sparkle::available(),
+            command_line: CommandLineView::new(
+                &crate::command_line::state(&host.command_line()),
+                self.cli_error.as_deref(),
+            ),
+            skill_command: SKILL_COMMAND,
         }
     }
 }
@@ -960,6 +1081,10 @@ impl Host for AppHost<'_> {
 
     fn set_login_item(&mut self, on: bool) -> anyhow::Result<()> {
         set_login_item(on)
+    }
+
+    fn command_line(&self) -> crate::command_line::Places {
+        crate::command_line::Places::system()
     }
 }
 
@@ -1184,6 +1309,7 @@ mod tests {
         path: PathBuf,
         paused: Vec<bool>,
         refuse: Option<String>,
+        cli: crate::command_line::Places,
     }
 
     impl Host for Fake {
@@ -1207,6 +1333,9 @@ mod tests {
         }
         fn set_login_item(&mut self, _on: bool) -> anyhow::Result<()> {
             Ok(())
+        }
+        fn command_line(&self) -> crate::command_line::Places {
+            self.cli.clone()
         }
     }
 
@@ -1245,6 +1374,11 @@ mod tests {
             path: dir.0.join("config.json"),
             paused: Vec::new(),
             refuse: None,
+            cli: crate::command_line::Places {
+                target: None,
+                install: vec![dir.0.join("bin")],
+                also: Vec::new(),
+            },
         }
     }
 
@@ -1656,6 +1790,75 @@ mod tests {
         assert_eq!(
             parse(r#"{"action":"check-for-updates"}"#),
             Action::CheckForUpdates
+        );
+        assert_eq!(parse(r#"{"action":"install-cli"}"#), Action::InstallCli);
+        assert_eq!(parse(r#"{"action":"uninstall-cli"}"#), Action::UninstallCli);
+    }
+
+    #[test]
+    fn the_command_line_row_installs_uninstalls_and_says_why_not() {
+        let dir = TempDir::new("cli");
+        let mut host = fake(&dir);
+        let mut panel = Panel::default();
+        // A development build has nothing to link.
+        let row = panel.view(&host).command_line;
+        assert_eq!((row.button, row.enabled), (Some("install"), false));
+        assert_eq!(
+            row.caption,
+            "The command-line tool works in the installed Scrawl.app."
+        );
+        assert_eq!(
+            panel.view(&host).skill_command,
+            "bunx skills add kitlangton/scrawl"
+        );
+
+        let macos = dir.0.join("Scrawl.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::write(macos.join("scrawl"), "").unwrap();
+        host.cli.target = Some(std::fs::canonicalize(macos.join("scrawl")).unwrap());
+        let row = panel.view(&host).command_line;
+        assert_eq!(
+            (row.button, row.enabled, row.path),
+            (Some("install"), true, None)
+        );
+        assert!(
+            row.caption.starts_with("Links scrawl into "),
+            "{}",
+            row.caption
+        );
+
+        panel.on(Action::InstallCli, &mut host);
+        let link = dir.0.join("bin/scrawl");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            host.cli.target.clone().unwrap()
+        );
+        let row = panel.view(&host).command_line;
+        assert_eq!(row.button, Some("uninstall"));
+        assert_eq!(row.path.as_deref(), Some(link.to_str().unwrap()));
+        // Not Homebrew's or /usr/local's bin, so it may not be on PATH.
+        assert!(row.caption.contains("to your PATH"), "{}", row.caption);
+        assert!(!row.error);
+
+        panel.on(Action::UninstallCli, &mut host);
+        assert!(link.symlink_metadata().is_err());
+        assert_eq!(panel.view(&host).command_line.button, Some("install"));
+
+        // Someone else's scrawl stays, and the row says so.
+        std::fs::write(&link, "other").unwrap();
+        let row = panel.view(&host).command_line;
+        assert_eq!((row.button, row.error), (None, true));
+        assert!(
+            row.caption
+                .ends_with("is another program, so Scrawl leaves it alone.")
+        );
+        panel.on(Action::InstallCli, &mut host);
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "other");
+        let row = panel.view(&host).command_line;
+        assert!(
+            row.error && row.caption.starts_with("Couldn't install it: "),
+            "{}",
+            row.caption
         );
     }
 }

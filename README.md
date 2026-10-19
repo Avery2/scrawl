@@ -15,6 +15,25 @@ brew install --cask kitlangton/tap/scrawl
 
 The app updates itself (Sparkle), so Homebrew leaves updates to it.
 
+## Agents
+
+Install the agent skill for Claude Code, OpenCode, Codex and other agents:
+
+```sh
+bunx skills add kitlangton/scrawl
+```
+
+The `scrawl` command is the binary inside Scrawl.app. The Homebrew cask links it onto your PATH, or click
+**Install** beside Command-line tool in Settings › Agents, which links it into `/opt/homebrew/bin`
+or `/usr/local/bin` when you can write there, else `~/.local/bin`. The link always runs the app's
+current copy, so it updates with the app.
+
+With the skill, an agent that gets a Scrawl paste reads the contact sheet and transcript, opens the
+keyframes the narration points at, and uses the command to look closer: `scrawl zoom <bundle> --at
+0:12` (or `--at "a phrase you said"`) makes a dense sheet of frames around a moment, `scrawl
+frames` pulls a range, `scrawl send` queues a capture into an OpenCode session, and `scrawl export`
+makes a shareable `.mp4`. `scrawl skill` prints the skill without installing anything.
+
 ## Usage
 
 ```sh
@@ -134,7 +153,7 @@ granted and each on-demand sheet: `target/debug/scrawl-helper onboarding --rende
 
 ## Settings
 
-**Settings…** in the menu bar (⌘, while the menu is open) opens a small window with five panes:
+**Settings…** in the menu bar (⌘, while the menu is open) opens a small window with six panes:
 
 - **General**: Launch at login, Send dev-site captures to OpenCode, and the two shortcuts, Record
   (`⌥⇧S`) and Paste last capture (`⌥⇧V`).
@@ -142,6 +161,8 @@ granted and each on-demand sheet: `target/debug/scrawl-helper onboarding --rende
   Experimental, Video export.
 - **Storage**: how long recordings are kept, how much space the captures take, and Show in Finder.
 - **Permissions**: the onboarding checklist, so a permission can be turned on later.
+- **Agents**: Install or Uninstall the `scrawl` command (see [Agents](#agents)), and the skill's
+  install command with Copy. A `scrawl` that belongs to another program is left alone.
 - **About**: the version, Check for Updates…, links, and the welcome tour.
 
 To change a shortcut, click its keys and press the new combination; `Esc` cancels. It needs ⌘, ⌥
