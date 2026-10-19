@@ -5,7 +5,7 @@ import { Demo } from "./demo/Demo"
 import { Download, useDownloadHref } from "./Download"
 import { HowItWorks } from "./HowItWorks"
 import { IPhoneSection } from "./IPhone"
-import { BREW, MAC_ZIP } from "./release"
+import { BREW, MAC_ZIP, SKILL } from "./release"
 
 const Brush3D = lazy(() => import("./Brush3D").then((m) => ({ default: m.Brush3D })))
 
@@ -90,8 +90,6 @@ export function App() {
           <div>
             <h2>Install</h2>
             <Download brew={false} />
-            {/* TODO: add a "For agents" note with `bunx skills add kitlangton/scrawl`
-                once README.md and skills/ on main describe the skill again (reverted in 52bdf48). */}
           </div>
           <div className="code-blocks">
             <div className="code-block">
@@ -119,6 +117,22 @@ export function App() {
                   </div>
                 ))}
               </pre>
+            </div>
+            <div className="code-block">
+              <div className="code-head">
+                <span>For agents</span>
+                <Copy text={SKILL} />
+              </div>
+              <pre>
+                <div>
+                  <span className="dim">$ </span>
+                  {SKILL}
+                </div>
+              </pre>
+              <p className="code-note">
+                With the skill, an agent that gets a Scrawl paste reads the contact sheet and transcript, opens the
+                keyframes the narration points at, and uses the <code>scrawl</code> command to look closer.
+              </p>
             </div>
           </div>
         </section>

@@ -5,6 +5,7 @@ import appcast from "../public/appcast.xml?raw"
 export const MAC_DMG = "/releases/Scrawl-latest-arm64.dmg"
 export const MAC_ZIP = "/releases/Scrawl-latest-arm64.zip"
 export const BREW = "brew install --cask kitlangton/tap/scrawl"
+export const SKILL = "bunx skills add kitlangton/scrawl"
 
 // Set this to the Windows build (e.g. "/releases/latest/Scrawl-windows-x64.zip"
 // or an installer) when it ships. While it's null the site says "coming soon".
