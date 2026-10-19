@@ -493,7 +493,7 @@ export function HowItWorks() {
           </Visual>
           <div className="feature-copy">
             <h3>Frames only when something happens</h3>
-            <p>Scrawl takes a frame when you draw, click, say “look” or “now”, or the screen changes, and never just because you paused.</p>
+            <p>Scrawl takes a frame when you draw, click, say “look” or “now”, or the screen changes.</p>
           </div>
         </article>
         <article className="feature-card">
@@ -502,7 +502,7 @@ export function HowItWorks() {
           </Visual>
           <div className="feature-copy">
             <h3>Each frame keeps its words</h3>
-            <p>Apple’s on-device speech recognition times every word, so each sentence sits next to the picture it was about.</p>
+            <p>Your speech is transcribed on your Mac, and each sentence goes with the frame it was about.</p>
           </div>
         </article>
         <article className="feature-card">
@@ -520,7 +520,7 @@ export function HowItWorks() {
           </Visual>
           <div className="feature-copy">
             <h3>A closer look when it’s needed</h3>
-            <p>When the frames aren’t enough, the agent can ask for a dense grid of frames around any moment, by time or by a phrase you said.</p>
+            <p>The agent can ask for a dense grid of frames around any moment, by time or by a phrase you said.</p>
           </div>
         </article>
       </div>
