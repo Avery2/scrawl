@@ -4,6 +4,27 @@ Show an agent a problem instead of describing it.
 
 Press a shortcut (`⌥⇧S`) and Scrawl starts recording the screen. Talk, click around, draw on it, and press `⌥⇧S` again to finish. Scrawl records the screen, your voice, and your marks, then packs them into a compact bundle: a contact sheet of annotated keyframes (`contact-sheet.png`), individual full-resolution keyframes (`frames/frame-XX.png`), a time-aligned transcript and interaction timeline (`summary.md`), and a structured manifest (`scrawl.json`).
 
+## Install
+
+Scrawl needs an Apple silicon Mac on macOS 26 or later. Download the DMG from
+[scrawl.kitlangton.com](https://scrawl.kitlangton.com), or use Homebrew:
+
+```sh
+brew install --cask kitlangton/tap/scrawl
+```
+
+The app updates itself (Sparkle), so Homebrew leaves updates to it.
+
+To teach your coding agent how to read captures, including `scrawl zoom` for a closer look at a
+moment, install the Scrawl skill. The [`skills`](https://github.com/vercel-labs/skills) CLI puts it
+where Claude Code, OpenCode, Codex, Cursor and other agents look for skills:
+
+```sh
+npx skills add kitlangton/scrawl -g
+```
+
+The skill is [`skills/scrawl/SKILL.md`](skills/scrawl/SKILL.md) if you'd rather copy it by hand.
+
 ## Usage
 
 ```sh
