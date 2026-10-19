@@ -4091,9 +4091,11 @@ impl Render for HudPillWindow {
             .track_focus(&self.focus)
             // Clicking a chip can make the pill the key window; keep the picker's keyboard map.
             .on_key_down(move |event: &KeyDownEvent, _, cx| {
-                c_keys.update(cx, |coord, cx| {
+                if c_keys.update(cx, |coord, cx| {
                     coord.handle_selection_key(&event.keystroke, cx)
-                });
+                }) {
+                    cx.stop_propagation();
+                }
             })
             .size_full()
             .flex()
@@ -4613,9 +4615,14 @@ impl Render for TargetPickerWindow {
             )
         })
         .on_key_down(move |event: &KeyDownEvent, _, cx| {
-            c_key.update(cx, |coord, cx| {
+            // Unhandled, gpui hands the key back to AppKit, which offers it again (as a key
+            // equivalent, keyDown, or input method command) and this runs up to three times:
+            // Space and the arrows then toggle or cycle back to where they started.
+            if c_key.update(cx, |coord, cx| {
                 coord.handle_selection_key(&event.keystroke, cx)
-            });
+            }) {
+                cx.stop_propagation();
+            }
         })
         .on_mouse_down(
             MouseButton::Left,
@@ -4886,15 +4893,19 @@ impl Render for BundleReviewWindow {
                 .id("scrawl-review-empty")
                 .track_focus(&self.focus)
                 .on_key_down(move |event: &KeyDownEvent, window, cx| {
-                    let handled =
-                        c_keydown.update(cx, |coord, cx| coord.handle_app_key(&event.keystroke, cx));
+                    let handled = c_keydown
+                        .update(cx, |coord, cx| coord.handle_app_key(&event.keystroke, cx));
                     let key = event.keystroke.key.as_str();
                     if !handled
                         && (key == "escape"
-                            || (event.keystroke.modifiers.platform && key.eq_ignore_ascii_case("w")))
+                            || (event.keystroke.modifiers.platform
+                                && key.eq_ignore_ascii_case("w")))
                     {
                         window.remove_window();
+                    } else if !handled {
+                        return;
                     }
+                    cx.stop_propagation();
                 })
                 .size_full()
                 .flex()
@@ -5010,7 +5021,10 @@ impl Render for BundleReviewWindow {
                 if !handled && (key == "escape" || (mods.platform && key.eq_ignore_ascii_case("w")))
                 {
                     window.remove_window();
+                } else if !handled {
+                    return;
                 }
+                cx.stop_propagation();
             })
             .size_full()
             .flex()
