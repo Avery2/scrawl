@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::capture::scrawl_log;
-use crate::handoff::OpenCodeSession;
+use crate::handoff::{ApiGet, OpenCodeSession};
 use crate::model::{Destination, ScrawlBundle};
 use crate::web::Registration;
 
@@ -272,25 +272,39 @@ pub fn project_root(dir: &Path) -> (PathBuf, bool) {
 /// The most recently active open root session for `root`. Inside a repository a session in any
 /// folder of it counts; outside one, only a session in that very folder, so a server started
 /// from the home folder doesn't claim every session.
-pub fn choose_session_for_directory<'a>(
-    sessions: &'a [OpenCodeSession],
+///
+/// The server filters by exact directory, so that takes one request. A session in a subfolder
+/// only wins if it's newer, so the newest-first scan for one stops at the exact match's age (or
+/// after [`ROOT_SEARCH_PAGES`](crate::handoff::ROOT_SEARCH_PAGES)).
+pub fn session_for_directory(
+    get: &mut ApiGet,
     root: &Path,
     whole_tree: bool,
-) -> Option<&'a OpenCodeSession> {
+) -> Result<Option<OpenCodeSession>> {
+    use crate::handoff::{ROOT_SEARCH_PAGES, Scan, find_root_session, query_escape};
     let home = dirs::home_dir();
     if root == Path::new("/") || Some(root) == home.as_deref() {
-        return None;
+        return Ok(None);
     }
-    sessions
-        .iter()
-        .filter(|s| s.is_open_root())
-        .filter(|s| {
-            s.directory().is_some_and(|dir| {
-                let dir = Path::new(dir);
-                dir == root || (whole_tree && dir.starts_with(root))
-            })
-        })
-        .max_by_key(|s| s.time.updated)
+    let directory = format!("&directory={}", query_escape(&root.to_string_lossy()));
+    let exact = find_root_session(get, &directory, ROOT_SEARCH_PAGES, |_| Scan::Take)?;
+    if !whole_tree {
+        return Ok(exact);
+    }
+    let floor = exact.as_ref().map(|s| s.time.updated);
+    let nested = find_root_session(get, "", ROOT_SEARCH_PAGES, |s| {
+        if floor.is_some_and(|floor| s.time.updated <= floor) {
+            Scan::Stop
+        } else if s
+            .directory()
+            .is_some_and(|dir| Path::new(dir).starts_with(root))
+        {
+            Scan::Take
+        } else {
+            Scan::Skip
+        }
+    })?;
+    Ok(nested.or(exact))
 }
 
 // MARK: Deciding
@@ -300,7 +314,8 @@ pub fn choose_session_for_directory<'a>(
 pub struct Hooks {
     pub sdk: fn(&str) -> Option<Registration>,
     pub listener_dir: fn(u16) -> Option<PathBuf>,
-    pub sessions: fn() -> Result<Vec<OpenCodeSession>>,
+    /// One `GET` against OpenCode's API.
+    pub api: fn(&str) -> Result<Vec<u8>>,
 }
 
 impl Default for Hooks {
@@ -308,7 +323,7 @@ impl Default for Hooks {
         Self {
             sdk: crate::web::lookup,
             listener_dir: listener_directory,
-            sessions: crate::handoff::list_root_sessions,
+            api: crate::handoff::api_get,
         }
     }
 }
@@ -323,21 +338,20 @@ pub fn route(url: &str, hooks: &Hooks) -> std::result::Result<Destination, Strin
         url: Some(url.to_owned()),
         directory: dir.map(|d| d.display().to_string()),
     };
-    let sessions = || (hooks.sessions)().map_err(|err| format!("couldn't list sessions: {err:#}"));
+    let mut api = hooks.api;
     let by_directory = |dir: &Path, via: &str| {
         let (root, git) = project_root(dir);
-        let sessions = sessions()?;
-        choose_session_for_directory(&sessions, &root, git)
-            .map(|s| destination(s, via, Some(&root)))
+        let mut api = hooks.api;
+        session_for_directory(&mut api, &root, git)
+            .map_err(|err| format!("couldn't list sessions: {err:#}"))?
+            .map(|s| destination(&s, via, Some(&root)))
             .ok_or_else(|| format!("no open OpenCode session in {}", root.display()))
     };
 
     if let Some(reg) = (hooks.sdk)(url) {
         if let Some(id) = reg.session.as_deref() {
-            let title = sessions()
-                .ok()
-                .and_then(|list| list.into_iter().find(|s| s.id == id))
-                .map_or_else(|| id.to_owned(), |s| s.label().to_owned());
+            let title = crate::handoff::get_session(&mut api, id)
+                .map_or_else(|_| id.to_owned(), |s| s.label().to_owned());
             return Ok(Destination {
                 session: id.to_owned(),
                 title,
@@ -506,21 +520,47 @@ mod tests {
         child.parent_id = Some("ses_app".into());
         let mut archived = session("ses_old", "/p/app", 800);
         archived.time.archived = Some(1);
-        let sessions = vec![
+        let mut sessions = vec![
             session("ses_app", "/p/app", 100),
             session("ses_site", "/p/app/site", 200),
             session("ses_other", "/p/application", 300),
             child,
             archived,
         ];
-        let pick = |root: &str, tree| {
-            choose_session_for_directory(&sessions, Path::new(root), tree).map(|s| s.id.as_str())
+        // Thousands of newer sessions elsewhere.
+        sessions.extend((0..3_000).map(|i| session(&format!("ses_x{i}"), "/q", 1_000 + i)));
+        let pick = |sessions: &[OpenCodeSession], root: &str, tree| {
+            let mut requests = 0;
+            let found = session_for_directory(
+                &mut |path: &str| {
+                    requests += 1;
+                    crate::handoff::fake_api::serve(sessions, path)
+                },
+                Path::new(root),
+                tree,
+            )
+            .unwrap()
+            .map(|s| s.id);
+            (found, requests)
         };
-        // Newest open root session in the repository; a sibling with a common prefix doesn't count.
-        assert_eq!(pick("/p/app", true), Some("ses_site"));
-        assert_eq!(pick("/p/app", false), Some("ses_app"));
-        assert_eq!(pick("/p/none", true), None);
-        assert_eq!(pick("/", true), None);
+        // Exact folder: one filtered request.
+        assert_eq!(pick(&sessions, "/p/app", false), (Some("ses_app".into()), 1));
+        // A subfolder needs a newest-first scan, which is capped: past it the exact match stands.
+        let (found, requests) = pick(&sessions, "/p/app", true);
+        assert_eq!(found.as_deref(), Some("ses_app"));
+        assert_eq!(requests, 1 + crate::handoff::ROOT_SEARCH_PAGES);
+        assert_eq!(pick(&sessions, "/p/none", false), (None, 1));
+        assert_eq!(pick(&sessions, "/", true), (None, 0));
+
+        // Recent work in a subfolder beats an older exact match; a sibling with a common prefix
+        // doesn't count.
+        sessions.truncate(5);
+        let (found, requests) = pick(&sessions, "/p/app", true);
+        assert_eq!(found.as_deref(), Some("ses_site"));
+        assert_eq!(requests, 2);
+        // An exact match newer than everything else stops the scan at once.
+        sessions[0].time.updated = 1_000;
+        assert_eq!(pick(&sessions, "/p/app", true), (Some("ses_app".into()), 2));
     }
 
     fn no_sdk(_: &str) -> Option<Registration> {
@@ -545,11 +585,14 @@ mod tests {
     fn listener(port: u16) -> Option<PathBuf> {
         (port == 4321).then(|| PathBuf::from("/p/app"))
     }
-    fn sessions() -> Result<Vec<OpenCodeSession>> {
-        Ok(vec![
-            session("ses_sdk", "/elsewhere", 5),
-            session("ses_app", "/p/app", 10),
-        ])
+    fn api(path: &str) -> Result<Vec<u8>> {
+        crate::handoff::fake_api::serve(
+            &[
+                session("ses_sdk", "/elsewhere", 5),
+                session("ses_app", "/p/app", 10),
+            ],
+            path,
+        )
     }
 
     #[test]
@@ -557,7 +600,7 @@ mod tests {
         let hooks = Hooks {
             sdk: sdk_session,
             listener_dir: listener,
-            sessions,
+            api,
         };
         let sdk = route("http://localhost:5173/page", &hooks).unwrap();
         assert_eq!((sdk.session.as_str(), sdk.via.as_str()), ("ses_sdk", "sdk"));
