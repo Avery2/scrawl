@@ -2,3 +2,5 @@ node_modules
 dist
 *.tsbuildinfo
 dist-ssr
+.wrangler/state
+.wrangler/tmp
