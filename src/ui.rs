@@ -2260,6 +2260,27 @@ impl ScrawlCoordinator {
 
     /// Picker keyboard map, shared by the picker window and the HUD pill. Returns whether the
     /// key was handled.
+    /// ⌘Q and ⌘, in Scrawl's own windows: a menu bar (accessory) app has no main menu to
+    /// carry them.
+    pub fn handle_app_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+        let mods = keystroke.modifiers;
+        if !mods.platform || mods.control || mods.alt || mods.shift {
+            return false;
+        }
+        match keystroke.key.as_str() {
+            "q" => cx.quit(),
+            "," => {
+                if self.is_selecting() {
+                    self.switcher.reset();
+                    self.cancel_recording(cx);
+                }
+                self.open_settings(None);
+            }
+            _ => return false,
+        }
+        true
+    }
+
     pub fn handle_selection_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
         let Some(mode) = self.selection_mode() else {
             return false;
@@ -2269,6 +2290,9 @@ impl ScrawlCoordinator {
         if keystroke.key == "escape" {
             self.switcher.reset();
             self.cancel_recording(cx);
+            return true;
+        }
+        if self.handle_app_key(keystroke, cx) {
             return true;
         }
         // The shortcut itself, if it reaches a picker window instead of Carbon.
@@ -4857,7 +4881,21 @@ impl Render for BundleReviewWindow {
         let Some((dir, bundle)) = state else {
             let c_start = self.coordinator.clone();
             let c_demo = self.coordinator.clone();
+            let c_keydown = self.coordinator.clone();
             return div()
+                .id("scrawl-review-empty")
+                .track_focus(&self.focus)
+                .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                    let handled =
+                        c_keydown.update(cx, |coord, cx| coord.handle_app_key(&event.keystroke, cx));
+                    let key = event.keystroke.key.as_str();
+                    if !handled
+                        && (key == "escape"
+                            || (event.keystroke.modifiers.platform && key.eq_ignore_ascii_case("w")))
+                    {
+                        window.remove_window();
+                    }
+                })
                 .size_full()
                 .flex()
                 .flex_col()
@@ -4947,6 +4985,9 @@ impl Render for BundleReviewWindow {
                             cx.notify();
                             return true;
                         }
+                    }
+                    if coord.handle_app_key(&event.keystroke, cx) {
+                        return true;
                     }
                     if let Some(cfg) = shortcut_from_key_and_mods(
                         key,
@@ -5742,12 +5783,13 @@ fn close_review_window(cx: &mut App) {
     }
 }
 
+/// Opens the review window in front with the keys. A menu bar (accessory) app isn't active when
+/// its menu is used, and the cooperative `NSApp.activate()` may leave the window behind the app
+/// in front, so it activates ignoring other apps once the window exists.
 fn open_review_window(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
-    if let Some(mtm) = MainThreadMarker::new() {
-        NSApplication::sharedApplication(mtm).activate();
-    }
     for handle in cx.windows() {
         if let Some(review) = handle.downcast::<BundleReviewWindow>() {
+            cx.activate(true);
             let _ = review.update(cx, |_, window, cx| {
                 window.activate_window();
                 cx.notify();
@@ -5781,6 +5823,7 @@ fn open_review_window(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
             })
         },
     );
+    cx.activate(true);
 }
 
 pub(crate) fn start_metric(name: &str, started: Instant) {
