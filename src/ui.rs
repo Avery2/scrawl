@@ -5529,6 +5529,11 @@ fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
                 configure_floating_window(&ns_win, picker_coord.read(cx).lab, 1);
                 // The display the picker was opened for, or has since followed the pointer to.
                 move_window_to_screen(&ns_win, picker_coord.read(cx).display_rect.map(f64::from));
+                // gpui made it key before the style change above; make it key again so it
+                // takes the keys once Scrawl is active (see the end of this function).
+                if !lab {
+                    ns_win.makeKeyAndOrderFront(None);
+                }
                 let num = ns_win.windowNumber().max(0) as u32;
                 if num > 0 {
                     picker_coord
@@ -5553,6 +5558,12 @@ fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
             })
         },
     );
+    // A menu bar (accessory) app isn't active when its menu or capsule is used, and keys only
+    // reach the picker while it is. The held switcher takes its keys from the key tap instead,
+    // so it leaves the app in front alone.
+    if !lab && !coord_entity.read(cx).switcher.is_held() {
+        cx.activate(true);
+    }
 
     ensure_hud_pill_open(coord_entity, cx);
 }
@@ -5679,19 +5690,46 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
 }
 
 fn close_picker_window(cx: &mut App) {
+    let mut closed = false;
     for handle in cx.windows() {
         if handle.downcast::<TargetPickerWindow>().is_some() {
-            let _ = handle.update(cx, |_, window, _| window.remove_window());
+            closed |= handle.update(cx, |_, window, _| window.remove_window()).is_ok();
         }
+    }
+    if closed {
+        hand_back_keys(cx);
     }
 }
 
 fn close_capture_windows(cx: &mut App) {
+    let mut closed_picker = false;
     for handle in cx.windows() {
-        if handle.downcast::<HudPillWindow>().is_some()
-            || handle.downcast::<TargetPickerWindow>().is_some()
-        {
-            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        let picker = handle.downcast::<TargetPickerWindow>().is_some();
+        if picker || handle.downcast::<HudPillWindow>().is_some() {
+            let closed = handle.update(cx, |_, window, _| window.remove_window()).is_ok();
+            closed_picker |= picker && closed;
+        }
+    }
+    if closed_picker {
+        hand_back_keys(cx);
+    }
+}
+
+/// `open_picker_windows` activates Scrawl so the picker gets the keys; once it closes, the app
+/// that was in front gets them back (and the window being recorded keeps them), unless the
+/// review window is open.
+fn hand_back_keys(cx: &mut App) {
+    if cx
+        .windows()
+        .iter()
+        .any(|handle| handle.downcast::<BundleReviewWindow>().is_some())
+    {
+        return;
+    }
+    if let Some(mtm) = MainThreadMarker::new() {
+        let app = NSApplication::sharedApplication(mtm);
+        if app.isActive() {
+            app.deactivate();
         }
     }
 }
@@ -6025,6 +6063,12 @@ pub fn run_app(
                     motion::poll_tune();
                     if loop_coord.read(cx).switcher.is_held() {
                         loop_coord.update(cx, |coord, cx| coord.tick_switcher(cx));
+                    } else if loop_coord.read(cx).telemetry.take_escape()
+                        && loop_coord.read(cx).is_selecting()
+                    {
+                        // The picker may not have the keys (another app is active), but the
+                        // key tap sees Esc anyway.
+                        loop_coord.update(cx, |coord, cx| coord.cancel_recording(cx));
                     }
                     if loop_coord.read(cx).gate.is_pending() {
                         loop_coord.update(cx, |coord, _| coord.tick_gate());
