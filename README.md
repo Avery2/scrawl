@@ -57,38 +57,52 @@ cargo run -- pin latest
 On first launch Scrawl opens a welcome window with four screens: a welcome, how ⌥⇧S works, one
 screen with every permission Scrawl needs, and a first capture. Each permission is a row with a
 button that shows the macOS prompt (or, once asked, opens System Settings) and a check that appears
-by itself when macOS grants it (the window re-reads the grants every 0.5 s). Grant them in any
-order; Continue unlocks once all three required ones are on, and the screen is skipped when they
-already are.
+by itself when macOS grants it (the window re-reads the grants every 0.5 s). Screen Recording is
+first and its button is filled in; after that the next row's button is. Grant them in any order;
+Continue unlocks once all three are on, and the screen is skipped when they already are.
 
 | Permission | Used for | When it's asked for |
 |---|---|---|
 | Screen & System Audio Recording | Recording the screen (ScreenCaptureKit) | onboarding, required |
 | Microphone | Your narration | onboarding, required |
-| Input Monitoring | The event tap that sees clicks, ⌘Z and shortcuts in every app | onboarding, required |
-| Accessibility | `⌥⇧V` and the Paste chip, which post ⌘V into the app in front | the first time you use them |
+| Accessibility ("Device Control and Data Access" on macOS 27) | The key event tap (⌘Z, Esc, S in the switcher, ⌘-shortcuts in the window log), and `⌥⇧V` and the Paste chip, which post ⌘V into the app in front | onboarding, required |
 | Camera | The cabled iPhone mirror (macOS treats it as a camera) | the first time you pick iPhone |
 
-Screen Recording, Input Monitoring and Accessibility are lists you drag an app into, so their
-button skips Apple's prompt: it opens the pane in System Settings, and a card flies from the button
-to just below the Settings window (or, with no room on screen there, over the window's empty lower
-area), with its Scrawl row lined up under the list. Drag that row into
-the list. The card follows the window, steps aside when another app is in front, and shows "Scrawl
-is allowed" once a fresh process sees the grant (a drop alone proves nothing). The row drags the
-`Scrawl.app` that contains the helper, the bundle macOS grants. With Reduce Motion on, the card
-fades in place. Microphone and Camera can't be dragged in, so they use the macOS prompt.
+Scrawl never asks for Input Monitoring. Clicks, drags and scrolls in other apps come from an AppKit
+global mouse monitor (`NSEvent.addGlobalMonitorForEvents`), which needs no permission; ⇧ for ink
+and the switcher's held ⌥⇧ come from polled modifier flags, which need none either; key presses
+come from an active event tap, which Accessibility allows. macOS applies an Accessibility grant to
+a running app at once (System Settings shows no "Quit & Reopen" for it), and Scrawl makes the tap
+within half a second of it.
 
-Accessibility and Camera are asked for in the same window, with just their row, when first needed.
-Speech recognition isn't asked for: SpeechAnalyzer transcribes without it. The ⌥⇧S hotkey itself
-needs no permission (Carbon `RegisterEventHotKey`).
+Screen Recording and Accessibility are lists you drag an app into, so their button skips Apple's
+prompt: it opens the pane in System Settings, and a card flies from the button to just below the
+Settings window (or, with no room on screen there, over the window's empty lower area), with its
+Scrawl row lined up under the list. Drag that row into the list. The card follows the window,
+steps aside when another app is in front, and shows "Scrawl is allowed" once a fresh process sees
+the grant (a drop alone proves nothing). The row drags the `Scrawl.app` that contains the helper,
+the bundle macOS grants. With Reduce Motion on, the card fades in place. Microphone and Camera
+can't be dragged in, so they use the macOS prompt.
+
+Camera is asked for in the same window, with just its row, when first needed. Speech recognition
+isn't asked for: SpeechAnalyzer transcribes without it. The ⌥⇧S and ⌥⇧V hotkeys themselves need
+no permission (Carbon `RegisterEventHotKey`).
 
 Until the required permissions are on, ⌥⇧S starts nothing (no switcher, picker or overlay that
 could sit over a macOS prompt): once the keys are released it brings the permissions window
-forward. A running app only sees a Screen Recording grant after it relaunches, so when Screen
-Recording was granted during onboarding the button becomes **Reopen Scrawl**, once, after
-everything else is on, and the tour comes back on its next screen. If macOS offers **Quit &
-Reopen** while you grant, **Later** is fine. Input Monitoring needs no relaunch: Scrawl remakes its
-event tap when the grant arrives.
+forward.
+
+A Screen Recording grant may not reach a running app, and macOS offers **Quit & Reopen** or
+**Later** as soon as it's granted. Either way nobody reopens Scrawl by hand. If you pick **Quit &
+Reopen**, macOS restarts Scrawl and the tour opens on the permissions screen again, Screen
+Recording checked. If you pick **Later** (or nothing), Scrawl checks whether it can capture anyway
+(a one-frame ScreenCaptureKit screenshot, tried only once a fresh helper reports the grant), and if
+it can't, the row shows "Reopening Scrawl" for a second and Scrawl relaunches itself into the same
+screen. It only does that once in two minutes (`relaunchedAt` in the config); if a fresh copy
+still can't capture, the row's button becomes **Reopen Scrawl**. The relaunch waits for this copy
+to exit and opens the app without `-n`, so if macOS's Quit & Reopen got there first there's still
+one Scrawl. `scrawl sck-probe [--watch SECONDS]` and `scrawl-helper sck-probe` try the same
+capture from the command line.
 
 Progress is `"onboarding"` in `~/.config/scrawl/config.json`, including the screen the tour is on,
 so it picks up there whatever quits Scrawl. Once seen, the tour only comes back from **Welcome
@@ -674,7 +688,7 @@ target/debug/scrawl-helper export plan.json   # the plan `scrawl export` writes 
 target/debug/scrawl-helper permission-panel --permission screen-recording --preview   # the drag card, no grant polling
 ```
 
-`permission-panel --permission screen-recording|accessibility|input-monitoring [--from X,Y,W,H]`
+`permission-panel --permission screen-recording|accessibility [--from X,Y,W,H]`
 (`--from` is the button's frame in global top-left points) prints JSON lines: `docked`, `dropped`,
 then `granted` or `cancelled` with a `reason` (`back`, `settings-closed`, `no-settings-window`,
 `parent`, `timeout`), and exits. On stdin it takes `cancel`, `back` and `granted`.

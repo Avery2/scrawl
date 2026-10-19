@@ -1,7 +1,7 @@
 // `scrawl-helper permission-panel`: the "drag Scrawl into the list" card for the Privacy panes
-// that take a dragged app (Screen Recording, Accessibility, Input Monitoring).
+// that take a dragged app (Screen Recording, Accessibility).
 //
-//   scrawl-helper permission-panel --permission screen-recording|accessibility|input-monitoring
+//   scrawl-helper permission-panel --permission screen-recording|accessibility
 //                                  [--from X,Y,W,H] [--app PATH] [--preview] [--reduce-motion]
 //   scrawl-helper permission-panel --check PERMISSION        {"granted":true|false} from a fresh process
 //   scrawl-helper permission-panel --plan --settings X,Y,W,H --visible X,Y,W,H   where the card docks
@@ -26,7 +26,6 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
-import IOKit.hid
 import SwiftUI
 
 enum PermissionPanel {
@@ -62,7 +61,7 @@ enum PermissionPanel {
       exit(0)
     }
     guard let raw = option("--permission", in: arguments), let kind = Kind(rawValue: raw) else {
-      fail("permission-panel needs --permission screen-recording|accessibility|input-monitoring")
+      fail("permission-panel needs --permission screen-recording|accessibility")
     }
     let source = option("--from", in: arguments).flatMap(parseRect)
     let app = NSApplication.shared
@@ -150,13 +149,11 @@ enum PermissionPanel {
   enum Kind: String {
     case screenRecording = "screen-recording"
     case accessibility = "accessibility"
-    case inputMonitoring = "input-monitoring"
 
     var anchor: String {
       switch self {
       case .screenRecording: return "Privacy_ScreenCapture"
       case .accessibility: return "Privacy_Accessibility"
-      case .inputMonitoring: return "Privacy_ListenEvent"
       }
     }
 
@@ -164,7 +161,6 @@ enum PermissionPanel {
     var title: String {
       switch self {
       case .screenRecording: return "Screen Recording"
-      case .inputMonitoring: return "Input Monitoring"
       case .accessibility:
         return ProcessInfo.processInfo.isOperatingSystemAtLeast(OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0))
           ? "Device Control and Data Access" : "Accessibility"
@@ -180,7 +176,6 @@ enum PermissionPanel {
       switch self {
       case .screenRecording: return CGPreflightScreenCaptureAccess()
       case .accessibility: return AXIsProcessTrusted()
-      case .inputMonitoring: return IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
       }
     }
 

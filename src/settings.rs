@@ -570,7 +570,7 @@ fn retention_note(policy: &crate::retention::Policy) -> String {
         }
     };
     match (policy.media_days, policy.bundle_days) {
-        (None, None) => "Scrawl keeps every recording.".to_owned(),
+        (None, None) => String::new(),
         (Some(media), Some(bundle)) => format!(
             "Video and audio go to the Trash after {}, the rest of each capture after {}.",
             days(media),
@@ -862,7 +862,6 @@ impl Panel {
         let order = [
             Permission::ScreenRecording,
             Permission::Microphone,
-            Permission::InputMonitoring,
             Permission::Accessibility,
             Permission::Camera,
         ];
@@ -1094,13 +1093,9 @@ impl Session {
             }
         };
         let result = match effect {
-            // These two are attributed to whichever process asks, so Scrawl itself asks.
+            // Attributed to whichever process asks, so Scrawl itself asks.
             Effect::Request(Permission::ScreenRecording) => {
                 crate::capture::request_screen_capture();
-                Effect::None
-            }
-            Effect::Request(Permission::InputMonitoring) => {
-                crate::capture::request_listen_access();
                 Effect::None
             }
             Effect::Request(permission) => {
@@ -1568,10 +1563,8 @@ mod tests {
         set(&mut panel, &mut host, "hexModel", "parakeet".into());
         assert_eq!(read_json(&host.path)["hexModel"], "parakeet");
         set(&mut panel, &mut host, "retention", "forever".into());
-        assert_eq!(
-            panel.view(&host).retention.note,
-            "Scrawl keeps every recording."
-        );
+        // "Forever" says it all; no caption.
+        assert_eq!(panel.view(&host).retention.note, "");
     }
 
     #[test]
@@ -1605,8 +1598,19 @@ mod tests {
             Effect::OpenSettings(Permission::Camera)
         );
         let view = panel.view(&host);
-        assert_eq!(view.permissions.len(), 5);
+        let order: Vec<_> = view.permissions.iter().map(|p| p.permission).collect();
+        assert_eq!(
+            order,
+            [
+                Permission::ScreenRecording,
+                Permission::Microphone,
+                Permission::Accessibility,
+                Permission::Camera
+            ],
+            "no Input Monitoring"
+        );
         assert!(view.permissions[..3].iter().all(|p| p.required));
+        assert!(!view.permissions[3].required);
         // Screen Recording granted but not yet usable: Reopen relaunches.
         assert_eq!(panel.on(Action::Reopen, &mut host), Effect::None);
         grants
