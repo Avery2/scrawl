@@ -95,8 +95,8 @@ struct SettingsState: Decodable, Equatable {
   var videoExport = false
   var retention = SettingsRetention()
   var capturesSize: String?
-  var permissions: [SettingsPermission] = ["screen-recording", "microphone", "input-monitoring", "accessibility", "camera"]
-    .map { SettingsPermission(permission: $0, required: ["screen-recording", "microphone", "input-monitoring"].contains($0)) }
+  var permissions: [SettingsPermission] = ["screen-recording", "microphone", "accessibility", "camera"]
+    .map { SettingsPermission(permission: $0, required: ["screen-recording", "microphone", "accessibility"].contains($0)) }
   var updates = true
 
   var pasteLabel: String { shortcuts.first { $0.kind == "paste" }?.label ?? "⌥⇧V" }
@@ -725,7 +725,9 @@ struct SettingsView: View {
           }
         }
       }
-      SettingsCaption(text: r.note)
+      if !r.note.isEmpty {
+        SettingsCaption(text: r.note)
+      }
       SettingsHeader("Captures")
       SettingsGroup {
         SettingsRow(title: "Captures folder") {
@@ -846,15 +848,18 @@ struct PermissionLine: View {
 
   /// Shorter than onboarding's, to fit one line beside the button.
   private var name: String {
-    row.permission == "screen-recording" ? "Screen Recording" : permissionInfo(row.permission, paste: paste).name
+    switch row.permission {
+    case "screen-recording": "Screen Recording"
+    case "accessibility": "Accessibility"
+    default: permissionInfo(row.permission, paste: paste).name
+    }
   }
 
   private var why: String {
     switch row.permission {
     case "screen-recording": "To see your screen"
     case "microphone": "To hear you"
-    case "input-monitoring": "To see clicks and shortcuts"
-    case "accessibility": "To press ⌘V when you use \(paste)"
+    case "accessibility": "For ⌘Z and \(paste)"
     case "camera": "To show a cabled iPhone"
     default: ""
     }
@@ -1047,7 +1052,7 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
     base.capturesSize = "1.4 GB"
     base.permissions = base.permissions.map { row in
       var row = row
-      row.status = ["screen-recording", "microphone", "input-monitoring"].contains(row.permission) ? "granted" : "not-determined"
+      row.status = ["screen-recording", "microphone", "accessibility"].contains(row.permission) ? "granted" : "not-determined"
       if row.permission == "camera" { row.status = "denied" }
       return row
     }

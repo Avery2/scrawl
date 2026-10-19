@@ -1523,7 +1523,8 @@ impl ScrawlCoordinator {
     }
 
     pub fn paste_latest(&mut self, cx: &mut Context<Self>) {
-        // Without Accessibility macOS drops the posted ⌘V; ask for it the first time instead.
+        // Without Accessibility macOS drops the posted ⌘V (onboarding asks for it, but it can be
+        // turned off later); bring the permissions window instead.
         if !crate::capture::accessibility_granted() {
             scrawl_log("⌥⇧V without Accessibility; asking for it");
             self.gate
@@ -1646,17 +1647,13 @@ impl ScrawlCoordinator {
         }
     }
 
-    /// Keeps a fresh read of the grants: remembers what was granted, and remakes the event tap
-    /// when Input Monitoring comes on, so it works without a relaunch.
+    /// Keeps a fresh read of the grants and remembers what was granted. (The key tap follows
+    /// Accessibility by itself, in the HID poller.)
     fn note_grants(&mut self, grants: &crate::onboarding::Grants) {
-        use crate::onboarding::{Permission, Progress};
+        use crate::onboarding::Progress;
         let mut progress = Progress::load();
         if progress.note(grants) {
             progress.save();
-        }
-        let listen = |g: &crate::onboarding::Grants| g.granted(Permission::InputMonitoring);
-        if self.grants.as_ref().is_some_and(|old| !listen(old)) && listen(grants) {
-            crate::capture::restart_input_tap(&self.telemetry);
         }
         self.grants = Some(grants.clone());
     }
@@ -1664,14 +1661,15 @@ impl ScrawlCoordinator {
     /// Required permissions that keep a capture from starting now.
     fn missing_to_record(&mut self) -> Vec<crate::onboarding::Permission> {
         use crate::onboarding::{Permission, missing_to_record};
-        let screen = crate::capture::screen_capture_granted();
-        let missing = missing_to_record(self.grants.as_ref(), screen);
+        let screen = crate::capture::screen_capture_usable(false);
+        let accessibility = crate::capture::accessibility_granted();
+        let missing = missing_to_record(self.grants.as_ref(), screen, accessibility);
         // The last read may be old; read again before standing in the way.
-        if missing.iter().any(|p| *p != Permission::ScreenRecording)
+        if missing.contains(&Permission::Microphone)
             && let Some(fresh) = crate::onboarding::read_grants()
         {
             self.note_grants(&fresh);
-            return missing_to_record(self.grants.as_ref(), screen);
+            return missing_to_record(self.grants.as_ref(), screen, accessibility);
         }
         missing
     }
@@ -1738,8 +1736,13 @@ impl ScrawlCoordinator {
         let effect = match event {
             Event::Launch(grants) => {
                 self.note_grants(&grants);
+                let mut progress = Progress::load();
+                let plan = crate::onboarding::launch_plan(&progress, &grants);
+                if std::mem::take(&mut progress.reopen_fix) {
+                    progress.save();
+                }
                 if self.onboarding.is_none()
-                    && let Some(flow) = crate::onboarding::launch_plan(&Progress::load(), &grants)
+                    && let Some(flow) = plan
                 {
                     self.open_onboarding(flow);
                 }
@@ -1772,12 +1775,12 @@ impl ScrawlCoordinator {
                 self.onboarding = None;
             }
             Effect::Relaunch { resume } => {
-                if let Some(step) = resume {
-                    let mut progress = Progress::load();
-                    progress.seen = false;
-                    progress.resume = Some(step);
-                    progress.save();
-                }
+                scrawl_log(format!(
+                    "Screen Recording granted but not usable here; relaunching (resume {resume:?})"
+                ));
+                let mut progress = Progress::load();
+                progress.relaunching(resume, crate::onboarding::unix_ms());
+                progress.save();
                 self.onboarding = None;
                 crate::onboarding::relaunch();
                 cx.quit();
@@ -1820,6 +1823,8 @@ impl ScrawlCoordinator {
                 return;
             }
             self.hold_mods = crate::capture::modifier_flags();
+            // An Esc from before this hold doesn't cancel it.
+            self.telemetry.take_escape();
         }
         if let Some(mode) = self.selection_mode() {
             self.switcher.follow(mode);
@@ -1839,7 +1844,7 @@ impl ScrawlCoordinator {
             self.switcher.reset();
             return;
         }
-        let action = if crate::capture::escape_down() {
+        let action = if self.telemetry.take_escape() {
             self.switcher.escape()
         } else {
             let mods = crate::capture::modifier_flags();
