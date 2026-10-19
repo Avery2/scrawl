@@ -39,13 +39,16 @@ use objc2_quartz_core::{CALayer, CATransaction};
 
 use self::atlas::{GlyphAtlas, IconKind};
 use self::model::{
-    CHIP_H, CHIP_PX, ElemId, FrameState, PANEL_H, PANEL_W, PillModel, Pres,
+    CHIP_H, DONE_TEXT_X, ElemId, FrameState, HUD_CAP, LEAD_TEXT_X, PANEL_H, PANEL_W,
+    PROCESSING_TEXT_X, PillModel, Pres, SEG_ICON, SEG_ICON_GAP, SEG_PX,
 };
 use crate::ui::{SelectionMode, motion};
 
 const OFFSCREEN_W_PT: f32 = 960.0;
 const OFFSCREEN_H_PT: f32 = 256.0;
 const TILE_PAD_PT: f32 = 20.0;
+/// Transparent padding around each rasterized label (`rasterize_text`'s `pad_px` at 1x and 2x).
+const TEXT_PAD_PT: f32 = 2.0;
 
 unsafe extern "C" {
     static _dispatch_main_q: c_void;
@@ -71,6 +74,9 @@ struct PillUniforms {
     ghost_meta: [f32; 4],
     hint_rect: [f32; 4],
     hint_uv: [f32; 4],
+    /// Selection highlight `l, t, r, b` and `radius, alpha, blur, 0`.
+    hl_rect: [f32; 4],
+    hl_meta: [f32; 4],
 }
 
 #[repr(C)]
@@ -114,7 +120,9 @@ struct CompositeElem {
     alpha: f32,
     sigma_pt: f32,
     pad_pt: f32,
-    _pad0: [f32; 2],
+    /// Label level outside and inside the selection highlight (chips are drawn white and
+    /// multiplied here, so the highlight reveals the bright label as it slides). `[1, 1]` = as drawn.
+    levels: [f32; 2],
 }
 
 struct PillViewIvars {
@@ -486,6 +494,7 @@ impl NativePill {
                 st.dirty = true;
             }
             st.model.reduced = snapshot.reduced_motion;
+            st.model.set_opts(motion::tune().pill_opts());
             if st.model.clock != snapshot.clock {
                 st.pipelines.atlas.update_clock(&snapshot.clock);
                 st.model.set_clock(&snapshot.clock);
@@ -687,6 +696,7 @@ impl SharedNativePill {
             return;
         }
 
+        st.model.set_opts(motion::tune().pill_opts());
         if dt > 0.0 {
             st.model.advance(dt);
         }
@@ -834,20 +844,20 @@ impl PillRuntimeState {
             (self.model.r.x - self.model.l.x).max(0.0),
         );
 
+        if let Some(hl) = frame.highlight {
+            let [hx, hy, hw, hh] = hl.rect;
+            motion::trace_element(
+                "highlight",
+                [ox + hx, oy + hy, hw, hh],
+                hl.alpha,
+                hh * 0.5,
+                Some("row"),
+                Some(shell),
+            );
+        }
         for elem in &frame.elems {
             let [ex, ey, ew, eh] = elem.rect;
-            let screen_rect = if matches!(elem.id, ElemId::DividerLead | ElemId::DividerClose) {
-                let dw = 1.0 * elem.scale;
-                let dh = 16.0 * elem.scale;
-                [
-                    ox + ex + (ew - dw) * 0.5,
-                    oy + ey + (eh - dh) * 0.5,
-                    dw,
-                    dh,
-                ]
-            } else {
-                [ox + ex, oy + ey, ew, eh]
-            };
+            let screen_rect = [ox + ex, oy + ey, ew, eh];
             motion::trace_element(
                 elem.id.trace_key(),
                 screen_rect,
@@ -887,6 +897,15 @@ impl PillRuntimeState {
                 _pad1: [0.0; 2],
             });
 
+            let levels = if elem.id.mode().is_some() {
+                if use_glass {
+                    [0.90 + 0.10 * elem.hover, 1.0]
+                } else {
+                    [0.608 + 0.353 * 0.65 * elem.hover, 0.961]
+                }
+            } else {
+                [1.0, 1.0]
+            };
             comp_elems.push(CompositeElem {
                 screen_rect: elem.rect,
                 tile_rect,
@@ -895,7 +914,7 @@ impl PillRuntimeState {
                 alpha: elem.alpha,
                 sigma_pt: elem.blur,
                 pad_pt: TILE_PAD_PT,
-                _pad0: [0.0; 2],
+                levels,
             });
         }
 
@@ -956,6 +975,12 @@ impl PillRuntimeState {
             ghost_meta,
             hint_rect,
             hint_uv,
+            hl_rect: frame.highlight.map_or([0.0; 4], |h| {
+                [h.rect[0], h.rect[1], h.rect[0] + h.rect[2], h.rect[1] + h.rect[3]]
+            }),
+            hl_meta: frame
+                .highlight
+                .map_or([0.0; 4], |h| [h.rect[3] * 0.5, h.alpha, h.blur, 0.0]),
         };
 
         let prim_count = prims.len() as u64;
@@ -1135,13 +1160,21 @@ impl PillRuntimeState {
                 _pad2: 0,
             });
         };
-        let center_text = |sp: atlas::Sprite| -> [f32; 4] {
+        // Labels sit on one baseline that centres SF Pro's caps on the chip, snapped to the pixel
+        // grid so the sprite (whose baseline is a whole pixel row) samples 1:1.
+        let px = self.pipelines.scale;
+        let snap = |v: f32| (v * px).round() / px;
+        let baseline = snap(oy + CHIP_H * 0.5 + HUD_CAP * 0.5);
+        let text_at = |sp: atlas::Sprite, glyph_x: f32| -> [f32; 4] {
             [
-                ox + (bw - sp.size_pt[0]) * 0.5,
-                oy + (bh - sp.size_pt[1]) * 0.5,
+                snap(glyph_x - TEXT_PAD_PT),
+                baseline - sp.baseline_pt,
                 sp.size_pt[0],
                 sp.size_pt[1],
             ]
+        };
+        let center_text = |sp: atlas::Sprite| -> [f32; 4] {
+            text_at(sp, ox + (bw - sp.size_pt[0]) * 0.5 + TEXT_PAD_PT)
         };
 
         let is_glass = self.style == PillStyle::Glass && self.glass_view.is_some();
@@ -1155,40 +1188,30 @@ impl PillRuntimeState {
                     ElemId::ChipIphone => SelectionMode::Iphone,
                     _ => unreachable!(),
                 };
+                // The selected chip's fill is the sliding highlight drawn in the composite pass,
+                // which also sets these white glyphs' level (`CompositeElem::levels`).
                 if is_glass {
-                    let smoke_a = 0.20 + 0.18 * elem.active + 0.10 * elem.hover;
+                    let smoke_a = 0.20 + 0.10 * elem.hover;
                     push_shape(out, [ox, oy, bw, bh], bh * 0.5, [0.06, 0.07, 0.10, smoke_a]);
                 } else {
-                    let bg_a = 0.16 * elem.active
-                        + 0.08 * elem.hover * (1.0 - elem.active)
-                        + 0.06 * elem.press;
+                    let bg_a = 0.08 * elem.hover * (1.0 - elem.active) + 0.06 * elem.press;
                     if bg_a > 0.002 {
                         push_shape(out, [ox, oy, bw, bh], bh * 0.5, [1.0, 1.0, 1.0, bg_a]);
                     }
                 }
                 let ic = atlas.icon(IconKind::from_mode(mode));
                 let tx = atlas.label(mode.label());
-                let fg = if is_glass {
-                    0.90 + 0.10 * elem.active.max(elem.hover)
-                } else {
-                    0.608 + 0.353 * elem.active.max(elem.hover * 0.65)
-                };
                 push_sprite(
                     out,
-                    [ox + CHIP_PX, oy + (CHIP_H - 14.0) * 0.5, 14.0, 14.0],
+                    [ox + SEG_PX, oy + (CHIP_H - SEG_ICON) * 0.5, SEG_ICON, SEG_ICON],
                     ic.uv,
-                    [fg, fg, fg, 1.0],
+                    [1.0, 1.0, 1.0, 1.0],
                 );
                 push_sprite(
                     out,
-                    [
-                        ox + CHIP_PX + 14.0 + 6.0 - 2.0,
-                        oy + (CHIP_H - tx.size_pt[1]) * 0.5,
-                        tx.size_pt[0],
-                        tx.size_pt[1],
-                    ],
+                    text_at(tx, ox + SEG_PX + SEG_ICON + SEG_ICON_GAP),
                     tx.uv,
-                    [fg, fg, fg, 1.0],
+                    [1.0, 1.0, 1.0, 1.0],
                 );
             }
             ElemId::Record | ElemId::Finish | ElemId::Paste => {
@@ -1235,12 +1258,7 @@ impl PillRuntimeState {
                 );
                 push_sprite(
                     out,
-                    [
-                        ox + CHIP_H - 2.0,
-                        oy + (CHIP_H - tx.size_pt[1]) * 0.5,
-                        tx.size_pt[0],
-                        tx.size_pt[1],
-                    ],
+                    text_at(tx, ox + LEAD_TEXT_X),
                     tx.uv,
                     [0.961, 0.961, 0.969, 1.0],
                 );
@@ -1305,14 +1323,6 @@ impl PillRuntimeState {
                     [fg, fg, fg, 1.0],
                 );
             }
-            ElemId::DividerLead | ElemId::DividerClose => {
-                push_shape(
-                    out,
-                    [ox + (bw - 1.0) * 0.5, oy + (bh - 16.0) * 0.5, 1.0, 16.0],
-                    0.5,
-                    [1.0, 1.0, 1.0, 0.11],
-                );
-            }
             ElemId::Processing => {
                 let head = (t * 8.0) % 8.0;
                 for k in 0..8 {
@@ -1332,12 +1342,7 @@ impl PillRuntimeState {
                 let tx = atlas.label("Processing…");
                 push_sprite(
                     out,
-                    [
-                        ox + CHIP_H + 6.0 - 2.0,
-                        oy + (CHIP_H - tx.size_pt[1]) * 0.5,
-                        tx.size_pt[0],
-                        tx.size_pt[1],
-                    ],
+                    text_at(tx, ox + PROCESSING_TEXT_X),
                     tx.uv,
                     [0.961, 0.961, 0.969, 1.0],
                 );
@@ -1359,12 +1364,7 @@ impl PillRuntimeState {
                 let tx = atlas.completed_sprite;
                 push_sprite(
                     out,
-                    [
-                        ox + CHIP_H + 8.0 - 2.0,
-                        oy + (CHIP_H - tx.size_pt[1]) * 0.5,
-                        tx.size_pt[0],
-                        tx.size_pt[1],
-                    ],
+                    text_at(tx, ox + DONE_TEXT_X),
                     tx.uv,
                     [0.961, 0.961, 0.969, 1.0],
                 );

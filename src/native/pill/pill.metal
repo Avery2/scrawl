@@ -168,7 +168,7 @@ struct CompositeElem {
     float alpha;        // element opacity (0 .. 1)
     float sigma_pt;     // vertical blur sigma in points
     float pad_pt;       // tile padding in points (16.0)
-    float2 _pad0;
+    float2 levels;      // label level outside / inside the selection highlight ((1, 1) = as drawn)
 };
 
 struct PillUniforms {
@@ -184,6 +184,8 @@ struct PillUniforms {
     float4 ghost_meta;     // radius, alpha, 0, 0
     float4 hint_rect;      // x, y, w, h of optional "Esc" badge below capsule (w == 0 when off)
     float4 hint_uv;        // u0, v0, u1, v1 of "Esc" label in atlas
+    float4 hl_rect;        // selection highlight l, t, r, b in panel points
+    float4 hl_meta;        // radius, alpha, blur sigma, 0
 };
 
 struct ScreenVertexOut {
@@ -267,7 +269,19 @@ fragment float4 pill_composite_fragment(
             out = blend_over(out, float4(bg_rgb * fill_a, fill_a));
         }
 
-        // 4. Composite per-element quads with 1D Vertical Gaussian blur from `offscreen_b`,
+        // 4a. The selection highlight: one capsule sliding between mode chips. Its coverage also
+        //     reveals the bright label level of whatever chip glyphs it sits under (4b).
+        float hl_cov = 0.0;
+        if (u.hl_meta.y > 0.001) {
+            float h_sdf = rrect_sdf(p, u.hl_rect, u.hl_meta.x);
+            float h_band = max(0.5 / u.scale, u.hl_meta.z * 1.75);
+            hl_cov = smoothstep(h_band, -h_band, h_sdf) * u.hl_meta.y;
+            float3 hl_rgb = (is_glass < 0.5) ? float3(1.0) : float3(0.06, 0.07, 0.10);
+            float hl_a = ((is_glass < 0.5) ? 0.16 : 0.18) * hl_cov * in_cov;
+            out = blend_over(out, float4(hl_rgb * hl_a, hl_a));
+        }
+
+        // 4b. Composite per-element quads with 1D Vertical Gaussian blur from `offscreen_b`,
         //    clipped to the capsule interior (`in_cov`).
         float2 inv_canvas = 1.0 / u.canvas_size;
         uint count = min(u.elem_count, 16u);
@@ -322,6 +336,8 @@ fragment float4 pill_composite_fragment(
                 float backing_a = min(1.0, sh_a * 0.64) * e.alpha * in_cov;
                 out = blend_over(out, float4(0.0, 0.0, 0.0, backing_a));
             }
+            float level = mix(e.levels.x, e.levels.y, hl_cov);
+            sample_col.rgb *= level;
             float eff_a = e.alpha * in_cov;
             out = blend_over(out, sample_col * eff_a);
         }

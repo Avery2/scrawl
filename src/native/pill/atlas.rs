@@ -38,6 +38,8 @@ pub struct Sprite {
     pub size_pt: [f32; 2],
     /// UV bounds `[u0, v0, u1, v1]` in `[0.0 .. 1.0]`.
     pub uv: [f32; 4],
+    /// Text only: points from the sprite's top to its baseline (a whole number of pixels).
+    pub baseline_pt: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -133,23 +135,25 @@ pub fn measure_metrics() -> Metrics {
 }
 
 /// Rasterizes a text label at `scale` into premultiplied white RGBA8 pixels.
+/// The baseline sits on a whole pixel row (`pad + ceil(descent)` from the bottom), so a sprite
+/// placed by its baseline on the pixel grid samples 1:1 and stays crisp.
 fn rasterize_text(
     text: &str,
     size_pt: f32,
     weight: f64,
     monospaced_digits: bool,
     scale: f32,
-) -> (u32, u32, [f32; 2], Vec<u8>) {
+) -> (u32, u32, [f32; 2], f32, Vec<u8>) {
     let size_px = f64::from(size_pt * scale);
     let Some((font, line)) = shape_ct_line(text, size_px, weight, monospaced_digits) else {
-        return (4, 4, [2.0, 2.0], vec![0; 64]);
+        return (4, 4, [2.0, 2.0], 2.0, vec![0; 64]);
     };
     let bounds = line.get_typographic_bounds();
     let pad_px = (2.0 * scale).ceil() as f64;
     let w_px = (bounds.width.ceil() + 2.0 * pad_px).max(4.0) as usize;
-    let ascent = font.ascent();
-    let descent = font.descent();
-    let h_px = ((ascent + descent).ceil() + 2.0 * pad_px).max(4.0) as usize;
+    let ascent = font.ascent().ceil();
+    let descent = font.descent().ceil();
+    let h_px = (ascent + descent + 2.0 * pad_px).max(4.0) as usize;
 
     let space = CGColorSpace::create_device_rgb();
     let mut ctx = CGContext::create_bitmap_context(
@@ -172,7 +176,8 @@ fn rasterize_text(
     ctx.flush();
 
     let size_pt = [w_px as f32 / scale, h_px as f32 / scale];
-    (w_px as u32, h_px as u32, size_pt, ctx.data().to_vec())
+    let baseline_pt = (pad_px + ascent) as f32 / scale;
+    (w_px as u32, h_px as u32, size_pt, baseline_pt, ctx.data().to_vec())
 }
 
 /// Rasterizes one of Scrawl's line icons into premultiplied white RGBA8 pixels at `scale`.
@@ -348,7 +353,7 @@ impl GlyphAtlas {
             (IconKind::Check, 13.0),
         ] {
             let (w, h, size_pt, bytes) = rasterize_icon(kind, size_pt, scale);
-            let sprite = atlas.pack(w, h, size_pt, &bytes);
+            let sprite = atlas.pack(w, h, size_pt, 0.0, &bytes);
             atlas.icons.insert(kind, sprite);
         }
 
@@ -366,8 +371,9 @@ impl GlyphAtlas {
             ("Inspect", HUD_TEXT, WEIGHT_MEDIUM),
             ("Esc", 11.0, WEIGHT_MEDIUM),
         ] {
-            let (w, h, size_pt, bytes) = rasterize_text(text, size_pt, weight, false, scale);
-            let sprite = atlas.pack(w, h, size_pt, &bytes);
+            let (w, h, size_pt, baseline_pt, bytes) =
+                rasterize_text(text, size_pt, weight, false, scale);
+            let sprite = atlas.pack(w, h, size_pt, baseline_pt, &bytes);
             atlas.labels.insert(text.to_owned(), sprite);
         }
 
@@ -376,7 +382,7 @@ impl GlyphAtlas {
         atlas
     }
 
-    fn pack(&mut self, w: u32, h: u32, size_pt: [f32; 2], bytes: &[u8]) -> Sprite {
+    fn pack(&mut self, w: u32, h: u32, size_pt: [f32; 2], baseline_pt: f32, bytes: &[u8]) -> Sprite {
         if self.cursor_x + w + 2 > ATLAS_W {
             self.cursor_x = 2;
             self.cursor_y += self.row_h + 2;
@@ -395,6 +401,7 @@ impl GlyphAtlas {
                 (x + w) as f32 / ATLAS_W as f32,
                 (y + h) as f32 / ATLAS_H as f32,
             ],
+            baseline_pt,
         }
     }
 
@@ -436,7 +443,7 @@ impl GlyphAtlas {
         }
         self.clock_text.clear();
         self.clock_text.push_str(clock);
-        let (w, h, size_pt, bytes) =
+        let (w, h, size_pt, baseline_pt, bytes) =
             rasterize_text(clock, HUD_TEXT, WEIGHT_SEMIBOLD, true, self.scale);
         let (x, y) = (4_u32, 380_u32);
         let w = w.min(240);
@@ -450,6 +457,7 @@ impl GlyphAtlas {
                 (x + w) as f32 / ATLAS_W as f32,
                 (y + h) as f32 / ATLAS_H as f32,
             ],
+            baseline_pt,
         };
         self.clock_sprite
     }
@@ -461,7 +469,7 @@ impl GlyphAtlas {
         }
         self.completed_text.clear();
         self.completed_text.push_str(text);
-        let (w, h, size_pt, bytes) =
+        let (w, h, size_pt, baseline_pt, bytes) =
             rasterize_text(text, HUD_TEXT, WEIGHT_SEMIBOLD, false, self.scale);
         let (x, y) = (256_u32, 380_u32);
         let w = w.min(ATLAS_W - x - 4);
@@ -475,6 +483,7 @@ impl GlyphAtlas {
                 (x + w) as f32 / ATLAS_W as f32,
                 (y + h) as f32 / ATLAS_H as f32,
             ],
+            baseline_pt,
         };
         self.completed_sprite
     }

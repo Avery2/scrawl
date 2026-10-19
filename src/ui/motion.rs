@@ -77,6 +77,13 @@ pub(crate) struct Tune {
     pub time_scale: f32,
     /// Capsule style override (`-1.0` = use config, `0.0` = black, `1.0` = glass).
     pub pill_glass: f32,
+    /// Where the native capsule enters from: `0` centre (0.3.3 scale), `1` top edge, `2` left end cap.
+    pub pill_origin: f32,
+    /// `1` keeps the chips still from the recording capsule to the picker; `0` centres every state.
+    pub pill_anchor: f32,
+    /// Peak blur (pt) of content entering or leaving in place, and of the shell's edge.
+    pub pill_blur: f32,
+    pub pill_shell_blur: f32,
 }
 
 impl Tune {
@@ -92,6 +99,10 @@ impl Tune {
         reveal_blur_px: 2.5,
         time_scale: 1.0,
         pill_glass: -1.0,
+        pill_origin: 1.0,
+        pill_anchor: 1.0,
+        pill_blur: crate::native::pill::model::CONTENT_BLUR_MAX,
+        pill_shell_blur: crate::native::pill::model::SHELL_BLUR_MAX,
     };
 }
 
@@ -160,6 +171,22 @@ pub(super) const KEYS: &[(&str, &str, Field)] = &[
         "Capsule style (-1 = config, 0 = black, 1 = glass)",
         |t| &mut t.pill_glass,
     ),
+    (
+        "pill.origin",
+        "Capsule entry (0 = centre scale, 1 = top edge, 2 = unroll from the left cap)",
+        |t| &mut t.pill_origin,
+    ),
+    (
+        "pill.anchor",
+        "Chips hold still into the picker (1) or every state centres (0)",
+        |t| &mut t.pill_anchor,
+    ),
+    ("pill.blur", "Content enter/exit peak blur (pt)", |t| {
+        &mut t.pill_blur
+    }),
+    ("pill.shellBlur", "Capsule edge enter/exit blur (pt)", |t| {
+        &mut t.pill_shell_blur
+    }),
 ];
 
 /// Numbered presets; 1 is what ships and names nothing.
@@ -207,6 +234,18 @@ pub(super) const PRESETS: &[(&str, &[(&str, f32)])] = &[
         ],
     ),
     ("Glass", &[("pill.glass", 1.0)]),
+    ("Centre", &[("pill.origin", 0.0)]),
+    ("Unroll", &[("pill.origin", 2.0)]),
+    ("Centred chips", &[("pill.anchor", 0.0)]),
+    (
+        "0.3.3 blur",
+        &[
+            ("pill.origin", 0.0),
+            ("pill.anchor", 0.0),
+            ("pill.blur", 5.0),
+            ("pill.shellBlur", 4.0),
+        ],
+    ),
 ];
 
 impl Tune {
@@ -217,6 +256,21 @@ impl Tune {
             Some(crate::native::pill::PillStyle::Black)
         } else {
             None
+        }
+    }
+
+    /// The native capsule's live options.
+    pub fn pill_opts(&self) -> crate::native::pill::model::PillOpts {
+        use crate::native::pill::model::{Origin, PillOpts};
+        PillOpts {
+            origin: match self.pill_origin.round() as i32 {
+                0 => Origin::Centre,
+                2 => Origin::Lead,
+                _ => Origin::Top,
+            },
+            hold_chips: self.pill_anchor >= 0.5,
+            content_blur: self.pill_blur,
+            shell_blur: self.pill_shell_blur,
         }
     }
 
@@ -282,6 +336,10 @@ impl Tune {
         self.reveal_blur_px = self.reveal_blur_px.clamp(0.0, 8.0);
         self.time_scale = self.time_scale.clamp(0.02, 4.0);
         self.pill_glass = self.pill_glass.clamp(-1.0, 1.0);
+        self.pill_origin = self.pill_origin.clamp(0.0, 2.0);
+        self.pill_anchor = self.pill_anchor.clamp(0.0, 1.0);
+        self.pill_blur = self.pill_blur.clamp(0.0, 8.0);
+        self.pill_shell_blur = self.pill_shell_blur.clamp(0.0, 8.0);
     }
 }
 
@@ -803,6 +861,19 @@ mod tests {
         let tune = Tune::from_json(&serde_json::json!({ "nope": 1, "island.bounce": 5 }));
         assert_eq!(tune.island.bounce, 0.9);
         assert_eq!(Tune::from_json(&serde_json::json!({})), Tune::DEFAULT);
+    }
+
+    #[test]
+    fn shipped_tune_matches_the_pill_defaults() {
+        assert_eq!(
+            Tune::DEFAULT.pill_opts(),
+            crate::native::pill::model::PillOpts::default()
+        );
+        let unroll = Tune::from_json(&serde_json::json!({ "pill.origin": 2 }));
+        assert_eq!(
+            unroll.pill_opts().origin,
+            crate::native::pill::model::Origin::Lead
+        );
     }
 
     #[test]
