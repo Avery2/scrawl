@@ -69,6 +69,15 @@ already are.
 | Accessibility | `⌥⇧V` and the Paste chip, which post ⌘V into the app in front | the first time you use them |
 | Camera | The cabled iPhone mirror (macOS treats it as a camera) | the first time you pick iPhone |
 
+Screen Recording, Input Monitoring and Accessibility are lists you drag an app into, so their
+button skips Apple's prompt: it opens the pane in System Settings, and a card flies from the button
+to just below the Settings window (or, with no room on screen there, over the window's empty lower
+area), with its Scrawl row lined up under the list. Drag that row into
+the list. The card follows the window, steps aside when another app is in front, and shows "Scrawl
+is allowed" once a fresh process sees the grant (a drop alone proves nothing). The row drags the
+`Scrawl.app` that contains the helper, the bundle macOS grants. With Reduce Motion on, the card
+fades in place. Microphone and Camera can't be dragged in, so they use the macOS prompt.
+
 Accessibility and Camera are asked for in the same window, with just their row, when first needed.
 Speech recognition isn't asked for: SpeechAnalyzer transcribes without it. The ⌥⇧S hotkey itself
 needs no permission (Carbon `RegisterEventHotKey`).
@@ -662,7 +671,16 @@ target/debug/scrawl-helper transcribe audio.wav
 target/debug/scrawl-helper frames recording.mov --out-dir /tmp/f --at 1000,2000 --max-edge 1600
 target/debug/scrawl-helper shrink recording.mov --out /tmp/small.mov --max-edge 1600
 target/debug/scrawl-helper export plan.json   # the plan `scrawl export` writes (src/export)
+target/debug/scrawl-helper permission-panel --permission screen-recording --preview   # the drag card, no grant polling
 ```
+
+`permission-panel --permission screen-recording|accessibility|input-monitoring [--from X,Y,W,H]`
+(`--from` is the button's frame in global top-left points) prints JSON lines: `docked`, `dropped`,
+then `granted` or `cancelled` with a `reason` (`back`, `settings-closed`, `no-settings-window`,
+`parent`, `timeout`), and exits. On stdin it takes `cancel`, `back` and `granted`.
+`permission-panel --check P` prints `{"granted":…}` from a fresh process. `permission-panel --plan --settings
+X,Y,W,H --visible X,Y,W,H` prints where the card would dock (`below`, `inside`, `right`, `left` or
+`clamped`); `scripts/check-permission-panel-dock.sh` checks the cases.
 
 ## Testing
 
@@ -685,3 +703,25 @@ taskpolicy -c utility cargo test -j 3 --offline -- --test-threads=2
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### THIRD_PARTY
+
+`helper/PermissionPanel.swift` adapts code and tuning from two MIT-licensed projects:
+
+- [AskForPermission](https://github.com/riko2chen/AskForPermission), Copyright (c) 2026 Riko: the
+  flight along a quadratic Bézier, waiting for the System Settings window to settle, following it
+  through the window server, and the race that resolves a drop.
+- [PermissionFlow](https://github.com/jaywcjlove/PermissionFlow), Copyright (c) 2026 小弟调调: the
+  Privacy pane deep links and macOS 27's "Device Control and Data Access" name for Accessibility.
+
+Both are under the MIT License: permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to use, copy, modify,
+merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to
+whom the Software is furnished to do so, subject to the following conditions: The above copyright
+notice and this permission notice shall be included in all copies or substantial portions of the
+Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES
+OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

@@ -9,6 +9,7 @@
 //   scrawl-helper shrink MOVIE --out FILE.mov [--max-edge PX] [--bitrate BPS]   HEVC copy, same timeline
 //   scrawl-helper export PLAN.json                      shareable .mp4: crop/camera, burned-in ink, audio (Export.swift)
 //   scrawl-helper permissions                           what Scrawl has been granted, as JSON
+//   scrawl-helper permission-panel --permission P [--from X,Y,W,H]   drag-to-allow card (PermissionPanel.swift)
 //   scrawl-helper onboarding [--shortcut L] [--render DIR]   the welcome window (Onboarding.swift)
 //   scrawl-helper settings [--pane P] [--render DIR]         the Settings window (Settings.swift)
 //
@@ -137,9 +138,8 @@ case "export":
 case "probe":
   guard arguments.count >= 2 else { fail("probe needs MOVIE") }
   runAsync { emit(try await Media.probe(URL(filePath: arguments[1]))) }
-case "guide":
-  let kind = (arguments.count >= 2 ? GuidePermission(rawValue: arguments[1]) : nil) ?? .accessibility
-  PermissionGuide.run(permission: kind, bundlePath: option("--bundle", in: arguments))
+case "permission-panel":
+  PermissionPanel.run(arguments: arguments)
 case "permissions":
   emit(Permissions.statuses())
 case "onboarding":
@@ -152,5 +152,5 @@ case "qr":
   }
   emit(["qr": qr])
 default:
-  fail("usage: scrawl-helper devices|mirror|transcribe|frames|audio|probe|export|shrink|guide|permissions|onboarding|settings|qr …")
+  fail("usage: scrawl-helper devices|mirror|transcribe|frames|audio|probe|export|shrink|permission-panel|permissions|onboarding|settings|qr …")
 }
