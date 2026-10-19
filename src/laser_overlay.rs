@@ -195,6 +195,9 @@ impl MetalLaserOverlay {
         if same_rect(screen.frame, self.screen) {
             return false;
         }
+        // Window first: AppKit sets the layer's contentsScale for the new screen as it moves,
+        // and `place` then sets the size and scale the shader draws at.
+        self.window.setFrame_display(frame, true);
         let shared = unsafe { &*self.display_link_context };
         shared.place(
             [screen.frame[0] as f32, screen.frame[1] as f32],
@@ -202,7 +205,6 @@ impl MetalLaserOverlay {
             frame.size.height as f32,
             (screen.scale as f32).max(1.0),
         );
-        self.window.setFrame_display(frame, true);
         if screen.id != 0 {
             let _ = self.display_link.set_current_cg_display(screen.id);
         }

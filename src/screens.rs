@@ -161,6 +161,12 @@ pub fn displays() -> Vec<Screen> {
             let display = CGDisplay::new(id);
             let b = display.bounds();
             let frame = [b.origin.x, b.origin.y, b.size.width, b.size.height];
+            (display, frame)
+        })
+        // A display unplugged while this runs reports zero bounds.
+        .filter(|(_, frame)| frame[2] > 0.0 && frame[3] > 0.0)
+        .map(|(display, frame)| {
+            let id = display.id;
             let scale = display
                 .display_mode()
                 .map(|m| m.pixel_width() as f64 / (m.width() as f64).max(1.0))
@@ -257,6 +263,10 @@ mod tests {
         assert_eq!(flip(above, 1117.0), [0.0, -1440.0, 2560.0, 1440.0]);
         assert_eq!(flip(flip(above, 1117.0), 1117.0), above);
         assert_eq!(flip(LAPTOP, 1117.0), LAPTOP);
+        // One below it: AppKit y negative, global y past the laptop's bottom.
+        let below = [0.0, -1080.0, 1920.0, 1080.0];
+        assert_eq!(flip(below, 1117.0), [0.0, 1117.0, 1920.0, 1080.0]);
+        assert_eq!(flip([0.0, 1117.0, 1920.0, 1080.0], 1117.0), below);
     }
 
     #[test]
@@ -270,6 +280,8 @@ mod tests {
             ([0.0, -1440.0, 2560.0, 1440.0], 2.0, [1000.0, -1.0]),
             // left, 2x
             ([-2560.0, -200.0, 2560.0, 1440.0], 2.0, [-2559.0, -199.0]),
+            // below, 1x
+            ([0.0, 1117.0, 1920.0, 1080.0], 1.0, [1800.0, 1117.0]),
         ];
         for (frame, scale, p) in cases {
             let screens = pair(frame, scale);

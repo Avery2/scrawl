@@ -1532,17 +1532,22 @@ mod tests {
     fn input_on_an_external_display_normalizes_into_it() {
         let (sender, _receiver) = flume::unbounded();
         let telemetry = SharedCaptureTelemetry::new(sender);
+        let left = [-1920.0, 37.0, 1920.0, 1080.0];
+        let right = [1728.0, 0.0, 1920.0, 1080.0];
+        let above = [0.0, -1440.0, 2560.0, 1440.0];
+        let small_left = [-1280.0, -100.0, 1280.0, 800.0];
+        let below = [0.0, 1117.0, 1920.0, 1080.0];
+        // (display, scale, global point, expected normalized point, recording size)
         let cases = [
-            // left, 1x: recorded at 1920×1080
-            ([-1920.0, 37.0, 1920.0, 1080.0], 1.0, [-960.0, 577.0], (1920, 1080)),
-            // right, 1x
-            ([1728.0, 0.0, 1920.0, 1080.0], 1.0, [1728.0 + 480.0, 270.0], (1920, 1080)),
-            // above, 2x: recorded at the 2560 px long edge
-            ([0.0, -1440.0, 2560.0, 1440.0], 2.0, [640.0, -360.0], (2560, 1440)),
-            // left, 2x, a smaller display: 1280×800 pt at 2560×1600
-            ([-1280.0, -100.0, 1280.0, 800.0], 2.0, [-320.0, 500.0], (2560, 1600)),
+            // 1x displays are recorded at their own pixels
+            (left, 1.0, [-960.0, 577.0], (0.5, 0.5), (1920, 1080)),
+            (right, 1.0, [2208.0, 270.0], (0.25, 0.25), (1920, 1080)),
+            (below, 1.0, [480.0, 1387.0], (0.25, 0.25), (1920, 1080)),
+            // 2x ones at the 2560 px long edge
+            (above, 2.0, [640.0, -360.0], (0.25, 0.75), (2560, 1440)),
+            (small_left, 2.0, [-320.0, 500.0], (0.75, 0.75), (2560, 1600)),
         ];
-        for (rect, scale, point, size) in cases {
+        for (rect, scale, point, expected, size) in cases {
             let frame = crate::screens::with_scale(rect, scale);
             let target = TargetInfo {
                 mode: CaptureMode::Display,
@@ -1559,8 +1564,7 @@ mod tests {
             // The laptop's centre is outside this target.
             assert!(!telemetry.contains_screen_point(864.0, 558.0));
             let (nx, ny, fw, fh) = telemetry.normalize_point(point[0], point[1]);
-            let [lx, ly] = crate::screens::to_local(rect, point);
-            assert_eq!((nx, ny), ((lx / rect[2]) as f32, (ly / rect[3]) as f32));
+            assert_eq!((nx, ny), expected, "{rect:?}");
             assert_eq!((fw, fh), (rect[2] as u32, rect[3] as u32));
             // A click there is recorded at those coordinates.
             telemetry.pointer_down(10, point[0], point[1]);
@@ -1744,8 +1748,8 @@ pub fn region_target(
         frame: TargetFrame {
             x,
             y,
-            width: width.max(32.0),
-            height: height.max(32.0),
+            width,
+            height,
             scale,
         },
     }

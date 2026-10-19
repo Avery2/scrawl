@@ -2427,7 +2427,7 @@ impl ScrawlCoordinator {
     }
 
     /// The iPhone's mirror window can be dragged to another display mid-recording: the ink
-    /// overlay goes with it.
+    /// overlay and the capsule go with it.
     fn follow_phone_mirror(&mut self) {
         let Some(ActiveRecording {
             source: CaptureSource::Phone(_),
@@ -2446,14 +2446,20 @@ impl ScrawlCoordinator {
             return;
         }
         let centre = [f.x + f.width / 2.0, f.y + f.height / 2.0];
-        if !crate::screens::contains(overlay.screen(), centre) {
-            overlay.move_to([f.x, f.y, f.width, f.height]);
+        if crate::screens::contains(overlay.screen(), centre)
+            || !overlay.move_to([f.x, f.y, f.width, f.height])
+        {
+            return;
+        }
+        self.display_rect = overlay.screen().map(|v| v as f32);
+        if let Some(ref pill) = self.native_pill {
+            pill.place_on(centre);
         }
     }
 
     /// While picking, the picker (its window, overlay and the capsule) follows the pointer to
     /// whichever display it's on, unless an area is being dragged (an area stays on one display).
-    fn follow_pointer_display(&mut self, pointer: [f32; 2]) {
+    fn follow_pointer_display(&mut self, pointer: [f32; 2], cx: &mut Context<Self>) {
         // The iPhone's mirror window stays where it is, and so does the highlight around it.
         if self.selection_drag.is_some()
             || self.lab
@@ -2484,6 +2490,9 @@ impl ScrawlCoordinator {
         }
         self.place_capsule();
         self.sync_picker_overlay();
+        // The picker draws relative to `display_rect`; with the native capsule nothing else
+        // redraws it, and a same-size display doesn't resize its window.
+        cx.notify();
     }
 
     pub(crate) fn ensure_native_pill(&mut self) {
@@ -2726,7 +2735,7 @@ impl ScrawlCoordinator {
 
         if let IslandPhase::Selecting { mode } = self.island_phase {
             if let Some(pos) = current_mouse_screen() {
-                self.follow_pointer_display(pos);
+                self.follow_pointer_display(pos, cx);
                 self.selection_pointer = Some(pos);
                 if mode == SelectionMode::Area
                     && let Some((start, _)) = self.selection_drag

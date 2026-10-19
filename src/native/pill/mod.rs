@@ -524,6 +524,13 @@ impl NativePill {
         st.screen_origin_top_left = origin;
         st.window
             .setFrame_display(panel_appkit_rect(mtm, origin), true);
+        // On a 1x screen AppKit resets the layer's contentsScale; keep the scale it's drawn at.
+        let scale = st.pipelines.scale;
+        st.pipelines.layer.set_contents_scale(f64::from(scale));
+        st.pipelines.layer.set_drawable_size(CGSize::new(
+            f64::from(PANEL_W * scale),
+            f64::from(PANEL_H * scale),
+        ));
         st.dirty = true;
     }
 
