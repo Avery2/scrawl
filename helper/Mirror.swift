@@ -254,7 +254,10 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
   // MARK: Window
 
   private func showWindow(title: String, orderFront: Bool) {
-    guard let screen = NSScreen.screens.first ?? NSScreen.main else { return }
+    // The display under the pointer, where the picker and capsule are.
+    let mouse = NSEvent.mouseLocation
+    guard let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) })
+      ?? NSScreen.main ?? NSScreen.screens.first else { return }
     let visible = screen.visibleFrame
     let height = (visible.height * 0.76).rounded()
     let width = (height / aspect).rounded()

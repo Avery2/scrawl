@@ -369,22 +369,16 @@ pub struct NativePill {
 impl NativePill {
     pub fn open() -> Result<Self, String> {
         let mtm = MainThreadMarker::new().ok_or("NativePill::open requires the main thread")?;
-        let screens = NSScreen::screens(mtm);
-        let primary_h = screens.firstObject().map_or(900.0, |s| s.frame().size.height);
-        let screen = NSScreen::mainScreen(mtm)
-            .or_else(|| screens.firstObject())
+        let screens = crate::screens::current();
+        // Drawn at the sharpest scale of any display, so moving between them needs no new
+        // textures (a 1x display just downsamples).
+        let scale = screens
+            .iter()
+            .map(|s| s.scale as f32)
+            .fold(2.0_f32, f32::max);
+        let [top_left_x, top_left_y] = panel_origin(&screens, crate::screens::pointer())
             .ok_or("No screen available for NativePill")?;
-        let s_frame = screen.frame();
-        let scale = (screen.backingScaleFactor() as f32).max(2.0);
-
-        let top_left_x = s_frame.origin.x as f32 + ((s_frame.size.width as f32 - PANEL_W) * 0.5).round();
-        let top_left_y = (primary_h - s_frame.origin.y - s_frame.size.height) as f32 + 34.0;
-        let appkit_x = f64::from(top_left_x);
-        let appkit_y = primary_h - f64::from(top_left_y) - f64::from(PANEL_H);
-        let panel_rect = NSRect::new(
-            NSPoint::new(appkit_x, appkit_y),
-            NSSize::new(f64::from(PANEL_W), f64::from(PANEL_H)),
-        );
+        let panel_rect = panel_appkit_rect(mtm, [top_left_x, top_left_y]);
 
         let pipelines = MetalPipelines::new(scale)?;
         let metrics = atlas::measure_metrics();
@@ -509,6 +503,30 @@ impl NativePill {
         self.window_num
     }
 
+    /// Moves the capsule to the screen holding `point` (global points, top-left origin), below
+    /// that screen's menu bar and notch. A no-op when it's already there.
+    pub fn place_on(&self, point: [f64; 2]) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let screens = crate::screens::current();
+        let Some(origin) = panel_origin(&screens, Some(point)) else {
+            return;
+        };
+        let Ok(mut st) = self.shared.state.lock() else {
+            return;
+        };
+        if (st.screen_origin_top_left[0] - origin[0]).abs() < 0.5
+            && (st.screen_origin_top_left[1] - origin[1]).abs() < 0.5
+        {
+            return;
+        }
+        st.screen_origin_top_left = origin;
+        st.window
+            .setFrame_display(panel_appkit_rect(mtm, origin), true);
+        st.dirty = true;
+    }
+
     /// Synchronizes coordinator state into the native pill model; the next `CVDisplayLink` tick
     /// advances springs and renders on the display refresh cadence (with main-loop fallback if
     /// `CVDisplayLink` is paused).
@@ -580,6 +598,36 @@ impl Drop for NativePill {
             unsafe { drop(Arc::from_raw(ctx)) };
         }
     }
+}
+
+/// The panel's top-left (global points) on the screen holding `point`, else the primary one.
+fn panel_origin(screens: &[crate::screens::Screen], point: Option<[f64; 2]>) -> Option<[f32; 2]> {
+    let index = point
+        .and_then(|p| crate::screens::index_at(screens, p))
+        .or(if screens.is_empty() { None } else { Some(0) })?;
+    let [x, y] = crate::screens::pill_origin(
+        &screens[index],
+        f64::from(PANEL_W),
+        f64::from(model::PANEL_Y),
+    );
+    Some([x as f32, y as f32])
+}
+
+/// The panel's AppKit frame for a top-left origin in global points.
+fn panel_appkit_rect(mtm: MainThreadMarker, [x, y]: [f32; 2]) -> NSRect {
+    let primary_h = NSScreen::screens(mtm)
+        .firstObject()
+        .map_or(900.0, |s| s.frame().size.height);
+    let [ax, ay, w, h] = crate::screens::flip(
+        [
+            f64::from(x),
+            f64::from(y),
+            f64::from(PANEL_W),
+            f64::from(PANEL_H),
+        ],
+        primary_h,
+    );
+    NSRect::new(NSPoint::new(ax, ay), NSSize::new(w, h))
 }
 
 /// Creates `NSGlassEffectView` dynamically on macOS 26+.

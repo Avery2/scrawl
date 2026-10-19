@@ -67,41 +67,42 @@ pub struct MetalLaserOverlay {
     window: Retained<NSPanel>,
     display_link: CVDisplayLink,
     display_link_context: *const SharedMetalOverlay,
+    /// The screen it covers, global points.
+    screen: [f64; 4],
+}
+
+/// The screen for a rect in global points: the one holding its centre (else most of it), else
+/// the one under the pointer. Returns it with its AppKit frame, scale and display.
+fn pick_screen(
+    mtm: MainThreadMarker,
+    on: Option<[f64; 4]>,
+) -> Option<(crate::screens::Screen, NSRect)> {
+    let screens = crate::screens::current();
+    let index = on
+        .and_then(|r| crate::screens::index_for_rect(&screens, r))
+        .or_else(|| crate::screens::pointer().and_then(|p| crate::screens::index_at(&screens, p)))
+        .or(if screens.is_empty() { None } else { Some(0) })?;
+    let screen = screens[index];
+    let primary_h = NSScreen::screens(mtm).firstObject()?.frame().size.height;
+    let [x, y, w, h] = crate::screens::flip(screen.frame, primary_h);
+    Some((
+        screen,
+        NSRect::new(NSPoint::new(x, y), objc2_foundation::NSSize::new(w, h)),
+    ))
 }
 
 impl MetalLaserOverlay {
     /// Opens over the screen holding the centre of `on` (global points, top-left origin, like
-    /// capture targets), else the main screen.
+    /// capture targets), else the screen under the pointer.
     pub fn open(
         telemetry: Arc<SharedCaptureTelemetry>,
         on: Option<[f64; 4]>,
     ) -> Result<Self, String> {
         let mtm = MainThreadMarker::new().ok_or("Metal overlay requires the main thread")?;
-        let screens = NSScreen::screens(mtm);
-        let primary_h = screens.firstObject().map_or(0.0, |s| s.frame().size.height);
-        // AppKit frames have a bottom-left origin on the primary screen; capture frames top-left.
-        let top_left = |f: NSRect| {
-            [
-                f.origin.x,
-                primary_h - f.origin.y - f.size.height,
-                f.size.width,
-                f.size.height,
-            ]
-        };
-        let screen = on
-            .and_then(|[x, y, w, h]| {
-                let (cx, cy) = (x + w / 2.0, y + h / 2.0);
-                screens.iter().find(|s| {
-                    let [sx, sy, sw, sh] = top_left(s.frame());
-                    cx >= sx && cx < sx + sw && cy >= sy && cy < sy + sh
-                })
-            })
-            .or_else(|| NSScreen::mainScreen(mtm))
-            .or_else(|| screens.firstObject())
-            .ok_or("No screen available for Metal overlay")?;
-        let frame = screen.frame();
-        let scale = (screen.backingScaleFactor() as f32).max(1.0);
-        let [ox, oy, _, _] = top_left(frame);
+        let (screen, frame) =
+            pick_screen(mtm, on).ok_or("No screen available for Metal overlay")?;
+        let scale = (screen.scale as f32).max(1.0);
+        let [ox, oy, _, _] = screen.frame;
 
         let shared = Arc::new(SharedMetalOverlay::new(
             telemetry,
@@ -152,6 +153,9 @@ impl MetalLaserOverlay {
 
         let display_link = CVDisplayLink::from_active_cg_displays()
             .map_err(|status| format!("Could not create CVDisplayLink: {status}"))?;
+        if screen.id != 0 {
+            let _ = display_link.set_current_cg_display(screen.id);
+        }
         let display_link_context = Arc::into_raw(shared);
         unsafe {
             display_link.set_output_callback(
@@ -166,12 +170,50 @@ impl MetalLaserOverlay {
             window,
             display_link,
             display_link_context,
+            screen: screen.frame,
         })
     }
 
     pub fn window_number(&self) -> u32 {
         self.window.windowNumber().max(0) as u32
     }
+
+    /// The screen it covers, global points.
+    pub fn screen(&self) -> [f64; 4] {
+        self.screen
+    }
+
+    /// Moves to the screen `rect` (global points) belongs to, taking its size, scale and origin.
+    /// Returns whether it moved.
+    pub fn move_to(&mut self, rect: [f64; 4]) -> bool {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return false;
+        };
+        let Some((screen, frame)) = pick_screen(mtm, Some(rect)) else {
+            return false;
+        };
+        if same_rect(screen.frame, self.screen) {
+            return false;
+        }
+        let shared = unsafe { &*self.display_link_context };
+        shared.place(
+            [screen.frame[0] as f32, screen.frame[1] as f32],
+            frame.size.width as f32,
+            frame.size.height as f32,
+            (screen.scale as f32).max(1.0),
+        );
+        self.window.setFrame_display(frame, true);
+        if screen.id != 0 {
+            let _ = self.display_link.set_current_cg_display(screen.id);
+        }
+        self.screen = screen.frame;
+        shared.draw();
+        true
+    }
+}
+
+fn same_rect(a: [f64; 4], b: [f64; 4]) -> bool {
+    (0..4).all(|i| (a[i] - b[i]).abs() < 1.0)
 }
 
 impl Drop for MetalLaserOverlay {
@@ -202,8 +244,6 @@ extern "C" fn display_link_callback(
 
 struct SharedMetalOverlay {
     telemetry: Arc<SharedCaptureTelemetry>,
-    /// The screen's top-left in global points: telemetry is global, the shader draws locally.
-    origin: [f32; 2],
     renderer: Mutex<MetalLaserRenderer>,
 }
 
@@ -215,6 +255,8 @@ struct MetalLaserRenderer {
     device: metal::Device,
     command_queue: metal::CommandQueue,
     pipeline: RenderPipelineState,
+    /// The screen's top-left in global points: telemetry is global, the shader draws locally.
+    origin: [f32; 2],
     width: f32,
     height: f32,
     scale: f32,
@@ -245,17 +287,41 @@ impl SharedMetalOverlay {
 
         Ok(Self {
             telemetry,
-            origin,
             renderer: Mutex::new(MetalLaserRenderer {
                 command_queue: device.new_command_queue(),
                 device,
                 layer,
                 pipeline,
+                origin,
                 width,
                 height,
                 scale,
             }),
         })
+    }
+
+    /// Takes another screen's origin, size and scale (`MetalLaserOverlay::move_to`).
+    fn place(&self, origin: [f32; 2], width: f32, height: f32, scale: f32) {
+        let mut renderer = self
+            .renderer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        renderer.origin = origin;
+        renderer.width = width;
+        renderer.height = height;
+        renderer.scale = scale;
+        renderer.layer.set_contents_scale(f64::from(scale));
+        renderer.layer.set_drawable_size(CGSize::new(
+            f64::from(width * scale),
+            f64::from(height * scale),
+        ));
+    }
+
+    fn origin(&self) -> [f32; 2] {
+        self.renderer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .origin
     }
 
     fn layer_ptr(&self) -> *const metal::MetalLayerRef {
@@ -324,7 +390,7 @@ impl SharedMetalOverlay {
             let constrained = mode > 0.5 && tx > -10_000.0;
             (tx, ty, tw, th, constrained, mode)
         };
-        let [ox, oy] = self.origin;
+        let [ox, oy] = self.origin();
         let (tx, ty) = (tx - ox, ty - oy);
         let to_screen = |nx: f32, ny: f32| -> [f32; 2] { [tx + nx * tw, ty + ny * th] };
 

@@ -2031,7 +2031,7 @@ impl ScrawlCoordinator {
         scrawl_log(format!("switch_recording -> {mode:?}"));
         // The morph continues the chips, so it needs them on screen.
         let chips_shown = self.reveal.is_open();
-        let Some((target, overlay)) = self.discard_recording() else {
+        let Some((_, overlay)) = self.discard_recording() else {
             return;
         };
         if mode == SelectionMode::Iphone {
@@ -2042,19 +2042,9 @@ impl ScrawlCoordinator {
             return;
         }
         // Window and Area: the chips stay up while the capsule morphs into the picker.
-        // The picker's overlay covers the primary display; when the recording was on it, keep
-        // its overlay so the border never swaps windows (as the picker → recording path does).
-        let same_display = cx.primary_display().is_some_and(|display| {
-            let b = display.bounds();
-            let f = target.frame;
-            (f64::from(f32::from(b.origin.x)) - f.x).abs() < 1.0
-                && (f64::from(f32::from(b.origin.y)) - f.y).abs() < 1.0
-                && (f64::from(f32::from(b.size.width)) - f.width).abs() < 1.0
-                && (f64::from(f32::from(b.size.height)) - f.height).abs() < 1.0
-        });
-        if same_display {
-            self.picker_metal_overlay = overlay;
-        }
+        // The recording's overlay becomes the picker's (moved if the picker opens on another
+        // display), so the border never swaps windows (as the picker → recording path does).
+        self.picker_metal_overlay = overlay;
         self.open_picker(Some(mode), false, cx);
         if self.is_selecting() && chips_shown && !self.reduced_motion {
             // The chips showed Screen; the picker shows `mode`.
@@ -2386,13 +2376,110 @@ impl ScrawlCoordinator {
             self.island_phase_since = motion::now();
             motion::trace_event(format!("phase:{}", phase.trace_name()));
         }
+        let appearing = matches!(
+            self.island_phase,
+            IslandPhase::Hidden | IslandPhase::Dismissing
+        );
         self.island_phase = phase;
         if crate::handoff::native_pill() {
             if !matches!(phase, IslandPhase::Hidden) {
                 self.ensure_native_pill();
             }
+            if changed
+                && (appearing
+                    || matches!(
+                        phase,
+                        IslandPhase::Selecting { .. } | IslandPhase::Recording
+                    ))
+            {
+                self.place_capsule();
+            }
             self.sync_native_pill();
         }
+    }
+
+    /// Puts the capsule on the display in use: the one being recorded, the one the picker is on,
+    /// else the one under the pointer.
+    fn place_capsule(&self) {
+        let Some(ref pill) = self.native_pill else {
+            return;
+        };
+        let centre = |[x, y, w, h]: [f64; 4]| [x + w / 2.0, y + h / 2.0];
+        let anchor = match self.island_phase {
+            IslandPhase::Recording => self
+                .active_recording
+                .as_ref()
+                .filter(|rec| rec.target.mode != CaptureMode::Device)
+                .map(|rec| {
+                    let f = rec.target.frame;
+                    centre([f.x, f.y, f.width, f.height])
+                }),
+            IslandPhase::Selecting { .. } => Some(centre(self.display_rect.map(f64::from))),
+            _ => None,
+        };
+        if let Some(point) = anchor.or_else(crate::screens::pointer) {
+            pill.place_on(point);
+        }
+    }
+
+    /// The iPhone's mirror window can be dragged to another display mid-recording: the ink
+    /// overlay goes with it.
+    fn follow_phone_mirror(&mut self) {
+        let Some(ActiveRecording {
+            source: CaptureSource::Phone(_),
+            _metal_overlay: Some(overlay),
+            ..
+        }) = self.active_recording.as_mut()
+        else {
+            return;
+        };
+        let f = *self
+            .telemetry
+            .target_frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if f.x <= -10_000.0 {
+            return;
+        }
+        let centre = [f.x + f.width / 2.0, f.y + f.height / 2.0];
+        if !crate::screens::contains(overlay.screen(), centre) {
+            overlay.move_to([f.x, f.y, f.width, f.height]);
+        }
+    }
+
+    /// While picking, the picker (its window, overlay and the capsule) follows the pointer to
+    /// whichever display it's on, unless an area is being dragged (an area stays on one display).
+    fn follow_pointer_display(&mut self, pointer: [f32; 2]) {
+        // The iPhone's mirror window stays where it is, and so does the highlight around it.
+        if self.selection_drag.is_some()
+            || self.lab
+            || self.selection_mode() == Some(SelectionMode::Iphone)
+        {
+            return;
+        }
+        let p = pointer.map(f64::from);
+        let current = self.display_rect.map(f64::from);
+        if crate::screens::contains(current, p) {
+            return;
+        }
+        let screens = crate::screens::current();
+        let Some(i) = crate::screens::index_at(&screens, p) else {
+            return;
+        };
+        let frame = screens[i].frame;
+        if (0..4).all(|k| (frame[k] - current[k]).abs() < 1.0) {
+            return;
+        }
+        scrawl_log(format!("picker follows the pointer to display {frame:?}"));
+        self.display_rect = frame.map(|v| v as f32);
+        if let Some(ref mut overlay) = self.picker_metal_overlay {
+            overlay.move_to(frame);
+        }
+        if let Some(ns_win) = find_picker_ns_window() {
+            move_window_to_screen(&ns_win, frame);
+        }
+        self.place_capsule();
+        self.sync_picker_overlay();
     }
 
     pub(crate) fn ensure_native_pill(&mut self) {
@@ -2635,6 +2722,7 @@ impl ScrawlCoordinator {
 
         if let IslandPhase::Selecting { mode } = self.island_phase {
             if let Some(pos) = current_mouse_screen() {
+                self.follow_pointer_display(pos);
                 self.selection_pointer = Some(pos);
                 if mode == SelectionMode::Area
                     && let Some((start, _)) = self.selection_drag
@@ -2665,6 +2753,7 @@ impl ScrawlCoordinator {
             }
             self.sync_picker_overlay();
         }
+        self.follow_phone_mirror();
 
         // Keep layout width at `island_target_width` during open and dismiss so the capsule never
         // clips its inner chips; open/dismiss use a restrained 0.92 <-> 1.0 scale.
@@ -2778,15 +2867,16 @@ impl ScrawlCoordinator {
         self.hovered_window = None;
         self.animated_window_rect = None;
         self.selection_pointer = current_mouse_screen();
-        // The picker window opens on the primary display; Screen mode highlights all of it.
-        if let Some(display) = cx.primary_display() {
-            let b = display.bounds();
-            self.display_rect = [
-                f32::from(b.origin.x),
-                f32::from(b.origin.y),
-                f32::from(b.size.width),
-                f32::from(b.size.height),
-            ];
+        // The picker opens on the display under the pointer and follows it there
+        // (`follow_pointer_display`); Screen mode highlights all of it.
+        let screens = crate::screens::current();
+        if let Some(i) =
+            crate::screens::pointer().and_then(|p| crate::screens::index_at(&screens, p))
+        {
+            self.display_rect = screens[i].frame.map(|v| v as f32);
+        }
+        if let Some(ref mut overlay) = self.picker_metal_overlay {
+            overlay.move_to(self.display_rect.map(f64::from));
         }
         self.selection_generation += 1;
         self.windows_loading = !self.lab;
@@ -2958,14 +3048,20 @@ impl ScrawlCoordinator {
         let stage = Instant::now();
         // Reuse the continuous 120Hz Metal overlay opened in `begin_target_selection` so the
         // cutout and border never swap windows or jump a single pixel when recording starts.
+        // It moves to the target's display if that's another one (a window picked there).
         let f = target.frame;
-        let metal_overlay = self.picker_metal_overlay.take().or_else(|| {
-            let ov = MetalLaserOverlay::open(
-                Arc::clone(&self.telemetry),
-                Some([f.x, f.y, f.width, f.height]),
-            )
-            .map_err(|error| scrawl_log(format!("Metal overlay failed: {error}")))
-            .ok();
+        let target_rect = [f.x, f.y, f.width, f.height];
+        if let Some(ref pill) = self.native_pill {
+            pill.place_on([f.x + f.width / 2.0, f.y + f.height / 2.0]);
+        }
+        let metal_overlay = self.picker_metal_overlay.take().map(|mut overlay| {
+            overlay.move_to(target_rect);
+            overlay
+        });
+        let metal_overlay = metal_overlay.or_else(|| {
+            let ov = MetalLaserOverlay::open(Arc::clone(&self.telemetry), Some(target_rect))
+                .map_err(|error| scrawl_log(format!("Metal overlay failed: {error}")))
+                .ok();
             if let Some(ref o) = ov {
                 self.telemetry
                     .excluded_window_ids
@@ -3136,8 +3232,15 @@ impl ScrawlCoordinator {
                 }
             }
         };
+        // Over the mirror window's display (the pointer's until the window reports its rect).
+        let mirror = (initial_frame.x > -10_000.0).then_some([
+            initial_frame.x,
+            initial_frame.y,
+            initial_frame.width,
+            initial_frame.height,
+        ]);
         let metal_overlay = self.picker_metal_overlay.take().or_else(|| {
-            MetalLaserOverlay::open(Arc::clone(&self.telemetry), None)
+            MetalLaserOverlay::open(Arc::clone(&self.telemetry), mirror)
                 .map_err(|error| scrawl_log(format!("Metal overlay failed: {error}")))
                 .ok()
         });
@@ -4291,7 +4394,8 @@ impl Render for TargetPickerWindow {
         let c_key = self.coordinator.clone();
 
         let win_bounds = window.bounds();
-        let origin = [0.0_f32, 0.0_f32];
+        // The picker covers one display; pointer, windows and areas are global points.
+        let origin = [coord.display_rect[0], coord.display_rect[1]];
         let screen = [
             f32::from(win_bounds.size.width),
             f32::from(win_bounds.size.height),
@@ -5325,16 +5429,43 @@ fn hint_button(
         })
 }
 
+/// The GPUI display that is the screen at `frame` (global points), else the primary one.
+fn display_at(frame: [f32; 4], cx: &App) -> Option<std::rc::Rc<dyn gpui::PlatformDisplay>> {
+    let screens = crate::screens::displays();
+    let id = crate::screens::index_for_rect(&screens, frame.map(f64::from)).map(|i| screens[i].id);
+    id.and_then(|id| cx.displays().into_iter().find(|d| u32::from(d.id()) == id))
+        .or_else(|| cx.primary_display())
+}
+
+/// Moves a window to cover the screen at `frame` (global points).
+fn move_window_to_screen(ns_win: &NSWindow, frame: [f64; 4]) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Some(primary_h) = objc2_app_kit::NSScreen::screens(mtm)
+        .firstObject()
+        .map(|s| s.frame().size.height)
+    else {
+        return;
+    };
+    let [x, y, w, h] = crate::screens::flip(frame, primary_h);
+    ns_win.setFrame_display(
+        objc2_foundation::NSRect::new(
+            objc2_foundation::NSPoint::new(x, y),
+            objc2_foundation::NSSize::new(w, h),
+        ),
+        true,
+    );
+}
+
 fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
     close_picker_window(cx);
-    let display = cx.primary_display();
-    let display_bounds = display.as_ref().map_or_else(
-        || Bounds {
-            origin: Point::default(),
-            size: size(px(1440.0), px(900.0)),
-        },
-        |d| d.bounds(),
-    );
+    let screen = coord_entity.read(cx).display_rect;
+    let display = display_at(screen, cx);
+    let display_bounds = Bounds {
+        origin: Point::default(),
+        size: size(px(screen[2]), px(screen[3])),
+    };
     let display_id = display.as_ref().map(|d| d.id());
     let lab = coord_entity.read(cx).lab;
 
@@ -5362,9 +5493,8 @@ fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
                     NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
                 );
                 configure_floating_window(&ns_win, picker_coord.read(cx).lab, 1);
-                if let Some(screen) = ns_win.screen() {
-                    ns_win.setFrame_display(screen.frame(), true);
-                }
+                // The display the picker was opened for, or has since followed the pointer to.
+                move_window_to_screen(&ns_win, picker_coord.read(cx).display_rect.map(f64::from));
                 let num = ns_win.windowNumber().max(0) as u32;
                 if num > 0 {
                     picker_coord
@@ -5413,7 +5543,19 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
             return;
         }
     }
-    let display = cx.primary_display();
+    // The display in use: the picker's or recording's, else the pointer's.
+    let coord = coord_entity.read(cx);
+    let in_use = match (&coord.active_recording, coord.island_phase) {
+        (Some(rec), _) if rec.target.mode != CaptureMode::Device => {
+            let f = rec.target.frame;
+            Some([f.x, f.y, f.width, f.height].map(|v| v as f32))
+        }
+        (_, IslandPhase::Selecting { .. }) => Some(coord.display_rect),
+        _ => None,
+    };
+    let near =
+        in_use.or_else(|| crate::screens::pointer().map(|[x, y]| [x as f32, y as f32, 1.0, 1.0]));
+    let display = near.map_or_else(|| cx.primary_display(), |r| display_at(r, cx));
     let display_bounds = display.as_ref().map_or_else(
         || Bounds {
             origin: Point::default(),
