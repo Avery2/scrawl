@@ -214,7 +214,7 @@ fn apple(wav: &Path) -> TranscriptData {
         TranscriptData {
             source: "offline".into(),
             missing: Some(crate::model::MissingTranscript {
-                reason: format!("Apple Speech failed ({error:#})."),
+                reason: format!("{LOCAL_ENGINE_TITLE} failed ({error:#})."),
                 retry: false,
             }),
             ..Default::default()

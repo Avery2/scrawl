@@ -113,6 +113,16 @@ struct Transcriber {
     hex_title: String,
     hex_enabled: bool,
     models: Vec<ModelOption>,
+    speech: Speech,
+}
+
+/// `speech_model::Status`: the local model's download.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+struct Speech {
+    state: String,
+    progress: f64,
+    error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -1070,7 +1080,7 @@ impl SettingsWindow {
                 "Parakeet runs on this PC and times each word. Hex uses a model you have in Hex, and its word times are estimates."
             }
             (true, false) => {
-                "Parakeet runs on this PC with the model Hex installed, and times each word. Hex shows up here while Hex is running."
+                "Parakeet runs on this PC and times each word. Scrawl downloads its 730 MB model once, unless Hex already has it. Hex shows up here while Hex is running."
             }
             (false, true) => {
                 "Apple Speech times each word. Hex uses a model you have in Hex, and its word times are estimates."
@@ -1079,12 +1089,37 @@ impl SettingsWindow {
                 "Apple Speech runs on this Mac and times each word. Hex shows up here while Hex is running."
             }
         };
+        let speech = match t.speech.state.as_str() {
+            _ if !WINDOWS || hex => None,
+            "downloading" => Some((
+                format!(
+                    "Downloading the speech model: {:.0}%",
+                    (t.speech.progress * 100.0).clamp(0.0, 100.0)
+                ),
+                false,
+            )),
+            "failed" => Some((
+                format!(
+                    "The speech model couldn't be downloaded{}. Scrawl tries again in a few minutes.",
+                    t.speech
+                        .error
+                        .as_deref()
+                        .map(|e| format!(" ({e})"))
+                        .unwrap_or_default()
+                ),
+                true,
+            )),
+            _ => None,
+        };
         let video = state.video_export;
         div()
             .flex()
             .flex_col()
             .child(group(theme, rows))
             .child(caption(theme, note, false))
+            .when_some(speech, |pane, (text, error)| {
+                pane.child(caption(theme, &text, error))
+            })
             .child(header(theme, "Experimental"))
             .child(group(
                 theme,

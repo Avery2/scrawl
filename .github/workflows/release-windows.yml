@@ -1,0 +1,113 @@
+name: Release (Windows)
+
+# Builds the Windows zip for a version tag and attaches it to that tag's GitHub release
+# (creating the release if the Mac side hasn't yet). Run it by hand with a tag to rebuild one,
+# or without a tag to only build and keep the zip as a workflow artifact.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build and attach the zip to (e.g. v0.3.6). Empty builds the branch without uploading.
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-windows-${{ github.ref }}-${{ inputs.tag }}
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+      # The C and C++ runtimes linked in, so a fresh Windows needs no Visual C++ redistributable.
+      # An explicit --target keeps the flag off build scripts and proc macros.
+      RUSTFLAGS: -C target-feature=+crt-static
+      BUILD: --release --locked --target x86_64-pc-windows-msvc
+      EXE: target\x86_64-pc-windows-msvc\release\scrawl.exe
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-crt-static
+          cache-on-failure: true
+
+      - run: cargo build ${{ env.BUILD }}
+
+      - name: scrawl --help runs headless
+        run: '& $env:EXE --help'
+
+      - name: Only system DLLs are needed
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * -find "VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $deps = & $dumpbin /nologo /dependents $env:EXE | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() }
+          $deps
+          $redist = $deps | Where-Object { $_ -match '^(vcruntime|msvcp|concrt|vcomp)' }
+          if ($redist) { throw "needs the Visual C++ runtime: $redist" }
+
+      - name: Downloads and loads the speech model
+        run: cargo test ${{ env.BUILD }} win::speech -- --ignored --nocapture
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $name = "Scrawl-$version-windows-x64.zip"
+          $dir = "dist\Scrawl"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item $env:EXE "$dir\scrawl.exe"
+          Copy-Item LICENSE "$dir\LICENSE.txt"
+          @"
+          Scrawl $version for Windows (preview)
+
+          Run scrawl.exe. Scrawl lives in the notification area; press Alt+Shift+S to record.
+
+          This build isn't signed yet, so Windows may say "Windows protected your PC".
+          Click More info, then Run anyway.
+
+          The first launch downloads the speech model (730 MB) in the background, unless Hex
+          already installed one. Captures made before it finishes get their transcript afterwards.
+
+          https://scrawl.kitlangton.com
+          https://github.com/kitlangton/scrawl
+          "@ | Set-Content -Encoding utf8 "$dir\README.txt"
+          Compress-Archive -Path $dir -DestinationPath "dist\$name" -Force
+          Get-ChildItem dist\$name | Format-Table Name, Length
+          (Get-FileHash "dist\$name" -Algorithm SHA256).Hash.ToLower() + "  $name" | Tee-Object "dist\$name.sha256"
+          "name=$name" >> $env:GITHUB_OUTPUT
+
+      - name: Check the zip
+        shell: pwsh
+        run: |
+          Expand-Archive "dist\${{ steps.package.outputs.name }}" -DestinationPath dist\check -Force
+          Get-ChildItem -Recurse dist\check | Format-Table FullName, Length
+          dist\check\Scrawl\scrawl.exe --version
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/${{ steps.package.outputs.name }}
+            dist/${{ steps.package.outputs.name }}.sha256
+
+      - name: Attach to the release
+        if: env.TAG != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --verify-tag --title "Scrawl ${TAG#v}" --notes "Release notes to follow."
+          gh release upload "$TAG" "dist/${{ steps.package.outputs.name }}" --clobber
