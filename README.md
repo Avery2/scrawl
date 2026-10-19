@@ -15,16 +15,6 @@ brew install --cask kitlangton/tap/scrawl
 
 The app updates itself (Sparkle), so Homebrew leaves updates to it.
 
-To teach your coding agent how to read captures, including `scrawl zoom` for a closer look at a
-moment, install the Scrawl skill. The [`skills`](https://github.com/vercel-labs/skills) CLI puts it
-where Claude Code, OpenCode, Codex, Cursor and other agents look for skills:
-
-```sh
-npx skills add kitlangton/scrawl -g
-```
-
-The skill is [`skills/scrawl/SKILL.md`](skills/scrawl/SKILL.md) if you'd rather copy it by hand.
-
 ## Usage
 
 ```sh
