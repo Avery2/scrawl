@@ -360,8 +360,8 @@ struct SharedNativePill {
 
 pub struct NativePill {
     shared: Arc<SharedNativePill>,
-    display_link: CVDisplayLink,
-    display_link_ctx: *const SharedNativePill,
+    display_link: Option<CVDisplayLink>,
+    display_link_ctx: Option<*const SharedNativePill>,
     action_rx: flume::Receiver<PillAction>,
     window_num: u32,
 }
@@ -415,8 +415,9 @@ impl NativePill {
             NSSize::new(f64::from(PANEL_W), f64::from(PANEL_H)),
         );
         let root_view = ScrawlPillView::new(mtm, local_bounds, action_tx.clone());
+        root_view.setWantsLayer(true);
 
-        // Optional AppKit Liquid Glass views (`NSGlassEffectContainerView` + `NSGlassEffectView`).
+        // Optional AppKit Liquid Glass view (`NSGlassEffectView` on macOS 26+).
         let glass_view = create_glass_views(&root_view, local_bounds);
 
         let metal_view = NSView::initWithFrame(mtm.alloc(), local_bounds);
@@ -443,6 +444,13 @@ impl NativePill {
         );
         window.setFrame_display(panel_rect, true);
         window.orderFrontRegardless();
+        // Force one initial AppKit display/layout pass while `glass_view` is non-hidden (alpha 0)
+        // so `NSGlassEffectView` constructs its `SDFLayer` + `CABackdropLayer` + `CASDFElementLayer`
+        // hierarchy on the main thread.
+        window.displayIfNeeded();
+        if let Some(ref gv) = glass_view {
+            gv.setHidden(true);
+        }
         let window_num = window.windowNumber().max(0) as u32;
 
         let shared = Arc::new(SharedNativePill {
@@ -468,17 +476,25 @@ impl NativePill {
         // Draw initial transparent frame synchronously.
         shared.tick_main();
 
-        let display_link = CVDisplayLink::from_active_cg_displays()
-            .map_err(|status| format!("Could not create CVDisplayLink for NativePill: {status}"))?;
-        let display_link_ctx = Arc::into_raw(shared.clone());
-        unsafe {
-            display_link.set_output_callback(
-                pill_display_link_cb,
-                display_link_ctx.cast_mut().cast::<c_void>(),
-            )
+        let mut display_link = None;
+        let mut display_link_ctx = None;
+        if let Ok(dl) = CVDisplayLink::from_active_cg_displays() {
+            let ctx = Arc::into_raw(shared.clone());
+            if unsafe {
+                dl.set_output_callback(
+                    pill_display_link_cb,
+                    ctx.cast_mut().cast::<c_void>(),
+                )
+            }
+            .is_ok()
+            {
+                let _ = dl.start();
+                display_link = Some(dl);
+                display_link_ctx = Some(ctx);
+            } else {
+                unsafe { drop(Arc::from_raw(ctx)) };
+            }
         }
-        .map_err(|status| format!("Could not configure NativePill CVDisplayLink: {status}"))?;
-        let _ = display_link.start();
 
         Ok(Self {
             shared,
@@ -494,8 +510,10 @@ impl NativePill {
     }
 
     /// Synchronizes coordinator state into the native pill model; the next `CVDisplayLink` tick
-    /// advances springs and renders on the display refresh cadence.
+    /// advances springs and renders on the display refresh cadence (with main-loop fallback if
+    /// `CVDisplayLink` is paused).
     pub fn sync(&self, snapshot: PillSnapshot) {
+        let mut needs_fallback_tick = self.display_link.is_none();
         if let Ok(mut st) = self.shared.state.lock() {
             if st.style != snapshot.style {
                 st.style = snapshot.style;
@@ -520,6 +538,12 @@ impl NativePill {
                     st.window.orderFrontRegardless();
                 }
             }
+            if (motion::now() - st.last_tick_now) >= f64::from(0.016 * motion::time_scale()) {
+                needs_fallback_tick = true;
+            }
+        }
+        if needs_fallback_tick {
+            self.shared.tick_main();
         }
     }
 
@@ -545,16 +569,20 @@ impl NativePill {
 impl Drop for NativePill {
     fn drop(&mut self) {
         self.shared.alive.store(false, Ordering::SeqCst);
-        let _ = self.display_link.stop();
+        if let Some(ref dl) = self.display_link {
+            let _ = dl.stop();
+        }
         if let Ok(st) = self.shared.state.lock() {
             st.window.orderOut(None);
             st.window.close();
         }
-        unsafe { drop(Arc::from_raw(self.display_link_ctx)) };
+        if let Some(ctx) = self.display_link_ctx {
+            unsafe { drop(Arc::from_raw(ctx)) };
+        }
     }
 }
 
-/// Creates `NSGlassEffectContainerView` and `NSGlassEffectView` dynamically on macOS 26+.
+/// Creates `NSGlassEffectView` dynamically on macOS 26+.
 fn create_glass_views(root_view: &NSView, bounds: NSRect) -> Option<Retained<NSView>> {
     let glass_cls = AnyClass::get(c"NSGlassEffectView")?;
     unsafe {
@@ -562,36 +590,27 @@ fn create_glass_views(root_view: &NSView, bounds: NSRect) -> Option<Retained<NSV
         if raw_glass.is_null() {
             return None;
         }
-        let raw_glass: *mut NSView = msg_send![raw_glass, initWithFrame: bounds];
+        let init_frame = NSRect::new(
+            NSPoint::new((bounds.size.width - 200.0) * 0.5, 22.0),
+            NSSize::new(200.0, 40.0),
+        );
+        let raw_glass: *mut NSView = msg_send![raw_glass, initWithFrame: init_frame];
         let glass_view = Retained::from_raw(raw_glass)?;
-        glass_view.setHidden(true);
+        glass_view.setWantsLayer(true);
+        glass_view.setAlphaValue(0.0);
 
         if msg_send![&*glass_view, respondsToSelector: sel!(setStyle:)] {
-            // 0 = NSGlassEffectViewStyleRegular
+            // 0 = NSGlassEffectViewStyleRegular (refractive Liquid Glass bottle + specular rim)
             let _: () = msg_send![&*glass_view, setStyle: 0_isize];
         }
         if msg_send![&*glass_view, respondsToSelector: sel!(setCornerRadius:)] {
             let _: () = msg_send![&*glass_view, setCornerRadius: 20.0_f64];
         }
         if msg_send![&*glass_view, respondsToSelector: sel!(setTintColor:)] {
-            let tint = NSColor::colorWithSRGBRed_green_blue_alpha(0.06, 0.06, 0.08, 0.72);
+            let tint = NSColor::colorWithSRGBRed_green_blue_alpha(0.06, 0.07, 0.10, 0.22);
             let _: () = msg_send![&*glass_view, setTintColor: Some(&*tint)];
         }
 
-        if let Some(container_cls) = AnyClass::get(c"NSGlassEffectContainerView") {
-            let raw_container: *mut NSView = msg_send![container_cls, alloc];
-            if !raw_container.is_null() {
-                let raw_container: *mut NSView = msg_send![raw_container, initWithFrame: bounds];
-                if let Some(container) = Retained::from_raw(raw_container) {
-                    if msg_send![&*container, respondsToSelector: sel!(setSpacing:)] {
-                        let _: () = msg_send![&*container, setSpacing: 12.0_f64];
-                    }
-                    container.addSubview(&glass_view);
-                    root_view.addSubview(&container);
-                    return Some(glass_view);
-                }
-            }
-        }
         root_view.addSubview(&glass_view);
         Some(glass_view)
     }
@@ -1066,13 +1085,15 @@ impl PillRuntimeState {
                     }
                     if msg_send![&**gv, respondsToSelector: sel!(setTintColor:)] {
                         let tint = if frame.is_completed {
-                            NSColor::colorWithSRGBRed_green_blue_alpha(0.05, 0.14, 0.10, 0.72)
+                            NSColor::colorWithSRGBRed_green_blue_alpha(0.04, 0.14, 0.09, 0.28)
                         } else {
-                            NSColor::colorWithSRGBRed_green_blue_alpha(0.06, 0.06, 0.08, 0.72)
+                            NSColor::colorWithSRGBRed_green_blue_alpha(0.06, 0.07, 0.10, 0.22)
                         };
                         let _: () = msg_send![&**gv, setTintColor: Some(&*tint)];
                     }
                 }
+                gv.setNeedsLayout(true);
+                gv.layoutSubtreeIfNeeded();
             } else {
                 gv.setHidden(true);
             }
@@ -1123,6 +1144,8 @@ impl PillRuntimeState {
             ]
         };
 
+        let is_glass = self.style == PillStyle::Glass && self.glass_view.is_some();
+
         match elem.id {
             ElemId::ChipArea | ElemId::ChipWindow | ElemId::ChipScreen | ElemId::ChipIphone => {
                 let mode = match elem.id {
@@ -1132,15 +1155,24 @@ impl PillRuntimeState {
                     ElemId::ChipIphone => SelectionMode::Iphone,
                     _ => unreachable!(),
                 };
-                let bg_a = 0.16 * elem.active
-                    + 0.08 * elem.hover * (1.0 - elem.active)
-                    + 0.06 * elem.press;
-                if bg_a > 0.002 {
-                    push_shape(out, [ox, oy, bw, bh], bh * 0.5, [1.0, 1.0, 1.0, bg_a]);
+                if is_glass {
+                    let smoke_a = 0.20 + 0.18 * elem.active + 0.10 * elem.hover;
+                    push_shape(out, [ox, oy, bw, bh], bh * 0.5, [0.06, 0.07, 0.10, smoke_a]);
+                } else {
+                    let bg_a = 0.16 * elem.active
+                        + 0.08 * elem.hover * (1.0 - elem.active)
+                        + 0.06 * elem.press;
+                    if bg_a > 0.002 {
+                        push_shape(out, [ox, oy, bw, bh], bh * 0.5, [1.0, 1.0, 1.0, bg_a]);
+                    }
                 }
                 let ic = atlas.icon(IconKind::from_mode(mode));
                 let tx = atlas.label(mode.label());
-                let fg = 0.608 + 0.353 * elem.active.max(elem.hover * 0.65);
+                let fg = if is_glass {
+                    0.90 + 0.10 * elem.active.max(elem.hover)
+                } else {
+                    0.608 + 0.353 * elem.active.max(elem.hover * 0.65)
+                };
                 push_sprite(
                     out,
                     [ox + CHIP_PX, oy + (CHIP_H - 14.0) * 0.5, 14.0, 14.0],
@@ -1175,6 +1207,9 @@ impl PillRuntimeState {
                 push_sprite(out, center_text(tx), tx.uv, [0.95, 0.95, 0.96, 1.0]);
             }
             ElemId::Lead => {
+                if is_glass {
+                    push_shape(out, [ox, oy, bw, bh], bh * 0.5, [0.06, 0.07, 0.10, 0.24]);
+                }
                 let tx = atlas.clock_sprite;
                 let cycle = 1.6_f32;
                 let ripple = (t / cycle).fract();
@@ -1217,21 +1252,38 @@ impl PillRuntimeState {
                     ElemId::Inspect => "Inspect",
                     _ => unreachable!(),
                 };
-                if elem.enabled && (elem.hover > 0.01 || elem.press > 0.01) {
+                if is_glass {
+                    let smoke_a = if elem.enabled {
+                        0.20 + 0.12 * elem.hover + 0.06 * elem.press
+                    } else {
+                        0.12
+                    };
+                    push_shape(out, [ox, oy, bw, bh], bh * 0.5, [0.06, 0.07, 0.10, smoke_a]);
+                } else if elem.enabled && (elem.hover > 0.01 || elem.press > 0.01) {
                     let bg_a = 0.08 * elem.hover + 0.06 * elem.press;
                     push_shape(out, [ox, oy, bw, bh], bh * 0.5, [1.0, 1.0, 1.0, bg_a]);
                 }
                 let tx = atlas.label(label);
                 let fg = if !elem.enabled {
-                    0.42
+                    if is_glass { 0.72 } else { 0.42 }
+                } else if is_glass {
+                    0.92 + 0.08 * elem.hover
                 } else {
                     0.72 + 0.24 * elem.hover
                 };
-                let fg_a = if !elem.enabled { 0.48 } else { 1.0 };
+                let fg_a = if !elem.enabled { 0.55 } else { 1.0 };
                 push_sprite(out, center_text(tx), tx.uv, [fg, fg, fg, fg_a]);
             }
             ElemId::Close => {
-                if elem.hover > 0.01 || elem.press > 0.01 {
+                if is_glass {
+                    let smoke_a = 0.20 + 0.12 * elem.hover + 0.06 * elem.press;
+                    push_shape(
+                        out,
+                        [ox + 2.0, oy + 2.0, bh - 4.0, bh - 4.0],
+                        (bh - 4.0) * 0.5,
+                        [0.06, 0.07, 0.10, smoke_a],
+                    );
+                } else if elem.hover > 0.01 || elem.press > 0.01 {
                     let bg_a = 0.10 * elem.hover + 0.06 * elem.press;
                     push_shape(
                         out,
@@ -1241,7 +1293,11 @@ impl PillRuntimeState {
                     );
                 }
                 let ic = atlas.icon(IconKind::Close);
-                let fg = 0.61 + 0.35 * elem.hover;
+                let fg = if is_glass {
+                    0.90 + 0.10 * elem.hover
+                } else {
+                    0.61 + 0.35 * elem.hover
+                };
                 push_sprite(
                     out,
                     [ox + (CHIP_H - 12.0) * 0.5, oy + (CHIP_H - 12.0) * 0.5, 12.0, 12.0],

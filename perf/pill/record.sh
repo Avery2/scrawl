@@ -27,20 +27,25 @@ here=$(cd "$(dirname "$0")" && pwd)
 motion_lint=${MOTION_LINT:-$HOME/code/open-source/motion-lint/cli/motion-lint.ts}
 
 for scene in "${scenes[@]}"; do
+  caffeinate -u -t 20 >/dev/null 2>&1 &
   rm -f "$out/$scene.mov"
   mkdir -p "$out/runs/$scene/trace"
   log="$out/.$scene.log"
   "$bin" lab pill "$scene" --trace "$out/runs/$scene/trace/$scene.jsonl" ${scale_args[@]+"${scale_args[@]}"} >"$log" 2>&1 &
   lab=$!
-  sleep 1.0 # the backdrop is up; the first step comes at 1.7 s (scaled)
-  # The lab prints the backdrop's rect (`lab::BACKDROP`) on the main display.
-  region=$(sed -n 's/^region //p' "$log" | head -1)
+  region=""
+  for _ in {1..30}; do
+    region=$(sed -n 's/^region //p' "$log" 2>/dev/null | head -1)
+    [[ -n $region ]] && break
+    sleep 0.05
+  done
+  sleep 0.25 # the backdrop is up; the first step comes at 0.85 s (scaled)
   region=${region:-${REGION:-}} # older builds don't print it
   [[ -n $region ]] || { echo "no region from the lab ($log)"; kill "$lab"; exit 1; }
   screencapture -v -x -R"$region" "$out/$scene.mov" &
   rec=$!
   wait "$lab"
-  sleep 0.2
+  sleep 0.25
   kill -INT "$rec" 2>/dev/null || true
   wait "$rec" 2>/dev/null || true
   rm -f "$log"

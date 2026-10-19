@@ -256,19 +256,13 @@ fragment float4 pill_composite_fragment(
     }
 
     // 3. Main capsule silhouette fill (opaque dark in black mode; transparent in glass mode where
-    //    NSGlassEffectView renders the real Liquid Glass backdrop behind the Metal layer).
+    //    NSGlassEffectView renders the real Liquid Glass bottle + lensing behind the Metal layer).
     float aa_band = max(1.0 / u.scale, u.shape_meta.z);
     float in_cov = smoothstep(aa_band * 0.5, -aa_band * 0.5, sdf);
     if (in_cov > 0.001) {
         if (is_glass < 0.5) {
             float fill_a = 0.96 * shape_alpha * in_cov;
             out = blend_over(out, float4(bg_rgb * fill_a, fill_a));
-        } else {
-            float3 glaze_rgb = (u.is_completed != 0u)
-                ? float3(0.04, 0.09, 0.07)
-                : float3(0.05, 0.05, 0.07);
-            float fill_a = 0.52 * shape_alpha * in_cov;
-            out = blend_over(out, float4(glaze_rgb * fill_a, fill_a));
         }
 
         // 4. Composite per-element quads with 1D Vertical Gaussian blur from `offscreen_b`,
@@ -310,13 +304,20 @@ fragment float4 pill_composite_fragment(
                     w_sum += w;
                 }
                 sample_col /= max(w_sum, 1e-5);
+                // Compensate for 2D Gaussian peak-alpha dilution on thin (1.5 pt) glyph/icon strokes
+                // so blurred text and chips remain bright and visually unmistakable in motion.
+                if (sample_col.a > 1e-4) {
+                    float blur_boost = 1.0 + min(sigma, 8.0) * 0.35;
+                    float boosted_a = min(1.0, sample_col.a * blur_boost);
+                    sample_col *= (boosted_a / sample_col.a);
+                }
             }
             // In Liquid Glass mode, add a subtle 1pt downward dark text/icon backing shadow so
             // white labels and the red dot stay crisp over bright white pages as well as dark ones.
-            if (is_glass >= 0.5 && sigma < 2.5) {
+            if (is_glass >= 0.5 && sigma < 3.5) {
                 float sh_y = clamp(tile_pt.y - 0.85, min_ty, max_ty);
                 float sh_a = offscreen_b.sample(s, float2(tile_pt.x, sh_y) * inv_canvas).a;
-                float backing_a = sh_a * 0.58 * e.alpha * in_cov;
+                float backing_a = min(1.0, sh_a * 0.64) * e.alpha * in_cov;
                 out = blend_over(out, float4(0.0, 0.0, 0.0, backing_a));
             }
             float eff_a = e.alpha * in_cov;

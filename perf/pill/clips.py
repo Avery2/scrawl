@@ -35,8 +35,9 @@ def frames(path: Path, w=160, h=19):
 def appear(path: Path) -> float:
     """Seconds until the capsule first shows: a frame that differs from the first."""
     f = frames(path)
-    diff = np.abs(f - f[0]).mean(axis=(1, 2))
-    hits = np.nonzero(diff > 1.5)[0]
+    ref = f[min(2, len(f) - 1), 3:15, 50:110]
+    diff = np.abs(f[:, 3:15, 50:110] - ref).mean(axis=(1, 2))
+    hits = np.nonzero(diff > 2.5)[0]
     if not len(hits):
         raise SystemExit(f"{path}: the capsule never appears")
     return hits[0] / 60.0

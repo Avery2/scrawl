@@ -17,9 +17,9 @@ use crate::model::{CaptureMode, TargetFrame, TargetInfo};
 pub(super) const PROCESSING_S: f32 = 0.8;
 /// Quiet time before a scene's first step, so motion-lint's launch settle passes and a screen
 /// recording starts on a still frame.
-const LEAD_IN_S: f32 = 1.7;
+const LEAD_IN_S: f32 = 0.85;
 /// Quiet time after the last step (and between repeats).
-const TAIL_S: f32 = 0.9;
+const TAIL_S: f32 = 0.75;
 /// The backdrop: x offset from the display's centre line, top, width and height in points.
 /// The capsule window is 520 × 84 at y = 34, under the menu bar.
 pub const BACKDROP: [f32; 4] = [0.0, 38.0, 640.0, 76.0];
@@ -197,9 +197,7 @@ pub fn run(options: Options) {
                     .await;
                 let alive = cx.update(|cx| {
                     motion::poll_tune();
-                    if loop_coord.read(cx).is_island_visible() {
-                        loop_coord.update(cx, |coord, cx| coord.island_tick(cx));
-                    }
+                    loop_coord.update(cx, |coord, cx| coord.island_tick(cx));
                 });
                 if alive.is_err() {
                     break;
@@ -227,8 +225,12 @@ pub fn run(options: Options) {
                 }
             }
             let _ = cx.update(|cx| {
+                let _ = coordinator.update(cx, |coord, _| {
+                    coord.native_pill = None;
+                });
                 motion::trace_close();
                 cx.quit();
+                std::process::exit(0);
             });
         })
         .detach();
@@ -247,60 +249,66 @@ impl Render for Backdrop {
                 .bg(rgb(0xfafafc))
                 .flex()
                 .flex_col()
+                .items_center()
                 .justify_center()
-                .gap(px(8.0))
-                .px(px(28.0))
+                .gap(px(6.0))
                 .child(
                     div()
                         .flex()
                         .items_center()
+                        .justify_center()
                         .gap(px(10.0))
-                        .child(div().w(px(84.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x1e293b)))
-                        .child(div().w(px(56.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x3b82f6)))
-                        .child(div().w(px(128.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xcbd5e1)))
-                        .child(div().w(px(72.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x10b981)))
-                        .child(div().w(px(140.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x94a3b8))),
+                        .child(div().w(px(88.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x1e293b)))
+                        .child(div().w(px(64.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x2563eb)))
+                        .child(div().w(px(108.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x94a3b8)))
+                        .child(div().w(px(74.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x10b981)))
+                        .child(div().w(px(84.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xf43f5e)))
+                        .child(div().w(px(96.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x475569))),
                 )
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(12.0))
-                        .child(div().w(px(110.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0xe2e8f0)))
-                        .child(div().w(px(96.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0x64748b)))
-                        .child(div().w(px(64.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0xf59e0b)))
-                        .child(div().w(px(150.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0xcbd5e1)))
-                        .child(div().w(px(80.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0x334155))),
+                        .justify_center()
+                        .gap(px(10.0))
+                        .child(div().w(px(104.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0x64748b)))
+                        .child(div().w(px(78.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0xf59e0b)))
+                        .child(div().w(px(124.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0x0f172a)))
+                        .child(div().w(px(68.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0x8b5cf6)))
+                        .child(div().w(px(116.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0x3b82f6))),
                 ),
             "dark" | "busy-dark" => div()
                 .size_full()
                 .bg(rgb(0x0f1117))
                 .flex()
                 .flex_col()
+                .items_center()
                 .justify_center()
-                .gap(px(8.0))
-                .px(px(28.0))
+                .gap(px(6.0))
                 .child(
                     div()
                         .flex()
                         .items_center()
+                        .justify_center()
                         .gap(px(10.0))
-                        .child(div().w(px(76.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xf43f5e)))
-                        .child(div().w(px(112.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x38bdf8)))
-                        .child(div().w(px(68.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xfbbf24)))
-                        .child(div().w(px(124.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xe2e8f0)))
-                        .child(div().w(px(92.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xa855f7))),
+                        .child(div().w(px(84.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xf43f5e)))
+                        .child(div().w(px(104.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x38bdf8)))
+                        .child(div().w(px(72.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xfbbf24)))
+                        .child(div().w(px(112.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xe2e8f0)))
+                        .child(div().w(px(82.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xa855f7)))
+                        .child(div().w(px(76.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x34d399))),
                 )
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(12.0))
-                        .child(div().w(px(104.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0x34d399)))
-                        .child(div().w(px(88.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0x94a3b8)))
-                        .child(div().w(px(136.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0x60a5fa)))
-                        .child(div().w(px(64.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0xf97316)))
-                        .child(div().w(px(96.0)).h(px(10.0)).rounded(px(4.0)).bg(rgb(0xcbd5e1))),
+                        .justify_center()
+                        .gap(px(10.0))
+                        .child(div().w(px(96.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0x34d399)))
+                        .child(div().w(px(84.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0xf97316)))
+                        .child(div().w(px(128.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0x60a5fa)))
+                        .child(div().w(px(72.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0xf472b6)))
+                        .child(div().w(px(108.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0xcbd5e1))),
                 ),
             _ => div().size_full().bg(rgb(0xd9d9de)),
         }

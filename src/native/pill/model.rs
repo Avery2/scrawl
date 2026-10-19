@@ -59,7 +59,7 @@ pub const BLUR_LEAD: f32 = 0.55;
 pub const CONTENT_SCALE_FROM: f32 = 0.82;
 pub const CONTENT_STAGGER_S: f32 = 0.013;
 pub const CONTENT_PUSH_PT: f32 = 1.75;
-pub const TRAVEL_BLUR_MAX: f32 = 4.0;
+pub const TRAVEL_BLUR_MAX: f32 = 6.0;
 pub const REDUCED_FADE_S: f32 = 0.20;
 pub const RADIUS_BLEND: f32 = 8.0;
 pub const PRESS_GROW_PT: f32 = 2.5;
@@ -1272,9 +1272,13 @@ impl PillModel {
                     }
                 }
                 let left = (st.x.x - st.x.target).hypot(st.y.x - st.y.target);
-                let going = st.trip > 4.0 && left > st.trip * 0.35;
+                let going = st.trip > 2.0 && left > st.trip * 0.22;
                 st.go_blur.target = f32::from(u8::from(going));
-                let blur_dur = (out.duration * BLUR_LEAD).max(0.03);
+                let blur_dur = if going {
+                    0.04
+                } else {
+                    (out.duration * BLUR_LEAD).max(0.03)
+                };
                 st.go_blur.step_critical(dt, blur_dur, 100.0);
                 if left < 1e-3 && st.x.v.abs() < 1e-2 && st.go_blur.x < 1e-3 {
                     st.x.snap(st.x.target);
