@@ -35,7 +35,7 @@ const LASER_REACH_PT: f32 = 22.0;
 const INK_REACH_PT: f32 = 4.6;
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 struct LaserUniforms {
     resolution: [f32; 2],
     scale: f32,
@@ -56,7 +56,7 @@ struct LaserUniforms {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 struct PathSegment {
     a: [f32; 2],
     b: [f32; 2],
@@ -67,7 +67,7 @@ struct PathSegment {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 struct PinMarker {
     pos: [f32; 2],
     radius: f32,
@@ -281,6 +281,9 @@ struct MetalLaserRenderer {
     device: metal::Device,
     command_queue: metal::CommandQueue,
     pipelines: OverlayPipelines,
+    /// What the frame on screen was drawn from. The layer keeps showing it, so a frame drawn
+    /// from the same inputs is skipped.
+    shown: Option<ShownFrame>,
     /// The screen's top-left in global points: telemetry is global, the shader draws locally.
     origin: [f32; 2],
     width: f32,
@@ -318,6 +321,7 @@ impl SharedMetalOverlay {
                 device,
                 layer,
                 pipelines,
+                shown: None,
                 origin,
                 width,
                 height,
@@ -333,6 +337,7 @@ impl SharedMetalOverlay {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         renderer.origin = origin;
+        renderer.shown = None;
         renderer.width = width;
         renderer.height = height;
         renderer.scale = scale;
@@ -540,23 +545,13 @@ impl SharedMetalOverlay {
             pins.push(PinMarker::default());
         }
 
-        let renderer = self
+        let mut renderer = self
             .renderer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tile_cols = (renderer.width / TILE_PT).ceil().max(1.0) as u32;
         let tile_rows = (renderer.height / TILE_PT).ceil().max(1.0) as u32;
-        objc2::rc::autoreleasepool(|_| {
-            let Some(drawable) = renderer.layer.next_drawable() else {
-                return;
-            };
-            let pass = RenderPassDescriptor::new();
-            let attachment = pass.color_attachments().object_at(0).unwrap();
-            attachment.set_texture(Some(drawable.texture()));
-            attachment.set_load_action(MTLLoadAction::Clear);
-            attachment.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0));
-            attachment.set_store_action(MTLStoreAction::Store);
-
+        let shown = objc2::rc::autoreleasepool(|_| {
             let segment_count = if !is_active || (segments.len() == 1 && segments[0].width == 0.0) {
                 0
             } else {
@@ -594,6 +589,18 @@ impl SharedMetalOverlay {
                 tile_size: TILE_PT,
                 _pad2: 0.0,
             };
+            let frame = ShownFrame::new(uniforms, &segments, &pins);
+            if renderer.shown.as_ref() == Some(&frame) {
+                return None;
+            }
+
+            let drawable = renderer.layer.next_drawable()?;
+            let pass = RenderPassDescriptor::new();
+            let attachment = pass.color_attachments().object_at(0).unwrap();
+            attachment.set_texture(Some(drawable.texture()));
+            attachment.set_load_action(MTLLoadAction::Clear);
+            attachment.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0));
+            attachment.set_store_action(MTLStoreAction::Store);
 
             let cmd = renderer.command_queue.new_command_buffer();
             encode_overlay(
@@ -607,7 +614,11 @@ impl SharedMetalOverlay {
             );
             cmd.present_drawable(drawable);
             cmd.commit();
+            Some(frame)
         });
+        if shown.is_some() {
+            renderer.shown = shown;
+        }
     }
 }
 
@@ -669,6 +680,35 @@ fn bin_segments(segments: &[PathSegment], cols: u32, rows: u32, size: f32) -> Ve
         }
     }
     table
+}
+
+/// What a frame's pixels depend on: the shader is a pure function of its uniforms and the
+/// first `segment_count` segments and `pin_count` pins.
+#[derive(PartialEq)]
+struct ShownFrame {
+    uniforms: LaserUniforms,
+    segments: Vec<PathSegment>,
+    pins: Vec<PinMarker>,
+}
+
+impl ShownFrame {
+    fn new(uniforms: LaserUniforms, segments: &[PathSegment], pins: &[PinMarker]) -> Self {
+        Self {
+            uniforms: LaserUniforms {
+                // Past the intro, time only changes pixels through the segments.
+                now_sec: uniforms.now_sec.min(SETTLED_SEC),
+                // The pointer only shows as the Shift tip.
+                tip_pos: if uniforms.tip_active > 0.0 {
+                    uniforms.tip_pos
+                } else {
+                    [0.0; 2]
+                },
+                ..uniforms
+            },
+            segments: segments[..uniforms.segment_count as usize].to_vec(),
+            pins: pins[..uniforms.pin_count as usize].to_vec(),
+        }
+    }
 }
 
 /// `laser_fragment` specialised by its `has_ink` and `skip_clear` function constants.
@@ -1357,6 +1397,51 @@ mod tests {
             "window or area dim and border"
         );
         assert!(with(|u| u._pad1 = -0.5), "picker dim");
+    }
+
+    /// A frame drawn from the same inputs is skipped; anything that changes pixels is drawn.
+    #[test]
+    fn identical_frames_are_skipped() {
+        let segments = ink_loop(100.0, 80.0, 40.0, 30.0, 1.0);
+        let pins = [PinMarker::default()];
+        let base = LaserUniforms {
+            segment_count: segments.len() as u32,
+            ..recording_uniforms(256.0, 192.0, 2.0)
+        };
+        let shown = ShownFrame::new(base, &segments, &pins);
+        let frame = |change: fn(&mut LaserUniforms)| {
+            let mut uniforms = base;
+            change(&mut uniforms);
+            ShownFrame::new(uniforms, &segments, &pins)
+        };
+        assert!(
+            shown == frame(|u| u.now_sec = 9.0),
+            "time passing once settled"
+        );
+        assert!(
+            shown == frame(|u| u.tip_pos = [10.0, 10.0]),
+            "pointer moving without Shift"
+        );
+        assert!(
+            shown != frame(|u| u.tip_active = 1.0),
+            "the Shift tip appearing"
+        );
+        assert!(shown != frame(|u| u.now_sec = 0.5), "time during the intro");
+        assert!(shown != frame(|u| u.segment_count -= 1), "a segment fewer");
+        assert!(
+            shown != frame(|u| u.target_rect[0] = 4.0),
+            "the window moving"
+        );
+
+        let mut faded = segments.clone();
+        faded[0].width = 0.5;
+        assert!(shown != ShownFrame::new(base, &faded, &pins), "ink fading");
+        let mut beyond = segments.clone();
+        beyond.push(PathSegment::default());
+        assert!(
+            shown == ShownFrame::new(base, &beyond, &pins),
+            "segments past the count"
+        );
     }
 
     /// GPU time per kind of frame on a 5120×2160 display, the general shader (every frame before
