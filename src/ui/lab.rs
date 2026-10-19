@@ -2,7 +2,7 @@
 //! pretend recording (no capture, microphone, files, overlay, hotkeys or ingest server), so a
 //! motion can be replayed, traced (`SCRAWL_MOTION_TRACE`), filmed and tuned (`scrawl tune`).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gpui::{
     App, Application, Bounds, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
@@ -170,21 +170,26 @@ pub fn run(options: Options) {
         if options.backdrop {
             open_backdrop(display, cx);
         }
+        // For screen recordings (`perf/pill/record.sh`): the backdrop's rect in screen points.
+        println!(
+            "region {},{},{},{}",
+            ((display[0] - BACKDROP[2]) * 0.5).round(),
+            BACKDROP[1],
+            BACKDROP[2],
+            BACKDROP[3]
+        );
 
         // The app's frame loop, minus everything that isn't the capsule.
         let loop_coord = coordinator.clone();
         cx.spawn(async move |cx| {
-            let mut last = Instant::now();
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(8))
                     .await;
-                let dt = last.elapsed().as_secs_f32();
-                last = Instant::now();
                 let alive = cx.update(|cx| {
                     motion::poll_tune();
                     if loop_coord.read(cx).is_island_visible() {
-                        loop_coord.update(cx, |coord, cx| coord.step_island(dt, cx));
+                        loop_coord.update(cx, |coord, cx| coord.island_tick(cx));
                     }
                 });
                 if alive.is_err() {

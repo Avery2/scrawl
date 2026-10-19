@@ -79,8 +79,8 @@ pub(super) struct Tune {
 
 impl Tune {
     pub const DEFAULT: Tune = Tune {
-        island: Spring::visual(0.28, 0.18),
-        island_scale: Spring::visual(0.22, 0.14),
+        island: Spring::visual(0.32, 0.0),
+        island_scale: Spring::visual(0.22, 0.0),
         reveal_open: Spring::visual(0.36, 0.16),
         reveal_close: Spring::visual(0.32, 0.08),
         switch_width: Spring::visual(0.30, 0.0),
@@ -290,6 +290,7 @@ pub(super) fn poll_tune() {
         return;
     }
     TUNE.with_borrow_mut(|state| {
+        let first = state.checked.is_none();
         if state
             .checked
             .is_some_and(|at| at.elapsed() < Duration::from_millis(250))
@@ -299,7 +300,7 @@ pub(super) fn poll_tune() {
         state.checked = Some(Instant::now());
         let Some(path) = tune_path() else { return };
         let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        if stamp == state.stamp {
+        if stamp == state.stamp && !first {
             return;
         }
         state.stamp = stamp;
@@ -580,6 +581,16 @@ pub(super) fn trace_event(event: impl Into<String>) {
 }
 
 /// Starts a frame: the previous one (now complete, its prepaint bounds included) is written.
+/// Ends the frame in progress without starting one: what is drawn until the next
+/// `trace_frame` isn't recorded (a new window's first frame, drawn fully transparent).
+pub(super) fn trace_skip_frame() {
+    TRACE.with_borrow_mut(|slot| {
+        if let Some(trace) = slot.as_mut() {
+            trace.flush_pending();
+        }
+    });
+}
+
 pub(super) fn trace_frame() {
     TRACE.with_borrow_mut(|slot| {
         let Some(trace) = slot.as_mut() else { return };

@@ -114,6 +114,8 @@ enum Morph {
     RevealOpen,
     /// The switch chips folding back (`Tune::reveal_close`).
     RevealClose,
+    /// A switch chip turning the recording into the picker (`Tune::switch_width`).
+    Switch,
 }
 
 impl Morph {
@@ -122,12 +124,28 @@ impl Morph {
             Self::Phase => tune.island,
             Self::RevealOpen => tune.reveal_open,
             Self::RevealClose => tune.reveal_close,
+            Self::Switch => tune.switch_width,
         }
     }
 }
 
 /// Reduced motion: no width travel, the groups only cross-fade over this long.
 const REDUCED_FADE_S: f32 = 0.18;
+/// The picker's highlight moving from one mode to another cross-fades over this long.
+const HIGHLIGHT_FADE_S: f32 = 0.18;
+
+/// A switch chip turning the recording into the picker (`switch_recording`). The capsule stays
+/// one shape: the chips are the picker's chips, so the picker row starts where they were and
+/// slides to its place on `Tune::switch_slide` while the width springs on `Tune::switch_width`
+/// (a touch faster, so it leads). The lead (dot and clock, frozen) and its divider ride along in
+/// front of the row and leave under the capsule's left edge; Record, the divider and ✕ ride
+/// behind it and fade in as the right edge uncovers them.
+#[derive(Clone, Copy, Debug)]
+struct SwitchMorph {
+    /// The row's offset from its resting place and its velocity, in points. Measured by the
+    /// first frame that draws it (text widths need the window).
+    slide: Option<(f32, f32)>,
+}
 
 /// Advances a damped spring with fixed 4ms sub-steps so long frames stay stable.
 fn spring_step(value: f32, velocity: f32, target: f32, dt: f32, spring: Spring) -> (f32, f32) {
@@ -320,6 +338,21 @@ fn trail_offsets(x0: f32, widths: &[f32]) -> Vec<f32> {
 /// trailing items fade in as the pill grows into them and out as it folds over them.
 fn edge_alpha(inner_now: f32, x: f32, w: f32) -> f32 {
     let t = ((inner_now - x) / w.max(1.0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The switch chips' clock: the animation clock, so they stay open as long in slow motion
+/// (`motion::time_scale`). The held switcher keeps the real clock: it times key presses.
+fn reveal_clock_ms() -> u64 {
+    (motion::now() * 1000.0) as u64
+}
+
+/// An item of the picker row sliding in from under the capsule's right edge (`outer`, the
+/// shell's outer edge): invisible while the edge would still cut into its middle, opaque once
+/// it is clear, so nothing shows half cut.
+fn uncover_alpha(outer: f32, x: f32, w: f32) -> f32 {
+    let inside = (outer - x) / w.max(1.0);
+    let t = ((inside - 0.7) / 0.4).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
@@ -1527,6 +1560,17 @@ pub struct ScrawlCoordinator {
     reveal_prev_chips: bool,
     /// macOS Reduce motion, read when a reveal starts.
     reduced_motion: bool,
+    switch: Option<SwitchMorph>,
+    /// When the springs were last advanced (`step_island`).
+    island_stepped: Instant,
+    /// A new capsule window has drawn its first frame and not its second (which comes late):
+    /// only its frames advance the springs, so the hitch slows the opening instead of eating it.
+    island_await_frame: bool,
+    /// The recording clock last shown, so the lead keeps its time while it leaves.
+    last_elapsed_ms: u64,
+    /// The highlighted mode before the last change and when it changed (`HIGHLIGHT_FADE_S`).
+    highlight_prev: Option<SelectionMode>,
+    highlight_since: f64,
     selectable_windows: Vec<TargetInfo>,
     selection_generation: u64,
     windows_loading: bool,
@@ -1609,6 +1653,12 @@ impl ScrawlCoordinator {
             reveal_outgoing: None,
             reveal_prev_chips: false,
             reduced_motion: false,
+            switch: None,
+            island_stepped: Instant::now(),
+            island_await_frame: false,
+            last_elapsed_ms: 0,
+            highlight_prev: None,
+            highlight_since: motion::now(),
             selectable_windows: Vec::new(),
             selection_generation: 0,
             windows_loading: false,
@@ -1804,7 +1854,9 @@ impl ScrawlCoordinator {
         if missing.is_empty() {
             return true;
         }
-        scrawl_log(format!("Not recording: {missing:?} off; opening onboarding"));
+        scrawl_log(format!(
+            "Not recording: {missing:?} off; opening onboarding"
+        ));
         self.gate.defer(missing);
         false
     }
@@ -2094,7 +2146,7 @@ impl ScrawlCoordinator {
         }
         self.reduced_motion = reduce_motion();
         let activity = self.reveal_activity();
-        self.reveal.show(self.clock_ms(), activity);
+        self.reveal.show(reveal_clock_ms(), activity);
         self.reveal_since = motion::now();
         self.reveal_outgoing = None;
         self.island_morph = Morph::RevealOpen;
@@ -2135,6 +2187,8 @@ impl ScrawlCoordinator {
             return;
         }
         scrawl_log(format!("switch_recording -> {mode:?}"));
+        // The morph continues the chips, so it needs them on screen.
+        let chips_shown = self.reveal.is_open();
         let Some((target, overlay)) = self.discard_recording() else {
             return;
         };
@@ -2160,6 +2214,13 @@ impl ScrawlCoordinator {
             self.picker_metal_overlay = overlay;
         }
         self.open_picker(Some(mode), false, cx);
+        if self.is_selecting() && chips_shown && !self.reduced_motion {
+            // The chips showed Screen; the picker shows `mode`.
+            self.highlight_prev = Some(SelectionMode::Screen);
+            self.highlight_since = motion::now();
+            self.island_morph = Morph::Switch;
+            self.switch = Some(SwitchMorph { slide: None });
+        }
     }
 
     /// Stops the active recording and deletes its bundle, leaving the island as it is. Returns
@@ -2463,6 +2524,11 @@ impl ScrawlCoordinator {
             self.reveal.close();
             self.reveal_outgoing = None;
             self.island_morph = Morph::Phase;
+            self.switch = None;
+            self.highlight_prev = None;
+            if matches!(self.island_phase, IslandPhase::Hidden) {
+                self.island_stepped = Instant::now();
+            }
             self.island_prev_phase = self.island_phase;
             if matches!(phase, IslandPhase::Dismissing) {
                 self.island_dismissed_from = self.island_phase;
@@ -2592,9 +2658,30 @@ impl ScrawlCoordinator {
         .detach();
     }
 
-    pub fn step_island(&mut self, dt_sec: f32, cx: &mut Context<Self>) {
+    /// The UI loop's tick: advances the springs unless a new capsule window awaits its second
+    /// frame (`island_await_frame`).
+    pub fn island_tick(&mut self, cx: &mut Context<Self>) {
+        if self.island_await_frame {
+            // Ask for the frame that ends the wait.
+            cx.notify();
+        } else {
+            self.step_island(cx);
+        }
+    }
+
+    /// Advances the capsule's springs to now. The UI loop calls it every few ms to keep frames
+    /// coming, and the capsule calls it as it draws, so every frame shows its own moment rather
+    /// than the loop's last tick (up to 8 ms stale, which made the steps uneven).
+    pub fn step_island(&mut self, cx: &mut Context<Self>) {
         let tune = motion::tune();
-        let dt = (dt_sec * motion::time_scale()).clamp(0.0005, 0.05);
+        let real = self.island_stepped.elapsed().as_secs_f32();
+        if real < 0.0002 {
+            return;
+        }
+        self.island_stepped = Instant::now();
+        // A late frame slows the motion rather than skipping it ahead (a new window's second
+        // frame comes ~50 ms after its first).
+        let dt = (real * motion::time_scale()).min(0.025);
         if let IslandPhase::Completed { finished_at, .. } = self.island_phase
             && finished_at.elapsed() >= Duration::from_millis(25_000)
         {
@@ -2647,7 +2734,7 @@ impl ScrawlCoordinator {
             let activity = self.reveal_activity();
             if self
                 .reveal
-                .tick(self.clock_ms(), pointer_on_hud_pill(), activity)
+                .tick(reveal_clock_ms(), pointer_on_hud_pill(), activity)
             {
                 self.play_fold();
             }
@@ -2686,6 +2773,15 @@ impl ScrawlCoordinator {
             dt,
             tune.island_scale,
         );
+        if let Some(morph) = self.switch.as_mut()
+            && let Some((x, v)) = morph.slide
+        {
+            let (x, v) = spring_step(x, v, 0.0, dt, tune.switch_slide);
+            morph.slide = Some((x, v));
+            if x.abs() < 0.2 && v.abs() < 2.0 {
+                self.switch = None;
+            }
+        }
         self.island_width = width.clamp(120.0, PILL_WINDOW_W - 16.0);
         self.island_velocity = velocity;
         self.island_scale = scale.clamp(0.35, 1.18);
@@ -3276,6 +3372,8 @@ pub struct HudPillWindow {
     focus: FocusHandle,
     ns_window: Option<Retained<NSWindow>>,
     shell_layer: Option<Retained<objc2_quartz_core::CALayer>>,
+    /// Frames drawn so far, counting to 2.
+    frames: u8,
 }
 
 impl Render for HudPillWindow {
@@ -3284,9 +3382,35 @@ impl Render for HudPillWindow {
             self.ns_window = find_hud_pill_ns_window();
         }
         let tracing = motion::tracing();
-        if tracing {
+        let frame = self.frames;
+        if tracing && frame == 0 {
+            motion::trace_skip_frame();
+        } else if tracing {
             motion::trace_frame();
         }
+        self.frames = self.frames.saturating_add(1).min(2);
+        if frame == 0 {
+            // A new window shows a few frames after it's asked for; its opening fade and blur
+            // start from the frame that is seen, not from the request.
+            self.coordinator.update(cx, |coord, _| {
+                if coord.island_opacity < 0.98
+                    && !matches!(coord.island_phase, IslandPhase::Dismissing)
+                {
+                    coord.island_opacity = 0.0;
+                    coord.island_phase_since = motion::now();
+                    coord.island_stepped = Instant::now();
+                    coord.island_await_frame = true;
+                }
+            });
+        }
+        self.coordinator.update(cx, |coord, cx| {
+            if frame == 1 {
+                coord.island_await_frame = false;
+            }
+            if coord.is_island_visible() {
+                coord.step_island(cx);
+            }
+        });
         let coord = self.coordinator.read(cx);
         let phase = coord.island_phase;
         let prev_phase = coord.island_prev_phase;
@@ -3299,10 +3423,17 @@ impl Render for HudPillWindow {
         let scale = coord.island_scale;
         let y_off = coord.island_y;
         let opacity = coord.island_opacity.clamp(0.0, 1.0);
-        let elapsed_ms = coord
+        let recording_ms = coord
             .active_recording
             .as_ref()
-            .map_or(0, ActiveRecording::elapsed_ms);
+            .map(ActiveRecording::elapsed_ms);
+        let elapsed_ms = recording_ms.unwrap_or(coord.last_elapsed_ms);
+        let switch = coord
+            .switch
+            .filter(|_| matches!(phase, IslandPhase::Selecting { .. }));
+        let island_velocity = coord.island_velocity;
+        let highlight_prev = coord.highlight_prev;
+        let highlight_p = ease_out_cubic(motion::age(coord.highlight_since) / HIGHLIGHT_FADE_S);
         let stroke_count = coord
             .telemetry
             .strokes
@@ -3345,10 +3476,29 @@ impl Render for HudPillWindow {
         );
         let snap_initial_width =
             phase_age < 0.025 && matches!(phase, IslandPhase::Selecting { .. }) && opacity < 0.35;
+        let switch_layout = switch.map(|morph| {
+            let clock_w = measure_text(
+                window,
+                &clock_template(&clock),
+                HUD_TEXT,
+                FontWeight::SEMIBOLD,
+            );
+            SwitchLayout::new(morph, width, target_width, clock_w)
+        });
         self.coordinator.update(cx, |coord, _| {
             coord.island_target_width = target_width;
             if snap_initial_width {
                 coord.island_width = target_width;
+            }
+            if recording_ms.is_some() {
+                coord.last_elapsed_ms = elapsed_ms;
+            }
+            if let (Some(morph), Some(layout)) = (coord.switch.as_mut(), switch_layout)
+                && morph.slide.is_none()
+            {
+                // The chips were pinned to the left edge, so they moved at half the width's
+                // speed: the row starts there, at that speed.
+                morph.slide = Some((layout.dx, -0.5 * island_velocity));
             }
         });
         let render_width = if snap_initial_width {
@@ -3362,8 +3512,12 @@ impl Render for HudPillWindow {
         //   * 0..55ms (exit): outgoing `prev_phase` stays mounted while blurring `0 -> 3.5px` and fading `1 -> 0.15`.
         //   * 55..140ms (enter): incoming `target_phase` mounts and unblurs `3.5 -> 0px` while fading `0.15 -> 1`.
         // - When opening/dismissing: subtle `3.5px -> 0px` blur over 110ms.
+        // A switch chip's morph keeps its items, so nothing is replaced (`SwitchMorph`).
         let has_prev = !matches!(prev_phase, IslandPhase::Hidden | IslandPhase::Dismissing)
-            && !matches!(phase, IslandPhase::Hidden | IslandPhase::Dismissing);
+            && !matches!(phase, IslandPhase::Hidden | IslandPhase::Dismissing)
+            && switch_layout.is_none();
+        // Reduce motion keeps the cross-fade and drops the blur.
+        let swap_blur = if reduced { 0.0 } else { 3.5 };
         let (content_phase, blur_radius, content_alpha) =
             if matches!(phase, IslandPhase::Dismissing) {
                 (
@@ -3371,12 +3525,14 @@ impl Render for HudPillWindow {
                     ((1.0 - opacity) * 3.5).clamp(0.0, 3.5),
                     opacity,
                 )
+            } else if switch_layout.is_some() {
+                (target_phase, 0.0, 1.0)
             } else if has_prev && phase_age < 0.055 {
                 let t_out = (phase_age / 0.055).clamp(0.0, 1.0);
-                (prev_phase, 3.5 * t_out, 1.0 - 0.85 * t_out)
+                (prev_phase, swap_blur * t_out, 1.0 - 0.85 * t_out)
             } else if has_prev && phase_age < 0.145 {
                 let t_in = ease_out_cubic(((phase_age - 0.055) / 0.090).clamp(0.0, 1.0));
-                (target_phase, 3.5 * (1.0 - t_in), 0.15 + 0.85 * t_in)
+                (target_phase, swap_blur * (1.0 - t_in), 0.15 + 0.85 * t_in)
             } else if swap.is_some() && !reduced {
                 // Chips ↔ controls in place: a sine blur pulse, sharp at both ends.
                 let t = (swap_age / enter_s).clamp(0.0, 1.0);
@@ -3390,9 +3546,9 @@ impl Render for HudPillWindow {
                 // with the lead pinned to its left edge, and each trailing item fades in as the
                 // edge uncovers it (`edge_alpha`), so nothing waits for the shell.
                 (target_phase, 0.0, 1.0)
-            } else if !has_prev && phase_age < 0.11 {
-                let t_open = ease_out_cubic((phase_age / 0.11).clamp(0.0, 1.0));
-                (target_phase, 3.5 * (1.0 - t_open), t_open)
+            } else if !has_prev && opacity < 0.999 {
+                // Opening: the content sharpens as the capsule fades in (both step-driven).
+                (target_phase, swap_blur * (1.0 - opacity), 1.0)
             } else {
                 (target_phase, 0.0, 1.0)
             };
@@ -3454,43 +3610,140 @@ impl Render for HudPillWindow {
             names.iter().map(|n| Some(((*n).to_owned(), 1.0))).collect()
         };
 
-        let capsule_content = match content_phase {
-            IslandPhase::Selecting { mode } => traced(
-                row,
-                SelectionMode::available(has_iphone || hold)
-                    .iter()
-                    .map(|m| Some((format!("chip:{}", m.label()), 1.0)))
-                    .chain((mode.shows_record() && !hold).then(|| Some(("record".to_owned(), 1.0))))
-                    .chain([
-                        Some(("divider.close".to_owned(), 1.0)),
-                        Some(("close".to_owned(), 1.0)),
-                    ])
-                    .collect(),
-            )
-            .children(
-                SelectionMode::available(has_iphone || hold)
-                    .iter()
-                    .map(|&segment| {
-                        let c_segment = self.coordinator.clone();
-                        mode_segment(segment, segment == mode).on_click(move |_, _, cx| {
-                            c_segment
-                                .update(cx, |coord, cx| coord.click_selection_mode(segment, cx));
-                        })
-                    }),
-            )
-            .when(mode.shows_record() && !hold, |row| {
-                row.child(
-                    primary_chip("sel-record", "Record").on_click(move |_, _, cx| {
-                        c_record.update(cx, |coord, cx| coord.record_selected_mode(cx));
-                    }),
+        // The highlight cross-fades from the mode it left.
+        let highlight = |m: SelectionMode, mode: SelectionMode| -> f32 {
+            match highlight_prev.filter(|prev| *prev != mode) {
+                _ if m == mode && highlight_prev.is_none() => 1.0,
+                Some(_) if m == mode => highlight_p,
+                Some(prev) if m == prev => 1.0 - highlight_p,
+                _ => f32::from(u8::from(m == mode)),
+            }
+        };
+        // Per-item opacity of the picker row while it slides in (`SwitchMorph`).
+        let selecting_alphas = |mode: SelectionMode| -> Vec<f32> {
+            let Some(layout) = switch_layout else {
+                return Vec::new();
+            };
+            let modes = SelectionMode::available(has_iphone || hold);
+            let mut widths: Vec<f32> = modes.iter().map(|&m| segment_width(window, m)).collect();
+            if mode.shows_record() && !hold {
+                widths.push(chip_width(window, "Record", FontWeight::SEMIBOLD));
+            }
+            widths.extend([layout.divider_w, CHIP_H]);
+            trail_offsets(layout.row_left(), &widths)
+                .iter()
+                .zip(&widths)
+                .map(|(&x, &w)| uncover_alpha(layout.inner_now + ISLAND_INSET, x, w))
+                .collect()
+        };
+        let ghost = switch_layout.map(|layout| {
+            let pieces = layout.ghost_alphas();
+            div()
+                .absolute()
+                .top(px(ISLAND_INSET))
+                .left(px(ISLAND_INSET + layout.ghost_left()))
+                .h(px(CHIP_H))
+                .flex()
+                .items_center()
+                .gap(px(CHIP_GAP))
+                .text_size(px(HUD_TEXT))
+                .whitespace_nowrap()
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .pr(px(LEAD_TRAIL))
+                        .child(
+                            div()
+                                .size(px(CHIP_H))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .opacity(pieces[0])
+                                .child(div().size(px(8.0)).rounded_full().bg(rgb(INK_RED))),
+                        )
+                        .child(
+                            div()
+                                .w(px(layout.clock_w))
+                                .font(tabular_font(FontWeight::SEMIBOLD))
+                                .opacity(pieces[1])
+                                .child(clock.clone()),
+                        ),
                 )
-            })
-            .child(island_divider())
-            .child(
-                icon_circle_chip("sel-cancel", "✕").on_click(move |_, _, cx| {
-                    c_sel_cancel.update(cx, |coord, cx| coord.cancel_recording(cx));
-                }),
-            ),
+                .child(island_divider().opacity(pieces[2]))
+        });
+        let ghost = match (ghost, trace_xf) {
+            (Some(g), Some(xf)) => {
+                let lead_alpha = switch_layout.map_or(0.0, |l| l.ghost_alphas()[1]);
+                let divider_alpha = switch_layout.map_or(0.0, |l| l.ghost_alphas()[2]);
+                Some(g.on_children_prepainted(motion::trace_children(
+                    vec![
+                        Some(("lead".into(), lead_alpha)),
+                        Some(("divider.lead".into(), divider_alpha)),
+                    ],
+                    xf,
+                    "row",
+                )))
+            }
+            (ghost, _) => ghost,
+        };
+
+        let capsule_content = match content_phase {
+            IslandPhase::Selecting { mode } => {
+                let alphas = selecting_alphas(mode);
+                let alpha = |i: usize| alphas.get(i).copied().unwrap_or(1.0);
+                let n_modes = SelectionMode::available(has_iphone || hold).len();
+                let record = mode.shows_record() && !hold;
+                let after = n_modes + usize::from(record);
+                traced(
+                    row.when_some(switch_layout, |row, layout| {
+                        row.relative().left(px(layout.dx))
+                    }),
+                    SelectionMode::available(has_iphone || hold)
+                        .iter()
+                        .map(|m| m.label())
+                        .map(|label| format!("chip:{label}"))
+                        .chain(record.then(|| "record".to_owned()))
+                        .chain(["divider.close".to_owned(), "close".to_owned()])
+                        .enumerate()
+                        .map(|(i, key)| Some((key, alpha(i))))
+                        .collect(),
+                )
+                .children(
+                    SelectionMode::available(has_iphone || hold)
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &segment)| {
+                            let c_segment = self.coordinator.clone();
+                            mode_segment_level(segment, highlight(segment, mode))
+                                .opacity(alpha(i))
+                                .on_click(move |_, _, cx| {
+                                    c_segment.update(cx, |coord, cx| {
+                                        coord.click_selection_mode(segment, cx)
+                                    });
+                                })
+                        }),
+                )
+                .when(record, |row| {
+                    row.child(
+                        primary_chip("sel-record", "Record")
+                            .opacity(alpha(n_modes))
+                            .on_click(move |_, _, cx| {
+                                c_record.update(cx, |coord, cx| coord.record_selected_mode(cx));
+                            }),
+                    )
+                })
+                .child(island_divider().opacity(alpha(after)))
+                .child(
+                    icon_circle_chip("sel-cancel", "✕")
+                        .opacity(alpha(after + 1))
+                        .on_click(move |_, _, cx| {
+                            c_sel_cancel.update(cx, |coord, cx| coord.cancel_recording(cx));
+                        }),
+                )
+            }
             IslandPhase::Completed { inbox_count, .. } => traced(
                 row,
                 named(&["done.lead", "divider.lead", "paste", "inspect", "close"]),
@@ -3746,8 +3999,74 @@ impl Render for HudPillWindow {
                     .text_color(rgb(TEXT_COLOR))
                     .text_size(px(HUD_TEXT))
                     .whitespace_nowrap()
+                    .relative()
+                    .when_some(ghost, |d, ghost| d.child(ghost))
                     .child(capsule_content),
             )
+    }
+}
+
+/// Where a switch chip's morph is this frame (`SwitchMorph`), in points from the capsule's
+/// inner left edge.
+#[derive(Clone, Copy, Debug)]
+struct SwitchLayout {
+    /// The picker row's offset from its resting place.
+    dx: f32,
+    clock_w: f32,
+    lead_w: f32,
+    divider_w: f32,
+    /// The capsule's inner width now, and the picker row's width.
+    inner_now: f32,
+    inner_row: f32,
+}
+
+impl SwitchLayout {
+    fn new(morph: SwitchMorph, width: f32, target_width: f32, clock_w: f32) -> Self {
+        let lead_w = CHIP_H + clock_w + LEAD_TRAIL;
+        let divider_w = 1.0 + 2.0 * DIVIDER_MX;
+        let inner_row = target_width - 2.0 * ISLAND_INSET;
+        let dx = morph.slide.map_or_else(
+            || {
+                // From the capsule's centre: where the chips were, pinned behind the lead, and
+                // where the centred picker row rests.
+                let chips = -width / 2.0 + ISLAND_INSET + lead_w + divider_w + 2.0 * CHIP_GAP;
+                chips + inner_row / 2.0
+            },
+            |(x, _)| x,
+        );
+        Self {
+            dx,
+            clock_w,
+            lead_w,
+            divider_w,
+            inner_now: width - 2.0 * ISLAND_INSET,
+            inner_row,
+        }
+    }
+
+    fn row_left(&self) -> f32 {
+        (self.inner_now - self.inner_row) / 2.0 + self.dx
+    }
+
+    /// The leaving lead and divider sit just in front of the row, as they did in the pill.
+    fn ghost_left(&self) -> f32 {
+        self.row_left() - 2.0 * CHIP_GAP - self.divider_w - self.lead_w
+    }
+
+    /// Dot, clock and divider each fade out as they near the capsule's left edge and are gone
+    /// when they reach it, so nothing is cut by a hard edge while it still shows.
+    fn ghost_alphas(&self) -> [f32; 3] {
+        // Each piece's left edge in the pill, from the shell's outer edge.
+        let rests = [
+            ISLAND_INSET + CHIP_H / 2.0 - 4.0,
+            ISLAND_INSET + CHIP_H,
+            ISLAND_INSET + self.lead_w + CHIP_GAP + DIVIDER_MX,
+        ];
+        rests.map(|rest| {
+            let left = self.ghost_left() + rest;
+            let t = (left / rest.min(40.0)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        })
     }
 }
 
@@ -3893,24 +4212,33 @@ fn icon_circle_chip(id: &'static str, icon: &'static str) -> gpui::Stateful<Div>
 /// One segment of the selection-mode control: line icon + label. Weight stays constant across
 /// states so switching never shifts the measured capsule width (`selecting_row_width`).
 fn mode_segment(mode: SelectionMode, active: bool) -> gpui::Stateful<Div> {
+    mode_segment_level(mode, f32::from(u8::from(active)))
+}
+
+fn mix_rgb(from: u32, to: u32, t: f32) -> gpui::Rgba {
+    let t = t.clamp(0.0, 1.0);
+    let channel = |shift: u32| {
+        let a = ((from >> shift) & 0xff) as f32;
+        let b = ((to >> shift) & 0xff) as f32;
+        ((a + (b - a) * t).round() as u32) << shift
+    };
+    rgb(channel(16) | channel(8) | channel(0))
+}
+
+/// A mode chip `level` of the way to selected, so the highlight can cross-fade between chips.
+fn mode_segment_level(mode: SelectionMode, level: f32) -> gpui::Stateful<Div> {
     let group = mode.chip_id();
+    let level = level.clamp(0.0, 1.0);
+    let active = level > 0.5;
     hud_chip(group)
         .group(group)
         .px(px(SEG_PX))
         .gap(px(SEG_ICON_GAP))
         .font_weight(FontWeight::MEDIUM)
-        .bg(if active {
-            rgba(0xffffff26)
-        } else {
-            rgba(0x00000000)
-        })
-        .text_color(if active {
-            rgb(TEXT_COLOR)
-        } else {
-            rgb(TEXT_SOFT)
-        })
+        .bg(with_alpha(0xffffff, 0x26 as f32 / 255.0 * level))
+        .text_color(mix_rgb(TEXT_SOFT, TEXT_COLOR, level))
         .cursor_pointer()
-        .hover(|s| {
+        .hover(move |s| {
             s.bg(if active {
                 rgba(0xffffff2e)
             } else {
@@ -3924,11 +4252,7 @@ fn mode_segment(mode: SelectionMode, active: bool) -> gpui::Stateful<Div> {
                 .path(mode.icon())
                 .size(px(SEG_ICON))
                 .flex_none()
-                .text_color(if active {
-                    rgb(TEXT_COLOR)
-                } else {
-                    rgb(MUTED_COLOR)
-                })
+                .text_color(mix_rgb(MUTED_COLOR, TEXT_COLOR, level))
                 .group_hover(group, |s| s.text_color(rgb(TEXT_COLOR))),
         )
         .child(mode.label())
@@ -5207,6 +5531,7 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
                     focus,
                     ns_window,
                     shell_layer,
+                    frames: 0,
                 }
             })
         },
@@ -5426,14 +5751,11 @@ pub fn run_app(
 
         let loop_coord = coordinator.clone();
         cx.spawn(async move |cx| {
-            let mut last_frame = Instant::now();
             let mut shown_status: Option<String> = None;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(8))
                     .await;
-                let dt = last_frame.elapsed().as_secs_f32();
-                last_frame = Instant::now();
                 let mut should_quit = false;
                 let _ = cx.update(|cx| {
                     let status = EXPORT_STATUS.lock().ok().and_then(|s| s.clone());
@@ -5628,7 +5950,7 @@ pub fn run_app(
                     }
                     if loop_coord.read(cx).is_island_visible() {
                         record_external_frontmost_app();
-                        loop_coord.update(cx, |coord, cx| coord.step_island(dt, cx));
+                        loop_coord.update(cx, |coord, cx| coord.island_tick(cx));
                     }
                 });
                 if should_quit {
@@ -5898,6 +6220,28 @@ mod tests {
         assert!((edge_alpha(125.0, 100.0, 50.0) - 0.5).abs() < 1e-6);
         assert_eq!(edge_alpha(150.0, 100.0, 50.0), 1.0);
         assert_eq!(edge_alpha(400.0, 100.0, 50.0), 1.0);
+    }
+
+    #[test]
+    fn a_switch_chip_morph_starts_where_the_pill_was_and_rests_centred() {
+        let (width, target, clock_w) = (336.0, 298.0, 35.0);
+        let start = SwitchLayout::new(SwitchMorph { slide: None }, width, target, clock_w);
+        // The lead is still pinned to the left edge and the chips start behind its divider.
+        assert!(start.ghost_left().abs() < 1e-3, "{}", start.ghost_left());
+        let chips_x = CHIP_H + clock_w + LEAD_TRAIL + 2.0 * CHIP_GAP + 1.0 + 2.0 * DIVIDER_MX;
+        assert!((start.row_left() - chips_x).abs() < 1e-3);
+        assert_eq!(start.ghost_alphas(), [1.0, 1.0, 1.0]);
+        // At rest the picker row is centred in the capsule, the lead past its edge and gone.
+        let rest = SwitchLayout::new(
+            SwitchMorph {
+                slide: Some((0.0, 0.0)),
+            },
+            target,
+            target,
+            clock_w,
+        );
+        assert!(rest.row_left().abs() < 1e-3);
+        assert_eq!(rest.ghost_alphas(), [0.0, 0.0, 0.0]);
     }
 
     #[test]
