@@ -446,6 +446,10 @@ enum Command {
     },
     /// Print which OpenCode session a capture of a browser tab would be sent to, without
     /// sending: a page registered through `/sdk.js`, else the project serving a localhost port.
+    ///
+    /// With `--explain <bundle>`, prints the evidence smart routing sees for that capture, the
+    /// sessions it weighed and their scores, and its decision (read-only). `--url` stands in for
+    /// the tab when the bundle didn't save one.
     Route {
         /// The tab's URL.
         #[arg(long, conflicts_with = "browser")]
@@ -453,6 +457,9 @@ enum Command {
         /// Read the front tab of this browser instead (bundle ID, e.g. `com.brave.Browser`).
         #[arg(long)]
         browser: Option<String>,
+        /// A `.scrawl` bundle (or `latest`) to explain.
+        #[arg(long, value_name = "BUNDLE")]
+        explain: Option<PathBuf>,
     },
     /// Open a `.scrawl` bundle in the native GPUI review window.
     Preview {
@@ -2107,7 +2114,26 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Route { url, browser } => {
+        Command::Route {
+            url,
+            browser,
+            explain: Some(bundle),
+        } => {
+            let url = match browser {
+                Some(browser) => Some(
+                    routing::browser_tab_url(&browser)
+                        .with_context(|| format!("Couldn't read the front tab of {browser}"))?,
+                ),
+                None => url,
+            };
+            print!("{}", routing::explain_bundle(&bundle, url.as_deref())?);
+            Ok(())
+        }
+        Command::Route {
+            url,
+            browser,
+            explain: None,
+        } => {
             let url = match (url, browser) {
                 (Some(url), _) => url,
                 (None, Some(browser)) => routing::browser_tab_url(&browser)
