@@ -1,6 +1,7 @@
 mod agent_context;
 mod audio;
 mod autocrop;
+mod ax;
 mod autocrop_lab;
 mod capture;
 mod command_line;
@@ -1289,7 +1290,7 @@ pub fn generate_demo_bundle(out: Option<PathBuf>) -> Result<(PathBuf, ScrawlBund
             y: 0.36,
             button: Some("left".into()),
             label: Some("Used 12 tools".into()),
-            role: Some("AXButton".into()),
+            role: Some("button".into()),
         },
         InteractionEvent::Scroll {
             t: 4_800,

@@ -209,9 +209,19 @@ pub fn describe_mark(mark: &Mark) -> String {
         Shape::Flag => "flagged this moment".into(),
     };
     if let Some(on) = &mark.on {
-        text.push_str(&format!(" over “{on}”"));
+        text.push_str(&format!(" over {}", quote_label(on)));
     }
     text
+}
+
+/// A label in curly quotes, unless it already quotes its own parts (`button “Area” #area`, from
+/// `crate::ax`).
+fn quote_label(label: &str) -> String {
+    if label.contains('“') {
+        label.to_owned()
+    } else {
+        format!("“{label}”")
+    }
 }
 
 /// The inked marks a keyframe draws (every mark of its screen's group), in drawing order.
@@ -321,6 +331,7 @@ pub fn describe_event(event: &InteractionEvent) -> String {
             y,
             label,
             button,
+            role,
             ..
         } => {
             let verb = if button.as_deref() == Some("touch") {
@@ -328,9 +339,16 @@ pub fn describe_event(event: &InteractionEvent) -> String {
             } else {
                 "clicked"
             };
+            let role = role
+                .as_deref()
+                .filter(|r| !r.is_empty())
+                .map(|r| format!(" {r}"))
+                .unwrap_or_default();
             match label.as_deref() {
-                Some(l) if !l.is_empty() => format!("{verb} “{l}” ({})", at([*x, *y])),
-                _ => format!("{verb} ({})", at([*x, *y])),
+                Some(l) if !l.is_empty() => {
+                    format!("{verb}{role} {} ({})", quote_label(l), at([*x, *y]))
+                }
+                _ => format!("{verb}{role} ({})", at([*x, *y])),
             }
         }
         InteractionEvent::Drag {
@@ -362,7 +380,7 @@ pub fn describe_event(event: &InteractionEvent) -> String {
                     label
                         .as_ref()
                         .filter(|s| !s.is_empty())
-                        .map(|s| format!(" “{s}”"))
+                        .map(|s| format!(" {}", quote_label(s)))
                         .unwrap_or_default(),
                     direction(x1 - x0, y1 - y0, 0.04),
                     at([*x0, *y0]),
