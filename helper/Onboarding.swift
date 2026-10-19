@@ -462,11 +462,15 @@ struct PermissionRowView: View {
         }
         .transition(Motion.swap)
       } else {
+        // A list Scrawl can be dragged into gets the drag card either way, so it says Allow
+        // until it has been pressed, even when macOS already lists Scrawl as switched off.
+        let draggable = PermissionPanel.Kind(rawValue: row.permission) != nil
+        let settings = row.requested || (row.status == "denied" && !draggable)
         HStack(spacing: 8) {
-          if row.requested && row.status != "denied" {
+          if row.requested && (row.status != "denied" || draggable) {
             Spinner()
           }
-          RowButton(title: row.requested || row.status == "denied" ? "Open Settings" : "Allow", action: grant)
+          RowButton(title: settings ? "Open Settings" : "Allow", action: grant)
             .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { buttonFrame($0) }
         }
         .transition(Motion.swap)
@@ -610,12 +614,14 @@ struct OnboardingView: View {
       default: break
       }
     }
-    let note = "If macOS offers to Quit & Reopen Scrawl, choose Later; Scrawl reopens once when you're done."
+    // Only Screen Recording makes macOS offer to quit Scrawl.
+    let screenPending = state.rows.contains { $0.permission == "screen-recording" && !$0.granted }
+    let note = screenPending ? " If macOS offers to Quit & Reopen Scrawl, choose Later; Scrawl reopens once when you're done." : ""
     if state.fix {
-      return ("Scrawl can't record yet", "Turn these on, then press \(model.shortcut) again. \(note)")
+      return ("Scrawl can't record yet", "Turn these on, then press \(model.shortcut) again.\(note)")
     }
     let count = ["zero", "one", "two", "three", "four", "five"][min(required, 5)]
-    return ("Scrawl needs \(count) permissions", "Each button opens the macOS prompt or System Settings. \(note)")
+    return ("Scrawl needs \(count) permissions", "Each button opens the macOS prompt or System Settings.\(note)")
   }
 
   private var permissions: some View {
