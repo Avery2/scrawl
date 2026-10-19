@@ -57,6 +57,13 @@ vertex VertexOutput laser_vertex(uint vertex_id [[vertex_id]]) {
     return out;
 }
 
+// Each frame picks a specialisation (`encode_overlay`), so it compiles only the work it needs:
+// an unused tile loop or early return still costs every pixel registers, and so occupancy.
+// `has_ink`: some segment is binned. `skip_clear`: no picker, constrained target or intro effect
+// shows (`LaserUniforms::has_backdrop`), so a pixel nothing reaches can return clear at once.
+constant bool has_ink [[function_constant(0)]];
+constant bool skip_clear [[function_constant(1)]];
+
 fragment float4 laser_fragment(
     VertexOutput in [[stage_in]],
     constant LaserUniforms &u [[buffer(0)]],
@@ -79,8 +86,13 @@ fragment float4 laser_fragment(
     uint tile_count = u.tile_cols * u.tile_rows;
     uint2 cell = min(uint2(max(p, float2(0.0)) / u.tile_size), uint2(u.tile_cols, u.tile_rows) - 1u);
     uint tile = cell.y * u.tile_cols + cell.x;
-    uint first = u.segment_count > 0u && tile_count > 0u ? tiles[tile] : 0u;
-    uint last = u.segment_count > 0u && tile_count > 0u ? tiles[tile + 1u] : 0u;
+    uint first = has_ink && tile_count > 0u ? tiles[tile] : 0u;
+    uint last = has_ink && tile_count > 0u ? tiles[tile + 1u] : 0u;
+    // No segment, pin or Shift tip reaches this pixel and nothing is behind it: it stays clear.
+    if (skip_clear && first == last && u.pin_count == 0u
+        && (u.tip_active <= 0.01 || length(p - u.tip_pos) >= 5.0)) {
+        return float4(0.0);
+    }
     for (uint j = first; j < last; ++j) {
         PathSegment seg = segments[tiles[tile_count + 1u + j]];
         float2 ab = seg.b - seg.a;

@@ -74,6 +74,19 @@ struct PinMarker {
     alpha: f32,
 }
 
+/// The start glow, the longest timed effect of the recording frame, is over 1.1 s in; from then
+/// on `now_sec` changes no pixel.
+const SETTLED_SEC: f32 = 1.1;
+
+impl LaserUniforms {
+    /// Whether the picker or recording frame (dim, border, start glow, intro fade) may colour
+    /// pixels away from ink: a picker, a constrained target, or the first `SETTLED_SEC`.
+    /// Mirrors the frame branches at the end of `laser_fragment`.
+    fn has_backdrop(&self) -> bool {
+        self.constrain_rect > 0.5 || self._pad1 < -0.0001 || self.now_sec < SETTLED_SEC
+    }
+}
+
 pub struct MetalLaserOverlay {
     window: Retained<NSPanel>,
     display_link: CVDisplayLink,
@@ -267,7 +280,7 @@ struct MetalLaserRenderer {
     layer: MetalLayer,
     device: metal::Device,
     command_queue: metal::CommandQueue,
-    pipeline: RenderPipelineState,
+    pipelines: OverlayPipelines,
     /// The screen's top-left in global points: telemetry is global, the shader draws locally.
     origin: [f32; 2],
     width: f32,
@@ -296,7 +309,7 @@ impl SharedMetalOverlay {
             f64::from(height * scale),
         ));
 
-        let pipeline = overlay_pipeline(&device)?;
+        let pipelines = OverlayPipelines::new(&device)?;
 
         Ok(Self {
             telemetry,
@@ -304,7 +317,7 @@ impl SharedMetalOverlay {
                 command_queue: device.new_command_queue(),
                 device,
                 layer,
-                pipeline,
+                pipelines,
                 origin,
                 width,
                 height,
@@ -587,7 +600,7 @@ impl SharedMetalOverlay {
                 cmd,
                 pass,
                 &renderer.device,
-                &renderer.pipeline,
+                renderer.pipelines.for_frame(&uniforms),
                 &uniforms,
                 &segments,
                 &pins,
@@ -658,18 +671,64 @@ fn bin_segments(segments: &[PathSegment], cols: u32, rows: u32, size: f32) -> Ve
     table
 }
 
+/// `laser_fragment` specialised by its `has_ink` and `skip_clear` function constants.
+struct OverlayPipelines([RenderPipelineState; 4]);
+
+impl OverlayPipelines {
+    fn new(device: &metal::DeviceRef) -> Result<Self, String> {
+        let library = overlay_library(device)?;
+        Ok(Self([
+            specialised_pipeline(device, &library, false, false)?,
+            specialised_pipeline(device, &library, false, true)?,
+            specialised_pipeline(device, &library, true, false)?,
+            specialised_pipeline(device, &library, true, true)?,
+        ]))
+    }
+
+    /// The variant that does only the work `uniforms` needs.
+    fn for_frame(&self, uniforms: &LaserUniforms) -> &RenderPipelineState {
+        let has_ink = uniforms.segment_count > 0;
+        let skip_clear = !uniforms.has_backdrop();
+        &self.0[usize::from(has_ink) * 2 + usize::from(skip_clear)]
+    }
+}
+
+/// The variant that runs every pixel through the tiles and the whole frame: correct for any
+/// frame, and what every frame ran before the shader was specialised.
+#[cfg(test)]
 fn overlay_pipeline(device: &metal::DeviceRef) -> Result<RenderPipelineState, String> {
-    let library = device
+    let library = overlay_library(device)?;
+    specialised_pipeline(device, &library, true, false)
+}
+
+fn overlay_library(device: &metal::DeviceRef) -> Result<metal::Library, String> {
+    device
         .new_library_with_data(include_bytes!(concat!(
             env!("OUT_DIR"),
             "/laser_overlay.metallib"
         )))
-        .map_err(|e| format!("Could not load laser shader library: {e}"))?;
+        .map_err(|e| format!("Could not load laser shader library: {e}"))
+}
+
+fn specialised_pipeline(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    has_ink: bool,
+    skip_clear: bool,
+) -> Result<RenderPipelineState, String> {
+    let constants = metal::FunctionConstantValues::new();
+    for (index, value) in [has_ink, skip_clear].iter().enumerate() {
+        constants.set_constant_value_at_index(
+            std::ptr::from_ref(value).cast(),
+            metal::MTLDataType::Bool,
+            index as u64,
+        );
+    }
     let vertex = library
         .get_function("laser_vertex", None)
         .map_err(|e| format!("Could not load laser_vertex: {e}"))?;
     let fragment = library
-        .get_function("laser_fragment", None)
+        .get_function("laser_fragment", Some(constants))
         .map_err(|e| format!("Could not load laser_fragment: {e}"))?;
 
     let descriptor = RenderPipelineDescriptor::new();
@@ -1058,6 +1117,316 @@ mod tests {
                 frame_ms[frame_ms.len() / 2],
                 frame_ms[frame_ms.len() * 95 / 100],
                 frame_ms[frame_ms.len() - 1],
+            );
+        }
+    }
+
+    /// Renders one frame offscreen through `pipeline` and returns its BGRA bytes.
+    fn render_frame(
+        device: &metal::DeviceRef,
+        pipeline: &RenderPipelineState,
+        uniforms: &LaserUniforms,
+        segments: &[PathSegment],
+        pins: &[PinMarker],
+    ) -> Vec<u8> {
+        let [w, h] = uniforms.resolution.map(|v| v as u64);
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_width(w);
+        descriptor.set_height(h);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+        let texture = device.new_texture(&descriptor);
+        let pass = RenderPassDescriptor::new();
+        let attachment = pass.color_attachments().object_at(0).unwrap();
+        attachment.set_texture(Some(&texture));
+        attachment.set_load_action(MTLLoadAction::Clear);
+        attachment.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0));
+        attachment.set_store_action(MTLStoreAction::Store);
+        let queue = device.new_command_queue();
+        let cmd = queue.new_command_buffer();
+        encode_overlay(cmd, pass, device, pipeline, uniforms, segments, pins);
+        cmd.commit();
+        cmd.wait_until_completed();
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        texture.get_bytes(
+            pixels.as_mut_ptr().cast(),
+            w * 4,
+            metal::MTLRegion::new_2d(0, 0, w, h),
+            0,
+        );
+        pixels
+    }
+
+    /// A settled full-screen recording on a `width`×`height` @`scale` screen, with no ink.
+    fn recording_uniforms(width: f32, height: f32, scale: f32) -> LaserUniforms {
+        LaserUniforms {
+            resolution: [width * scale, height * scale],
+            scale,
+            now_sec: 5.0,
+            tail_duration: 1.0,
+            target_rect: [0.0, 0.0, width, height],
+            tile_cols: (width / TILE_PT).ceil() as u32,
+            tile_rows: (height / TILE_PT).ceil() as u32,
+            tile_size: TILE_PT,
+            ..LaserUniforms::default()
+        }
+    }
+
+    /// Ink around an ellipse at `[cx, cy]`, `turns` of the way round.
+    fn ink_loop(cx: f32, cy: f32, rx: f32, ry: f32, turns: f32) -> Vec<PathSegment> {
+        let samples: Vec<[f32; 2]> = (0..(120.0 * turns) as usize)
+            .map(|i| {
+                let t = i as f32 / 120.0 * std::f32::consts::TAU;
+                [cx + rx * t.cos(), cy + ry * t.sin()]
+            })
+            .collect();
+        smooth_ink_points(&samples)
+            .windows(2)
+            .map(|pair| PathSegment {
+                a: pair[0].0,
+                b: pair[1].0,
+                w0: pair[0].1,
+                w1: pair[1].1,
+                kind: 1.0,
+                width: 1.0,
+            })
+            .collect()
+    }
+
+    /// The frames a recording shows, as (name, uniforms, segments, pins): ink or none, over a
+    /// settled screen, the start glow, a window's dim and border, or the picker.
+    fn frame_kinds(
+        width: f32,
+        height: f32,
+        scale: f32,
+    ) -> Vec<(
+        &'static str,
+        LaserUniforms,
+        Vec<PathSegment>,
+        Vec<PinMarker>,
+    )> {
+        let settled = recording_uniforms(width, height, scale);
+        let window = LaserUniforms {
+            constrain_rect: 1.0,
+            _pad1: 2.0,
+            target_rect: [width * 0.2, height * 0.2, width * 0.5, height * 0.5],
+            ..settled
+        };
+        let glow = LaserUniforms {
+            now_sec: 0.5,
+            glow: [1.0, 0.0, 0.0, 0.0],
+            ..settled
+        };
+        let picker = LaserUniforms {
+            now_sec: 0.0,
+            tail_duration: 0.6,
+            _pad1: -0.6,
+            ..settled
+        };
+        let tip = LaserUniforms {
+            tip_active: 1.0,
+            tip_pos: [width * 0.3, height * 0.4],
+            ..settled
+        };
+        let half = ink_loop(width * 0.4, height * 0.4, width * 0.12, height * 0.18, 0.5);
+        let full = ink_loop(
+            width * 0.45,
+            height * 0.45,
+            width * 0.1,
+            height * 0.15,
+            1.05,
+        );
+        let pin = vec![PinMarker {
+            pos: [width * 0.7, height * 0.3],
+            radius: 11.5,
+            _pad: 0.0,
+        }];
+        let none = vec![PathSegment::default()];
+        let no_pin = vec![PinMarker::default()];
+        let with =
+            |uniforms: LaserUniforms, segments: &[PathSegment], pins: &[PinMarker]| LaserUniforms {
+                segment_count: if segments[0].width == 0.0 {
+                    0
+                } else {
+                    segments.len() as u32
+                },
+                pin_count: if pins[0].radius == 0.0 {
+                    0
+                } else {
+                    pins.len() as u32
+                },
+                ..uniforms
+            };
+        vec![
+            (
+                "nothing drawn",
+                with(settled, &none, &no_pin),
+                none.clone(),
+                no_pin.clone(),
+            ),
+            (
+                "start glow",
+                with(glow, &none, &no_pin),
+                none.clone(),
+                no_pin.clone(),
+            ),
+            (
+                "picker",
+                with(picker, &none, &no_pin),
+                none.clone(),
+                no_pin.clone(),
+            ),
+            (
+                "window dim and border",
+                with(window, &none, &no_pin),
+                none.clone(),
+                no_pin.clone(),
+            ),
+            (
+                "Shift tip, no ink",
+                with(tip, &none, &no_pin),
+                none.clone(),
+                no_pin.clone(),
+            ),
+            (
+                "a pin",
+                with(settled, &none, &pin),
+                none.clone(),
+                pin.clone(),
+            ),
+            (
+                "circle half drawn",
+                with(tip, &half, &no_pin),
+                half.clone(),
+                no_pin.clone(),
+            ),
+            (
+                "circle in a window",
+                with(window, &full, &pin),
+                full.clone(),
+                pin.clone(),
+            ),
+            (
+                "circle in the start glow",
+                with(glow, &full, &no_pin),
+                full,
+                no_pin,
+            ),
+        ]
+    }
+
+    /// Each frame's specialisation draws exactly what the general shader does: skipping the tile
+    /// loop or returning clear early only drops work whose result was clear. A `has_backdrop`
+    /// that missed a frame effect, or an early return that missed a pin or the tip, differs here.
+    #[test]
+    fn specialised_frames_match_the_general_shader() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let general = overlay_pipeline(&device).expect("pipeline");
+        let pipelines = OverlayPipelines::new(&device).expect("pipelines");
+        for scale in [1.0, 2.0] {
+            for (name, uniforms, segments, pins) in frame_kinds(256.0, 192.0, scale) {
+                let specialised = pipelines.for_frame(&uniforms);
+                let expected = render_frame(&device, &general, &uniforms, &segments, &pins);
+                let actual = render_frame(&device, specialised, &uniforms, &segments, &pins);
+                let differ = actual
+                    .chunks(4)
+                    .zip(expected.chunks(4))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                assert_eq!(differ, 0, "{name} @{scale}x: {differ} pixels differ");
+            }
+        }
+    }
+
+    #[test]
+    fn backdrop_covers_every_frame_effect() {
+        let settled = recording_uniforms(256.0, 192.0, 1.0);
+        assert!(!settled.has_backdrop(), "settled full-screen recording");
+        let with = |change: fn(&mut LaserUniforms)| {
+            let mut uniforms = settled;
+            change(&mut uniforms);
+            uniforms.has_backdrop()
+        };
+        assert!(with(|u| u.now_sec = 0.2), "intro fade");
+        assert!(with(|u| u.now_sec = 1.0), "start glow");
+        assert!(
+            with(|u| u.constrain_rect = 1.0),
+            "window or area dim and border"
+        );
+        assert!(with(|u| u._pad1 = -0.5), "picker dim");
+    }
+
+    /// GPU time per kind of frame on a 5120×2160 display, the general shader (every frame before
+    /// specialising) against each frame's own variant, alternating so neither gets a warmer GPU.
+    /// Fails if any kind is slower specialised. Run with
+    /// `cargo test --release overlay_frame_kinds -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn overlay_frame_kinds() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let general = overlay_pipeline(&device).expect("pipeline");
+        let pipelines = OverlayPipelines::new(&device).expect("pipelines");
+        let (width, height) = (5120.0, 2160.0);
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_width(width as u64);
+        descriptor.set_height(height as u64);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        let texture = device.new_texture(&descriptor);
+        let queue = device.new_command_queue();
+        let gpu_ms = |cmd: &metal::CommandBufferRef| {
+            use metal::foreign_types::ForeignTypeRef;
+            let cmd = unsafe { &*cmd.as_ptr().cast::<objc2::runtime::AnyObject>() };
+            let start: f64 = unsafe { objc2::msg_send![cmd, GPUStartTime] };
+            let end: f64 = unsafe { objc2::msg_send![cmd, GPUEndTime] };
+            (end - start) * 1_000.0
+        };
+        println!("\n{width}x{height} @1x, GPU ms per frame (median of 48)\n");
+        println!(
+            "{:<26} {:>9} {:>12} {:>7}",
+            "frame", "general", "specialised", "ratio"
+        );
+        for (name, uniforms, segments, pins) in frame_kinds(width, height, 1.0) {
+            let specialised = pipelines.for_frame(&uniforms);
+            let mut times = [Vec::new(), Vec::new()];
+            for round in 0..50 {
+                for which in [round % 2, 1 - round % 2] {
+                    let pass = RenderPassDescriptor::new();
+                    let attachment = pass.color_attachments().object_at(0).unwrap();
+                    attachment.set_texture(Some(&texture));
+                    attachment.set_load_action(MTLLoadAction::Clear);
+                    attachment.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0));
+                    attachment.set_store_action(MTLStoreAction::Store);
+                    let pipeline = if which == 0 { &general } else { specialised };
+                    let cmd = queue.new_command_buffer();
+                    encode_overlay(cmd, pass, &device, pipeline, &uniforms, &segments, &pins);
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                    if round >= 2 {
+                        times[which].push(gpu_ms(cmd));
+                    }
+                }
+            }
+            let [before, after] = times.map(|mut t| {
+                t.sort_by(f64::total_cmp);
+                t[t.len() / 2]
+            });
+            // Ink over a picker, window or intro runs the general variant itself.
+            let same = uniforms.segment_count > 0 && uniforms.has_backdrop();
+            let note = if same { "  (general variant)" } else { "" };
+            println!(
+                "{name:<26} {before:>9.2} {after:>12.2} {:>6.2}x{note}",
+                after / before
+            );
+            assert!(
+                same || after <= before,
+                "{name}: {after:.2} ms specialised, {before:.2} ms general"
             );
         }
     }
