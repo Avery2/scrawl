@@ -5548,8 +5548,7 @@ fn move_window_to_screen(ns_win: &NSWindow, frame: [f64; 4]) {
 }
 
 fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
-    // A picker replacing another one keeps the keys.
-    remove_picker_windows(cx);
+    close_picker_window(cx);
     let screen = coord_entity.read(cx).display_rect;
     let display = display_at(screen, cx);
     let display_bounds = Bounds {
@@ -5747,65 +5746,52 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
 }
 
 fn close_picker_window(cx: &mut App) {
-    if remove_picker_windows(cx) {
-        hand_back_keys(cx);
-    }
-}
-
-fn remove_picker_windows(cx: &mut App) -> bool {
-    let mut closed = false;
     for handle in cx.windows() {
         if handle.downcast::<TargetPickerWindow>().is_some() {
-            closed |= handle
-                .update(cx, |_, window, _| window.remove_window())
-                .is_ok();
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
         }
     }
-    closed
 }
 
 fn close_capture_windows(cx: &mut App) {
-    let mut closed_picker = false;
     for handle in cx.windows() {
-        let picker = handle.downcast::<TargetPickerWindow>().is_some();
-        if picker || handle.downcast::<HudPillWindow>().is_some() {
-            let closed = handle
-                .update(cx, |_, window, _| window.remove_window())
-                .is_ok();
-            closed_picker |= picker && closed;
+        if handle.downcast::<HudPillWindow>().is_some()
+            || handle.downcast::<TargetPickerWindow>().is_some()
+        {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
         }
-    }
-    if closed_picker {
-        hand_back_keys(cx);
     }
 }
 
-/// The app that was in front when `open_picker_windows` activated Scrawl (0: none).
-static PICKER_PREVIOUS_APP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// The app that was in front when Scrawl activated itself for the picker or the review window
+/// (0: none).
+static PREVIOUS_FRONT_APP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+/// Called just before Scrawl activates itself to take the keys. Scrawl in front already (one
+/// key window opening over another) keeps the app remembered first.
 fn remember_front_app() {
     use objc2_app_kit::NSWorkspace;
     let front = NSWorkspace::sharedWorkspace()
         .frontmostApplication()
         .map_or(0, |app| app.processIdentifier());
     if front > 0 && front != std::process::id() as i32 {
-        PICKER_PREVIOUS_APP.store(front, std::sync::atomic::Ordering::Release);
+        PREVIOUS_FRONT_APP.store(front, std::sync::atomic::Ordering::Release);
     }
 }
 
-/// `open_picker_windows` activates Scrawl so the picker gets the keys; once it closes, the app
-/// that was in front gets them back, unless the review window is open. `NSApp.deactivate()`
-/// isn't enough: a menu bar (accessory) app stays frontmost with no windows, and keys go nowhere.
+/// Run (deferred) after any window closes: once neither a picker nor a review window is left,
+/// the app that was in front before gets the keys back. `NSApp.deactivate()` isn't enough: a
+/// menu bar (accessory) app stays frontmost with no windows, and keys go nowhere. Deferred, a
+/// picker replacing another one is open again by the time this looks.
 fn hand_back_keys(cx: &mut App) {
     use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
-    let previous = PICKER_PREVIOUS_APP.swap(0, std::sync::atomic::Ordering::AcqRel);
-    if cx
-        .windows()
-        .iter()
-        .any(|handle| handle.downcast::<BundleReviewWindow>().is_some())
-    {
+    if cx.windows().iter().any(|handle| {
+        handle.downcast::<TargetPickerWindow>().is_some()
+            || handle.downcast::<BundleReviewWindow>().is_some()
+    }) {
         return;
     }
+    let previous = PREVIOUS_FRONT_APP.swap(0, std::sync::atomic::Ordering::AcqRel);
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
@@ -5835,6 +5821,7 @@ fn close_review_window(cx: &mut App) {
 fn open_review_window(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
     for handle in cx.windows() {
         if let Some(review) = handle.downcast::<BundleReviewWindow>() {
+            remember_front_app();
             cx.activate(true);
             let _ = review.update(cx, |_, window, cx| {
                 window.activate_window();
@@ -5869,6 +5856,7 @@ fn open_review_window(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
             })
         },
     );
+    remember_front_app();
     cx.activate(true);
 }
 
@@ -5957,6 +5945,8 @@ pub fn run_app(
     app.run(move |cx: &mut App| {
         scrawl_log(format!("run_app started pid={}", std::process::id()));
         stay_out_of_dock();
+        // ⌘W, Esc, the close button or Scrawl itself: every way a window closes ends up here.
+        cx.on_window_closed(|cx| cx.defer(hand_back_keys)).detach();
         let (ui_sender, ui_receiver) = flume::unbounded();
         crate::phone::start_ingest_server(ui_sender.clone());
         let telemetry = SharedCaptureTelemetry::new(ui_sender);
