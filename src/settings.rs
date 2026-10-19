@@ -486,17 +486,20 @@ mod login {
         }
     }
 
+    fn login_item_from_status(status: isize) -> LoginItem {
+        match status {
+            1 => LoginItem::On,
+            2 => LoginItem::NeedsApproval,
+            _ => LoginItem::Off,
+        }
+    }
+
     pub fn login_item() -> LoginItem {
         let Some(service) = main_app_service() else {
             return LoginItem::Unavailable;
         };
         let status: isize = unsafe { objc2::msg_send![&*service, status] };
-        match status {
-            1 => LoginItem::On,
-            2 => LoginItem::NeedsApproval,
-            3 => LoginItem::Unavailable,
-            _ => LoginItem::Off,
-        }
+        login_item_from_status(status)
     }
 
     pub fn set_login_item(on: bool) -> anyhow::Result<()> {
@@ -529,6 +532,20 @@ mod login {
         use objc2::runtime::AnyClass;
         if let Some(class) = AnyClass::get(c"SMAppService") {
             let _: () = unsafe { objc2::msg_send![class, openSystemSettingsLoginItems] };
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn login_item_statuses_keep_the_toggle_available() {
+            assert_eq!(login_item_from_status(0), LoginItem::Off);
+            assert_eq!(login_item_from_status(1), LoginItem::On);
+            assert_eq!(login_item_from_status(2), LoginItem::NeedsApproval);
+            assert_eq!(login_item_from_status(3), LoginItem::Off);
+            assert_eq!(login_item_from_status(99), LoginItem::Off);
         }
     }
 }
