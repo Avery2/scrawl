@@ -633,7 +633,9 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
     });
     let (record, paste) = telemetry.shortcuts();
     if let Err(kind) = register_shortcuts(state_mutex, &record, &paste) {
-        scrawl_log(format!("install_global_hotkeys: {kind:?} shortcut could not be registered"));
+        scrawl_log(format!(
+            "install_global_hotkeys: {kind:?} shortcut could not be registered"
+        ));
     }
 }
 
@@ -764,7 +766,11 @@ pub fn pause_shortcuts(telemetry: &SharedCaptureTelemetry, paused: bool) {
         return;
     };
     if paused {
-        unregister_all(&mut state.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        unregister_all(
+            &mut state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
     } else {
         let (record, paste) = telemetry.shortcuts();
         let _ = register_shortcuts(state, &record, &paste);
@@ -801,7 +807,16 @@ pub fn is_capture_shortcut(
     alt: bool,
     shift: bool,
 ) -> bool {
-    shortcut_matches(ShortcutKind::Record, cfg, s_code, keycode, cmd, ctrl, alt, shift)
+    shortcut_matches(
+        ShortcutKind::Record,
+        cfg,
+        s_code,
+        keycode,
+        cmd,
+        ctrl,
+        alt,
+        shift,
+    )
 }
 
 /// `is_capture_shortcut` for any of Scrawl's shortcuts; `layout_code` is the default key on the
@@ -1357,8 +1372,15 @@ mod tests {
         // Once changed, ⌥⇧S and its aliases are free for other apps.
         assert!(!hit(&custom, s, (false, false, true, true)), "⌥⇧S");
         assert!(!hit(&custom, KEY_S, (true, true, true, true)), "hyper S");
-        assert_eq!(hotkey_combos(ShortcutKind::Record, &custom), [(15, custom.carbon_modifiers)]);
-        assert_eq!(hotkey_combos(ShortcutKind::Record, &default).len(), 4, "⌥⇧S and three aliases");
+        assert_eq!(
+            hotkey_combos(ShortcutKind::Record, &custom),
+            [(15, custom.carbon_modifiers)]
+        );
+        assert_eq!(
+            hotkey_combos(ShortcutKind::Record, &default).len(),
+            4,
+            "⌥⇧S and three aliases"
+        );
 
         // The paste shortcut works the same way.
         let v = 9_u16;
@@ -1372,7 +1394,10 @@ mod tests {
         };
         assert!(paste_hit(&paste, v, (false, false, true, true)), "⌥⇧V");
         assert!(paste_hit(&paste, v, (true, true, true, false)), "⌃⌥⌘V");
-        assert!(!paste_hit(&paste, s, (false, false, true, true)), "⌥⇧S isn't paste");
+        assert!(
+            !paste_hit(&paste, s, (false, false, true, true)),
+            "⌥⇧S isn't paste"
+        );
         let paste_custom = ShortcutConfig {
             key_code: 35,
             carbon_modifiers: CARBON_CONTROL_KEY | CARBON_OPTION_KEY,
@@ -1380,8 +1405,14 @@ mod tests {
         };
         assert!(paste_hit(&paste_custom, 35, (false, true, true, false)));
         assert!(!paste_hit(&paste_custom, v, (false, false, true, true)));
-        assert!(paste.is_default_for(ShortcutKind::Paste) && !paste.is_default_for(ShortcutKind::Record));
-        assert_eq!(modifier_symbols(CARBON_CMD_KEY | CARBON_CONTROL_KEY | CARBON_SHIFT_KEY), "⌃⇧⌘");
+        assert!(
+            paste.is_default_for(ShortcutKind::Paste)
+                && !paste.is_default_for(ShortcutKind::Record)
+        );
+        assert_eq!(
+            modifier_symbols(CARBON_CMD_KEY | CARBON_CONTROL_KEY | CARBON_SHIFT_KEY),
+            "⌃⇧⌘"
+        );
 
         assert_eq!(shortcut_parts("⌥⇧S"), ("⌥⇧", "S"));
         assert_eq!(shortcut_parts("⌃⌥⌘R"), ("⌃⌥⌘", "R"));
@@ -2746,9 +2777,8 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
 
         let z_code = layout_z_keycode();
         let (record_cfg, paste_cfg) = telemetry.shortcuts();
-        let key_down = |code: u16| unsafe {
-            CGEventSourceKeyState(1, code) || CGEventSourceKeyState(0, code)
-        };
+        let key_down =
+            |code: u16| unsafe { CGEventSourceKeyState(1, code) || CGEventSourceKeyState(0, code) };
         // Whether `kind`'s shortcut is down: its own key, or for a default its alias keys.
         let shortcut_down = |kind: ShortcutKind, cfg: &ShortcutConfig| {
             let mut codes = vec![cfg.key_code as u16];

@@ -166,7 +166,11 @@ pub fn save_shortcut(kind: ShortcutKind, cfg: &ShortcutConfig) {
     }
 }
 
-pub fn save_shortcut_in(path: &Path, kind: ShortcutKind, cfg: &ShortcutConfig) -> anyhow::Result<()> {
+pub fn save_shortcut_in(
+    path: &Path,
+    kind: ShortcutKind,
+    cfg: &ShortcutConfig,
+) -> anyhow::Result<()> {
     let mut shortcuts = read_json(path)
         .get("shortcuts")
         .cloned()
@@ -295,7 +299,9 @@ pub fn key_label(key_code: u32, typed: &str) -> Option<String> {
     if key_code == KEY_ESCAPE {
         return None;
     }
-    let mut chars = typed.chars().filter(|c| !c.is_control() && !c.is_whitespace());
+    let mut chars = typed
+        .chars()
+        .filter(|c| !c.is_control() && !c.is_whitespace());
     let ch = chars.next()?;
     if chars.next().is_some() {
         return None;
@@ -345,8 +351,8 @@ pub fn validate(
     pressed: &Pressed,
     other: &ShortcutConfig,
 ) -> Result<ShortcutConfig, Rejection> {
-    let modifiers =
-        pressed.modifiers & (CARBON_CMD_KEY | CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY);
+    let modifiers = pressed.modifiers
+        & (CARBON_CMD_KEY | CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY);
     let key = key_label(pressed.key_code, &pressed.key).ok_or(Rejection::UnsupportedKey)?;
     let strong = modifiers & (CARBON_CMD_KEY | CARBON_CONTROL_KEY | CARBON_OPTION_KEY) != 0;
     if !strong && !is_function_key(pressed.key_code) {
@@ -421,7 +427,8 @@ pub fn login_item() -> LoginItem {
 pub fn set_login_item(on: bool) -> anyhow::Result<()> {
     use objc2::runtime::Bool;
     use objc2_foundation::NSError;
-    let service = main_app_service().ok_or_else(|| anyhow::anyhow!("not running from Scrawl.app"))?;
+    let service =
+        main_app_service().ok_or_else(|| anyhow::anyhow!("not running from Scrawl.app"))?;
     let mut error: Option<objc2::rc::Retained<NSError>> = None;
     let ok: Bool = unsafe {
         if on {
@@ -435,7 +442,10 @@ pub fn set_login_item(on: bool) -> anyhow::Result<()> {
     } else {
         anyhow::bail!(
             "{}",
-            error.map_or_else(|| "unknown error".to_owned(), |e| e.localizedDescription().to_string())
+            error.map_or_else(
+                || "unknown error".to_owned(),
+                |e| e.localizedDescription().to_string()
+            )
         )
     }
 }
@@ -552,7 +562,13 @@ fn preset_id(preset: crate::retention::Preset) -> &'static str {
 }
 
 fn retention_note(policy: &crate::retention::Policy) -> String {
-    let days = |n: u32| if n == 1 { "1 day".to_owned() } else { format!("{n} days") };
+    let days = |n: u32| {
+        if n == 1 {
+            "1 day".to_owned()
+        } else {
+            format!("{n} days")
+        }
+    };
     match (policy.media_days, policy.bundle_days) {
         (None, None) => "Scrawl keeps every recording.".to_owned(),
         (Some(media), Some(bundle)) => format!(
@@ -565,7 +581,12 @@ fn retention_note(policy: &crate::retention::Policy) -> String {
     }
 }
 
-fn shortcut_view(kind: ShortcutKind, cfg: &ShortcutConfig, recording: bool, error: Option<&String>) -> ShortcutView {
+fn shortcut_view(
+    kind: ShortcutKind,
+    cfg: &ShortcutConfig,
+    recording: bool,
+    error: Option<&String>,
+) -> ShortcutView {
     let mods = cfg.carbon_modifiers;
     ShortcutView {
         kind,
@@ -590,9 +611,14 @@ fn shortcut_view(kind: ShortcutKind, cfg: &ShortcutConfig, recording: bool, erro
 pub enum Action {
     /// A toggle or popup: `launchAtLogin`, `autoSend`, `videoExport` (bool), `transcriber`
     /// ("apple"/"hex"), `hexModel` (an id), `retention` (a preset id).
-    Set { key: String, value: serde_json::Value },
+    Set {
+        key: String,
+        value: serde_json::Value,
+    },
     /// The recorder for `kind` was clicked.
-    RecordShortcut { kind: ShortcutKind },
+    RecordShortcut {
+        kind: ShortcutKind,
+    },
     /// A combination was pressed while recording.
     Shortcut {
         kind: ShortcutKind,
@@ -601,9 +627,13 @@ pub enum Action {
     },
     /// Esc, a click elsewhere, or the window losing focus.
     CancelShortcut,
-    ResetShortcut { kind: ShortcutKind },
+    ResetShortcut {
+        kind: ShortcutKind,
+    },
     /// A permission row's button.
-    Grant { permission: Permission },
+    Grant {
+        permission: Permission,
+    },
     /// Reopen Scrawl so a Screen Recording grant takes.
     Reopen,
     ShowCaptures,
@@ -725,7 +755,13 @@ impl Panel {
         }
     }
 
-    fn apply(&mut self, kind: ShortcutKind, cfg: ShortcutConfig, shortcuts: &mut Shortcuts, host: &mut dyn Host) {
+    fn apply(
+        &mut self,
+        kind: ShortcutKind,
+        cfg: ShortcutConfig,
+        shortcuts: &mut Shortcuts,
+        host: &mut dyn Host,
+    ) {
         if shortcuts.get(kind) == &cfg {
             self.error = None;
             return;
@@ -841,8 +877,17 @@ impl Panel {
             shortcuts: ShortcutKind::ALL
                 .into_iter()
                 .map(|kind| {
-                    let error = self.error.as_ref().filter(|(k, _)| *k == kind).map(|(_, e)| e);
-                    shortcut_view(kind, shortcuts.get(kind), self.recording == Some(kind), error)
+                    let error = self
+                        .error
+                        .as_ref()
+                        .filter(|(k, _)| *k == kind)
+                        .map(|(_, e)| e);
+                    shortcut_view(
+                        kind,
+                        shortcuts.get(kind),
+                        self.recording == Some(kind),
+                        error,
+                    )
                 })
                 .collect(),
             transcriber: TranscriberView {
@@ -971,10 +1016,15 @@ impl Session {
         let reader = std::sync::Arc::clone(&events);
         std::thread::spawn(move || {
             if let Some(stdout) = stdout {
-                for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                for line in std::io::BufReader::new(stdout)
+                    .lines()
+                    .map_while(Result::ok)
+                {
                     match serde_json::from_str::<Action>(&line) {
                         Ok(action) => reader(Event::Action(action)),
-                        Err(error) => crate::capture::scrawl_log(format!("settings: {error}: {line}")),
+                        Err(error) => {
+                            crate::capture::scrawl_log(format!("settings: {error}: {line}"))
+                        }
                     }
                 }
             }
@@ -987,12 +1037,14 @@ impl Session {
         std::thread::spawn(move || {
             let mut n = 0_u32;
             while alive.load(Ordering::Acquire) {
-                // The size on open and every 30 s; grants, Hex and the login item every second.
+                // Hex and the size on open (`hex::watch` keeps Hex fresh) and every 30 s; the
+                // grants and the login item every second.
                 if n % 30 == 0 {
-                    let size = crate::retention::captures_size(&crate::handoff::default_captures_dir());
+                    crate::hex::refresh_in_background();
+                    let size =
+                        crate::retention::captures_size(&crate::handoff::default_captures_dir());
                     poll(Event::CapturesSize(size));
                 }
-                crate::hex::refresh_in_background();
                 if let Some(grants) = crate::onboarding::read_grants()
                     && alive.load(Ordering::Acquire)
                 {
@@ -1077,7 +1129,8 @@ impl Session {
                 crate::retention::nudge();
                 let events = std::sync::Arc::clone(&self.events);
                 std::thread::spawn(move || {
-                    let size = crate::retention::captures_size(&crate::handoff::default_captures_dir());
+                    let size =
+                        crate::retention::captures_size(&crate::handoff::default_captures_dir());
                     events(Event::CapturesSize(size));
                 });
                 Effect::None
@@ -1203,13 +1256,22 @@ mod tests {
     #[test]
     fn a_shortcut_needs_a_real_modifier_and_a_free_key() {
         let paste = ShortcutConfig::default_paste();
-        let ok = validate(ShortcutKind::Record, &pressed(R, CARBON_CONTROL_KEY | CARBON_OPTION_KEY, "r"), &paste).unwrap();
+        let ok = validate(
+            ShortcutKind::Record,
+            &pressed(R, CARBON_CONTROL_KEY | CARBON_OPTION_KEY, "r"),
+            &paste,
+        )
+        .unwrap();
         assert_eq!(ok.label, "⌃⌥R");
         assert_eq!(ok.key_label(), "R");
         // Labels follow macOS's order whatever order the bits come in.
         let ok = validate(
             ShortcutKind::Record,
-            &pressed(R, CARBON_CMD_KEY | CARBON_SHIFT_KEY | CARBON_CONTROL_KEY | CARBON_OPTION_KEY, "r"),
+            &pressed(
+                R,
+                CARBON_CMD_KEY | CARBON_SHIFT_KEY | CARBON_CONTROL_KEY | CARBON_OPTION_KEY,
+                "r",
+            ),
             &paste,
         )
         .unwrap();
@@ -1218,18 +1280,41 @@ mod tests {
         assert_eq!(no(pressed(R, 0, "r")), Rejection::NoModifier);
         assert_eq!(no(pressed(R, CARBON_SHIFT_KEY, "r")), Rejection::NoModifier);
         // A function key may stand alone.
-        assert_eq!(validate(ShortcutKind::Record, &pressed(96, 0, ""), &paste).unwrap().label, "F5");
-        assert_eq!(no(pressed(53, CARBON_OPTION_KEY, "\u{1b}")), Rejection::UnsupportedKey);
+        assert_eq!(
+            validate(ShortcutKind::Record, &pressed(96, 0, ""), &paste)
+                .unwrap()
+                .label,
+            "F5"
+        );
+        assert_eq!(
+            no(pressed(53, CARBON_OPTION_KEY, "\u{1b}")),
+            Rejection::UnsupportedKey
+        );
         // ⌘ and one key belongs to apps; macOS's own combinations are refused.
-        assert_eq!(no(pressed(R, CARBON_CMD_KEY, "r")), Rejection::Reserved("⌘R".into()));
-        assert_eq!(no(pressed(R, CARBON_CMD_KEY, "r")).message(), "Apps use ⌘R. Add ⌥ or ⌃.");
-        assert_eq!(no(pressed(21, CARBON_CMD_KEY | CARBON_SHIFT_KEY, "4")), Rejection::Reserved("⇧⌘4".into()));
-        assert_eq!(no(pressed(49, CARBON_CONTROL_KEY, " ")).message(), "macOS uses ⌃Space.");
+        assert_eq!(
+            no(pressed(R, CARBON_CMD_KEY, "r")),
+            Rejection::Reserved("⌘R".into())
+        );
+        assert_eq!(
+            no(pressed(R, CARBON_CMD_KEY, "r")).message(),
+            "Apps use ⌘R. Add ⌥ or ⌃."
+        );
+        assert_eq!(
+            no(pressed(21, CARBON_CMD_KEY | CARBON_SHIFT_KEY, "4")),
+            Rejection::Reserved("⇧⌘4".into())
+        );
+        assert_eq!(
+            no(pressed(49, CARBON_CONTROL_KEY, " ")).message(),
+            "macOS uses ⌃Space."
+        );
         let mut system = pressed(R, CARBON_CONTROL_KEY | CARBON_OPTION_KEY, "r");
         system.reserved = true;
         assert_eq!(no(system), Rejection::Reserved("⌃⌥R".into()));
         // Scrawl's other shortcut.
-        assert_eq!(no(pressed(9, OPT_SHIFT, "v")), Rejection::Taken(ShortcutKind::Paste));
+        assert_eq!(
+            no(pressed(9, OPT_SHIFT, "v")),
+            Rejection::Taken(ShortcutKind::Paste)
+        );
         assert_eq!(
             Rejection::Taken(ShortcutKind::Paste).message(),
             "Paste last capture already uses this."
@@ -1238,7 +1323,11 @@ mod tests {
 
     #[test]
     fn keys_are_named_for_the_layout_in_use() {
-        assert_eq!(key_label(41, "s").as_deref(), Some("S"), "Dvorak S sits on ANSI ;");
+        assert_eq!(
+            key_label(41, "s").as_deref(),
+            Some("S"),
+            "Dvorak S sits on ANSI ;"
+        );
         assert_eq!(key_label(49, " ").as_deref(), Some("Space"));
         assert_eq!(key_label(122, "").as_deref(), Some("F1"));
         assert_eq!(key_label(44, "/").as_deref(), Some("/"));
@@ -1252,7 +1341,10 @@ mod tests {
         let path = dir.0.join("config.json");
         let legacy = dir.0.join("legacy.json");
         std::fs::write(&path, r#"{"ingestToken":"secret","autoSend":false}"#).unwrap();
-        assert_eq!(Shortcuts::load_from(&path, &legacy), (Shortcuts::default(), false));
+        assert_eq!(
+            Shortcuts::load_from(&path, &legacy),
+            (Shortcuts::default(), false)
+        );
         let custom = ShortcutConfig {
             key_code: R,
             carbon_modifiers: CARBON_CONTROL_KEY | CARBON_OPTION_KEY,
@@ -1266,7 +1358,10 @@ mod tests {
         assert_eq!(config["ingestToken"], "secret");
         assert_eq!(config["autoSend"], false);
         assert_eq!(config["shortcuts"]["record"]["label"], "⌃⌥R");
-        assert!(config["shortcuts"].get("paste").is_none(), "defaults aren't written");
+        assert!(
+            config["shortcuts"].get("paste").is_none(),
+            "defaults aren't written"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1274,7 +1369,12 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
         // Back to the default removes it.
-        save_shortcut_in(&path, ShortcutKind::Record, &ShortcutConfig::default_record()).unwrap();
+        save_shortcut_in(
+            &path,
+            ShortcutKind::Record,
+            &ShortcutConfig::default_record(),
+        )
+        .unwrap();
         assert!(read_json(&path)["shortcuts"].get("record").is_none());
         assert_eq!(read_json(&path)["ingestToken"], "secret");
     }
@@ -1285,15 +1385,34 @@ mod tests {
         let path = dir.0.join("config.json");
         let legacy = dir.0.join("legacy.json");
         // 0.3.x wrote its default too: that stays the default (on the active layout's S).
-        std::fs::write(&legacy, r#"{"key_code":41,"carbon_modifiers":2560,"label":"⌥⇧S"}"#).unwrap();
-        assert_eq!(Shortcuts::load_from(&path, &legacy), (Shortcuts::default(), false));
-        std::fs::write(&legacy, r#"{"key_code":15,"carbon_modifiers":6144,"label":"⌃⌥R"}"#).unwrap();
+        std::fs::write(
+            &legacy,
+            r#"{"key_code":41,"carbon_modifiers":2560,"label":"⌥⇧S"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Shortcuts::load_from(&path, &legacy),
+            (Shortcuts::default(), false)
+        );
+        std::fs::write(
+            &legacy,
+            r#"{"key_code":15,"carbon_modifiers":6144,"label":"⌃⌥R"}"#,
+        )
+        .unwrap();
         let (loaded, migrate) = Shortcuts::load_from(&path, &legacy);
         assert!(migrate);
         assert_eq!(loaded.record.label, "⌃⌥R");
         // Once the new config has shortcuts, the old file is ignored.
-        save_shortcut_in(&path, ShortcutKind::Record, &ShortcutConfig::default_record()).unwrap();
-        assert_eq!(Shortcuts::load_from(&path, &legacy), (Shortcuts::default(), false));
+        save_shortcut_in(
+            &path,
+            ShortcutKind::Record,
+            &ShortcutConfig::default_record(),
+        )
+        .unwrap();
+        assert_eq!(
+            Shortcuts::load_from(&path, &legacy),
+            (Shortcuts::default(), false)
+        );
     }
 
     #[test]
@@ -1301,7 +1420,12 @@ mod tests {
         let dir = TempDir::new("record");
         let mut host = fake(&dir);
         let mut panel = Panel::default();
-        panel.on(Action::RecordShortcut { kind: ShortcutKind::Record }, &mut host);
+        panel.on(
+            Action::RecordShortcut {
+                kind: ShortcutKind::Record,
+            },
+            &mut host,
+        );
         assert_eq!(panel.recording(), Some(ShortcutKind::Record));
         assert_eq!(host.paused, [true]);
         // A key for the other recorder does nothing.
@@ -1326,10 +1450,23 @@ mod tests {
         assert_eq!(read_json(&host.path)["shortcuts"]["record"]["label"], "⌃⌥R");
         let view = panel.view(&host);
         let record = &view.shortcuts[0];
-        assert_eq!((record.key.as_str(), record.control, record.option, record.shift), ("R", true, true, false));
+        assert_eq!(
+            (
+                record.key.as_str(),
+                record.control,
+                record.option,
+                record.shift
+            ),
+            ("R", true, true, false)
+        );
         assert!(!record.is_default && record.error.is_none());
         // Reset puts the default back and removes it from the config.
-        panel.on(Action::ResetShortcut { kind: ShortcutKind::Record }, &mut host);
+        panel.on(
+            Action::ResetShortcut {
+                kind: ShortcutKind::Record,
+            },
+            &mut host,
+        );
         assert!(host.shortcuts.record.is_default_for(ShortcutKind::Record));
         assert!(read_json(&host.path)["shortcuts"].get("record").is_none());
     }
@@ -1340,25 +1477,56 @@ mod tests {
         let mut host = fake(&dir);
         let mut panel = Panel::default();
         let press = |panel: &mut Panel, host: &mut Fake, p: Pressed| {
-            panel.on(Action::RecordShortcut { kind: ShortcutKind::Paste }, host);
-            panel.on(Action::Shortcut { kind: ShortcutKind::Paste, pressed: p }, host);
+            panel.on(
+                Action::RecordShortcut {
+                    kind: ShortcutKind::Paste,
+                },
+                host,
+            );
+            panel.on(
+                Action::Shortcut {
+                    kind: ShortcutKind::Paste,
+                    pressed: p,
+                },
+                host,
+            );
         };
         press(&mut panel, &mut host, pressed(R, CARBON_SHIFT_KEY, "r"));
         assert_eq!(host.shortcuts, Shortcuts::default());
-        assert_eq!(panel.view(&host).shortcuts[1].error.as_deref(), Some("Hold ⌘, ⌥ or ⌃ with the key."));
+        assert_eq!(
+            panel.view(&host).shortcuts[1].error.as_deref(),
+            Some("Hold ⌘, ⌥ or ⌃ with the key.")
+        );
         host.refuse = Some("⌃⌥R".into());
-        press(&mut panel, &mut host, pressed(R, CARBON_CONTROL_KEY | CARBON_OPTION_KEY, "r"));
+        press(
+            &mut panel,
+            &mut host,
+            pressed(R, CARBON_CONTROL_KEY | CARBON_OPTION_KEY, "r"),
+        );
         assert_eq!(host.shortcuts, Shortcuts::default());
-        assert_eq!(panel.view(&host).shortcuts[1].error.as_deref(), Some("Another app has this shortcut."));
+        assert_eq!(
+            panel.view(&host).shortcuts[1].error.as_deref(),
+            Some("Another app has this shortcut.")
+        );
         assert!(!dir.0.join("config.json").exists(), "nothing saved");
         // Esc cancels and resumes the hotkeys; the old message goes when recording starts again.
-        panel.on(Action::RecordShortcut { kind: ShortcutKind::Paste }, &mut host);
+        panel.on(
+            Action::RecordShortcut {
+                kind: ShortcutKind::Paste,
+            },
+            &mut host,
+        );
         assert!(panel.view(&host).shortcuts[1].error.is_none());
         panel.on(Action::CancelShortcut, &mut host);
         assert_eq!(host.paused.last(), Some(&false));
         assert_eq!(panel.recording(), None);
         // Closing the window while recording resumes them too.
-        panel.on(Action::RecordShortcut { kind: ShortcutKind::Record }, &mut host);
+        panel.on(
+            Action::RecordShortcut {
+                kind: ShortcutKind::Record,
+            },
+            &mut host,
+        );
         assert_eq!(panel.on(Action::Close, &mut host), Effect::Close);
         assert_eq!(host.paused.last(), Some(&false));
     }
@@ -1370,13 +1538,22 @@ mod tests {
         std::fs::write(&host.path, r#"{"ingestToken":"secret"}"#).unwrap();
         let mut panel = Panel::default();
         let set = |panel: &mut Panel, host: &mut Fake, key: &str, value: serde_json::Value| {
-            panel.on(Action::Set { key: key.into(), value }, host)
+            panel.on(
+                Action::Set {
+                    key: key.into(),
+                    value,
+                },
+                host,
+            )
         };
         assert!(panel.view(&host).auto_send);
         set(&mut panel, &mut host, "autoSend", false.into());
         set(&mut panel, &mut host, "videoExport", true.into());
         set(&mut panel, &mut host, "transcriber", "hex".into());
-        assert_eq!(set(&mut panel, &mut host, "retention", "month".into()), Effect::Measure);
+        assert_eq!(
+            set(&mut panel, &mut host, "retention", "month".into()),
+            Effect::Measure
+        );
         set(&mut panel, &mut host, "transcriber", "nonsense".into());
         let view = panel.view(&host);
         assert!(!view.auto_send && view.video_export);
@@ -1391,7 +1568,10 @@ mod tests {
         set(&mut panel, &mut host, "hexModel", "parakeet".into());
         assert_eq!(read_json(&host.path)["hexModel"], "parakeet");
         set(&mut panel, &mut host, "retention", "forever".into());
-        assert_eq!(panel.view(&host).retention.note, "Scrawl keeps every recording.");
+        assert_eq!(
+            panel.view(&host).retention.note,
+            "Scrawl keeps every recording."
+        );
     }
 
     #[test]
@@ -1400,20 +1580,38 @@ mod tests {
         let mut host = fake(&dir);
         let mut panel = Panel::default();
         let mut grants = Grants::default();
-        grants.statuses.insert(Permission::Microphone, Status::Granted);
+        grants
+            .statuses
+            .insert(Permission::Microphone, Status::Granted);
         grants.statuses.insert(Permission::Camera, Status::Denied);
         panel.set_grants(grants.clone());
-        let grant = |panel: &mut Panel, host: &mut Fake, permission| panel.on(Action::Grant { permission }, host);
-        assert_eq!(grant(&mut panel, &mut host, Permission::Microphone), Effect::None);
-        assert_eq!(grant(&mut panel, &mut host, Permission::Accessibility), Effect::Request(Permission::Accessibility));
-        assert_eq!(grant(&mut panel, &mut host, Permission::Accessibility), Effect::OpenSettings(Permission::Accessibility));
-        assert_eq!(grant(&mut panel, &mut host, Permission::Camera), Effect::OpenSettings(Permission::Camera));
+        let grant = |panel: &mut Panel, host: &mut Fake, permission| {
+            panel.on(Action::Grant { permission }, host)
+        };
+        assert_eq!(
+            grant(&mut panel, &mut host, Permission::Microphone),
+            Effect::None
+        );
+        assert_eq!(
+            grant(&mut panel, &mut host, Permission::Accessibility),
+            Effect::Request(Permission::Accessibility)
+        );
+        assert_eq!(
+            grant(&mut panel, &mut host, Permission::Accessibility),
+            Effect::OpenSettings(Permission::Accessibility)
+        );
+        assert_eq!(
+            grant(&mut panel, &mut host, Permission::Camera),
+            Effect::OpenSettings(Permission::Camera)
+        );
         let view = panel.view(&host);
         assert_eq!(view.permissions.len(), 5);
         assert!(view.permissions[..3].iter().all(|p| p.required));
         // Screen Recording granted but not yet usable: Reopen relaunches.
         assert_eq!(panel.on(Action::Reopen, &mut host), Effect::None);
-        grants.statuses.insert(Permission::ScreenRecording, Status::Granted);
+        grants
+            .statuses
+            .insert(Permission::ScreenRecording, Status::Granted);
         grants.screen_needs_relaunch = true;
         panel.set_grants(grants);
         assert!(panel.view(&host).permissions[0].relaunch);
@@ -1424,7 +1622,9 @@ mod tests {
     fn helper_lines_parse_into_actions() {
         let parse = |line: &str| serde_json::from_str::<Action>(line).unwrap();
         assert_eq!(
-            parse(r#"{"action":"shortcut","kind":"paste","keyCode":15,"modifiers":6144,"key":"r","reserved":false}"#),
+            parse(
+                r#"{"action":"shortcut","kind":"paste","keyCode":15,"modifiers":6144,"key":"r","reserved":false}"#
+            ),
             Action::Shortcut {
                 kind: ShortcutKind::Paste,
                 pressed: pressed(R, CARBON_CONTROL_KEY | CARBON_OPTION_KEY, "r")
@@ -1432,10 +1632,26 @@ mod tests {
         );
         assert_eq!(
             parse(r#"{"action":"set","key":"autoSend","value":true}"#),
-            Action::Set { key: "autoSend".into(), value: true.into() }
+            Action::Set {
+                key: "autoSend".into(),
+                value: true.into()
+            }
         );
-        assert_eq!(parse(r#"{"action":"record-shortcut","kind":"record"}"#), Action::RecordShortcut { kind: ShortcutKind::Record });
-        assert_eq!(parse(r#"{"action":"grant","permission":"camera"}"#), Action::Grant { permission: Permission::Camera });
-        assert_eq!(parse(r#"{"action":"check-for-updates"}"#), Action::CheckForUpdates);
+        assert_eq!(
+            parse(r#"{"action":"record-shortcut","kind":"record"}"#),
+            Action::RecordShortcut {
+                kind: ShortcutKind::Record
+            }
+        );
+        assert_eq!(
+            parse(r#"{"action":"grant","permission":"camera"}"#),
+            Action::Grant {
+                permission: Permission::Camera
+            }
+        );
+        assert_eq!(
+            parse(r#"{"action":"check-for-updates"}"#),
+            Action::CheckForUpdates
+        );
     }
 }

@@ -82,8 +82,8 @@ Reopen** while you grant, **Later** is fine. Input Monitoring needs no relaunch:
 event tap when the grant arrives.
 
 Progress is `"onboarding"` in `~/.config/scrawl/config.json`, including the screen the tour is on,
-so it picks up there whatever quits Scrawl. Once seen, the tour only comes back from **Welcome to
-Scrawl…** in the menu, but a required permission that was granted and is gone again reopens the
+so it picks up there whatever quits Scrawl. Once seen, the tour only comes back from **Welcome
+tour** in Settings › About, but a required permission that was granted and is gone again reopens the
 permissions screen at launch. `SCRAWL_NO_ONBOARDING=1` skips it.
 
 To replay it from scratch:
@@ -98,12 +98,35 @@ Preview every screen without the app, including the permissions screen with none
 granted and each on-demand sheet: `target/debug/scrawl-helper onboarding --render /tmp/onboarding
 --icon assets/app-icon.png`.
 
+## Settings
+
+**Settings…** in the menu bar (⌘, while the menu is open) opens a small window with five panes:
+
+- **General**: Launch at login, Send dev-site captures to OpenCode, and the two shortcuts, Record
+  (`⌥⇧S`) and Paste last capture (`⌥⇧V`).
+- **Recording**: the transcriber (Apple Speech, or Hex while it runs, with its model) and, under
+  Experimental, Video export.
+- **Storage**: how long recordings are kept, how much space the captures take, and Show in Finder.
+- **Permissions**: the onboarding checklist, so a permission can be turned on later.
+- **About**: the version, Check for Updates…, links, and the welcome tour.
+
+To change a shortcut, click its keys and press the new combination; `Esc` cancels. It needs ⌘, ⌥
+or ⌃ (a function key can stand alone), and Scrawl turns down ⌘ with one key, combinations macOS
+uses, the other Scrawl shortcut, and anything another app has already taken. The arrow beside the
+heading puts the default back. While the recorder listens, Scrawl's own shortcuts are paused. They
+are saved as `"shortcuts"` in `~/.config/scrawl/config.json`. The menu keeps Record Screen, Choose
+What to Record…, Open Latest Capture, Export Last Capture as Video… (when on), Settings…, Check
+for Updates… and Quit.
+
+Preview every pane, dark and light, with the recorder listening and a combination turned down:
+`target/debug/scrawl-helper settings --render /tmp/settings --icon assets/app-icon.png`.
+
 ## Capture Controls
 
 - **Tap `⌥⇧S`** (release within 0.25 s): record the display under the pointer straight away,
   auto-cropped (see below). Tap it again to finish; a tap within 0.4 s of the start is ignored, so a
-  double press doesn't leave an empty capture. `⌃⌥⇧S` also works, as does your own shortcut if you
-  set one in the review window. As it starts, the island opens onto the modes (Area · Window ·
+  double press doesn't leave an empty capture. `⌃⌥⇧S` also works (only while `⌥⇧S` is the
+  shortcut; see [Settings](#settings) to change it). As it starts, the island opens onto the modes (Area · Window ·
   **Screen** · iPhone when one is cabled) for about 3.5 s, or until you click, scroll or draw;
   hovering keeps them. Click Window or Area to retarget (the first seconds are dropped and the
   picker takes over: click a window or drag an area), iPhone to record the phone instead, or just
@@ -113,7 +136,7 @@ granted and each on-demand sheet: `target/debug/scrawl-helper onboarding --rende
   pointer. Dragging with the mouse selects an area instead. Release `⌥⇧` to record what's
   selected; `Esc` cancels. With no iPhone cabled, iPhone says so and releasing records nothing.
 - **Choose What to Record…** in the menu bar: the full picker (Area, Window, Screen, iPhone).
-- `⌥⇧V`: Paste both `contact-sheet.png` and `summary.md` into the active app or terminal (`⌃⌥⇧V` also works)
+- `⌥⇧V`: Paste both `contact-sheet.png` and `summary.md` into the active app or terminal (`⌃⌥⇧V` also works while it's the default)
 - **Normal pointer**: Clicks and scrolls pass straight through to the app underneath
 - **Hold `⇧` (Shift) + move**: Draw a persistent red marker stroke (`#ff3b30`) on screen that fades out after release
 - **`⌘Z`**: Undo the last stroke
@@ -185,7 +208,7 @@ scrawl route --url http://localhost:5173/
 scrawl route --browser com.brave.Browser   # the browser's front tab
 ```
 
-Turn it off with **Send Dev Site Captures to OpenCode** in the menu, or `"autoSend": false` in
+Turn it off with **Send dev-site captures to OpenCode** in Settings › General, or `"autoSend": false` in
 `~/.config/scrawl/config.json`. `SCRAWL_NO_OPENCODE=1` also turns it off.
 
 ## Auto-crop (Screen captures)
@@ -268,7 +291,7 @@ bun scripts/autocrop-gallery.mjs /tmp/gallery /tmp/bundles --scores /tmp/scores.
 ## iPhone
 
 Plug an iPhone in with a cable (unlocked, trusted) and the picker shows **iPhone** next to Area,
-Window, and Screen (also **Record iPhone** in the menu bar). Choosing it opens a floating mirror of the
+Window, and Screen. Choosing it opens a floating mirror of the
 phone on the right of the screen and starts recording:
 
 - The phone's own video is recorded natively (1320×2868 at up to 60 fps on an iPhone Pro Max) with
@@ -551,8 +574,8 @@ scrawl export latest --crop 0.1,0.2,0.6,0.5       # x,y,w,h as fractions, or pix
 - **Audio**: `audio.wav` starts where the video does (`videoOffsetMs`); a cabled iPhone's movie
   uses its own audio track. `--no-ink` and `--no-clicks` leave the annotations out, `--fps` sets the
   rate (default 60 for a 60 fps recording).
-- **Menu**: with `"videoExport": true` in `~/.config/scrawl/config.json` (default off), the menu
-  shows **Export Last Capture as Video…**. It saves to `~/Movies/Scrawl/<name>.mp4`, shows progress
+- **Menu**: with **Video export** on in Settings › Recording (`"videoExport": true` in
+  `~/.config/scrawl/config.json`, default off), the menu shows **Export Last Capture as Video…**. It saves to `~/Movies/Scrawl/<name>.mp4`, shows progress
   beside the menu bar icon, and reveals the file in Finder. The command works without the flag.
 
 ## Keeping captures small
@@ -565,9 +588,10 @@ daily, at low priority, and logs what it did:
   `scrawl.json`, `contact-sheet.png`, `frames/`) stays, so pasting and reading still work;
   `scrawl zoom` says the video was cleaned up.
 - **Whole bundles** go to the Trash after 30 days.
-- **Keep Recordings** in the menu bar picks Video for 7 Days (bundles 30), Video for 30 Days
+- **Keep recordings** in Settings › Storage picks Video for 7 Days (bundles 30), Video for 30 Days
   (bundles 90), or Forever. It's stored as `"retention": {"mediaDays": 7, "bundleDays": 30}` in
-  `~/.config/scrawl/config.json`; `null` keeps forever. **Show Captures in Finder** opens the folder.
+  `~/.config/scrawl/config.json`; `null` keeps forever. The same pane shows how much the captures
+  take and opens the folder in Finder.
 - Never touched: a bundle under a day old or changed in the last day (a copy just arrived from
   another Mac, a zoom), one whose media is still copying (`.media-pending` there, `.media-sending`
   here; a marker over a day old is ignored), one being recorded or re-encoded, and one with a
@@ -599,7 +623,8 @@ word was spoken. The word timings drive two things:
 
 Apple's SpeechAnalyzer is the default and needs nothing. If you use Hex
 (2.2 or later, running), Scrawl can transcribe with it instead and with whichever model Hex has
-ready: menu → **Transcription** → **Hex**, then pick a model under **Hex model**. Or in
+ready: Settings › Recording › **Transcription** → **Hex**, then pick a model under **Hex model**.
+Or in
 `~/.config/scrawl/config.json`:
 
 ```json
