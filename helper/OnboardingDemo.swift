@@ -703,6 +703,9 @@ struct HowItWorksDemo: View {
   @State private var inkOpacity = 1.0
   @State private var resume: DispatchWorkItem?
   @State private var reportedWatched = false
+  /// The moment a rewind left, fading out over the one it went to.
+  @State private var ghost: Double?
+  @State private var ghostOpacity = 0.0
   @StateObject private var shift = ShiftWatcher()
   private let ticker = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
 
@@ -721,17 +724,20 @@ struct HowItWorksDemo: View {
           .overlay(practiceLayer)
       } else if let phase = onboardingFixedPhase {
         stage(t: phase * DemoScript.loop)
+          .overlay(alignment: .top) { stageOverlay }
       } else {
+        // Re-made whenever it pauses or resumes (`idleRevision`), so the pause always takes.
         TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: paused)) { context in
           stage(t: elapsed(context.date).truncatingRemainder(dividingBy: DemoScript.loop))
         }
         .id(idleRevision)
+        .overlay(alignment: .top) { rewindGhost }
+        .overlay(alignment: .top) { stageOverlay }
       }
       if storyboard {
         hint.frame(height: 16).padding(.top, 8)
       }
     }
-    .onChange(of: paused) { idleRevision += 1 }
     .onChange(of: shift.down) { _, down in if !down { endStroke() } }
     .onReceive(ticker) { _ in reportWatched() }
     .onAppear {
@@ -751,14 +757,6 @@ struct HowItWorksDemo: View {
       ZStack {
         RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color(red: 0.10, green: 0.10, blue: 0.105))
         DemoStageFrame(t: t, showCursor: strokes.isEmpty && !drawing)
-        practiceLayer
-        // Where the hand goes, so it sits on the stage, on the page's left edge.
-        hint
-          .frame(height: DemoGeo.pillHeight)
-          .padding(.leading, DemoGeo.app.minX)
-          .padding(.top, DemoGeo.pillTop)
-          .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-          .allowsHitTesting(false)
       }
       .frame(width: DemoGeo.size.width, height: DemoGeo.size.height)
       .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -775,6 +773,20 @@ struct HowItWorksDemo: View {
   }
 
   // MARK: Trying a mark
+
+  /// Over the stage and outside the clock, so a stroke isn't interrupted when the loop pauses:
+  /// the ink being drawn, and the hint where the hand goes, on the page's left edge.
+  private var stageOverlay: some View {
+    ZStack(alignment: .topLeading) {
+      practiceLayer
+      hint
+        .frame(height: DemoGeo.pillHeight)
+        .padding(.leading, DemoGeo.app.minX)
+        .padding(.top, DemoGeo.pillTop)
+        .allowsHitTesting(false)
+    }
+    .frame(width: DemoGeo.size.width, height: DemoGeo.size.height)
+  }
 
   private var practiceLayer: some View {
     Canvas { ctx, _ in
@@ -807,10 +819,7 @@ struct HowItWorksDemo: View {
       inkOpacity = 1
       drawing = true
       strokes.append([point])
-      if let since {
-        base += Date().timeIntervalSince(since)
-        self.since = nil
-      }
+      pause()
       return
     }
     guard let last = strokes.last?.last, hypot(point.x - last.x, point.y - last.y) >= 1.5 else { return }
@@ -833,11 +842,50 @@ struct HowItWorksDemo: View {
         guard !drawing else { return }
         strokes = []
         inkOpacity = 1
-        if !storyboard && since == nil { since = Date() }
+        if !storyboard && since == nil {
+          since = Date()
+          idleRevision += 1
+        }
       }
     }
     resume = work
     DispatchQueue.main.asyncAfter(deadline: .now() + 2.2, execute: work)
+  }
+
+  /// Stops the loop for a mark. While the first words show and nothing is drawn yet it stops
+  /// where it is; anywhere else it goes back to that moment (2.1 s: recording, "This button is
+  /// cut off"), softly, so the mark goes on the page rather than on the lifted frame or the chat.
+  private func pause() {
+    guard let since, !storyboard else { return }
+    let total = base + Date().timeIntervalSince(since)
+    let t = total.truncatingRemainder(dividingBy: DemoScript.loop)
+    let ready = (1.4..<2.35).contains(t)
+    if ready {
+      base = total
+      self.since = nil
+      idleRevision += 1
+    } else {
+      base = total - t + 2.1
+      self.since = nil
+      idleRevision += 1
+      // Only the old moment fades, on top of the new one, so the page both share never dims.
+      ghost = t
+      ghostOpacity = 1
+      DispatchQueue.main.async {
+        withAnimation(.easeOut(duration: 0.22)) { ghostOpacity = 0 }
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { ghost = nil }
+    }
+  }
+
+  @ViewBuilder private var rewindGhost: some View {
+    if let ghost {
+      DemoStageFrame(t: ghost, showCursor: false)
+        .blur(radius: 3 * (1 - ghostOpacity))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .opacity(ghostOpacity)
+        .allowsHitTesting(false)
+    }
   }
 
   private func reportWatched(force: Bool = false) {
@@ -850,7 +898,7 @@ struct HowItWorksDemo: View {
   private var hint: some View {
     let text: String = if drawing {
       "Let go of ⇧ to finish"
-    } else if practiced {
+    } else if practiced && !strokes.isEmpty {
       "That's a mark"
     } else if storyboard {
       "Try it: hold ⇧ over the pictures and move the mouse"
@@ -860,7 +908,7 @@ struct HowItWorksDemo: View {
     return ZStack(alignment: .leading) {
       Text(text)
         .font(.system(size: storyboard ? 11.5 : 11))
-        .foregroundStyle(practiced && !drawing ? Palette.soft : Palette.muted)
+        .foregroundStyle(text == "That's a mark" ? Palette.soft : Palette.muted)
         .id(text)
         .transition(Motion.swap)
     }
