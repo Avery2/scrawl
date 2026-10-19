@@ -29,8 +29,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 pub use x11::{
-    Monitor, WindowInfo, active_window as foreground_window, cursor_position, monitor_at,
-    monitors, primary_monitor, top_level_windows, window_info,
+    Monitor, WindowInfo, active_window as foreground_window, monitor_at, monitors,
+    primary_monitor, top_level_windows, window_info,
 };
 
 static WAYLAND_DISPLAY: OnceLock<Option<OsString>> = OnceLock::new();
@@ -65,6 +65,41 @@ pub fn wayland_display() -> Option<OsString> {
 pub fn wayland_session() -> bool {
     wayland_display().is_some()
         || std::env::var("XDG_SESSION_TYPE").is_ok_and(|t| t.eq_ignore_ascii_case("wayland"))
+}
+
+/// Where the pointer is (global pixels). On Wayland the X server sees it only over X11 windows,
+/// so an absolute pointing device's position comes first when one moved it last
+/// (`input::absolute_pointer`).
+pub fn cursor_position() -> Option<(f64, f64)> {
+    if wayland_session()
+        && let Some([nx, ny]) = input::absolute_pointer()
+        && let Some([x, y, w, h]) = desktop_rect()
+    {
+        return Some((x + nx * w, y + ny * h));
+    }
+    x11::cursor_position()
+}
+
+/// The bounding box of every monitor (global pixels), read at most once a second.
+fn desktop_rect() -> Option<[f64; 4]> {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Option<[f64; 4]>)>> =
+        std::sync::Mutex::new(None);
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((at, rect)) = *cache
+        && at.elapsed() < std::time::Duration::from_secs(1)
+    {
+        return rect;
+    }
+    let monitors = monitors();
+    let x0 = monitors.iter().map(|m| m.rect[0]).reduce(f64::min)?;
+    let y0 = monitors.iter().map(|m| m.rect[1]).reduce(f64::min)?;
+    let x1 = monitors.iter().map(|m| m.rect[0] + m.rect[2]).reduce(f64::max)?;
+    let y1 = monitors.iter().map(|m| m.rect[1] + m.rect[3]).reduce(f64::max)?;
+    let rect = Some([x0, y0, x1 - x0, y1 - y0]);
+    *cache = Some((std::time::Instant::now(), rect));
+    rect
 }
 
 /// The desktop, lowercased (`gnome`, `kde`, `ubuntu:gnome`, …).

@@ -91,6 +91,9 @@ fn find_focused() -> Option<FocusedApp> {
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
                 .unwrap_or_else(|| app_name.clone())
                 .to_ascii_lowercase();
+            if id == X11_FRAMES {
+                return x11_front();
+            }
             let identity = pid.and_then(super::app_identity);
             let title: String = window.get_property("Name").unwrap_or_default();
             return Some(FocusedApp {
@@ -102,6 +105,25 @@ fn find_focused() -> Option<FocusedApp> {
         }
     }
     None
+}
+
+/// GNOME draws X11 apps' title bars in this process, whose frame windows report the app
+/// window's title and focus.
+const X11_FRAMES: &str = "mutter-x11-frames";
+
+/// An X11 app is in front: XWayland knows which.
+fn x11_front() -> Option<FocusedApp> {
+    let front = super::foreground_window()?;
+    if front.pid == std::process::id() {
+        return None;
+    }
+    let (name, id) = super::app_identity(front.pid)?;
+    Some(FocusedApp {
+        pid: Some(front.pid),
+        name,
+        id,
+        title: Some(front.title).filter(|t| !t.is_empty()),
+    })
 }
 
 /// The app whose window has focus (not Scrawl), asked at most every 250 ms.

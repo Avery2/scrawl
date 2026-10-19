@@ -109,6 +109,7 @@ struct Recorder {
     candidate: (u32, u32),
     video: bool,
     first_frame_ms: Arc<AtomicU64>,
+    last: Option<Vec<u8>>,
 }
 
 impl Recorder {
@@ -130,7 +131,7 @@ impl Recorder {
         );
         if let (Some(encoder), Some(movie)) = (encoder, movie) {
             launch.push_str(&format!(
-                " t. ! queue max-size-time=3000000000 max-size-buffers=0 max-size-bytes=0 ! videorate drop-only=true ! video/x-raw,framerate=0/1,max-framerate={FPS}/1 ! videoconvert ! video/x-raw,format=I420 ! {encoder} name=encoder ! h264parse ! mp4mux faststart=true ! filesink location=\"{}\"",
+                " t. ! queue max-size-time=3000000000 max-size-buffers=0 max-size-bytes=0 ! videorate ! video/x-raw,framerate={FPS}/1 ! videoconvert ! video/x-raw,format=I420 ! {encoder} name=encoder ! h264parse ! mp4mux faststart=true ! filesink location=\"{}\"",
                 movie.display().to_string().replace('"', "\\\"")
             ));
         }
@@ -185,6 +186,7 @@ impl Recorder {
             candidate,
             video,
             first_frame_ms,
+            last: None,
         })
     }
 
@@ -203,25 +205,54 @@ impl Recorder {
         None
     }
 
-    fn candidate(&self, t_ms: u64) -> Option<RgbaFrame> {
-        let sample = self
-            .candidates
-            .try_pull_sample(gst::ClockTime::ZERO)
-            .or_else(|| self.candidates.try_pull_preroll(gst::ClockTime::ZERO))?;
+    /// The newest frame, or the last one again: compositors send frames only when the screen
+    /// changes.
+    fn candidate(&mut self, t_ms: u64, masks: &[[f64; 4]]) -> Option<RgbaFrame> {
         let (w, h) = self.candidate;
-        rgba_of(&sample, w, h).map(|rgba| RgbaFrame::new(t_ms, w, h, rgba))
+        if let Some(sample) = self.candidates.try_pull_sample(gst::ClockTime::ZERO)
+            && let Some(mut rgba) = rgba_of(&sample, w, h)
+        {
+            for &rect in masks {
+                mask(&mut rgba, w, h, rect);
+            }
+            self.last = Some(rgba);
+        }
+        let rgba = self.last.clone()?;
+        Some(RgbaFrame::new(t_ms, w, h, rgba))
     }
 
     /// Sends end-of-stream and waits (a few seconds at most) for the movie to be finished.
     fn finish(self) -> bool {
         let _ = self.pipeline.send_event(gst::event::Eos::new());
-        let finished = self.pipeline.bus().is_some_and(|bus| {
-            bus.timed_pop_filtered(
-                gst::ClockTime::from_seconds(8),
-                &[gst::MessageType::Eos, gst::MessageType::Error],
-            )
-            .is_some_and(|m| matches!(m.view(), gst::MessageView::Eos(_)))
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let message = self.pipeline.bus().and_then(|bus| {
+            loop {
+                // The candidate sink holds end-of-stream back until its last frame is taken.
+                while self
+                    .candidates
+                    .try_pull_sample(gst::ClockTime::ZERO)
+                    .is_some()
+                {}
+                let message = bus.timed_pop_filtered(
+                    gst::ClockTime::from_mseconds(20),
+                    &[gst::MessageType::Eos, gst::MessageType::Error],
+                );
+                if message.is_some() || Instant::now() >= deadline {
+                    break message;
+                }
+            }
         });
+        let finished = match message.as_ref().map(|m| m.view()) {
+            Some(gst::MessageView::Eos(_)) => true,
+            Some(gst::MessageView::Error(error)) => {
+                scrawl_log(format!("Movie failed to finish: {}", error.error()));
+                false
+            }
+            _ => {
+                scrawl_log("Movie failed to finish: no end of stream within 8 s");
+                false
+            }
+        };
         let _ = self.pipeline.set_state(gst::State::Null);
         finished && self.video
     }
@@ -272,6 +303,45 @@ fn rgba_of(sample: &gst::Sample, width: u32, height: u32) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Paints `rect` (frame pixels) over with the row just below it (or above, at the bottom).
+fn mask(rgba: &mut [u8], width: u32, height: u32, rect: [f64; 4]) {
+    let (w, h) = (width as usize, height as usize);
+    let x0 = (rect[0].floor().max(0.0) as usize).min(w);
+    let y0 = (rect[1].floor().max(0.0) as usize).min(h);
+    let x1 = ((rect[0] + rect[2]).ceil().max(0.0) as usize).min(w);
+    let y1 = ((rect[1] + rect[3]).ceil().max(0.0) as usize).min(h);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let source = if y1 < h {
+        y1
+    } else if y0 > 0 {
+        y0 - 1
+    } else {
+        return;
+    };
+    let row: Vec<u8> = rgba[(source * w + x0) * 4..(source * w + x1) * 4].to_vec();
+    for y in y0..y1 {
+        rgba[(y * w + x0) * 4..(y * w + x1) * 4].copy_from_slice(&row);
+    }
+}
+
+/// Scrawl's floating windows (the pill) over `frame` (global pixels), in the candidates' pixels:
+/// X11 and GNOME record every window, so the candidates leave them out to keep the pill's clock
+/// from counting as activity. The ink overlay and picker cover a whole monitor and are skipped.
+fn own_window_masks(ids: &[u32], frame: [f64; 4], candidate: (u32, u32)) -> Vec<[f64; 4]> {
+    let [fx, fy, fw, fh] = frame;
+    let (sx, sy) = (f64::from(candidate.0) / fw, f64::from(candidate.1) / fh);
+    ids.iter()
+        .filter_map(|&id| super::window_info(id as isize))
+        .filter(|w| w.on_screen() && w.rect[2] * w.rect[3] < fw * fh * 0.5)
+        .map(|w| {
+            let [x, y, ww, wh] = w.rect;
+            [(x - fx) * sx, (y - fy) * sy, ww * sx, wh * sy]
+        })
+        .collect()
+}
+
 /// The recording thread: see `crate::capture::Sampler`.
 pub fn run_sampler(sampler: Sampler) -> Option<PathBuf> {
     let Sampler {
@@ -282,7 +352,7 @@ pub fn run_sampler(sampler: Sampler) -> Option<PathBuf> {
         urgent,
         frames,
         video_offset_ms,
-        ..
+        excluded_window_ids,
     } = sampler;
     let long_edge = if target.mode == CaptureMode::Display {
         2560.0
@@ -325,7 +395,25 @@ pub fn run_sampler(sampler: Sampler) -> Option<PathBuf> {
         .unwrap_or_else(Instant::now);
     let mut phase = 0_u32;
     let mut offset_set = false;
+    let records_others = !matches!(
+        recorder.as_ref().map(|(_, source)| source),
+        Some(Source::X11Window { .. })
+    );
+    let f = target.frame;
+    let mut masks = (Instant::now(), Vec::new());
+    let mut masks_read = false;
     while !stopping.load(Ordering::Acquire) {
+        if records_others && (!masks_read || masks.0.elapsed() >= Duration::from_millis(500)) {
+            let ids = excluded_window_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            masks = (
+                Instant::now(),
+                own_window_masks(&ids, [f.x, f.y, f.width, f.height], candidate),
+            );
+            masks_read = true;
+        }
         if let Some((r, _)) = recorder.as_ref() {
             if let Some(error) = r.error() {
                 scrawl_log(format!("Recording failed: {error}"));
@@ -351,16 +439,21 @@ pub fn run_sampler(sampler: Sampler) -> Option<PathBuf> {
             if is_urgent {
                 phase = phase.saturating_add(1);
             }
-            let frame = recorder
-                .as_ref()
-                .and_then(|(r, _)| r.candidate(t_ms))
-                .unwrap_or_else(|| {
-                    crate::render::render_synthetic_demo_frame(1280, 800, t_ms, phase)
-                });
-            frames
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(frame, is_urgent);
+            let frame = match recorder.as_mut() {
+                // No frame from the compositor yet: look again on the next turn.
+                Some((r, _)) => r.candidate(t_ms, &masks.1),
+                None => Some(crate::render::render_synthetic_demo_frame(
+                    1280, 800, t_ms, phase,
+                )),
+            };
+            match frame {
+                Some(frame) => frames
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(frame, is_urgent),
+                None if is_urgent => urgent.store(true, Ordering::Release),
+                None => {}
+            }
         }
         std::thread::park_timeout(Duration::from_millis(8));
     }
@@ -599,6 +692,19 @@ mod tests {
         assert_eq!(rgba, vec![255; 2 * 4]);
         let (w, h, _) = shrink_to_edge(4, 2, vec![0; 32], 0);
         assert_eq!((w, h), (4, 2));
+    }
+
+    #[test]
+    fn masks_take_the_row_below() {
+        // 3x3, each row its own grey; the pill over the top two rows' middle.
+        let mut rgba: Vec<u8> = (0..3).flat_map(|y| [y as u8 * 100; 12]).collect();
+        mask(&mut rgba, 3, 3, [1.0, 0.0, 1.0, 2.0]);
+        assert_eq!(rgba[4], 200);
+        assert_eq!(rgba[16], 200);
+        assert_eq!(rgba[0], 0);
+        // At the bottom it takes the row above.
+        mask(&mut rgba, 3, 3, [0.0, 2.0, 1.0, 1.0]);
+        assert_eq!(rgba[24], 100);
     }
 
     #[test]

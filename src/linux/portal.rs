@@ -380,14 +380,10 @@ pub fn bind_gnome_keybindings(bindings: &[(&str, String)]) -> Result<()> {
             paths.push(path.clone());
         }
         let schema = format!("{GNOME_KEYS}.custom-keybinding:{path}");
-        gsettings(&["set", &schema, "name", &format!("Scrawl: {id}")])?;
-        gsettings(&[
-            "set",
-            &schema,
-            "command",
-            &format!("'{}' shortcut {id}", exe.display()),
-        ])?;
-        gsettings(&["set", &schema, "binding", binding])?;
+        let command = format!("'{}' shortcut {id}", exe.display());
+        gsettings(&["set", &schema, "name", &gvariant_string(&format!("Scrawl: {id}"))])?;
+        gsettings(&["set", &schema, "command", &gvariant_string(&command)])?;
+        gsettings(&["set", &schema, "binding", &gvariant_string(binding)])?;
     }
     let value = format!(
         "[{}]",
@@ -399,6 +395,11 @@ pub fn bind_gnome_keybindings(bindings: &[(&str, String)]) -> Result<()> {
     );
     gsettings(&["set", GNOME_KEYS, "custom-keybindings", &value])?;
     Ok(())
+}
+
+/// A string as GVariant text, which `gsettings set` reads: `"…"` with `\\` and `"` escaped.
+fn gvariant_string(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 // MARK: Keystrokes
@@ -462,5 +463,7 @@ mod tests {
         let mods = CARBON_OPTION_KEY | CARBON_SHIFT_KEY;
         assert_eq!(portal_trigger(mods, "S"), "ALT+SHIFT+s");
         assert_eq!(gnome_binding(mods, "S"), "<Alt><Shift>s");
+        assert_eq!(gvariant_string("'/a b/scrawl' shortcut record"), "\"'/a b/scrawl' shortcut record\"");
+        assert_eq!(gvariant_string(r#"say "hi"\"#), r#""say \"hi\"\\""#);
     }
 }

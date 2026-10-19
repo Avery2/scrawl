@@ -536,7 +536,32 @@ pub fn float(id: u32, rect: [f64; 4]) {
     let Some(x) = x() else {
         return;
     };
+    // GPUI's map is a request the window manager answers in its own time: let it finish, so it
+    // doesn't map the window again after it's been taken over.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    while std::time::Instant::now() < deadline
+        && x.conn
+            .get_window_attributes(id)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|a| a.map_state != MapState::VIEWABLE)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     let _ = x.conn.unmap_window(id);
+    // The window manager takes its frame off (reparenting the window back to the root) in its
+    // own time; until it has, GNOME on Wayland would keep drawing the window at the frame's
+    // offset.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    while std::time::Instant::now() < deadline
+        && x.conn
+            .query_tree(id)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|tree| tree.parent != x.root)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     let _ = x.conn.change_window_attributes(
         id,
         &ChangeWindowAttributesAux::new().override_redirect(1),
@@ -653,14 +678,56 @@ pub fn set_click_through(id: u32, through: bool) {
     x.flush();
 }
 
-/// The X11 window id of a GPUI window.
+/// Scrawl's own windows that GPUI made, at the top level or one down (in a window manager's
+/// frame).
+fn own_gpui_windows(x: &X) -> Vec<Window> {
+    let pid = std::process::id();
+    let children = |window: Window| -> Vec<Window> {
+        x.conn
+            .query_tree(window)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|tree| tree.children)
+            .unwrap_or_default()
+    };
+    children(x.root)
+        .into_iter()
+        .flat_map(|top| std::iter::once(top).chain(children(top)))
+        .filter(|&id| x.property32(id, "_NET_WM_PID").first() == Some(&pid))
+        .collect()
+}
+
+/// GPUI windows' X11 ids, by GPUI window id.
+static GPUI_WINDOWS: Mutex<Option<HashMap<u64, Window>>> = Mutex::new(None);
+
+/// The X11 window id of a GPUI window. GPUI 0.2.2 doesn't hand out its X11 window's handle, so
+/// the first time a window is asked about (right after it opens), it's the newest window of
+/// this process not yet known. Called from the window's build callback, that is the window
+/// just made.
 pub fn window_id(window: &gpui::Window) -> Option<u32> {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    match HasWindowHandle::window_handle(window).ok()?.as_raw() {
-        RawWindowHandle::Xcb(handle) => Some(handle.window.get()),
-        RawWindowHandle::Xlib(handle) => Some(handle.window as u32),
-        _ => None,
+    let key = window.window_handle().window_id().as_u64();
+    let x = x()?;
+    let mut slot = GPUI_WINDOWS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let known = slot.get_or_insert_with(HashMap::new);
+    if let Some(&id) = known.get(&key) {
+        return Some(id);
     }
+    // Forget windows that have closed.
+    known.retain(|_, id| {
+        x.conn
+            .get_window_attributes(*id)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some()
+    });
+    let fresh = own_gpui_windows(x)
+        .into_iter()
+        .filter(|id| !known.values().any(|v| v == id))
+        .max()?;
+    known.insert(key, fresh);
+    Some(fresh)
 }
 
 /// Sets a window's `WM_CLASS`, so docks and the window switcher match it to `scrawl.desktop`.

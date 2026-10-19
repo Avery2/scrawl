@@ -760,7 +760,7 @@ fn shortcut_key(cfg: &ShortcutConfig) -> String {
 fn bind_gnome(record: &ShortcutConfig, paste: &ShortcutConfig, paused: bool) -> anyhow::Result<()> {
     let binding = |cfg: &ShortcutConfig| {
         if paused {
-            "''".to_owned()
+            String::new()
         } else {
             linux::portal::gnome_binding(cfg.carbon_modifiers, &shortcut_key(cfg))
         }

@@ -24,14 +24,26 @@ pub mod code {
     pub const KEY_RIGHTMETA: u16 = 126;
     pub const BTN_LEFT: u16 = 0x110;
     pub const BTN_RIGHT: u16 = 0x111;
+    pub const BTN_TOOL_FINGER: u16 = 0x145;
+    pub const BTN_TOUCH: u16 = 0x14a;
 }
 
 const EV_KEY: u16 = 0x01;
+const EV_REL: u16 = 0x02;
+const EV_ABS: u16 = 0x03;
+const ABS_X: u16 = 0x00;
+const ABS_Y: u16 = 0x01;
+const REL_X: u16 = 0x00;
+const REL_Y: u16 = 0x01;
 
 /// What is held down right now, across every keyboard and mouse.
 #[derive(Clone, Debug, Default)]
 pub struct Held {
     pub keys: HashSet<u16>,
+    /// Where an absolute pointing device (a tablet, a touchscreen, a virtual machine's or remote
+    /// desktop's pointer) last put the pointer, 0–1 across the desktop; `None` once a mouse or
+    /// touchpad has moved it since.
+    pub absolute: Option<[f64; 2]>,
 }
 
 impl Held {
@@ -113,6 +125,27 @@ fn interesting(fd: &OwnedFd) -> bool {
     })
 }
 
+/// `EVIOCGABS(axis)`: an absolute axis's range, `None` when the device has none.
+fn abs_range(fd: &OwnedFd, axis: u16) -> Option<(i32, i32)> {
+    // struct input_absinfo: value, minimum, maximum, fuzz, flat, resolution.
+    let mut info = [0_i32; 6];
+    let request = (2_u64 << 30) | (24 << 16) | (u64::from(b'E') << 8) | (0x40 + u64::from(axis));
+    // SAFETY: the kernel writes one `input_absinfo` (24 bytes) into `info`.
+    let n = unsafe { libc::ioctl(fd.as_raw_fd(), request as _, info.as_mut_ptr()) };
+    (n >= 0 && info[2] > info[1]).then_some((info[1], info[2]))
+}
+
+/// A device that points at absolute positions (not a touchpad, whose axes are the pad's).
+fn absolute_axes(fd: &OwnedFd) -> Option<[(i32, i32); 2]> {
+    let bits = key_bits(fd)?;
+    if has_key(&bits, code::BTN_TOOL_FINGER)
+        || !(has_key(&bits, code::BTN_LEFT) || has_key(&bits, code::BTN_TOUCH))
+    {
+        return None;
+    }
+    Some([abs_range(fd, ABS_X)?, abs_range(fd, ABS_Y)?])
+}
+
 /// Whether Scrawl may read at least one keyboard or mouse.
 pub fn devices_readable() -> bool {
     event_devices()
@@ -145,6 +178,12 @@ pub fn start() -> bool {
         .is_some()
 }
 
+/// Where an absolute pointing device put the pointer, 0–1 across the desktop, unless a mouse
+/// has moved it since.
+pub fn absolute_pointer() -> Option<[f64; 2]> {
+    held()?.absolute
+}
+
 /// What is held, when the devices are being read.
 pub fn held() -> Option<Held> {
     READER.get()?.as_ref().map(|r| {
@@ -158,6 +197,7 @@ pub fn held() -> Option<Held> {
 fn read_loop(fds: Vec<OwnedFd>) {
     // struct input_event on 64-bit Linux: timeval (16), type (2), code (2), value (4).
     const SIZE: usize = 24;
+    let axes: Vec<Option<[(i32, i32); 2]>> = fds.iter().map(absolute_axes).collect();
     let mut polls: Vec<libc::pollfd> = fds
         .iter()
         .map(|fd| libc::pollfd {
@@ -174,7 +214,7 @@ fn read_loop(fds: Vec<OwnedFd>) {
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }
-        for poll in &mut polls {
+        for (poll, axes) in polls.iter_mut().zip(&axes) {
             if poll.revents & libc::POLLIN == 0 {
                 continue;
             }
@@ -187,20 +227,30 @@ fn read_loop(fds: Vec<OwnedFd>) {
                 let kind = u16::from_ne_bytes([event[16], event[17]]);
                 let code = u16::from_ne_bytes([event[18], event[19]]);
                 let value = i32::from_ne_bytes([event[20], event[21], event[22], event[23]]);
-                if kind != EV_KEY || value == 2 {
+                let Some(reader) = READER.get().and_then(Option::as_ref) else {
                     continue;
-                }
-                let down = value == 1;
-                if let Some(reader) = READER.get().and_then(Option::as_ref) {
-                    let mut held = reader
-                        .held
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if down {
-                        held.keys.insert(code);
-                    } else {
-                        held.keys.remove(&code);
+                };
+                let mut held = reader
+                    .held
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match (kind, axes) {
+                    (EV_KEY, _) if value != 2 => {
+                        if value == 1 {
+                            held.keys.insert(code);
+                        } else {
+                            held.keys.remove(&code);
+                        }
                     }
+                    (EV_ABS, Some(ranges)) if code == ABS_X || code == ABS_Y => {
+                        let (min, max) = ranges[usize::from(code)];
+                        let at = f64::from(value - min) / f64::from(max - min);
+                        let mut point = held.absolute.unwrap_or([0.5, 0.5]);
+                        point[usize::from(code)] = at.clamp(0.0, 1.0);
+                        held.absolute = Some(point);
+                    }
+                    (EV_REL, _) if code == REL_X || code == REL_Y => held.absolute = None,
+                    _ => {}
                 }
             }
         }
