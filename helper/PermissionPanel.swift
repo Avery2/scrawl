@@ -342,6 +342,8 @@ extension PermissionPanel {
     let appName: String
     let icon: NSImage
     let interactive: Bool
+    /// The list already shows the app, switched off.
+    var listed = false
     let dragView: () -> NSView
 
     var body: some View {
@@ -398,7 +400,13 @@ extension PermissionPanel {
     }
 
     private var dragText: Text {
-      Text("Drag ").foregroundStyle(.secondary)
+      if listed {
+        // macOS already lists the app, switched off; dropping it on the list switches it on.
+        return Text("Switch on ").foregroundStyle(.secondary)
+          + Text(appName).foregroundStyle(.primary).fontWeight(.medium)
+          + Text(" in the list above, or drag it there").foregroundStyle(.secondary)
+      }
+      return Text("Drag ").foregroundStyle(.secondary)
         + Text(appName).foregroundStyle(.primary).fontWeight(.medium)
         + Text(" to the list above to allow ").foregroundStyle(.secondary)
         + Text(kind.title).foregroundStyle(.primary).fontWeight(.medium)
@@ -698,6 +706,9 @@ extension PermissionPanel {
     let reduceMotion: Bool
     let appName: String
     let icon: NSImage
+    /// Input Monitoring reads denied once Scrawl has made its event tap without the grant, which
+    /// lists it in the pane, switched off.
+    let listed: Bool
 
     private var layout = Layout(settingsWidth: 740)
     private var panel: OverlayPanel?
@@ -725,6 +736,7 @@ extension PermissionPanel {
       let icon = NSWorkspace.shared.icon(forFile: appURL.path)
       icon.size = NSSize(width: 64, height: 64)
       self.icon = icon
+      listed = kind == .inputMonitoring && IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeDenied
     }
 
     func applicationDidFinishLaunching(_: Notification) {
@@ -811,7 +823,7 @@ extension PermissionPanel {
       dragSource.onEnded = { [weak self] operation in self?.dragEnded(operation) }
       let content = CardContent(
         model: model, kind: kind, layout: layout, appName: appName, icon: icon,
-        interactive: interactive, dragView: { dragSource }
+        interactive: interactive, listed: listed, dragView: { dragSource }
       )
       let host = NSHostingView(rootView: content)
       host.sizingOptions = []
