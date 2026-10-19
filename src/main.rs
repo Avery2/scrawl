@@ -19,6 +19,7 @@ mod keyframes;
 #[cfg(target_os = "macos")]
 mod laser_overlay;
 mod live_transcribe;
+mod mic;
 mod model;
 mod native;
 mod onboarding;
@@ -113,6 +114,36 @@ fn hex_status() {
             _ => transcribe::LOCAL_ENGINE_TITLE.to_owned(),
         }
     );
+}
+
+#[derive(Subcommand)]
+enum MicCommand {
+    /// The connected microphones (id, name), marking the default and the one recordings use.
+    List,
+    /// Record from this device id, or `default` to follow macOS.
+    Set { id: String },
+    /// Print the list again whenever an input is plugged in or out or the default changes.
+    Watch,
+}
+
+fn mic_list() {
+    let inputs = mic::inputs();
+    let choice = mic::choice();
+    let pick = mic::Pick::new(choice.as_ref(), &inputs);
+    let using = pick.device().map(|d| d.id.clone());
+    for input in &inputs.devices {
+        let mut tags = Vec::new();
+        if inputs.default.as_deref() == Some(input.id.as_str()) {
+            tags.push("default");
+        }
+        if using.as_deref() == Some(input.id.as_str()) {
+            tags.push("recording");
+        }
+        println!("{}\t{}\t{}", input.id, input.name, tags.join(","));
+    }
+    if let Some(note) = pick.note() {
+        println!("{note}");
+    }
 }
 
 #[derive(Subcommand)]
@@ -262,6 +293,11 @@ enum Command {
     Tune {
         #[command(subcommand)]
         command: Option<TuneCommand>,
+    },
+    /// List microphones or choose the one Mac captures record from (Settings › Recording).
+    Mic {
+        #[command(subcommand)]
+        command: MicCommand,
     },
     /// Check the Hex transcriber: is it running, which models are ready, which one Scrawl uses.
     Hex {
@@ -1820,6 +1856,34 @@ fn main() -> Result<()> {
             TuneCommand::Reset => ui::TuneAction::Reset,
             TuneCommand::Rust => ui::TuneAction::Rust,
         }),
+        Command::Mic {
+            command: MicCommand::List,
+        } => {
+            mic_list();
+            Ok(())
+        }
+        Command::Mic {
+            command: MicCommand::Watch,
+        } => {
+            let _watch = mic::Watch::start(|| {
+                println!("[{}]", now_epoch_ms());
+                mic_list();
+            });
+            loop {
+                std::thread::park();
+            }
+        }
+        Command::Mic {
+            command: MicCommand::Set { id },
+        } => {
+            let inputs = mic::inputs();
+            if id != "default" && inputs.find(&id).is_none() {
+                anyhow::bail!("No connected microphone has id {id}; see `scrawl mic list`");
+            }
+            mic::save_in(&handoff::default_config_path(), &id, &inputs)?;
+            mic_list();
+            Ok(())
+        }
         Command::Hex {
             command: HexCommand::Status,
         } => {

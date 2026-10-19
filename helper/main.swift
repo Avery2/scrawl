@@ -1,7 +1,8 @@
 // scrawl-helper: the parts of Scrawl that need Swift-only Apple frameworks.
 //
 //   scrawl-helper devices                               cabled iPhones/iPads (USB registry) as JSON
-//   scrawl-helper mirror --out FILE.mov [--device ID]   live mirror window + native recording (JSON lines)
+//   scrawl-helper mirror --out FILE.mov [--device ID] [--microphone UID --microphone-name NAME]
+//                                                       live mirror window + native recording (JSON lines)
 //   scrawl-helper transcribe FILE                       SpeechAnalyzer transcript with word timings
 //   scrawl-helper transcribe-stream                     the same while recording: PCM on stdin, JSON lines (LiveTranscribe.swift)
 //   scrawl-helper frames MOVIE --out-dir DIR (--every MS | --at MS,MS…) [--max-edge PX]
@@ -110,7 +111,10 @@ case "mirror":
   let hidden = arguments.contains("--hidden")
   let out = option("--out", in: arguments).map { URL(filePath: $0) }
   if !preview && out == nil { fail("mirror needs --out FILE.mov or --preview") }
-  Mirror.run(output: out, previewOnly: preview, hiddenPreview: hidden, deviceID: option("--device", in: arguments))
+  Mirror.run(
+    output: out, previewOnly: preview, hiddenPreview: hidden, deviceID: option("--device", in: arguments),
+    microphone: option("--microphone", in: arguments).map { ($0, option("--microphone-name", in: arguments) ?? $0) }
+  )
 case "transcribe":
   guard arguments.count >= 2 else { fail("transcribe needs a file") }
   runAsync { emit(try await Transcriber.transcribe(URL(filePath: arguments[1]))) }

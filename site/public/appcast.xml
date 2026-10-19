@@ -3,6 +3,18 @@
     <channel>
         <title>Scrawl</title>
         <item>
+            <title>0.3.4</title>
+            <pubDate>Mon, 19 Oct 2026 13:26:04 -0700</pubDate>
+            <sparkle:version>7</sparkle:version>
+            <sparkle:shortVersionString>0.3.4</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl-0.3.4-arm64.zip" length="9186250" type="application/octet-stream" sparkle:edSignature="gyaFGuxqFkW+ckY07+138GT8h96+PfuHup2gLaF/7nLDuf6JvN0TJYlcrGFlekcgMCskF7ea4MMkR33pLdWSDQ=="/>
+            <sparkle:deltas>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl7-6.delta" sparkle:deltaFrom="6" length="1487150" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="78htpTEw1CpJQTObGsCHsyGZxcIqp+EvbAU36qBY70hRO/yFLlqUSx+RrJ5lDU8sC5WiMMbSLk1U0JMkGxpqBQ=="/>
+            </sparkle:deltas>
+        </item>
+        <item>
             <title>0.3.3</title>
             <pubDate>Mon, 19 Oct 2026 01:45:03 -0700</pubDate>
             <sparkle:version>6</sparkle:version>

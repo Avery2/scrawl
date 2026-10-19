@@ -871,17 +871,25 @@ fn handle_hook_event(telemetry: &SharedCaptureTelemetry, event: HookEvent) {
             y,
             pure_shift,
         } => {
-            if !telemetry.active.load(Ordering::Acquire) || pure_shift {
+            if !telemetry.active.load(Ordering::Acquire) {
                 return;
             }
             let t_ms = telemetry.elapsed_ms();
+            // A Shift-press is never a click: a Shift-click drops a pin, a Shift-drag is ink.
             if down {
                 // Scrawl's own controls (the HUD) aren't part of what is being shown.
                 if !telemetry.on_scrawl_window(x, y) {
-                    telemetry.pointer_down(t_ms, x, y);
+                    if !pure_shift {
+                        telemetry.pointer_down(t_ms, x, y);
+                    } else if !right {
+                        telemetry.shift_down(t_ms, x, y);
+                    }
                 }
             } else {
-                telemetry.pointer_up(t_ms, x, y, right);
+                let shift_press = !right && telemetry.shift_up(t_ms, x, y);
+                if !shift_press && !pure_shift {
+                    telemetry.pointer_up(t_ms, x, y, right);
+                }
             }
         }
         HookEvent::Wheel { x, y, dx, dy } => {
