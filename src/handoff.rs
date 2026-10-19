@@ -317,6 +317,9 @@ pub struct Config {
     /// Feature flag: shows **Export Last Capture as Video…** in the menu (default off).
     #[serde(default)]
     pub video_export: Option<bool>,
+    /// `true` gives Scrawl a Dock icon; by default it lives in the menu bar only.
+    #[serde(default)]
+    pub show_in_dock: Option<bool>,
     /// `"apple"` (default) or `"hex"`: which engine transcribes recordings (`transcribe`).
     #[serde(default)]
     pub transcriber: Option<String>,
@@ -439,6 +442,11 @@ pub fn auto_send() -> bool {
 /// either way.
 pub fn video_export() -> bool {
     config().video_export.unwrap_or(false)
+}
+
+/// Whether Scrawl shows a Dock icon (`showInDock`, default off).
+pub fn show_in_dock() -> bool {
+    config().show_in_dock.unwrap_or(false)
 }
 
 /// The configured transcriber name (`transcriber`) as written, unvalidated.

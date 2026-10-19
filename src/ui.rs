@@ -5632,6 +5632,30 @@ pub fn run_start_benchmark() {
     });
 }
 
+/// Shows or hides the Dock icon (`showInDock`). Info.plist's `LSUIElement` starts Scrawl as a
+/// menu bar app, but gpui 0.2.2 makes it a regular Dock app once launched, so this runs after
+/// that and again when the setting changes.
+pub fn set_dock_icon(show: bool) {
+    use objc2_app_kit::NSApplicationActivationPolicy as Policy;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let policy = if show {
+        Policy::Regular
+    } else {
+        Policy::Accessory
+    };
+    if app.activationPolicy() != policy {
+        app.setActivationPolicy(policy);
+    }
+    scrawl_log(format!(
+        "Dock icon {}: activation policy {:?}",
+        if show { "shown" } else { "hidden" },
+        app.activationPolicy()
+    ));
+}
+
 /// Runs the GPUI desktop app, optionally opening an initial `.scrawl` bundle in the Review window
 /// or starting recording immediately.
 pub fn run_app(
@@ -5643,6 +5667,7 @@ pub fn run_app(
     let app = Application::new().with_assets(crate::icons::Assets);
     app.run(move |cx: &mut App| {
         scrawl_log(format!("run_app started pid={}", std::process::id()));
+        set_dock_icon(crate::handoff::show_in_dock());
         let (ui_sender, ui_receiver) = flume::unbounded();
         crate::phone::start_ingest_server(ui_sender.clone());
         let telemetry = SharedCaptureTelemetry::new(ui_sender);
