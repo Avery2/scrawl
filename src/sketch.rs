@@ -216,7 +216,7 @@ pub fn describe_mark(mark: &Mark) -> String {
 
 /// A label in curly quotes, unless it already quotes its own parts (`button “Area” #area` from
 /// `crate::ax`, `<div.capsule> in Pill (src/Pill.tsx:42)` from `crate::page`).
-fn quote_label(label: &str) -> String {
+pub(crate) fn quote_label(label: &str) -> String {
     if label.contains('“') || label.starts_with('<') {
         label.to_owned()
     } else {
@@ -294,7 +294,7 @@ pub fn settled_events(events: &[InteractionEvent]) -> Vec<InteractionEvent> {
     out
 }
 
-fn direction(dx: f32, dy: f32, threshold: f32) -> String {
+pub(crate) fn direction(dx: f32, dy: f32, threshold: f32) -> String {
     let h = if dx.abs() > threshold {
         if dx > 0.0 { "right" } else { "left" }
     } else {
