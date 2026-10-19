@@ -241,32 +241,7 @@ impl SharedMetalOverlay {
             f64::from(height * scale),
         ));
 
-        let library = device
-            .new_library_with_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/laser_overlay.metallib"
-            )))
-            .map_err(|e| format!("Could not load laser shader library: {e}"))?;
-        let vertex = library
-            .get_function("laser_vertex", None)
-            .map_err(|e| format!("Could not load laser_vertex: {e}"))?;
-        let fragment = library
-            .get_function("laser_fragment", None)
-            .map_err(|e| format!("Could not load laser_fragment: {e}"))?;
-
-        let descriptor = RenderPipelineDescriptor::new();
-        descriptor.set_vertex_function(Some(&vertex));
-        descriptor.set_fragment_function(Some(&fragment));
-        let attachment = descriptor
-            .color_attachments()
-            .object_at(0)
-            .ok_or("Missing color attachment")?;
-        attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        attachment.set_blending_enabled(false);
-
-        let pipeline = device
-            .new_render_pipeline_state(&descriptor)
-            .map_err(|e| format!("Could not create laser pipeline: {e}"))?;
+        let pipeline = overlay_pipeline(&device)?;
 
         Ok(Self {
             telemetry,
@@ -521,32 +496,82 @@ impl SharedMetalOverlay {
             };
 
             let cmd = renderer.command_queue.new_command_buffer();
-            let enc = cmd.new_render_command_encoder(pass);
-            enc.set_render_pipeline_state(&renderer.pipeline);
-            enc.set_fragment_bytes(
-                0,
-                size_of::<LaserUniforms>() as u64,
-                (&raw const uniforms).cast(),
+            encode_overlay(
+                cmd,
+                pass,
+                &renderer.device,
+                &renderer.pipeline,
+                &uniforms,
+                &segments,
+                &pins,
             );
-            // Up to MAX_SEGMENTS * 32 B = 48 KB, past the 4 KB `set_fragment_bytes` limit (128
-            // segments), so segments go in a buffer. Metal retains it until the command buffer completes.
-            let segment_buffer = renderer.device.new_buffer_with_data(
-                segments.as_ptr().cast(),
-                (segments.len() * size_of::<PathSegment>()) as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
-            enc.set_fragment_buffer(1, Some(&segment_buffer), 0);
-            enc.set_fragment_bytes(
-                2,
-                (pins.len() * size_of::<PinMarker>()) as u64,
-                pins.as_ptr().cast(),
-            );
-            enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
-            enc.end_encoding();
             cmd.present_drawable(drawable);
             cmd.commit();
         });
     }
+}
+
+fn overlay_pipeline(device: &metal::DeviceRef) -> Result<RenderPipelineState, String> {
+    let library = device
+        .new_library_with_data(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/laser_overlay.metallib"
+        )))
+        .map_err(|e| format!("Could not load laser shader library: {e}"))?;
+    let vertex = library
+        .get_function("laser_vertex", None)
+        .map_err(|e| format!("Could not load laser_vertex: {e}"))?;
+    let fragment = library
+        .get_function("laser_fragment", None)
+        .map_err(|e| format!("Could not load laser_fragment: {e}"))?;
+
+    let descriptor = RenderPipelineDescriptor::new();
+    descriptor.set_vertex_function(Some(&vertex));
+    descriptor.set_fragment_function(Some(&fragment));
+    let attachment = descriptor
+        .color_attachments()
+        .object_at(0)
+        .ok_or("Missing color attachment")?;
+    attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+    attachment.set_blending_enabled(false);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .map_err(|e| format!("Could not create laser pipeline: {e}"))
+}
+
+fn encode_overlay(
+    cmd: &metal::CommandBufferRef,
+    pass: &metal::RenderPassDescriptorRef,
+    device: &metal::DeviceRef,
+    pipeline: &RenderPipelineState,
+    uniforms: &LaserUniforms,
+    segments: &[PathSegment],
+    pins: &[PinMarker],
+) {
+    let enc = cmd.new_render_command_encoder(pass);
+    enc.set_render_pipeline_state(pipeline);
+    enc.set_fragment_bytes(
+        0,
+        size_of::<LaserUniforms>() as u64,
+        std::ptr::from_ref(uniforms).cast(),
+    );
+    // Up to MAX_SEGMENTS * 32 B = 48 KB, past the 4 KB `set_fragment_bytes` limit (128
+    // segments), so segments go in a fresh buffer each frame. The command buffer retains it
+    // until the GPU is done, so a frame never overwrites one still being read.
+    let segment_buffer = device.new_buffer_with_data(
+        segments.as_ptr().cast(),
+        (segments.len() * size_of::<PathSegment>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    enc.set_fragment_buffer(1, Some(&segment_buffer), 0);
+    enc.set_fragment_bytes(
+        2,
+        (pins.len() * size_of::<PinMarker>()) as u64,
+        pins.as_ptr().cast(),
+    );
+    enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
+    enc.end_encoding();
 }
 
 #[cfg(test)]
@@ -561,6 +586,89 @@ mod tests {
     fn inline_fragment_bytes_fit_the_metal_limit() {
         assert!(size_of::<LaserUniforms>() <= SET_BYTES_LIMIT);
         assert!(MAX_PINS * size_of::<PinMarker>() <= SET_BYTES_LIMIT);
+    }
+
+    /// Renders the real shader offscreen with `MAX_SEGMENTS` segments (48 KB, which aborted in
+    /// `setFragmentBytes`). Only the last segment is on screen, so the ink shows only if the
+    /// shader read the whole array.
+    #[test]
+    fn renders_a_full_segment_buffer() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let pipeline = overlay_pipeline(&device).expect("pipeline");
+        let size = 64;
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_width(size);
+        descriptor.set_height(size);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+        let texture = device.new_texture(&descriptor);
+
+        let off_screen = PathSegment {
+            a: [-500.0, -500.0],
+            b: [-400.0, -500.0],
+            w0: 1.0,
+            w1: 1.0,
+            kind: 1.0,
+            width: 1.0,
+        };
+        let mut segments = vec![off_screen; MAX_SEGMENTS];
+        segments[MAX_SEGMENTS - 1] = PathSegment {
+            a: [0.0, 32.0],
+            b: [64.0, 32.0],
+            ..off_screen
+        };
+        let uniforms = LaserUniforms {
+            resolution: [size as f32, size as f32],
+            scale: 1.0,
+            now_sec: 1.0,
+            tail_duration: 1.0,
+            tip_active: 0.0,
+            tip_pos: [0.0, 0.0],
+            segment_count: MAX_SEGMENTS as u32,
+            pin_count: 0,
+            constrain_rect: 0.0,
+            _pad1: 0.0,
+            target_rect: [0.0, 0.0, size as f32, size as f32],
+            glow: [0.0; 4],
+        };
+
+        let pass = RenderPassDescriptor::new();
+        let attachment = pass.color_attachments().object_at(0).unwrap();
+        attachment.set_texture(Some(&texture));
+        attachment.set_load_action(MTLLoadAction::Clear);
+        attachment.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0));
+        attachment.set_store_action(MTLStoreAction::Store);
+        let queue = device.new_command_queue();
+        let cmd = queue.new_command_buffer();
+        encode_overlay(
+            cmd,
+            pass,
+            &device,
+            &pipeline,
+            &uniforms,
+            &segments,
+            &[PinMarker::default()],
+        );
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let mut pixels = vec![0u8; (size * size * 4) as usize];
+        texture.get_bytes(
+            pixels.as_mut_ptr().cast(),
+            size * 4,
+            metal::MTLRegion::new_2d(0, 0, size, size),
+            0,
+        );
+        let bgra = |x: u64, y: u64| {
+            let i = ((y * size + x) * 4) as usize;
+            [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+        };
+        let [b, g, r, a] = bgra(32, 32);
+        assert!(a > 200 && r > 200 && g < 100 && b < 100, "stroke pixel {:?}", [b, g, r, a]);
+        assert_eq!(bgra(32, 4)[3], 0, "nothing drawn away from the stroke");
     }
 
     /// The shader must load on the oldest macOS Scrawl supports (`LSMinimumSystemVersion` 26.0).
