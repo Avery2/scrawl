@@ -314,8 +314,19 @@ pub enum LiveOverlayEvent {
 
 static LAYOUT_KEY_CODES: std::sync::OnceLock<std::collections::HashMap<char, u16>> =
     std::sync::OnceLock::new();
+/// The reverse view for naming shortcuts: virtual keycode -> the character ⌘ + that key types.
+static LAYOUT_KEY_CHARS: std::sync::OnceLock<std::collections::HashMap<u16, char>> =
+    std::sync::OnceLock::new();
+
+/// `UCKeyTranslate`'s modifier state for ⌘ (`cmdKey >> 8`), so a "Dvorak – QWERTY ⌘" layout
+/// names ⌘ shortcuts by their QWERTY letters, as macOS does.
+const UC_COMMAND_MODIFIER: u32 = 1;
 
 fn translate_keycode(layout: *const u8, key_code: u16) -> Option<char> {
+    translate_keycode_with(layout, key_code, 0)
+}
+
+fn translate_keycode_with(layout: *const u8, key_code: u16, modifier_state: u32) -> Option<char> {
     if layout.is_null() {
         return None;
     }
@@ -327,7 +338,7 @@ fn translate_keycode(layout: *const u8, key_code: u16) -> Option<char> {
             layout,
             key_code,
             3, // kUCKeyActionDisplay
-            0,
+            modifier_state,
             u32::from(LMGetKbdType()),
             0,
             &raw mut dead_key_state,
@@ -352,6 +363,7 @@ fn translate_keycode(layout: *const u8, key_code: u16) -> Option<char> {
 pub fn init_keyboard_layout_map() -> &'static std::collections::HashMap<char, u16> {
     LAYOUT_KEY_CODES.get_or_init(|| {
         let mut map = std::collections::HashMap::new();
+        let mut chars = std::collections::HashMap::new();
         for source in unsafe {
             [
                 TISCopyCurrentKeyboardLayoutInputSource(),
@@ -369,10 +381,16 @@ pub fn init_keyboard_layout_map() -> &'static std::collections::HashMap<char, u1
                     if let Some(ch) = translate_keycode(bytes, code) {
                         map.entry(ch).or_insert(code);
                     }
+                    if let Some(ch) = translate_keycode_with(bytes, code, UC_COMMAND_MODIFIER)
+                        .filter(|c| !c.is_control() && !c.is_whitespace())
+                    {
+                        chars.entry(code).or_insert(ch);
+                    }
                 }
             }
             unsafe { CFRelease(source) };
         }
+        let _ = LAYOUT_KEY_CHARS.set(chars);
         scrawl_log(format!(
             "keyboard layout resolved: 's'={:?} 'z'={:?}",
             map.get(&'s'),
@@ -1236,6 +1254,38 @@ pub fn selectable_window_at(windows: &[TargetInfo], x: f64, y: f64) -> Option<&T
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortcut_keys_are_named_by_the_layout_not_their_qwerty_position() {
+        // Dvorak puts B where QWERTY has N (45) and T where QWERTY has K (40).
+        let dvorak = |code: u16| match code {
+            45 => Some('b'),
+            40 => Some('t'),
+            13 => Some(','),
+            _ => None,
+        };
+        assert_eq!(key_name(45, dvorak).as_deref(), Some("B"));
+        assert_eq!(key_name(40, dvorak).as_deref(), Some("T"));
+        assert_eq!(key_name(13, dvorak).as_deref(), Some(","));
+        // Keys that type nothing keep fixed names whatever the layout says.
+        let odd = |_| Some('x');
+        assert_eq!(key_name(36, odd).as_deref(), Some("↩"));
+        assert_eq!(key_name(123, odd).as_deref(), Some("←"));
+        assert_eq!(key_name(122, odd).as_deref(), Some("F1"));
+        assert_eq!(key_name(53, odd).as_deref(), Some("Esc"));
+    }
+
+    #[test]
+    fn shortcut_keys_fall_back_to_ansi_positions_without_a_layout() {
+        let none = |_| None;
+        assert_eq!(key_name(45, none).as_deref(), Some("N"));
+        assert_eq!(key_name(17, none).as_deref(), Some("T"));
+        assert_eq!(key_name(0, none).as_deref(), Some("A"));
+        assert_eq!(key_name(47, none).as_deref(), Some("."));
+        assert_eq!(key_name(29, none).as_deref(), Some("0"));
+        assert_eq!(key_name(10, none), None);
+        assert_eq!(key_name(200, none), None);
+    }
 
     #[test]
     fn screen_stop_joins_worker_before_collecting_its_final_media() {
@@ -2933,7 +2983,7 @@ unsafe extern "C" fn key_tap_callback(
             if cmd {
                 chord.push('⌘');
             }
-            chord.push_str(key_name);
+            chord.push_str(&key_name);
             telemetry.window_log_request.store(true, Ordering::Release);
             telemetry
                 .events
@@ -3172,32 +3222,59 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
     }
 }
 
-fn shortcut_key_name(keycode: u16) -> Option<&'static str> {
-    match keycode {
-        0 => Some("A"),
-        1 => Some("S"),
-        2 => Some("D"),
-        3 => Some("F"),
-        6 => Some("Z"),
-        7 => Some("X"),
-        8 => Some("C"),
-        9 => Some("V"),
-        11 => Some("B"),
-        12 => Some("Q"),
-        13 => Some("W"),
-        14 => Some("E"),
-        15 => Some("R"),
-        17 => Some("T"),
-        31 => Some("O"),
-        35 => Some("P"),
-        36 => Some("↩"),
-        40 => Some("K"),
-        45 => Some("N"),
-        48 => Some("⇥"),
-        49 => Some("Space"),
-        51 => Some("⌫"),
-        _ => None,
+/// The key of a logged shortcut as the user's keyboard layout labels it (Dvorak's ⌘B, not the
+/// QWERTY ⌘N at the same position).
+fn shortcut_key_name(keycode: u16) -> Option<String> {
+    let _ = init_keyboard_layout_map();
+    let chars = LAYOUT_KEY_CHARS.get();
+    key_name(keycode, |code| chars.and_then(|c| c.get(&code).copied()))
+}
+
+/// Keys that type no character are named the same on every layout; the rest come from
+/// `layout_char` (what ⌘ + the key types), else from the ANSI QWERTY positions.
+fn key_name(keycode: u16, layout_char: impl Fn(u16) -> Option<char>) -> Option<String> {
+    let fixed = match keycode {
+        36 | 76 => "↩",
+        48 => "⇥",
+        49 => "Space",
+        51 => "⌫",
+        53 => "Esc",
+        117 => "⌦",
+        123 => "←",
+        124 => "→",
+        125 => "↓",
+        126 => "↑",
+        115 => "Home",
+        119 => "End",
+        116 => "PgUp",
+        121 => "PgDn",
+        122 => "F1",
+        120 => "F2",
+        99 => "F3",
+        118 => "F4",
+        96 => "F5",
+        97 => "F6",
+        98 => "F7",
+        100 => "F8",
+        101 => "F9",
+        109 => "F10",
+        103 => "F11",
+        111 => "F12",
+        _ => "",
+    };
+    if !fixed.is_empty() {
+        return Some(fixed.to_string());
     }
+    layout_char(keycode)
+        .or_else(|| ansi_key_char(keycode))
+        .map(|c| c.to_uppercase().collect())
+}
+
+fn ansi_key_char(keycode: u16) -> Option<char> {
+    const ANSI: &str = "asdfhgzxcv\0bqweryt123465=97-80]ou[ip\0lj'k;\\,/nm.";
+    ANSI.chars()
+        .nth(usize::from(keycode))
+        .filter(|&c| c != '\0')
 }
 
 /// Writes all bundle artifacts (`scrawl.json`, `summary.md`, `contact-sheet.png`, `frames/frame-XX.png`)
