@@ -71,7 +71,8 @@ already are.
 
 Screen Recording, Input Monitoring and Accessibility are lists you drag an app into, so their
 button skips Apple's prompt: it opens the pane in System Settings, and a card flies from the button
-to just below the Settings window, with its Scrawl row lined up under the list. Drag that row into
+to just below the Settings window (or, with no room on screen there, over the window's empty lower
+area), with its Scrawl row lined up under the list. Drag that row into
 the list. The card follows the window, steps aside when another app is in front, and shows "Scrawl
 is allowed" once a fresh process sees the grant (a drop alone proves nothing). The row drags the
 `Scrawl.app` that contains the helper, the bundle macOS grants. With Reduce Motion on, the card
@@ -652,7 +653,9 @@ target/debug/scrawl-helper permission-panel --permission screen-recording --prev
 (`--from` is the button's frame in global top-left points) prints JSON lines: `docked`, `dropped`,
 then `granted` or `cancelled` with a `reason` (`back`, `settings-closed`, `no-settings-window`,
 `parent`, `timeout`), and exits. On stdin it takes `cancel`, `back` and `granted`.
-`permission-panel --check P` prints `{"granted":…}` from a fresh process.
+`permission-panel --check P` prints `{"granted":…}` from a fresh process. `permission-panel --plan --settings
+X,Y,W,H --visible X,Y,W,H` prints where the card would dock (`below`, `inside`, `right`, `left` or
+`clamped`); `scripts/check-permission-panel-dock.sh` checks the cases.
 
 ## Testing
 

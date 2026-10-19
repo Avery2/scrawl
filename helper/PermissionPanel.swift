@@ -4,10 +4,12 @@
 //   scrawl-helper permission-panel --permission screen-recording|accessibility|input-monitoring
 //                                  [--from X,Y,W,H] [--app PATH] [--preview] [--reduce-motion]
 //   scrawl-helper permission-panel --check PERMISSION        {"granted":true|false} from a fresh process
+//   scrawl-helper permission-panel --plan --settings X,Y,W,H --visible X,Y,W,H   where the card docks
 //
 // It opens the pane in System Settings, waits for its window to settle, flies a card from
-// `--from` (the Grant button, global top-left points like CGWindow bounds) and docks it just
-// below the Settings window with its app row lined up under the Privacy list's column. The row
+// `--from` (the Grant button, global top-left points like CGWindow bounds) and docks it below
+// the Settings window, or inside its empty lower area when there's no room (`dock`), with its
+// app row lined up under the Privacy list's column. The row
 // drags the real Scrawl.app, the bundle that holds the grant. stdin takes `cancel` (fade out;
 // EOF on a pipe does the same), `back` (fly back to `--from`, as the card's back button does) and
 // `granted` (the parent saw the grant first: show it, then fade). Events go to stdout as JSON lines and the last one is either
@@ -53,6 +55,7 @@ enum PermissionPanel {
   // MARK: Entry
 
   static func run(arguments: [String]) -> Never {
+    if arguments.contains("--plan") { printPlan(arguments: arguments) }
     if let raw = option("--check", in: arguments) {
       guard let kind = Kind(rawValue: raw) else { fail("permission-panel --check needs a permission") }
       emit(["granted": kind.isGrantedInThisProcess])
@@ -234,30 +237,61 @@ enum PermissionPanel {
     CGRect(x: r.minX, y: primaryHeight - r.minY - r.height, width: r.width, height: r.height)
   }
 
-  /// Where the card docks: just below the Settings window, its app row lined up under the
-  /// Privacy list's column. It stays outside the window so it never covers a toggle or macOS's
-  /// "Quit & Reopen" sheet: below if there's room, else beside, else along the inside bottom.
-  static func dockFrame(settingsQuartz: CGRect, layout: Layout) -> NSRect {
-    let settings = appKit(fromQuartz: settingsQuartz)
+  enum Dock: String { case below, inside, right, left, clamped }
+
+  /// Where the card docks for a Settings window on a screen, both in AppKit coordinates
+  /// (`visible` is the screen's `visibleFrame`, without the menu bar and Dock). In order:
+  /// - below the window, its app row under the Privacy list's column, if all of it fits;
+  /// - inside the window's empty lower area (the lowest 30% of these panes holds no rows or
+  ///   toggles), on the list's column and 20 pt above its bottom edge, as Codex does;
+  /// - beside it, right then left;
+  /// - else the below position pushed onto the screen.
+  static func dock(settings: NSRect, visible: NSRect, layout: Layout) -> (frame: NSRect, dock: Dock) {
     let size = layout.cardSize
-    let screen = NSScreen.screens.first { $0.frame.contains(NSPoint(x: settings.midX, y: settings.midY)) }
-      ?? NSScreen.screens.first { $0.frame.intersects(settings) } ?? NSScreen.main
-    let visible = screen?.visibleFrame ?? settings
-    let gap = layout.dockGap
+    let fits = { (r: NSRect) in
+      r.minX >= visible.minX && r.maxX <= visible.maxX && r.minY >= visible.minY && r.maxY <= visible.maxY
+    }
     let clampX = { (x: CGFloat) in min(max(x, visible.minX + 8), visible.maxX - size.width - 8) }
     let clampY = { (y: CGFloat) in min(max(y, visible.minY + 8), visible.maxY - size.height - 8) }
-    let column = settings.minX + settingsListLeading - layout.gutter
-    let origin: NSPoint
-    if settings.minY - gap - size.height >= visible.minY {
-      origin = NSPoint(x: clampX(column), y: settings.minY - gap - size.height)
-    } else if settings.maxX + gap + size.width <= visible.maxX {
-      origin = NSPoint(x: settings.maxX + gap, y: clampY(settings.minY))
-    } else if settings.minX - gap - size.width >= visible.minX {
-      origin = NSPoint(x: settings.minX - gap - size.width, y: clampY(settings.minY))
-    } else {
-      origin = NSPoint(x: clampX(settings.maxX - layout.inset - size.width), y: clampY(settings.minY + layout.inset))
+    // The list's column; nudged left if the card would pass the window's right edge.
+    let column = min(settings.minX + settingsListLeading - layout.gutter, settings.maxX - layout.inset - size.width)
+    let gap = layout.dockGap
+
+    let below = NSRect(x: clampX(column), y: settings.minY - gap - size.height, width: size.width, height: size.height)
+    if fits(below) { return (below, .below) }
+
+    let insideY = max(settings.minY + layout.insideBottom, visible.minY + 8)
+    let inside = NSRect(x: column, y: insideY, width: size.width, height: size.height)
+    if fits(inside), inside.minX >= settings.minX, inside.maxY <= settings.minY + settings.height * 0.3 {
+      return (inside, .inside)
     }
-    return NSRect(origin: origin, size: size)
+
+    let right = NSRect(x: settings.maxX + gap, y: clampY(settings.minY), width: size.width, height: size.height)
+    if fits(right) { return (right, .right) }
+    let left = NSRect(x: settings.minX - gap - size.width, y: clampY(settings.minY), width: size.width, height: size.height)
+    if fits(left) { return (left, .left) }
+
+    return (NSRect(x: clampX(below.minX), y: clampY(below.minY), width: size.width, height: size.height), .clamped)
+  }
+
+  /// `dock` for a window given in CGWindow (top-left) coordinates, on the screen holding it.
+  static func dockFrame(settingsQuartz: CGRect, layout: Layout) -> NSRect {
+    let settings = appKit(fromQuartz: settingsQuartz)
+    let screen = NSScreen.screens.first { $0.frame.contains(NSPoint(x: settings.midX, y: settings.midY)) }
+      ?? NSScreen.screens.first { $0.frame.intersects(settings) } ?? NSScreen.main
+    return dock(settings: settings, visible: screen?.visibleFrame ?? settings, layout: layout).frame
+  }
+
+  /// `--plan --settings X,Y,W,H --visible X,Y,W,H` (AppKit coordinates): the dock as JSON, for
+  /// checking placement without a screen.
+  static func printPlan(arguments: [String]) -> Never {
+    guard let settings = option("--settings", in: arguments).flatMap(parseRect),
+          let visible = option("--visible", in: arguments).flatMap(parseRect)
+    else { fail("permission-panel --plan needs --settings X,Y,W,H --visible X,Y,W,H") }
+    let plan = dock(settings: settings, visible: visible, layout: Layout(settingsWidth: settings.width))
+    let f = plan.frame
+    emit(["dock": plan.dock.rawValue, "frame": [f.minX, f.minY, f.width, f.height].map { Double($0) }])
+    exit(0)
   }
 
   /// Card metrics. The app row matches the Privacy list's column in the Settings window.
@@ -272,6 +306,8 @@ enum PermissionPanel {
     let gap: CGFloat = 4
     let inset: CGFloat = 8
     let dockGap: CGFloat = 10
+    /// Inside the window: this far above its bottom edge.
+    let insideBottom: CGFloat = 20
     let radius: CGFloat = 18
     let rowRadius: CGFloat = 9
     let icon: CGFloat = 26
@@ -597,6 +633,10 @@ extension PermissionPanel {
 
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
+
+    /// The flight's window spans the arc, which can rise past the menu bar. AppKit would push
+    /// it down onto the screen, and the card with it.
+    override func constrainFrameRect(_ frameRect: NSRect, to _: NSScreen?) -> NSRect { frameRect }
   }
 }
 
@@ -754,7 +794,17 @@ extension PermissionPanel {
     }
 
     private func docked() {
-      emit(["event": "docked", "permission": kind.rawValue])
+      var event: [String: Any] = ["event": "docked", "permission": kind.rawValue]
+      if let settingsFrame, let panel {
+        // Where it went, in CGWindow coordinates, for checking placement in a log.
+        let card = quartz(fromAppKit: panel.frame.insetBy(dx: Controller.margin, dy: Controller.margin))
+        let settings = appKit(fromQuartz: settingsFrame)
+        let screen = NSScreen.screens.first { $0.frame.intersects(settings) } ?? NSScreen.main
+        event["dock"] = PermissionPanel.dock(settings: settings, visible: screen?.visibleFrame ?? settings, layout: layout).dock.rawValue
+        event["card"] = [card.minX, card.minY, card.width, card.height].map { Double($0) }
+        event["settings"] = [settingsFrame.minX, settingsFrame.minY, settingsFrame.width, settingsFrame.height].map { Double($0) }
+      }
+      emit(event)
       startTracking()
       startPolling()
     }
@@ -1091,7 +1141,11 @@ extension PermissionPanel {
     static func control(source: NSRect, target: NSRect) -> CGPoint {
       let distance = hypot(target.midX - source.midX, target.midY - source.midY)
       let lift = min(PermissionPanel.arcHeight, distance * PermissionPanel.arcShare)
-      return CGPoint(x: (source.midX + target.midX) / 2, y: max(source.midY, target.midY) + lift)
+      let top = max(source.midY, target.midY)
+      // The card's centre stays far enough below the top of the screen for the card to fit.
+      let screen = NSScreen.screens.first { $0.frame.contains(NSPoint(x: source.midX, y: source.midY)) } ?? NSScreen.main
+      let ceiling = (screen?.visibleFrame.maxY ?? .greatestFiniteMagnitude) - target.height / 2 - 8
+      return CGPoint(x: (source.midX + target.midX) / 2, y: max(top, min(top + lift, ceiling)))
     }
 
     func start(done: @escaping () -> Void) {
