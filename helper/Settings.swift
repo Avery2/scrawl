@@ -923,6 +923,10 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
   let model: SettingsModel
   var window: NSWindow?
+  private lazy var keys = HelperWindowKeys(
+    window: { [weak self] in self?.window },
+    enabled: { [weak self] in self?.model.state.recording == nil }
+  )
   private var monitor: Any?
   private var presented = false
 
@@ -959,12 +963,14 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
     host.autoresizingMask = [.width, .height]
     window.center()
     self.window = window
+    _ = keys
     model.send = { emit($0) }
     readCommands()
   }
 
   func windowWillClose(_: Notification) {
     emit(["action": "close"])
+    keys.handBack()
     exit(0)
   }
 
@@ -974,9 +980,7 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
   private func present(_ pane: SettingsPane?) {
     if let pane { model.pane = pane }
-    window?.orderFrontRegardless()
-    window?.makeKey()
-    NSApp.activate()
+    keys.bringForward(window)
   }
 
   /// Listens for keys only while a recorder is waiting for one.
@@ -1035,7 +1039,9 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
           case "show": self.present(pane)
           case "request": Permissions.request(permission)
           case "open-settings": Permissions.openSettings(permission)
-          case "close": exit(0)
+          case "close":
+            self.keys.handBack()
+            exit(0)
           default: break
           }
         }
