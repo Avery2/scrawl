@@ -70,6 +70,8 @@ pub const CHIP_CORE_ROUND: f32 = 13.0;
 pub const CLEAR: f32 = 2.0;
 pub const EDGE_BAND: f32 = 3.0;
 pub const EXIT_LEAD_S: f32 = 0.08;
+/// The look-ahead cap reaches zero this long before the wall arrives.
+pub const CAP_EARLY_S: f32 = 0.012;
 /// Short pause before narrowing between two visible states so edge items get about four 60 Hz
 /// frames to fade before the capsule wall moves across them. Never used on Entry or Exit
 /// (`Pres::Hidden`).
@@ -1627,7 +1629,8 @@ impl PillModel {
                 if d < CLEAR {
                     st.cap = if hidden { 1.0 } else { 0.0 };
                 } else if contact.is_finite() {
-                    st.cap -= st.cap * (dt / contact.max(dt)).min(1.0);
+                    // Aim to be gone one short frame early, so the last visible step is small.
+                    st.cap -= st.cap * (dt / (contact - CAP_EARLY_S).max(dt)).min(1.0);
                 } else if hidden {
                     st.cap = 1.0;
                 } else {
