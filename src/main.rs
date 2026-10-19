@@ -106,6 +106,41 @@ enum HexCommand {
 }
 
 #[derive(Subcommand)]
+enum LabCommand {
+    /// Play a capsule scene: tap-then-area, tap-then-window, tap-then-screen, hold-switcher, finish.
+    Pill {
+        #[arg(value_enum)]
+        scene: ui::LabScene,
+        /// Write a motion-lint trace of every frame here (same as `SCRAWL_MOTION_TRACE`).
+        #[arg(long)]
+        trace: Option<PathBuf>,
+        /// Times to play it; 0 repeats until stopped (tune while it loops).
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
+        /// Animation time scale, e.g. 0.25 for slow motion (overrides tune.json's timeScale).
+        #[arg(long)]
+        time_scale: Option<f32>,
+        /// Leave out the plain backdrop behind the capsule.
+        #[arg(long)]
+        no_backdrop: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TuneCommand {
+    /// Every key with its live and default value, and the presets (default).
+    List,
+    /// Set one key, e.g. `switch.slide.duration 0.4`.
+    Set { key: String, value: f32 },
+    /// Apply a numbered preset (1 is Today); clears individual keys.
+    Preset { number: usize },
+    /// Delete tune.json: back to the built-in defaults.
+    Reset,
+    /// Print the live values as Rust, to bake into `Tune::DEFAULT`.
+    Rust,
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Launch the GPUI menu-bar and review application (default).
     App {
@@ -180,6 +215,20 @@ enum Command {
         /// Transcribe with `apple` or `hex` instead of the configured transcriber.
         #[arg(long, value_parser = parse_engine)]
         transcriber: Option<crate::transcribe::Engine>,
+    },
+    /// Motion lab: replay the capsule's states on a fixed timeline with nothing captured, for
+    /// traces (`--trace`, motion-lint's format), screen recordings and tuning.
+    #[command(hide = true)]
+    Lab {
+        #[command(subcommand)]
+        command: LabCommand,
+    },
+    /// Tune the capsule's springs live: edits `~/.config/scrawl/tune.json`, which debug builds
+    /// (the lab and the installed app) re-read within a quarter second.
+    #[command(hide = true)]
+    Tune {
+        #[command(subcommand)]
+        command: Option<TuneCommand>,
     },
     /// Check the Hex transcriber: is it running, which models are ready, which one Scrawl uses.
     Hex {
@@ -1653,6 +1702,39 @@ fn main() -> Result<()> {
             print!("{summary}");
             Ok(())
         }
+        Command::Lab {
+            command:
+                LabCommand::Pill {
+                    scene,
+                    trace,
+                    repeat,
+                    time_scale,
+                    no_backdrop,
+                },
+        } => {
+            // Set before the app starts any thread; the lab reads them once.
+            unsafe {
+                if let Some(trace) = trace {
+                    std::env::set_var("SCRAWL_MOTION_TRACE", trace);
+                }
+                if let Some(scale) = time_scale {
+                    std::env::set_var("SCRAWL_TIME_SCALE", scale.to_string());
+                }
+            }
+            ui::run_lab(ui::LabOptions {
+                scene,
+                repeat,
+                backdrop: !no_backdrop,
+            });
+            Ok(())
+        }
+        Command::Tune { command } => ui::tune_command(match command.unwrap_or(TuneCommand::List) {
+            TuneCommand::List => ui::TuneAction::List,
+            TuneCommand::Set { key, value } => ui::TuneAction::Set(key, value),
+            TuneCommand::Preset { number } => ui::TuneAction::Preset(number),
+            TuneCommand::Reset => ui::TuneAction::Reset,
+            TuneCommand::Rust => ui::TuneAction::Rust,
+        }),
         Command::Hex {
             command: HexCommand::Status,
         } => {
