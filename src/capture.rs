@@ -395,7 +395,8 @@ pub fn shortcut_matches(
     cfg.is_default_for(kind) && is_key && alt && (shift || (ctrl && cmd))
 }
 
-/// The active layout's key for `kind`'s default letter.
+/// The active layout's key for `kind`'s default letter (Windows' hooks and poller match on it).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn layout_default_keycode(kind: ShortcutKind) -> u16 {
     key_code_for_char(kind.default_char()).unwrap_or(kind.ansi_code())
 }

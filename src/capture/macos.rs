@@ -19,8 +19,8 @@ use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
 use super::{
     CANDIDATE_EDGE, CANDIDATE_EDGE_NO_VIDEO, CARBON_CMD_KEY, CARBON_CONTROL_KEY, CARBON_OPTION_KEY,
     CARBON_SHIFT_KEY, FRAME_SAMPLE_INTERVAL, LiveOverlayEvent, Sampler, SharedCaptureTelemetry,
-    ShortcutConfig, ShortcutKind, capture_size, clean_label, hotkey_combos, layout_default_keycode,
-    pick_display, poll_clicks, scrawl_log, shortcut_matches, track_shift_ink,
+    ShortcutConfig, ShortcutKind, capture_size, clean_label, hotkey_combos, pick_display,
+    poll_clicks, scrawl_log, track_shift_ink,
 };
 use crate::model::{CaptureMode, InteractionEvent, RgbaFrame, TargetFrame, TargetInfo};
 
