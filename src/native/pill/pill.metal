@@ -257,8 +257,10 @@ fragment float4 pill_composite_fragment(
 
     // 3. Main capsule silhouette fill (opaque dark in black mode; transparent in glass mode where
     //    NSGlassEffectView renders the real Liquid Glass bottle + lensing behind the Metal layer).
-    float aa_band = max(1.0 / u.scale, u.shape_meta.z);
-    float in_cov = smoothstep(aa_band * 0.5, -aa_band * 0.5, sdf);
+    //    When `u.shape_meta.z` (`shape.blur`, sigma in pt) > 0 on Entry/Exit, feather the SDF over
+    //    `±1.75 * sigma` (matching the cumulative normal distribution of a 2D Gaussian blur).
+    float half_band = max(0.5 / u.scale, u.shape_meta.z * 1.75);
+    float in_cov = smoothstep(half_band, -half_band, sdf);
     if (in_cov > 0.001) {
         if (is_glass < 0.5) {
             float fill_a = 0.96 * shape_alpha * in_cov;
@@ -325,12 +327,15 @@ fragment float4 pill_composite_fragment(
         }
     }
 
-    // 5. Analytic 1px specular hairline border on the capsule rim (never blurred).
+    // 5. Analytic 1px specular hairline border on the capsule rim (fades out while the shell is blurred
+    //    on Entry/Exit so a sharp 1px ring never sits around a blurred capsule).
     //    In glass mode, only tint the border green when Completed (NSGlassEffectView draws its own
     //    specular glass rim otherwise).
     if (is_glass < 0.5 || u.is_completed != 0u) {
+        float border_sharp = clamp(1.0 - u.shape_meta.z * 0.22, 0.0, 1.0);
         float border_cov = clamp(1.0 + 0.5 / u.scale + sdf, 0.0, 1.0)
-                         * clamp(0.5 / u.scale - sdf, 0.0, 1.0);
+                         * clamp(0.5 / u.scale - sdf, 0.0, 1.0)
+                         * border_sharp;
         if (border_cov > 0.001) {
             float3 border_rgb = (u.is_completed != 0u)
                 ? float3(105.0 / 255.0, 216.0 / 255.0, 159.0 / 255.0)
