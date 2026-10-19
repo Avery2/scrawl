@@ -203,11 +203,26 @@ final class PermissionGuide: NSObject, NSApplicationDelegate {
     )
     let screen = NSScreen.screens.first(where: { $0.frame.intersects(settings) }) ?? NSScreen.main
     let visible = screen?.visibleFrame ?? settings
-    let size = panel.frame.size
-    let x = min(max(settings.maxX - size.width - 16, visible.minX + 8), visible.maxX - size.width - 8)
-    let y = min(max(settings.minY + 16, visible.minY + 8), visible.maxY - size.height - 8)
-    panel.setFrameOrigin(NSPoint(x: x, y: y))
+    panel.setFrameOrigin(Self.origin(for: panel.frame.size, beside: settings, in: visible))
     panel.orderFrontRegardless()
+  }
+
+  /// Outside the Settings window, so it never covers a toggle or macOS's "Quit & Reopen" sheet:
+  /// below it, else beside it, else (no room anywhere) along its bottom-left corner.
+  static func origin(for size: NSSize, beside settings: NSRect, in visible: NSRect) -> NSPoint {
+    let gap: CGFloat = 12
+    let clampX = { (x: CGFloat) in min(max(x, visible.minX + 8), visible.maxX - size.width - 8) }
+    let clampY = { (y: CGFloat) in min(max(y, visible.minY + 8), visible.maxY - size.height - 8) }
+    if settings.minY - gap - size.height >= visible.minY {
+      return NSPoint(x: clampX(settings.midX - size.width / 2), y: settings.minY - gap - size.height)
+    }
+    if settings.maxX + gap + size.width <= visible.maxX {
+      return NSPoint(x: settings.maxX + gap, y: clampY(settings.minY))
+    }
+    if settings.minX - gap - size.width >= visible.minX {
+      return NSPoint(x: settings.minX - gap - size.width, y: clampY(settings.minY))
+    }
+    return NSPoint(x: clampX(settings.minX + 16), y: clampY(settings.minY + 16))
   }
 
   private func currentSettingsFrame() -> CGRect? {

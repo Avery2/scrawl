@@ -54,24 +54,37 @@ cargo run -- pin latest
 
 ## Welcome and permissions
 
-On first launch Scrawl opens a welcome window: what it does, how ⌥⇧S works, then each permission
-on its own step, then a first capture. A step's check appears by itself once macOS grants it (it
-re-reads the grants every 0.5 s), and steps already granted are passed.
+On first launch Scrawl opens a welcome window with four screens: a welcome, how ⌥⇧S works, one
+screen with every permission Scrawl needs, and a first capture. Each permission is a row with a
+button that shows the macOS prompt (or, once asked, opens System Settings) and a check that appears
+by itself when macOS grants it (the window re-reads the grants every 0.5 s). Grant them in any
+order; Continue unlocks once all three required ones are on, and the screen is skipped when they
+already are.
 
-| Permission | Used for | |
+| Permission | Used for | When it's asked for |
 |---|---|---|
-| Screen & System Audio Recording | Recording the screen (ScreenCaptureKit) | required |
-| Microphone | Your narration | required |
-| Input Monitoring | The event tap that sees clicks and ⇧-drags in every app | required |
-| Accessibility | `⌥⇧V`, which posts ⌘V into the app in front | optional |
-| Camera | The cabled iPhone mirror (macOS treats it as a camera) | optional |
+| Screen & System Audio Recording | Recording the screen (ScreenCaptureKit) | onboarding, required |
+| Microphone | Your narration | onboarding, required |
+| Input Monitoring | The event tap that sees clicks, ⌘Z and shortcuts in every app | onboarding, required |
+| Accessibility | `⌥⇧V` and the Paste chip, which post ⌘V into the app in front | the first time you use them |
+| Camera | The cabled iPhone mirror (macOS treats it as a camera) | the first time you pick iPhone |
 
-Speech recognition isn't asked for: SpeechAnalyzer transcribes without it. Captures never prompt
-for Screen Recording; without it, ⌥⇧S opens that step instead. After granting Screen Recording macOS
-may need Scrawl relaunched; the step offers **Relaunch Scrawl** and the tour resumes after it.
-Progress is `"onboarding"` in `~/.config/scrawl/config.json`: once seen, the tour only comes back
-from **Welcome to Scrawl…** in the menu, but a required permission that was granted and is gone
-again reopens its own step at launch. `SCRAWL_NO_ONBOARDING=1` skips it.
+Accessibility and Camera are asked for in the same window, with just their row, when first needed.
+Speech recognition isn't asked for: SpeechAnalyzer transcribes without it. The ⌥⇧S hotkey itself
+needs no permission (Carbon `RegisterEventHotKey`).
+
+Until the required permissions are on, ⌥⇧S starts nothing (no switcher, picker or overlay that
+could sit over a macOS prompt): once the keys are released it brings the permissions window
+forward. A running app only sees a Screen Recording grant after it relaunches, so when Screen
+Recording was granted during onboarding the button becomes **Reopen Scrawl**, once, after
+everything else is on, and the tour comes back on its next screen. If macOS offers **Quit &
+Reopen** while you grant, **Later** is fine. Input Monitoring needs no relaunch: Scrawl remakes its
+event tap when the grant arrives.
+
+Progress is `"onboarding"` in `~/.config/scrawl/config.json`, including the screen the tour is on,
+so it picks up there whatever quits Scrawl. Once seen, the tour only comes back from **Welcome to
+Scrawl…** in the menu, but a required permission that was granted and is gone again reopens the
+permissions screen at launch. `SCRAWL_NO_ONBOARDING=1` skips it.
 
 To replay it from scratch:
 
@@ -81,7 +94,8 @@ jq 'del(.onboarding)' ~/.config/scrawl/config.json > /tmp/c.json && mv /tmp/c.js
 # then quit and reopen Scrawl
 ```
 
-Preview every step without the app: `target/debug/scrawl-helper onboarding --render /tmp/onboarding
+Preview every screen without the app, including the permissions screen with none, some and all
+granted and each on-demand sheet: `target/debug/scrawl-helper onboarding --render /tmp/onboarding
 --icon assets/app-icon.png`.
 
 ## Capture Controls

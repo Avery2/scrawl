@@ -1448,6 +1448,10 @@ pub struct ScrawlCoordinator {
     open_iphone_when_found: bool,
     /// The welcome window, while it's open (`crate::onboarding`).
     onboarding: Option<crate::onboarding::Session>,
+    /// The last fresh read of what macOS has granted (at launch, then while onboarding is open).
+    grants: Option<crate::onboarding::Grants>,
+    /// Holds the permissions window until the shortcut's modifiers are up.
+    gate: crate::onboarding::Gate,
     /// ⌥⇧S held as a ⌘Tab-style switcher (`crate::hold`).
     switcher: crate::hold::Switcher,
     /// The modifiers held when the shortcut went down; releasing any of them commits.
@@ -1513,6 +1517,8 @@ impl ScrawlCoordinator {
             last_mode: SelectionMode::load_last_used(),
             open_iphone_when_found: false,
             onboarding: None,
+            grants: None,
+            gate: crate::onboarding::Gate::default(),
             switcher: crate::hold::Switcher::default(),
             hold_mods: 0,
             hold_picker: false,
@@ -1567,6 +1573,13 @@ impl ScrawlCoordinator {
     }
 
     pub fn paste_latest(&mut self, cx: &mut Context<Self>) {
+        // Without Accessibility macOS drops the posted ⌘V; ask for it the first time instead.
+        if !crate::capture::accessibility_granted() {
+            scrawl_log("⌥⇧V without Accessibility; asking for it");
+            self.gate
+                .defer(vec![crate::onboarding::Permission::Accessibility]);
+            return;
+        }
         let dir = self.take_paste_target();
         if matches!(self.island_phase, IslandPhase::Completed { .. }) {
             self.dismiss_island(cx);
@@ -1636,26 +1649,102 @@ impl ScrawlCoordinator {
         }
     }
 
+    /// Keeps a fresh read of the grants: remembers what was granted, and remakes the event tap
+    /// when Input Monitoring comes on, so it works without a relaunch.
+    fn note_grants(&mut self, grants: &crate::onboarding::Grants) {
+        use crate::onboarding::{Permission, Progress};
+        let mut progress = Progress::load();
+        if progress.note(grants) {
+            progress.save();
+        }
+        let listen = |g: &crate::onboarding::Grants| g.granted(Permission::InputMonitoring);
+        if self.grants.as_ref().is_some_and(|old| !listen(old)) && listen(grants) {
+            crate::capture::restart_input_tap(&self.telemetry);
+        }
+        self.grants = Some(grants.clone());
+    }
+
+    /// Required permissions that keep a capture from starting now.
+    fn missing_to_record(&mut self) -> Vec<crate::onboarding::Permission> {
+        use crate::onboarding::{Permission, missing_to_record};
+        let screen = crate::capture::screen_capture_granted();
+        let missing = missing_to_record(self.grants.as_ref(), screen);
+        // The last read may be old; read again before standing in the way.
+        if missing.iter().any(|p| *p != Permission::ScreenRecording)
+            && let Some(fresh) = crate::onboarding::read_grants()
+        {
+            self.note_grants(&fresh);
+            return missing_to_record(self.grants.as_ref(), screen);
+        }
+        missing
+    }
+
+    /// Whether this may go on: with a required permission off it starts nothing, and the
+    /// permissions window comes forward once the modifiers are up.
+    fn ready_to_record(&mut self) -> bool {
+        let missing = self.missing_to_record();
+        if missing.is_empty() {
+            return true;
+        }
+        scrawl_log(format!("Not recording: {missing:?} off; opening onboarding"));
+        self.gate.defer(missing);
+        false
+    }
+
+    /// Whether `permission`, asked for on first use (Camera, Accessibility), is on. If not, its
+    /// window comes forward once the modifiers are up.
+    fn ready_for(&mut self, permission: crate::onboarding::Permission) -> bool {
+        let granted = |g: &crate::onboarding::Grants| g.granted(permission);
+        if self.grants.as_ref().is_none_or(granted) {
+            return true;
+        }
+        if let Some(fresh) = crate::onboarding::read_grants() {
+            self.note_grants(&fresh);
+            if granted(&fresh) {
+                return true;
+            }
+        }
+        scrawl_log(format!("{permission:?} is off; asking for it"));
+        self.gate.defer(vec![permission]);
+        false
+    }
+
+    /// Polled while the gate holds a request: shows the permissions window once ⌥⇧ is up.
+    pub fn tick_gate(&mut self) {
+        use crate::onboarding::{Flow, Input, Mode, Permission};
+        let Some(asks) = self.gate.tick(crate::capture::modifier_flags() != 0) else {
+            return;
+        };
+        let required = asks.iter().any(|p| p.required());
+        match self.onboarding.as_mut() {
+            Some(session) if session.mode() == Mode::Tour && required => {
+                session.input(Input::Blocked);
+            }
+            _ => {
+                let asks = if required {
+                    Permission::REQUIRED.to_vec()
+                } else {
+                    asks
+                };
+                self.open_onboarding(Flow::fix(asks, self.grants.clone()));
+            }
+        }
+    }
+
     fn onboarding_event(&mut self, event: crate::onboarding::Event, cx: &mut Context<Self>) {
         use crate::onboarding::{Effect, Event, Progress};
         let effect = match event {
             Event::Launch(grants) => {
-                let mut progress = Progress::load();
-                if progress.note(&grants) {
-                    progress.save();
-                }
+                self.note_grants(&grants);
                 if self.onboarding.is_none()
-                    && let Some(flow) = crate::onboarding::launch_plan(&progress, &grants)
+                    && let Some(flow) = crate::onboarding::launch_plan(&Progress::load(), &grants)
                 {
                     self.open_onboarding(flow);
                 }
                 Effect::None
             }
             Event::Grants(grants) => {
-                let mut progress = Progress::load();
-                if progress.note(&grants) {
-                    progress.save();
-                }
+                self.note_grants(&grants);
                 self.onboarding
                     .as_mut()
                     .map_or(Effect::None, |session| session.grants(grants))
@@ -1714,7 +1803,17 @@ impl ScrawlCoordinator {
     /// The capture shortcut went down (from Carbon, the event tap or the HID poller).
     pub fn press_shortcut(&mut self, cx: &mut Context<Self>) {
         let activity = self.activity();
+        if self.gate.is_pending() {
+            return;
+        }
         if !self.switcher.is_held() && activity == crate::hold::Activity::Free {
+            // No switcher, picker or overlay before the permissions are on: they sit above
+            // macOS's permission prompts and take the clicks meant for them.
+            let missing = self.missing_to_record();
+            if !self.gate.press(missing) {
+                scrawl_log("Shortcut held back: a required permission is off");
+                return;
+            }
             self.hold_mods = crate::capture::modifier_flags();
         }
         if let Some(mode) = self.selection_mode() {
@@ -2062,6 +2161,11 @@ impl ScrawlCoordinator {
             return;
         }
         scrawl_log("preview_iphone invoked");
+        // The mirror would raise the camera prompt under the picker, which takes its clicks.
+        if !self.ready_for(crate::onboarding::Permission::Camera) {
+            self.cancel_recording(cx);
+            return;
+        }
         self.set_selection_mode(SelectionMode::Iphone, cx);
         if let Some(ref mut preview) = self.iphone_preview {
             preview.show_preview();
@@ -2299,8 +2403,14 @@ impl ScrawlCoordinator {
             .completed_dir
             .clone()
             .unwrap_or_else(|| PathBuf::from("latest"));
-        self.mark_handled(&dir);
         self.dismiss_island(cx);
+        if !crate::capture::accessibility_granted() {
+            scrawl_log("Paste chip without Accessibility; asking for it");
+            self.gate
+                .defer(vec![crate::onboarding::Permission::Accessibility]);
+            return;
+        }
+        self.mark_handled(&dir);
         std::thread::spawn(move || {
             if let Err(err) = crate::handoff::paste_bundle_at_target(&dir, click_target) {
                 scrawl_log(format!("paste_bundle_at_target error: {err}"));
@@ -2467,7 +2577,9 @@ impl ScrawlCoordinator {
 
     /// The menu bar's picker, opening on the mode the last recording used.
     pub fn begin_target_selection(&mut self, cx: &mut Context<Self>) {
-        self.open_picker(None, false, cx);
+        if self.ready_to_record() {
+            self.open_picker(None, false, cx);
+        }
     }
 
     /// Opens the picker on `mode`, else on the mode the last recording used. `hold`: it is the
@@ -2613,17 +2725,9 @@ impl ScrawlCoordinator {
         if self.is_recording() || self.is_processing() {
             return;
         }
-        // No surprise prompt mid-capture: Screen Recording is granted in onboarding.
-        if !crate::capture::screen_capture_granted() {
-            scrawl_log("Screen recording not granted; opening its onboarding step");
-            self.dismiss_island(cx);
-            match self.onboarding.as_mut() {
-                Some(session) => session.show(),
-                None => self.open_onboarding(crate::onboarding::Flow::fix(
-                    crate::onboarding::Permission::ScreenRecording,
-                    None,
-                )),
-            }
+        // No surprise prompt mid-capture: the permissions are granted in onboarding.
+        if !self.ready_to_record() {
+            self.cancel_recording(cx);
             return;
         }
         let started = Instant::now();
@@ -2747,6 +2851,10 @@ impl ScrawlCoordinator {
             return;
         }
         scrawl_log("start_recording_iphone invoked");
+        if !self.ready_for(crate::onboarding::Permission::Camera) {
+            self.cancel_recording(cx);
+            return;
+        }
         self.remember_mode(SelectionMode::Iphone);
         self.recording_shortcut_key = false;
         self.selection_drag = None;
@@ -5182,7 +5290,7 @@ pub fn run_app(
                                     loop_coord.update(cx, |coord, _| {
                                         coord.open_onboarding(crate::onboarding::Flow::tour(
                                             crate::onboarding::Step::Welcome,
-                                            None,
+                                            coord.grants.clone(),
                                         ));
                                     });
                                 }
@@ -5291,6 +5399,9 @@ pub fn run_app(
 
                     if loop_coord.read(cx).switcher.is_held() {
                         loop_coord.update(cx, |coord, cx| coord.tick_switcher(cx));
+                    }
+                    if loop_coord.read(cx).gate.is_pending() {
+                        loop_coord.update(cx, |coord, _| coord.tick_gate());
                     }
                     if loop_coord.read(cx).is_island_visible() {
                         record_external_frontmost_app();
