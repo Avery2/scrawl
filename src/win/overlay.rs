@@ -304,34 +304,37 @@ impl InkOverlay {
     }
 }
 
-/// Puts the overlay window over `rect` (global pixels) on top, and shows it.
-fn place(id: isize, rect: [f64; 4]) {
+/// Puts one of Scrawl's GPUI windows (the overlay, picker or pill) over `rect` (global pixels)
+/// on top, and shows it without activating it. Call it outside GPUI updates: the moves it makes
+/// reach GPUI's resize and DPI handlers at once.
+pub(crate) fn place(id: isize, rect: [f64; 4]) {
     let hwnd = super::hwnd(id);
     let [x, y, w, h] = rect.map(|v| v.round() as i32);
     let _ = unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE) };
-    // GPUI keeps a resize frame around the client area; grow the window by it so the
-    // client area (what GPUI draws) covers the display exactly.
-    let (mut client, mut origin) = (RECT::default(), POINT::default());
+    // GPUI keeps a resize frame around the client area; grow the window by it so the client
+    // area (what GPUI draws) covers `rect` exactly. Measured from where the window is now: a
+    // move onto a monitor of another DPI has GPUI resize it to Windows' suggested rect.
+    let (mut window, mut client, mut origin) = (RECT::default(), RECT::default(), POINT::default());
     let placed = unsafe {
-        GetClientRect(hwnd, &mut client).is_ok() && ClientToScreen(hwnd, &mut origin).as_bool()
+        GetWindowRect(hwnd, &mut window).is_ok()
+            && GetClientRect(hwnd, &mut client).is_ok()
+            && ClientToScreen(hwnd, &mut origin).as_bool()
     };
     if placed {
-        let (left, top) = (origin.x - x, origin.y - y);
-        let right = w - left - client.right;
-        let bottom = h - top - client.bottom;
-        let _ = unsafe {
-            SetWindowPos(
-                hwnd,
-                Some(HWND_TOPMOST),
-                x - left,
-                y - top,
-                w + left + right,
-                h + top + bottom,
-                SWP_NOACTIVATE,
-            )
-        };
+        let [x, y, w, h] = grown_by_frame([x, y, w, h], window, origin, client);
+        let _ = unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE) };
     }
     let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+}
+
+/// The window rect whose client area is `target`, given where the window is now (`window`), its
+/// client area's screen origin and its client rect.
+fn grown_by_frame(target: [i32; 4], window: RECT, origin: POINT, client: RECT) -> [i32; 4] {
+    let [x, y, w, h] = target;
+    let (left, top) = (origin.x - window.left, origin.y - window.top);
+    let right = window.right - origin.x - client.right;
+    let bottom = window.bottom - origin.y - client.bottom;
+    [x - left, y - top, w + left + right, h + top + bottom]
 }
 
 impl Drop for InkOverlay {
@@ -771,5 +774,37 @@ impl Render for OverlayView {
             },
         )
         .size_full()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_window_is_grown_by_its_frame_as_it_is_now() {
+        let rect = |left, top, right, bottom| RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        // Asked for 1920×1080 at the origin, then resized by a DPI change to 2880×1620, with a
+        // 1 px frame left, right and bottom and 2 px on top.
+        let grown = grown_by_frame(
+            [0, 0, 1920, 1080],
+            rect(0, 0, 2880, 1620),
+            POINT { x: 1, y: 2 },
+            rect(0, 0, 2878, 1617),
+        );
+        assert_eq!(grown, [-1, -2, 1922, 1083]);
+        // No frame: the target itself.
+        let none = grown_by_frame(
+            [-1920, 0, 400, 100],
+            rect(-1920, 0, -1520, 100),
+            POINT { x: -1920, y: 0 },
+            rect(0, 0, 400, 100),
+        );
+        assert_eq!(none, [-1920, 0, 400, 100]);
     }
 }

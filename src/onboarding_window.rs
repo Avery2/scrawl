@@ -196,6 +196,7 @@ fn open(request: Request, cx: &mut App) {
                             messages.push(message);
                         }
                         let disconnected = commands.is_disconnected();
+                        let arrived = !messages.is_empty();
                         let alive = this
                             .update_in(cx, |view: &mut OnboardingWindow, window, cx| {
                                 for message in messages {
@@ -208,7 +209,8 @@ fn open(request: Request, cx: &mut App) {
                                     window.remove_window();
                                     return false;
                                 }
-                                if view.animating() {
+                                // A new view (a grant that arrived later, say) repaints too.
+                                if arrived || view.animating() {
                                     cx.notify();
                                 }
                                 true

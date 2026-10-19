@@ -148,7 +148,6 @@ pub fn with_scale(frame: Rect, scale: f64) -> TargetFrame {
 
 /// Where the capsule's panel (`width` points wide) goes on `screen`: centred, its top
 /// `PANEL_Y` below the screen's top, and lower when a taller menu bar or the notch needs it.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn pill_origin(screen: &Screen, width: f64, panel_y: f64) -> [f64; 2] {
     let menu_bar = screen.visible[1] - screen.frame[1];
     let top = panel_y.max(menu_bar - 3.0).max(screen.safe_top + 2.0);
@@ -156,6 +155,15 @@ pub fn pill_origin(screen: &Screen, width: f64, panel_y: f64) -> [f64; 2] {
         screen.frame[0] + ((screen.frame[2] - width) / 2.0).round(),
         screen.frame[1] + top,
     ]
+}
+
+/// The GPUI pill window's rect on `screen` (Windows, global pixels): `w`×`h` points at the
+/// screen's scale, placed as `pill_origin` places the capsule (below a taskbar on top).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub fn pill_window_rect(screen: &Screen, w: f64, h: f64, top: f64) -> Rect {
+    let width = (w * screen.scale).round();
+    let [x, y] = pill_origin(screen, width, top * screen.scale);
+    [x, y, width, (h * screen.scale).round()]
 }
 
 /// Every active display from CoreGraphics (any thread). `visible` is the whole frame and
@@ -452,5 +460,24 @@ mod tests {
             ..screen(4, [0.0, 0.0, 1512.0, 982.0], 2.0)
         };
         assert_eq!(pill_origin(&tall, 640.0, 34.0)[1], 42.0);
+    }
+
+    #[test]
+    fn the_windows_pill_window_lands_on_its_own_monitor_in_pixels() {
+        // A 150% monitor left of the primary, taskbar at the bottom: centred, 14 pt down.
+        let left = screen(1, [-2880.0, 0.0, 2880.0, 1620.0], 1.5);
+        assert_eq!(
+            pill_window_rect(&left, 400.0, 100.0, 14.0),
+            [-1740.0, 21.0, 600.0, 150.0]
+        );
+        // The primary at 100% with the taskbar on top (48 px): below it.
+        let top_bar = Screen {
+            visible: [0.0, 48.0, 1920.0, 1032.0],
+            ..screen(0, [0.0, 0.0, 1920.0, 1080.0], 1.0)
+        };
+        assert_eq!(
+            pill_window_rect(&top_bar, 400.0, 100.0, 14.0),
+            [760.0, 45.0, 400.0, 100.0]
+        );
     }
 }

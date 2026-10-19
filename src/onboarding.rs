@@ -1012,19 +1012,24 @@ impl Drop for Session {
     }
 }
 
-/// Starts Scrawl again a moment after this copy quits.
+/// Starts Scrawl again once this copy has quit: the new copy waits for this one
+/// (`win::shell::wait_for_relauncher`) before it starts the app.
 #[cfg(windows)]
 pub fn relaunch() {
+    use std::os::windows::process::CommandExt;
+    /// No console window flashes up for the new copy (`scrawl.exe` is a console program).
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let mut args: Vec<std::ffi::OsString> = vec![
-        "/C".into(),
-        "timeout /t 1 /nobreak >nul & start \"\"".into(),
-    ];
-    args.push(exe.into_os_string());
-    args.extend(std::env::args_os().skip(1));
-    let _ = std::process::Command::new("cmd.exe").args(args).spawn();
+    let _ = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(crate::win::shell::RELAUNCHED_BY, std::process::id().to_string())
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 #[cfg(not(windows))]

@@ -329,10 +329,9 @@ pub fn scrawl_log(msg: impl AsRef<str>) {
 /// A shortcut label split into its modifiers and key: `⌥⇧S` → (`⌥⇧`, `S`), and on Windows
 /// `Alt+Shift+S` → (`Alt+Shift`, `S`).
 pub fn shortcut_parts(label: &str) -> (&str, &str) {
-    if let Some(plus) = label
-        .get(..label.len().saturating_sub(1))
-        .and_then(|l| l.rfind('+'))
-    {
+    // The key itself may be "+" (`Ctrl++`), or a letter outside ASCII.
+    let before_key = label.char_indices().last().map_or("", |(i, _)| &label[..i]);
+    if let Some(plus) = before_key.rfind('+') {
         return (&label[..plus], &label[plus + 1..]);
     }
     let split = label
@@ -1664,6 +1663,11 @@ mod tests {
 
         assert_eq!(shortcut_parts("⌥⇧S"), ("⌥⇧", "S"));
         assert_eq!(shortcut_parts("⌃⌥⌘R"), ("⌃⌥⌘", "R"));
+        assert_eq!(shortcut_parts("⌥⇧É"), ("⌥⇧", "É"));
+        assert_eq!(shortcut_parts("Alt+Shift+S"), ("Alt+Shift", "S"));
+        assert_eq!(shortcut_parts("Ctrl+Alt+Ä"), ("Ctrl+Alt", "Ä"));
+        assert_eq!(shortcut_parts("Ctrl++"), ("Ctrl", "+"));
+        assert_eq!(shortcut_parts(""), ("", ""));
     }
 
     #[test]

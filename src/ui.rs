@@ -1773,29 +1773,28 @@ impl ScrawlCoordinator {
             IslandPhase::Hidden | IslandPhase::Dismissing
         );
         self.island_phase = phase;
+        let place = changed
+            && (appearing
+                || matches!(
+                    phase,
+                    IslandPhase::Selecting { .. } | IslandPhase::Recording
+                ));
         if crate::handoff::native_pill() {
             if !matches!(phase, IslandPhase::Hidden) {
                 self.ensure_native_pill();
             }
-            if changed
-                && (appearing
-                    || matches!(
-                        phase,
-                        IslandPhase::Selecting { .. } | IslandPhase::Recording
-                    ))
-            {
+            if place {
                 self.place_capsule();
             }
             self.sync_native_pill();
+        } else if place {
+            self.place_capsule();
         }
     }
 
     /// Puts the capsule on the display in use: the one being recorded, the one the picker is on,
     /// else the one under the pointer.
     fn place_capsule(&self) {
-        let Some(ref pill) = self.native_pill else {
-            return;
-        };
         let centre = |[x, y, w, h]: [f64; 4]| [x + w / 2.0, y + h / 2.0];
         let anchor = match self.island_phase {
             IslandPhase::Recording => self
@@ -1809,8 +1808,12 @@ impl ScrawlCoordinator {
             IslandPhase::Selecting { .. } => Some(centre(self.display_rect.map(f64::from))),
             _ => None,
         };
-        if let Some(point) = anchor.or_else(crate::screens::pointer) {
-            pill.place_on(point);
+        let Some(point) = anchor.or_else(crate::screens::pointer) else {
+            return;
+        };
+        match self.native_pill {
+            Some(ref pill) => pill.place_on(point),
+            None => platform::place_hud_pill(point),
         }
     }
 
@@ -1873,7 +1876,7 @@ impl ScrawlCoordinator {
         if let Some(ref mut overlay) = self.picker_metal_overlay {
             overlay.move_to(frame);
         }
-        platform::move_picker_window(frame);
+        platform::move_picker_window(frame, cx);
         self.place_capsule();
         self.sync_picker_overlay();
         // The picker draws relative to `display_rect`; with the native capsule nothing else
@@ -4999,8 +5002,9 @@ fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
     close_picker_window(cx);
     let screen = coord_entity.read(cx).display_rect;
     let display = platform::display_at(screen, cx);
-    let display_bounds = Bounds {
-        origin: Point::default(),
+    // Windows wants the display's own origin, or GPUI puts the picker at its default bounds.
+    let picker_bounds = Bounds {
+        origin: platform::window_origin(display.as_deref()),
         size: platform::layout_size(screen, display.as_deref()),
     };
     let display_id = display.as_ref().map(|d| d.id());
@@ -5009,10 +5013,7 @@ fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
     let picker_coord = coord_entity.clone();
     let _ = cx.open_window(
         WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds {
-                origin: Point::default(),
-                size: display_bounds.size,
-            })),
+            window_bounds: Some(WindowBounds::Windowed(picker_bounds)),
             display_id,
             titlebar: None,
             focus: !lab,
@@ -5027,7 +5028,7 @@ fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
         move |window, cx| {
             // The display the picker was opened for, or has since followed the pointer to.
             let frame = picker_coord.read(cx).display_rect.map(f64::from);
-            if let Some(num) = platform::configure_picker_window(window, lab, frame) {
+            if let Some(num) = platform::configure_picker_window(window, lab, frame, cx) {
                 picker_coord
                     .read(cx)
                     .telemetry
@@ -5125,10 +5126,7 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
     // Transparent Dynamic Island host positioned cleanly below the 37pt macOS menu bar
     let pill_size: Size<Pixels> = size(px(PILL_WINDOW_W), px(PILL_WINDOW_H));
     let pill_bounds = Bounds {
-        origin: point(
-            (display_bounds.size.width - pill_size.width) * 0.5,
-            px(platform::PILL_TOP),
-        ),
+        origin: platform::hud_pill_origin(display_bounds),
         size: pill_size,
     };
     let pill_coord = coord_entity.clone();
@@ -5147,7 +5145,7 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
             ..Default::default()
         },
         move |window, cx| {
-            let chrome = PillChrome::open(window);
+            let chrome = PillChrome::open(window, cx);
             if let Some(num) = chrome.window_number() {
                 pill_coord
                     .read(cx)

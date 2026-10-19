@@ -184,6 +184,29 @@ pub fn release_own_console() {
     }
 }
 
+/// Set on a copy started by `onboarding::relaunch`: the process id of the copy that started it.
+pub const RELAUNCHED_BY: &str = "SCRAWL_RELAUNCHED_BY";
+
+/// A copy started by `onboarding::relaunch` waits (at most 10 s) for the one that started it to
+/// quit, so there are never two running.
+pub fn wait_for_relauncher() {
+    if let Some(pid) = std::env::var(RELAUNCHED_BY).ok().and_then(|v| v.parse().ok()) {
+        wait_for_exit(pid, Duration::from_secs(10));
+    }
+}
+
+/// Waits for process `pid` to exit, at most `limit`. Returns whether it has (or never ran).
+fn wait_for_exit(pid: u32, limit: Duration) -> bool {
+    use windows::Win32::Foundation::WAIT_TIMEOUT;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+    let Ok(process) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }) else {
+        return true;
+    };
+    let waited = unsafe { WaitForSingleObject(process, limit.as_millis() as u32) };
+    let _ = unsafe { CloseHandle(process) };
+    waited != WAIT_TIMEOUT
+}
+
 /// Windows 11 (build 22000 and later), which has Segoe Fluent Icons.
 pub fn windows_11() -> bool {
     static BUILD: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -213,4 +236,22 @@ pub fn random_bytes(bytes: &mut [u8]) -> Result<()> {
     unsafe { BCryptGenRandom(None, bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
         .ok()
         .context("Could not read random bytes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_relaunched_copy_waits_for_the_one_that_started_it() {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/C", "ping -n 2 127.0.0.1 >nul"])
+            .spawn()
+            .unwrap();
+        assert!(!wait_for_exit(child.id(), Duration::from_millis(50)));
+        assert!(wait_for_exit(child.id(), Duration::from_secs(10)));
+        let _ = child.wait();
+        // Already gone (or never there).
+        assert!(wait_for_exit(u32::MAX - 3, Duration::from_millis(50)));
+    }
 }

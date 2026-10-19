@@ -76,11 +76,27 @@ fn move_window_to_screen(ns_win: &NSWindow, frame: [f64; 4]) {
 }
 
 /// Moves the open picker to cover the screen at `frame` (global points).
-pub(super) fn move_picker_window(frame: [f64; 4]) {
+pub(super) fn move_picker_window(frame: [f64; 4], _cx: &mut App) {
     if let Some(ns_win) = find_picker_ns_window() {
         move_window_to_screen(&ns_win, frame);
     }
 }
+
+/// GPUI places windows relative to their display on macOS.
+pub(super) fn window_origin(_display: Option<&dyn gpui::PlatformDisplay>) -> gpui::Point<gpui::Pixels> {
+    gpui::Point::default()
+}
+
+/// Where the GPUI pill window opens on `display`: centred, `PILL_TOP` below its top.
+pub(super) fn hud_pill_origin(display: gpui::Bounds<gpui::Pixels>) -> gpui::Point<gpui::Pixels> {
+    gpui::point(
+        (display.size.width - gpui::px(PILL_WINDOW_W)) * 0.5,
+        gpui::px(PILL_TOP),
+    )
+}
+
+/// The GPUI pill (`SCRAWL_NATIVE_PILL=0`) stays where it opened on macOS.
+pub(super) fn place_hud_pill(_point: [f64; 2]) {}
 
 /// Dragging a region moves its window.
 pub(super) fn window_drag_region(region: Div) -> Div {
@@ -208,6 +224,7 @@ pub(super) fn configure_picker_window(
     _window: &mut Window,
     lab: bool,
     frame: [f64; 4],
+    _cx: &mut App,
 ) -> Option<u32> {
     let ns_win = find_picker_ns_window()?;
     ns_win.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
@@ -229,7 +246,7 @@ pub(super) struct PillChrome {
 }
 
 impl PillChrome {
-    pub(super) fn open(_window: &mut Window) -> Self {
+    pub(super) fn open(_window: &mut Window, _cx: &mut App) -> Self {
         let ns_window = find_hud_pill_ns_window();
         let mut shell_layer = None;
         if let Some(ref ns_win) = ns_window {

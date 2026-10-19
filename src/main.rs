@@ -1439,7 +1439,10 @@ fn main() -> Result<()> {
     match command {
         Command::App { record, iphone } => {
             #[cfg(target_os = "windows")]
-            win::shell::release_own_console();
+            {
+                win::shell::release_own_console();
+                win::shell::wait_for_relauncher();
+            }
             ui::run_app(None, record, iphone, None);
             Ok(())
         }

@@ -907,42 +907,66 @@ impl VideoReader {
     /// for times in increasing order. Returns `(requested, frame)`.
     fn at(&self, times: &[u64], max_edge: u32) -> Result<Vec<(u64, Decoded)>> {
         let mut out = Vec::with_capacity(times.len());
-        let mut previous: Option<(u64, IMFSample)> = None;
-        let mut pending: Option<(u64, IMFSample)> = None;
-        let mut position: Option<u64> = None;
-        for &want in times {
-            let want = want.min(self.duration_ms.saturating_sub(1));
-            // Far ahead (or behind): seek, landing on the key frame before it.
-            if position.is_none_or(|p| want + 40 < p || want > p + 2_000) {
-                self.seek(want.saturating_sub(40))?;
-                previous = None;
-                pending = None;
-            }
-            loop {
-                let next = match pending.take() {
-                    Some(sample) => Some(sample),
-                    None => self.next()?,
-                };
-                let Some((t, sample)) = next else {
-                    break;
-                };
-                position = Some(t);
-                if t > want + 40 {
-                    if previous.is_none() {
-                        previous = Some((t, sample));
-                    } else {
-                        pending = Some((t, sample));
-                    }
-                    break;
-                }
-                previous = Some((t, sample));
-            }
-            if let Some((t, sample)) = previous.as_ref() {
-                out.push((want, self.convert(*t, sample, max_edge)?));
-            }
-        }
+        on_screen_at(
+            times,
+            self.duration_ms,
+            |t| self.seek(t),
+            || self.next(),
+            |want, t, sample| {
+                out.push((want, self.convert(t, sample, max_edge)?));
+                Ok(())
+            },
+        )?;
         Ok(out)
     }
+}
+
+/// Walks a movie's samples (`next`, in order; `seek` jumps to the key frame before a time) and
+/// hands `emit` the one on screen at each requested time (in increasing order): the last at or
+/// before it, give or take 40 ms. A time past the end gets the last sample, and is still
+/// answered as the time asked for, so callers can match it.
+fn on_screen_at<S>(
+    times: &[u64],
+    duration_ms: u64,
+    mut seek: impl FnMut(u64) -> Result<()>,
+    mut next: impl FnMut() -> Result<Option<(u64, S)>>,
+    mut emit: impl FnMut(u64, u64, &S) -> Result<()>,
+) -> Result<()> {
+    let mut previous: Option<(u64, S)> = None;
+    let mut pending: Option<(u64, S)> = None;
+    let mut position: Option<u64> = None;
+    for &want in times {
+        let target = want.min(duration_ms.saturating_sub(1));
+        // Far ahead (or behind): seek, landing on the key frame before it.
+        if position.is_none_or(|p| target + 40 < p || target > p + 2_000) {
+            seek(target.saturating_sub(40))?;
+            previous = None;
+            pending = None;
+        }
+        loop {
+            let sample = match pending.take() {
+                Some(sample) => Some(sample),
+                None => next()?,
+            };
+            let Some((t, sample)) = sample else {
+                break;
+            };
+            position = Some(t);
+            if t > target + 40 {
+                if previous.is_none() {
+                    previous = Some((t, sample));
+                } else {
+                    pending = Some((t, sample));
+                }
+                break;
+            }
+            previous = Some((t, sample));
+        }
+        if let Some((t, sample)) = previous.as_ref() {
+            emit(want, *t, sample)?;
+        }
+    }
+    Ok(())
 }
 
 /// Box-filters a frame down so its long edge is at most `max_edge` (0 keeps it).
@@ -1114,4 +1138,55 @@ pub fn export_audio(movie: &Path, wav: &Path) -> Result<()> {
         .collect();
     std::fs::write(wav, crate::audio::encode_wav_16k(&resampled)?)
         .with_context(|| format!("Could not write {}", wav.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Picks from a movie with a frame every 100 ms up to `last`, seeking to the frame at or
+    /// before a time as a key frame every 1 s would.
+    fn pick(times: &[u64], duration_ms: u64, last: u64) -> Vec<(u64, u64)> {
+        let cursor = std::cell::Cell::new(0_u64);
+        let mut out = Vec::new();
+        on_screen_at(
+            times,
+            duration_ms,
+            |t| {
+                cursor.set(t / 1_000 * 1_000);
+                Ok(())
+            },
+            || {
+                let t = cursor.get();
+                cursor.set(t + 100);
+                Ok((t <= last).then_some((t, t)))
+            },
+            |want, t, &sample| {
+                assert_eq!(t, sample);
+                out.push((want, t));
+                Ok(())
+            },
+        )
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn a_time_past_the_end_gets_the_last_frame_under_its_own_time() {
+        // A 3 s movie whose last frame is at 2.9 s; the last keyframe is asked for at 3.2 s.
+        assert_eq!(
+            pick(&[0, 1_250, 3_200], 3_000, 2_900),
+            [(0, 0), (1_250, 1_200), (3_200, 2_900)]
+        );
+    }
+
+    #[test]
+    fn frames_are_the_last_at_or_before_each_time_give_or_take_40_ms() {
+        assert_eq!(
+            pick(&[150, 160, 1_030, 2_510], 3_000, 2_900),
+            [(150, 100), (160, 200), (1_030, 1_000), (2_510, 2_500)]
+        );
+        // Far ahead: a seek, then the walk from the key frame.
+        assert_eq!(pick(&[150, 2_510], 3_000, 2_900), [(150, 100), (2_510, 2_500)]);
+    }
 }

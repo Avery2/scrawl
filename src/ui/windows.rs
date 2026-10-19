@@ -6,10 +6,11 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicIsize, Ordering};
 
 use gpui::{
-    AnyElement, App, Div, InteractiveElement, IntoElement, ParentElement, Styled, Window,
-    WindowControlArea, div, px, rgb, rgba,
+    AnyElement, App, Div, InteractiveElement, IntoElement, ParentElement, Pixels, Point, Styled,
+    Window, WindowControlArea, div, px, rgb, rgba,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use tray_icon::menu::{
@@ -18,10 +19,11 @@ use tray_icon::menu::{
 use tray_icon::{MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GetWindowLongPtrW, HWND_TOPMOST, SPI_GETCLIENTAREAANIMATION, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    GWL_EXSTYLE, GetWindowLongPtrW, GetWindowThreadProcessId, HWND_TOPMOST, IsWindow,
+    SPI_GETCLIENTAREAANIMATION, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, SystemParametersInfoW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST,
 };
 use windows::core::BOOL;
 
@@ -82,21 +84,40 @@ pub(crate) fn gpui_display_for(
     })
 }
 
-/// The open picker's window, to move it when it follows the pointer to another display.
-static PICKER_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// The open picker's and pill's windows, to move them when they follow the pointer or the
+/// recording to another display.
+static PICKER_HWND: AtomicIsize = AtomicIsize::new(0);
+static PILL_HWND: AtomicIsize = AtomicIsize::new(0);
 
-/// Moves the open picker to cover the monitor at `frame` (global pixels).
-pub(super) fn move_picker_window(frame: [f64; 4]) {
-    let id = PICKER_HWND.load(std::sync::atomic::Ordering::Acquire);
+/// The window in `slot`, while it's still one of Scrawl's.
+fn own_window(slot: &AtomicIsize) -> Option<isize> {
+    let id = slot.load(Ordering::Acquire);
     if id == 0 {
-        return;
+        return None;
     }
     let hwnd = win::hwnd(id);
-    if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(hwnd)) }.as_bool() {
-        return;
+    let mut pid = 0;
+    unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return None;
+        }
+        GetWindowThreadProcessId(hwnd, Some(&raw mut pid));
     }
-    let [x, y, w, h] = frame.map(|v| v.round() as i32);
-    let _ = unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE) };
+    (pid == std::process::id()).then_some(id)
+}
+
+/// GPUI windows are placed in global DIPs on Windows: the display's own origin.
+pub(super) fn window_origin(display: Option<&dyn gpui::PlatformDisplay>) -> Point<Pixels> {
+    display.map_or_else(Point::default, |d| d.bounds().origin)
+}
+
+/// Moves the open picker to cover the monitor at `frame` (global pixels). On the next turn of
+/// the event loop: from inside an update, GPUI's resize and DPI callbacks can't reach the app,
+/// and the window would keep its old layout size and scale.
+pub(super) fn move_picker_window(frame: [f64; 4], cx: &mut App) {
+    if let Some(id) = own_window(&PICKER_HWND) {
+        cx.spawn(async move |_| win::overlay::place(id, frame)).detach();
+    }
 }
 
 /// The picker takes the keys itself (`configure_picker_window`); the review window opens in front.
@@ -319,14 +340,64 @@ pub(super) fn configure_picker_window(
     window: &mut Window,
     _lab: bool,
     frame: [f64; 4],
+    cx: &mut App,
 ) -> Option<u32> {
     let hwnd = hwnd_of(window)?;
     style_floating(hwnd, true);
-    let [x, y, w, h] = frame.map(|v| v.round() as i32);
-    let _ = unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_SHOWWINDOW) };
-    let _ = unsafe { SetForegroundWindow(hwnd) };
-    PICKER_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Release);
+    let id = hwnd.0 as isize;
+    PICKER_HWND.store(id, Ordering::Release);
+    // Placed and brought forward once `open_window` has returned (see `move_picker_window`).
+    cx.spawn(async move |_| {
+        win::overlay::place(id, frame);
+        let _ = unsafe { SetForegroundWindow(win::hwnd(id)) };
+    })
+    .detach();
     Some(hwnd.0 as usize as u32)
+}
+
+/// The pill window's rect (global pixels) on the display holding `point`.
+fn pill_rect_at(point: [f64; 2]) -> Option<[f64; 4]> {
+    let screens = crate::screens::displays();
+    let screen = screens.get(crate::screens::index_at(&screens, point)?)?;
+    Some(crate::screens::pill_window_rect(
+        screen,
+        f64::from(PILL_WINDOW_W),
+        f64::from(PILL_WINDOW_H),
+        f64::from(PILL_TOP),
+    ))
+}
+
+/// Where the pill window opens on `display` (GPUI's global DIPs): below the work area's top.
+pub(super) fn hud_pill_origin(display: gpui::Bounds<Pixels>) -> Point<Pixels> {
+    let origin = [f64::from(f32::from(display.origin.x)), f64::from(f32::from(display.origin.y))];
+    let screen = crate::screens::displays().into_iter().find(|s| {
+        (origin[0] * s.scale - s.frame[0]).abs() < 2.0 && (origin[1] * s.scale - s.frame[1]).abs() < 2.0
+    });
+    match screen {
+        Some(s) => {
+            let [x, y, _, _] = crate::screens::pill_window_rect(
+                &s,
+                f64::from(PILL_WINDOW_W),
+                f64::from(PILL_WINDOW_H),
+                f64::from(PILL_TOP),
+            );
+            gpui::point(px((x / s.scale) as f32), px((y / s.scale) as f32))
+        }
+        None => gpui::point(
+            display.origin.x + (display.size.width - px(PILL_WINDOW_W)) * 0.5,
+            display.origin.y + px(PILL_TOP),
+        ),
+    }
+}
+
+/// Moves the pill window to the display holding `point` (global pixels). Off the UI thread, as
+/// the ink overlay's `move_to` is: this runs inside an update, where GPUI's resize and DPI
+/// callbacks can't reach the app; the window's thread handles the move from its loop.
+pub(super) fn place_hud_pill(point: [f64; 2]) {
+    let (Some(id), Some(rect)) = (own_window(&PILL_HWND), pill_rect_at(point)) else {
+        return;
+    };
+    std::thread::spawn(move || win::overlay::place(id, rect));
 }
 
 /// The pill's window. Windows has no native shell for it: GPUI draws the capsule, its shadow
@@ -335,31 +406,35 @@ pub(super) struct PillChrome {
     hwnd: Option<HWND>,
 }
 
+impl Drop for PillChrome {
+    fn drop(&mut self) {
+        if let Some(hwnd) = self.hwnd {
+            let _ =
+                PILL_HWND.compare_exchange(hwnd.0 as isize, 0, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+}
+
 impl PillChrome {
-    pub(super) fn open(window: &mut Window) -> Self {
+    /// GPUI opens the window on the display in use (`hud_pill_origin`); it's sized to the
+    /// pixel once `open_window` has returned, past the frame GPUI keeps around it.
+    pub(super) fn open(window: &mut Window, cx: &mut App) -> Self {
         let hwnd = hwnd_of(window);
         if let Some(hwnd) = hwnd {
             style_floating(hwnd, false);
-            let scale = f64::from(window.scale_factor());
-            if let Some(monitor) = win::primary_monitor() {
-                let [mx, my, mw, _] = monitor.rect;
-                let w = f64::from(PILL_WINDOW_W) * scale;
-                let h = f64::from(PILL_WINDOW_H) * scale;
-                let x = mx + (mw - w) / 2.0;
-                let y = my + f64::from(PILL_TOP) * scale;
-                let _ = unsafe {
-                    SetWindowPos(
-                        hwnd,
-                        Some(HWND_TOPMOST),
-                        x.round() as i32,
-                        y.round() as i32,
-                        w.round() as i32,
-                        h.round() as i32,
-                        SWP_NOACTIVATE,
-                    )
-                };
-            }
             let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+            let id = hwnd.0 as isize;
+            PILL_HWND.store(id, Ordering::Release);
+            let bounds = window.bounds();
+            let scale = f64::from(window.scale_factor());
+            let centre = bounds.center();
+            let at = [
+                f64::from(f32::from(centre.x)) * scale,
+                f64::from(f32::from(centre.y)) * scale,
+            ];
+            if let Some(rect) = pill_rect_at(at) {
+                cx.spawn(async move |_| win::overlay::place(id, rect)).detach();
+            }
         }
         Self { hwnd }
     }
