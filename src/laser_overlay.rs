@@ -24,8 +24,15 @@ use crate::capture::SharedCaptureTelemetry;
 use crate::sketch::{slice_laser_window, smooth_ink_points, smooth_laser_points};
 
 const TAIL_DURATION_SEC: f32 = 0.42;
-const MAX_SEGMENTS: usize = 1536;
+const MAX_SEGMENTS: usize = 16_384;
 const MAX_PINS: usize = 64;
+/// Side of a culling tile, in points. Each pixel runs only the segments binned into its tile.
+const TILE_PT: f32 = 32.0;
+/// How far a segment can colour a pixel, in points. They must stay at or past the shader's
+/// cutoffs, or the stroke is clipped at tile edges: the laser glow ends at three sigma
+/// (`glow_sigma` <= 6.2 * (0.28 + 0.72 * 1.25) = 7.32), the ink at `r + 2.0` (`r` <= 2.59).
+const LASER_REACH_PT: f32 = 22.0;
+const INK_REACH_PT: f32 = 4.6;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -42,6 +49,10 @@ struct LaserUniforms {
     _pad1: f32,
     target_rect: [f32; 4],
     glow: [f32; 4],
+    tile_cols: u32,
+    tile_rows: u32,
+    tile_size: f32,
+    _pad2: f32,
 }
 
 #[repr(C)]
@@ -447,9 +458,6 @@ impl SharedMetalOverlay {
                 let raw = slice_laser_window(&stroke.timed_points(), now_ms, tail_ms, to_screen);
                 let smoothed = smooth_laser_points(&raw);
                 for pair in smoothed.windows(2) {
-                    if segments.len() >= MAX_SEGMENTS {
-                        break;
-                    }
                     let (a, w0) = pair[0];
                     let (b, w1) = pair[1];
                     segments.push(PathSegment {
@@ -483,9 +491,6 @@ impl SharedMetalOverlay {
                     .collect();
                 let smoothed = smooth_ink_points(&pts);
                 for pair in smoothed.windows(2) {
-                    if segments.len() >= MAX_SEGMENTS {
-                        break;
-                    }
                     segments.push(PathSegment {
                         a: pair[0].0,
                         b: pair[1].0,
@@ -496,6 +501,12 @@ impl SharedMetalOverlay {
                     });
                 }
             }
+        }
+
+        // Strokes run oldest to newest, the live ones last. Past the cap, drop from the front, so
+        // the tip being drawn keeps showing and a long scribble never runs out of ink.
+        if segments.len() > MAX_SEGMENTS {
+            segments.drain(..segments.len() - MAX_SEGMENTS);
         }
 
         let shift_held = self.telemetry.shift_held.load(Ordering::Acquire);
@@ -519,6 +530,8 @@ impl SharedMetalOverlay {
             .renderer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tile_cols = (renderer.width / TILE_PT).ceil().max(1.0) as u32;
+        let tile_rows = (renderer.height / TILE_PT).ceil().max(1.0) as u32;
         objc2::rc::autoreleasepool(|_| {
             let Some(drawable) = renderer.layer.next_drawable() else {
                 return;
@@ -530,6 +543,11 @@ impl SharedMetalOverlay {
             attachment.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0));
             attachment.set_store_action(MTLStoreAction::Store);
 
+            let segment_count = if !is_active || (segments.len() == 1 && segments[0].width == 0.0) {
+                0
+            } else {
+                segments.len().min(MAX_SEGMENTS)
+            };
             let uniforms = LaserUniforms {
                 resolution: [
                     renderer.width * renderer.scale,
@@ -540,11 +558,7 @@ impl SharedMetalOverlay {
                 tail_duration: picker_fade,
                 tip_active: if is_active && shift_held { 1.0 } else { 0.0 },
                 tip_pos: pointer,
-                segment_count: if !is_active || (segments.len() == 1 && segments[0].width == 0.0) {
-                    0
-                } else {
-                    segments.len().min(MAX_SEGMENTS) as u32
-                },
+                segment_count: segment_count as u32,
                 pin_count: if !is_active || (pins.len() == 1 && pins[0].radius == 0.0) {
                     0
                 } else {
@@ -561,6 +575,10 @@ impl SharedMetalOverlay {
                     0.0,
                     0.0,
                 ],
+                tile_cols,
+                tile_rows,
+                tile_size: TILE_PT,
+                _pad2: 0.0,
             };
 
             let cmd = renderer.command_queue.new_command_buffer();
@@ -577,6 +595,66 @@ impl SharedMetalOverlay {
             cmd.commit();
         });
     }
+}
+
+/// Sorts segments into a `cols`×`rows` grid of `size`-point tiles by the area each can colour.
+/// One buffer: `cols * rows + 1` offsets, then each tile's segment indices from its offset to
+/// the next tile's. A segment off the screen lands in no tile.
+fn bin_segments(segments: &[PathSegment], cols: u32, rows: u32, size: f32) -> Vec<u32> {
+    let tile_count = (cols * rows) as usize;
+    let span = |seg: &PathSegment| {
+        let reach = if seg.kind < 0.5 {
+            LASER_REACH_PT
+        } else {
+            INK_REACH_PT
+        };
+        let lo = [
+            seg.a[0].min(seg.b[0]) - reach,
+            seg.a[1].min(seg.b[1]) - reach,
+        ];
+        let hi = [
+            seg.a[0].max(seg.b[0]) + reach,
+            seg.a[1].max(seg.b[1]) + reach,
+        ];
+        if hi[0] < 0.0
+            || hi[1] < 0.0
+            || lo[0] >= cols as f32 * size
+            || lo[1] >= rows as f32 * size
+        {
+            return None;
+        }
+        let cell = |v: f32, n: u32| ((v / size).max(0.0) as u32).min(n - 1);
+        Some((
+            cell(lo[0], cols)..=cell(hi[0], cols),
+            cell(lo[1], rows)..=cell(hi[1], rows),
+        ))
+    };
+    let mut table = vec![0u32; tile_count + 1];
+    for (cols_span, rows_span) in segments.iter().filter_map(span) {
+        for row in rows_span {
+            for col in cols_span.clone() {
+                table[(row * cols + col) as usize + 1] += 1;
+            }
+        }
+    }
+    for i in 1..=tile_count {
+        table[i] += table[i - 1];
+    }
+    let mut next: Vec<u32> = table[..tile_count].to_vec();
+    table.resize(tile_count + 1 + table[tile_count] as usize, 0);
+    for (index, seg) in segments.iter().enumerate() {
+        let Some((cols_span, rows_span)) = span(seg) else {
+            continue;
+        };
+        for row in rows_span {
+            for col in cols_span.clone() {
+                let tile = (row * cols + col) as usize;
+                table[tile_count + 1 + next[tile] as usize] = index as u32;
+                next[tile] += 1;
+            }
+        }
+    }
+    table
 }
 
 fn overlay_pipeline(device: &metal::DeviceRef) -> Result<RenderPipelineState, String> {
@@ -624,7 +702,7 @@ fn encode_overlay(
         size_of::<LaserUniforms>() as u64,
         std::ptr::from_ref(uniforms).cast(),
     );
-    // Up to MAX_SEGMENTS * 32 B = 48 KB, past the 4 KB `set_fragment_bytes` limit (128
+    // Up to MAX_SEGMENTS * 32 B = 512 KB, past the 4 KB `set_fragment_bytes` limit (128
     // segments), so segments go in a fresh buffer each frame. The command buffer retains it
     // until the GPU is done, so a frame never overwrites one still being read.
     let segment_buffer = device.new_buffer_with_data(
@@ -638,6 +716,18 @@ fn encode_overlay(
         (pins.len() * size_of::<PinMarker>()) as u64,
         pins.as_ptr().cast(),
     );
+    let tiles = bin_segments(
+        &segments[..uniforms.segment_count as usize],
+        uniforms.tile_cols,
+        uniforms.tile_rows,
+        uniforms.tile_size,
+    );
+    let tile_buffer = device.new_buffer_with_data(
+        tiles.as_ptr().cast(),
+        size_of_val(tiles.as_slice()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    enc.set_fragment_buffer(3, Some(&tile_buffer), 0);
     enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
     enc.end_encoding();
 }
@@ -656,7 +746,7 @@ mod tests {
         assert!(MAX_PINS * size_of::<PinMarker>() <= SET_BYTES_LIMIT);
     }
 
-    /// Renders the real shader offscreen with `MAX_SEGMENTS` segments (48 KB, which aborted in
+    /// Renders the real shader offscreen with `MAX_SEGMENTS` segments (512 KB; 48 KB aborted in
     /// `setFragmentBytes`). Only the last segment is on screen, so the ink shows only if the
     /// shader read the whole array.
     #[test]
@@ -701,6 +791,10 @@ mod tests {
             _pad1: 0.0,
             target_rect: [0.0, 0.0, size as f32, size as f32],
             glow: [0.0; 4],
+            tile_cols: 2,
+            tile_rows: 2,
+            tile_size: TILE_PT,
+            _pad2: 0.0,
         };
 
         let pass = RenderPassDescriptor::new();
@@ -737,6 +831,207 @@ mod tests {
         let [b, g, r, a] = bgra(32, 32);
         assert!(a > 200 && r > 200 && g < 100 && b < 100, "stroke pixel {:?}", [b, g, r, a]);
         assert_eq!(bgra(32, 4)[3], 0, "nothing drawn away from the stroke");
+    }
+
+    /// Tiles only skip work: the frame matches one where every pixel runs every segment, as
+    /// before tiling, byte for byte. A reach shorter than the shader's cutoff fails here as a
+    /// seam along a tile edge.
+    #[test]
+    fn tiled_frame_matches_an_untiled_one() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let pipeline = overlay_pipeline(&device).expect("pipeline");
+        let (width, height, scale) = (256.0_f32, 192.0_f32, 2.0_f32);
+        let ink: Vec<[f32; 2]> = (0..48)
+            .map(|i| {
+                let t = i as f32 / 48.0 * std::f32::consts::TAU;
+                [128.0 + 90.0 * t.cos(), 96.0 + 60.0 * t.sin()]
+            })
+            .collect();
+        let mut segments: Vec<PathSegment> = smooth_ink_points(&ink)
+            .windows(2)
+            .map(|pair| PathSegment {
+                a: pair[0].0,
+                b: pair[1].0,
+                w0: pair[0].1,
+                w1: pair[1].1,
+                kind: 1.0,
+                width: 1.0,
+            })
+            .collect();
+        // Ink at full pressure and a laser at full weight reach the furthest, both crossing
+        // tile edges both ways.
+        segments.extend((0..12).map(|i| PathSegment {
+            a: [10.0 + i as f32 * 20.0, 170.0 - i as f32 * 13.0],
+            b: [30.0 + i as f32 * 20.0, 157.0 - i as f32 * 13.0],
+            w0: 1.15,
+            w1: 1.15,
+            kind: 1.0,
+            width: 1.0,
+        }));
+        segments.extend((0..12).map(|i| PathSegment {
+            a: [20.0 + i as f32 * 18.0, 30.0 + i as f32 * 11.0],
+            b: [38.0 + i as f32 * 18.0, 41.0 + i as f32 * 11.0],
+            w0: 1.25,
+            w1: 1.25,
+            kind: 0.0,
+            width: 3.0,
+        }));
+        let n = segments.len() as u32;
+        let uniforms = LaserUniforms {
+            resolution: [width * scale, height * scale],
+            scale,
+            now_sec: 5.0,
+            tail_duration: 1.0,
+            segment_count: n,
+            target_rect: [0.0, 0.0, width, height],
+            tile_cols: (width / TILE_PT).ceil() as u32,
+            tile_rows: (height / TILE_PT).ceil() as u32,
+            tile_size: TILE_PT,
+            ..LaserUniforms::default()
+        };
+        let render = |uniforms: &LaserUniforms| {
+            let (w, h) = ((width * scale) as u64, (height * scale) as u64);
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_width(w);
+            descriptor.set_height(h);
+            descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+            descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+            let texture = device.new_texture(&descriptor);
+            let pass = RenderPassDescriptor::new();
+            let attachment = pass.color_attachments().object_at(0).unwrap();
+            attachment.set_texture(Some(&texture));
+            attachment.set_load_action(MTLLoadAction::Clear);
+            attachment.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0));
+            attachment.set_store_action(MTLStoreAction::Store);
+            let queue = device.new_command_queue();
+            let cmd = queue.new_command_buffer();
+            let pins = [PinMarker::default()];
+            encode_overlay(cmd, pass, &device, &pipeline, uniforms, &segments, &pins);
+            cmd.commit();
+            cmd.wait_until_completed();
+            let mut pixels = vec![0u8; (w * h * 4) as usize];
+            texture.get_bytes(
+                pixels.as_mut_ptr().cast(),
+                w * 4,
+                metal::MTLRegion::new_2d(0, 0, w, h),
+                0,
+            );
+            pixels
+        };
+
+        let tiled = render(&uniforms);
+        // One tile bigger than the screen holds every segment.
+        let untiled = render(&LaserUniforms {
+            tile_cols: 1,
+            tile_rows: 1,
+            tile_size: f32::MAX,
+            ..uniforms
+        });
+        assert!(tiled.iter().any(|&b| b != 0), "the scene draws something");
+        let differ = tiled.chunks(4).zip(untiled.chunks(4)).filter(|(a, b)| a != b).count();
+        assert_eq!(differ, 0, "{differ} pixels differ from the untiled frame");
+    }
+
+    /// Times one overlay frame on a 14" MacBook Pro's built-in display (2056×1329 pt at 2x)
+    /// while Shift ink is on screen: a big loop (120 pointer samples, ~900 segments) and a
+    /// scribble that fills `MAX_SEGMENTS`. Run with
+    /// `cargo test --release overlay_frame_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn overlay_frame_time() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let pipeline = overlay_pipeline(&device).expect("pipeline");
+        let (width, height, scale) = (2056.0_f32, 1329.0_f32, 2.0_f32);
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_width((width * scale) as u64);
+        descriptor.set_height((height * scale) as u64);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        let texture = device.new_texture(&descriptor);
+
+        // One big loop, then a long fast scribble that fills the whole segment cap.
+        let big_loop: Vec<[f32; 2]> = (0..120)
+            .map(|i| {
+                let t = i as f32 / 120.0 * std::f32::consts::TAU * 1.1;
+                [1028.0 + 575.0 * t.cos(), 585.0 + 290.0 * t.sin()]
+            })
+            .collect();
+        let scribble: Vec<[f32; 2]> = (0..2_400)
+            .map(|i| {
+                let t = i as f32 * 0.05;
+                [1028.0 + 600.0 * (t * 1.3).sin(), 600.0 + 330.0 * (t * 1.7).cos()]
+            })
+            .collect();
+        let queue = device.new_command_queue();
+        for samples in [big_loop, scribble] {
+            let smoothed = smooth_ink_points(&samples);
+            let segments: Vec<PathSegment> = smoothed
+                .windows(2)
+                .skip((smoothed.len() - 1).saturating_sub(MAX_SEGMENTS))
+                .map(|pair| PathSegment {
+                    a: pair[0].0,
+                    b: pair[1].0,
+                    w0: pair[0].1,
+                    w1: pair[1].1,
+                    kind: 1.0,
+                    width: 1.0,
+                })
+                .collect();
+            let uniforms = LaserUniforms {
+                resolution: [width * scale, height * scale],
+                scale,
+                now_sec: 5.0,
+                tail_duration: 1.0,
+                segment_count: segments.len() as u32,
+                target_rect: [0.0, 0.0, width, height],
+                tile_cols: (width / TILE_PT).ceil() as u32,
+                tile_rows: (height / TILE_PT).ceil() as u32,
+                tile_size: TILE_PT,
+                ..LaserUniforms::default()
+            };
+            let mut frame_ms = Vec::new();
+            for frame in 0..70 {
+                let pass = RenderPassDescriptor::new();
+                let attachment = pass.color_attachments().object_at(0).unwrap();
+                attachment.set_texture(Some(&texture));
+                attachment.set_load_action(MTLLoadAction::Clear);
+                attachment.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0));
+                attachment.set_store_action(MTLStoreAction::Store);
+                let started = std::time::Instant::now();
+                let cmd = queue.new_command_buffer();
+                encode_overlay(
+                    cmd,
+                    pass,
+                    &device,
+                    &pipeline,
+                    &uniforms,
+                    &segments,
+                    &[PinMarker::default()],
+                );
+                cmd.commit();
+                cmd.wait_until_completed();
+                if frame >= 10 {
+                    frame_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+                }
+            }
+            frame_ms.sort_by(f64::total_cmp);
+            println!(
+                "{} samples, {} segments at {}x{} px: median {:.2} ms, p95 {:.2} ms, max {:.2} ms",
+                samples.len(),
+                segments.len(),
+                width * scale,
+                height * scale,
+                frame_ms[frame_ms.len() / 2],
+                frame_ms[frame_ms.len() * 95 / 100],
+                frame_ms[frame_ms.len() - 1],
+            );
+        }
     }
 
     /// The shader must load on the oldest macOS Scrawl supports (`LSMinimumSystemVersion` 26.0).

@@ -15,6 +15,10 @@ struct LaserUniforms {
     float4 target_rect;
     // x: 1 when a full-screen recording started straight from the shortcut (no picker).
     float4 glow;
+    uint tile_cols;
+    uint tile_rows;
+    float tile_size;
+    float _pad2;
 };
 
 // Each segment connects A -> B in logical screen points.
@@ -56,7 +60,9 @@ fragment float4 laser_fragment(
     VertexOutput in [[stage_in]],
     constant LaserUniforms &u [[buffer(0)]],
     const device PathSegment *segments [[buffer(1)]],
-    const device PinMarker *pins [[buffer(2)]]
+    const device PinMarker *pins [[buffer(2)]],
+    // `tile_cols * tile_rows + 1` offsets, then each tile's segment indices (`bin_segments`).
+    const device uint *tiles [[buffer(3)]]
 ) {
     // Pixel position in logical screen points (top-left origin).
     float2 p = (in.uv * u.resolution) / max(u.scale, 1.0);
@@ -70,9 +76,13 @@ fragment float4 laser_fragment(
     float ink_halo_cov = 0.0;
     float ink_red_cov = 0.0;
 
-    uint count = min(u.segment_count, 1536u);
-    for (uint i = 0; i < count; ++i) {
-        PathSegment seg = segments[i];
+    uint tile_count = u.tile_cols * u.tile_rows;
+    uint2 cell = min(uint2(max(p, float2(0.0)) / u.tile_size), uint2(u.tile_cols, u.tile_rows) - 1u);
+    uint tile = cell.y * u.tile_cols + cell.x;
+    uint first = u.segment_count > 0u && tile_count > 0u ? tiles[tile] : 0u;
+    uint last = u.segment_count > 0u && tile_count > 0u ? tiles[tile + 1u] : 0u;
+    for (uint j = first; j < last; ++j) {
+        PathSegment seg = segments[tiles[tile_count + 1u + j]];
         float2 ab = seg.b - seg.a;
         float len2 = max(dot(ab, ab), 0.0001);
         float h = clamp(dot(p - seg.a, ab) / len2, 0.0, 1.0);
