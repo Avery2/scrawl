@@ -1,3 +1,4 @@
+mod agent_context;
 mod audio;
 mod autocrop;
 mod autocrop_lab;
@@ -228,6 +229,10 @@ enum Command {
         /// Transcribe with `apple` or `hex` instead of the configured transcriber.
         #[arg(long, value_parser = parse_engine)]
         transcriber: Option<crate::transcribe::Engine>,
+        /// Turn an experiment on for this run, as `"experiments"` in `config.json` would
+        /// (e.g. `agentContext`). Repeatable.
+        #[arg(long = "experiment", value_name = "NAME")]
+        experiments: Vec<String>,
     },
     /// Motion lab: replay the capsule's states on a fixed timeline with nothing captured, for
     /// traces (`--trace`, motion-lint's format), screen recordings and tuning.
@@ -256,6 +261,9 @@ enum Command {
         /// Emit raw `scrawl.json` instead of `summary.md`.
         #[arg(long)]
         json: bool,
+        /// Turn an experiment on for this summary (e.g. `agentContext`). Repeatable.
+        #[arg(long = "experiment", value_name = "NAME")]
+        experiments: Vec<String>,
     },
     /// Extract a dense burst of frames from a `.scrawl` bundle's time range (`M:SS` or seconds).
     Frames {
@@ -1489,9 +1497,13 @@ fn main() -> Result<()> {
             out,
             bench,
             transcriber,
+            experiments,
         } => {
             if let Some(engine) = transcriber {
                 transcribe::set_override(engine);
+            }
+            for name in &experiments {
+                handoff::enable_experiment(name);
             }
             let (dir, old) = handoff::load_bundle(&bundle)?;
             let video = old
@@ -1799,7 +1811,14 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Inspect { bundle, json } => {
+        Command::Inspect {
+            bundle,
+            json,
+            experiments,
+        } => {
+            for name in &experiments {
+                handoff::enable_experiment(name);
+            }
             let (dir, loaded) = handoff::load_bundle(&bundle)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&loaded)?);
