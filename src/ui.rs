@@ -1934,7 +1934,10 @@ impl ScrawlCoordinator {
                     self.cancel_recording(cx);
                 }
             }
-            SelectionMode::Area => match self.selection_drag.and_then(|(a, b)| area_rect(a, b)) {
+            SelectionMode::Area => match self
+                .selection_drag
+                .and_then(|(a, b)| area_rect(a, b, self.display_rect))
+            {
                 Some([x, y, w, h]) => {
                     let target = region_target(x, y, w, h, &self.selectable_windows);
                     self.start_recording_with_target(target, cx);
@@ -2100,6 +2103,7 @@ impl ScrawlCoordinator {
             IslandPhase::Selecting {
                 mode: SelectionMode::Area,
             } => self.selection_drag.and_then(|(a, b)| {
+                let [a, b] = [a, b].map(|p| clamp_point(p, self.display_rect));
                 let w = (a[0] - b[0]).abs();
                 let h = (a[1] - b[1]).abs();
                 (w >= 1.0 && h >= 1.0).then_some(([a[0].min(b[0]), a[1].min(b[1]), w, h], 1))
@@ -4416,6 +4420,7 @@ impl Render for TargetPickerWindow {
         // Selection rect in window-local coordinates, clipped to the screen, plus its badge.
         let highlight: Option<([f32; 4], String)> = match mode {
             SelectionMode::Area => drag.map(|(a, b)| {
+                let [a, b] = [a, b].map(|p| clamp_point(p, coord.display_rect));
                 let w = (a[0] - b[0]).abs().max(1.0);
                 let h = (a[1] - b[1]).abs().max(1.0);
                 (
@@ -4694,11 +4699,7 @@ impl Render for TargetPickerWindow {
                         return;
                     }
                     if let Some((start, _)) = coord.selection_drag.take() {
-                        let x = f64::from(start[0].min(sx));
-                        let y = f64::from(start[1].min(sy));
-                        let w = f64::from((start[0] - sx).abs());
-                        let h = f64::from((start[1] - sy).abs());
-                        if w >= 36.0 && h >= 36.0 {
+                        if let Some([x, y, w, h]) = area_rect(start, [sx, sy], coord.display_rect) {
                             let target = region_target(x, y, w, h, &coord.selectable_windows);
                             coord.start_recording_with_target(target, cx);
                         } else {
@@ -4726,11 +4727,24 @@ enum BadgeAnchor {
     Center,
 }
 
-/// A dragged area in global points, if it's big enough to record (as in the Area picker).
-fn area_rect(a: [f32; 2], b: [f32; 2]) -> Option<[f64; 4]> {
-    let w = f64::from((a[0] - b[0]).abs());
-    let h = f64::from((a[1] - b[1]).abs());
-    (w >= 36.0 && h >= 36.0).then(|| [f64::from(a[0].min(b[0])), f64::from(a[1].min(b[1])), w, h])
+/// The smallest area the picker records, points a side (`screens::MIN_AREA` is the floor
+/// after trimming).
+const MIN_AREA_SIDE: f32 = 36.0;
+
+/// A point dragged past the picker's display (global points), pulled back onto its edge: an
+/// area belongs to the display the drag started on, which the picker stays on while dragging.
+fn clamp_point([x, y]: [f32; 2], [dx, dy, dw, dh]: [f32; 4]) -> [f32; 2] {
+    [x.clamp(dx, dx + dw), y.clamp(dy, dy + dh)]
+}
+
+/// A dragged area in global points, kept on the picker's `display` (so the cutout, the size
+/// badge and the recording agree), if it's big enough to record.
+fn area_rect(a: [f32; 2], b: [f32; 2], display: [f32; 4]) -> Option<[f64; 4]> {
+    let [a, b] = [a, b].map(|p| clamp_point(p, display));
+    let w = (a[0] - b[0]).abs();
+    let h = (a[1] - b[1]).abs();
+    (w >= MIN_AREA_SIDE && h >= MIN_AREA_SIDE)
+        .then(|| [a[0].min(b[0]), a[1].min(b[1]), w, h].map(f64::from))
 }
 
 fn clip_rect([x, y, w, h]: [f32; 4], [sw, sh]: [f32; 2]) -> [f32; 4] {
@@ -6154,11 +6168,49 @@ mod tests {
 
     #[test]
     fn a_held_drag_needs_room_for_an_area() {
+        let laptop = [0.0, 0.0, 1728.0, 1117.0];
         assert_eq!(
-            area_rect([100.0, 80.0], [40.0, 20.0]),
+            area_rect([100.0, 80.0], [40.0, 20.0], laptop),
             Some([40.0, 20.0, 60.0, 60.0])
         );
-        assert_eq!(area_rect([0.0, 0.0], [30.0, 200.0]), None);
+        assert_eq!(area_rect([0.0, 0.0], [30.0, 200.0], laptop), None);
+    }
+
+    /// Kit's review: a drag that starts at x -150 on a left display and overshoots to x 160 on
+    /// the laptop keeps to the left display, so it's recorded there (`screens::area_on_display`).
+    #[test]
+    fn an_area_drag_stays_on_the_display_it_started_on() {
+        let left = [-1920.0, 37.0, 1920.0, 1080.0];
+        assert_eq!(
+            area_rect([-150.0, 200.0], [160.0, 400.0], left),
+            Some([-150.0, 200.0, 150.0, 200.0])
+        );
+        // Past its bottom-left corner too.
+        assert_eq!(
+            area_rect([-1800.0, 1000.0], [-2100.0, 1300.0], left),
+            Some([-1920.0, 1000.0, 120.0, 117.0])
+        );
+        // What's left on the display can be too small to record.
+        assert_eq!(area_rect([-20.0, 200.0], [400.0, 400.0], left), None);
+        let screens = [
+            crate::screens::Screen {
+                id: 1,
+                frame: [0.0, 0.0, 1728.0, 1117.0],
+                visible: [0.0, 0.0, 1728.0, 1117.0],
+                scale: 2.0,
+                safe_top: 0.0,
+            },
+            crate::screens::Screen {
+                id: 2,
+                frame: left.map(f64::from),
+                visible: left.map(f64::from),
+                scale: 1.0,
+                safe_top: 0.0,
+            },
+        ];
+        let area = area_rect([-150.0, 200.0], [160.0, 400.0], left).unwrap();
+        let (i, rect) = crate::screens::area_on_display(&screens, area).unwrap();
+        assert_eq!((screens[i].id, rect), (2, area));
     }
 
     #[test]

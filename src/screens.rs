@@ -104,6 +104,26 @@ pub fn source_rect(area: Rect, display: Rect) -> Rect {
     [lx, ly, w, h]
 }
 
+/// The smallest area Scrawl records, points a side.
+pub const MIN_AREA: f64 = 32.0;
+
+/// Where an area dragged in the picker is recorded: on the display holding its centre (the
+/// picker already keeps the drag on one display), trimmed to it and grown to `MIN_AREA` a side
+/// without leaving it, so the `TargetFrame` and the display-local `sourceRect` are the same
+/// rect. Returns the display's index and the rect in global points.
+pub fn area_on_display(screens: &[Screen], area: Rect) -> Option<(usize, Rect)> {
+    let i = index_for_rect(screens, area)?;
+    let [dx, dy, dw, dh] = screens[i].frame;
+    let [cx, cy, cw, ch] = clamp_to(area, screens[i].frame);
+    let grow = |start: f64, len: f64, origin: f64, extent: f64| {
+        let len = len.max(MIN_AREA).min(extent);
+        (start.min(origin + extent - len).max(origin), len)
+    };
+    let (x, w) = grow(cx, cw, dx, dw);
+    let (y, h) = grow(cy, ch, dy, dh);
+    Some((i, [x, y, w, h]))
+}
+
 /// `frame` with its display's scale.
 pub fn with_scale(frame: Rect, scale: f64) -> TargetFrame {
     TargetFrame {
@@ -312,6 +332,39 @@ mod tests {
             source_rect([10.0, 20.0, 300.0, 200.0], LAPTOP),
             [10.0, 20.0, 300.0, 200.0]
         );
+    }
+
+    /// Kit's review: a drag that starts on a left display and overshoots onto the laptop. The
+    /// picker keeps the drag on the display it started on (`ui::area_rect`), so the area is the
+    /// left display's part and is recorded there.
+    #[test]
+    fn an_area_dragged_across_the_seam_stays_on_its_display() {
+        let left = [-1920.0, 37.0, 1920.0, 1080.0];
+        let screens = pair(left, 1.0);
+        // The picker pulled the overshoot (x 160) back to the seam (x 0).
+        let (i, rect) = area_on_display(&screens, [-150.0, 200.0, 150.0, 200.0]).unwrap();
+        assert_eq!((i, rect), (1, [-150.0, 200.0, 150.0, 200.0]));
+        // Without that, the centre (x 5) is on the laptop, and only the laptop's part of the
+        // area is recorded there: the frame never spans the seam.
+        let (i, rect) = area_on_display(&screens, [-150.0, 200.0, 310.0, 200.0]).unwrap();
+        assert_eq!((i, rect), (0, [0.0, 200.0, 160.0, 200.0]));
+    }
+
+    /// A sliver at a display's edge grows to `MIN_AREA` inward, so the target frame and the
+    /// display-local `sourceRect` describe the same pixels.
+    #[test]
+    fn small_areas_grow_inside_their_display() {
+        let left = [-1920.0, 37.0, 1920.0, 1080.0];
+        let screens = pair(left, 1.0);
+        let (i, rect) = area_on_display(&screens, [-20.0, 1100.0, 10.0, 10.0]).unwrap();
+        assert_eq!((i, rect), (1, [-32.0, 1085.0, 32.0, 32.0]));
+        let [x, y, w, h] = rect;
+        assert_eq!(source_rect(rect, left), [x - left[0], y - left[1], w, h]);
+        assert_eq!(source_rect(rect, left), [1888.0, 1048.0, 32.0, 32.0]);
+        // Top-left corner of the laptop.
+        let (_, rect) = area_on_display(&screens, [0.0, 0.0, 5.0, 40.0]).unwrap();
+        assert_eq!(rect, [0.0, 0.0, 32.0, 40.0]);
+        assert_eq!(source_rect(rect, LAPTOP), rect);
     }
 
     #[test]

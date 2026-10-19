@@ -1718,15 +1718,18 @@ pub fn region_target(
     let mid_y = y + height * 0.5;
     let hit = selectable_window_at(windows, mid_x, mid_y);
     let frontmost = frontmost_app_info();
-    // One display per recording: the area's (by its centre), trimmed to that display.
+    // One display per recording: the area's (by its centre), trimmed to that display and at
+    // least `MIN_AREA` a side inside it, so this frame is exactly the recorded `sourceRect`.
     let screens = crate::screens::displays();
-    let (display_id, scale) = display_of(&screens, [x, y, width, height]);
-    let [x, y, width, height] = screens
-        .iter()
-        .find(|s| s.id == display_id)
-        .map_or([x, y, width, height], |s| {
-            crate::screens::clamp_to([x, y, width, height], s.frame)
-        });
+    let (display_id, scale, [x, y, width, height]) =
+        crate::screens::area_on_display(&screens, [x, y, width, height]).map_or_else(
+            || {
+                let min = crate::screens::MIN_AREA;
+                let rect = [x, y, width.max(min), height.max(min)];
+                (unsafe { CGMainDisplayID() }, 2.0, rect)
+            },
+            |(i, rect)| (screens[i].id, screens[i].scale, rect),
+        );
     TargetInfo {
         mode: CaptureMode::Region,
         app: hit
@@ -2099,8 +2102,8 @@ fn sck_config(target: &TargetInfo, long_edge: f64) -> SCStreamConfiguration {
         let area = [
             target.frame.x,
             target.frame.y,
-            target.frame.width.max(32.0),
-            target.frame.height.max(32.0),
+            target.frame.width,
+            target.frame.height,
         ];
         let [x, y, w, h] = if display[2] > 0.0 && display[3] > 0.0 {
             crate::screens::source_rect(area, display)
