@@ -129,6 +129,11 @@ pub const CONTENT_OUT_SPRING: SpringCfg = SpringCfg::new(0.17, 0.0);
 pub const HIGHLIGHT_SPRING: SpringCfg = SpringCfg::new(0.25, 0.0);
 /// `Origin::Lead` unroll: the right wall leads out of the left end cap with the morph's width bounce.
 pub const UNROLL_SPRING: SpringCfg = SpringCfg::new(0.32, 0.12);
+/// `Origin::Top` / `Origin::Lead` exit: folds or rolls back up, ~20% quicker than the unroll,
+/// after `FOLD_WAIT_S` so the content (which starts fading at once) is gone before the wall
+/// reaches it.
+pub const FOLD_EXIT_SPRING: SpringCfg = SpringCfg::new(0.26, 0.0);
+pub const FOLD_WAIT_S: f32 = 0.06;
 
 /// Where the capsule appears from and disappears into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -910,6 +915,8 @@ pub struct PillModel {
     pub squish: SpringVal,
     /// Entry/Exit progress (`0` hidden pose, `1` rest); what it does depends on `opts.origin`.
     pub grow: SpringVal,
+    /// `grow` holds until then on a folding exit (`FOLD_WAIT_S`).
+    fold_at: f32,
     pub shell_alpha: SpringVal,
     pub shell_blur: SpringVal,
     entering_from_hidden: bool,
@@ -945,6 +952,7 @@ impl PillModel {
             press: SpringVal::new(0.0, PRESS_SPRING),
             squish: SpringVal::new(0.0, TAP_SPRING),
             grow: SpringVal::new(0.0, ENTRY_SHELL_SPRING),
+            fold_at: 0.0,
             shell_alpha: SpringVal::new(0.0, ENTRY_ALPHA_SPRING),
             shell_blur: SpringVal::new(1.0, ENTRY_SHELL_SPRING),
             entering_from_hidden: false,
@@ -1110,8 +1118,16 @@ impl PillModel {
                 self.l.to(cur_l, CLOSE_SPRING);
                 self.r.to(cur_r, CLOSE_SPRING);
                 self.b.to(cur_b, CLOSE_SPRING);
-                self.grow.to(0.0, EXIT_SHELL_SPRING);
-                self.shell_alpha.to(0.0, EXIT_SHELL_SPRING);
+                // A fold or roll-up sweeps a wall across the row, so it runs a little calmer
+                // than the in-place scale-out and its content fades ahead of the wall.
+                let exit = if self.opts.origin == Origin::Centre {
+                    EXIT_SHELL_SPRING
+                } else {
+                    self.fold_at = self.t + FOLD_WAIT_S;
+                    FOLD_EXIT_SPRING
+                };
+                self.grow.to(0.0, exit);
+                self.shell_alpha.to(0.0, exit);
                 self.shell_blur.to(
                     1.0,
                     SpringCfg::new((EXIT_SHELL_SPRING.duration * BLUR_LEAD).max(0.04), 0.0),
@@ -1358,23 +1374,44 @@ impl PillModel {
         (rect, own * k)
     }
 
-    /// Predicts the capsule silhouette over the next `lead` seconds on its current springs at 240 Hz.
+    /// Predicts the capsule silhouette over the next `lead` seconds on its current springs at 240 Hz,
+    /// including a narrowing still waiting out `COLLAPSE_WAIT_S`, so leaving items fade out before
+    /// the wall that is about to start moving reaches them.
     fn predict(&self, lead: f32) -> Vec<(f32, Silhouette)> {
         let mut l = self.l;
         let mut r = self.r;
         let mut b = self.b;
         let mut g = self.grow;
+        let mut pending = (self.geo_pres != self.pres).then(|| {
+            let (lay, _) = self.layout(&self.pres);
+            (self.geo_at - self.t, lay)
+        });
         let mut out = Vec::with_capacity(28);
         let mut t = AHEAD_STEP;
         while t <= lead + 1e-9 {
+            if let Some((at, lay)) = pending
+                && t >= at
+            {
+                l.to(lay.l, CLOSE_SPRING);
+                r.to(lay.r, CLOSE_SPRING);
+                b.to(lay.b, CLOSE_SPRING);
+                pending = None;
+            }
             l.step(AHEAD_STEP);
             r.step(AHEAD_STEP);
             b.step(AHEAD_STEP);
-            g.step(AHEAD_STEP);
+            if !self.folding_held(self.t + t) {
+                g.step(AHEAD_STEP);
+            }
             out.push((t, self.silhouette_from(l.x, r.x, b.x, g.x)));
             t += AHEAD_STEP;
         }
         out
+    }
+
+    /// Whether a folding exit is still holding its shape at time `t`.
+    fn folding_held(&self, t: f32) -> bool {
+        t < self.fold_at && matches!(self.geo_pres, Pres::Hidden) && self.grow.target < 0.5
     }
 
     fn grown_enough(&self) -> bool {
@@ -1426,7 +1463,9 @@ impl PillModel {
             self.b.step(dt);
             self.press.step(dt);
             self.squish.step(dt);
-            self.grow.step(dt);
+            if !self.folding_held(self.t) {
+                self.grow.step(dt);
+            }
             self.shell_alpha
                 .step_critical(dt, self.shell_alpha.duration, 100.0);
             self.shell_blur
@@ -1562,10 +1601,11 @@ impl PillModel {
             };
             st.blur.step_critical(dt, blur_dur, 100.0);
 
-            // Look-ahead exit cap (`stepCap` in `island/model.js`): only for non-travelling elements
-            // during visible morphs. Items the wall crosses fade at the edge; they never blur.
+            // Look-ahead exit cap (`stepCap` in `island/model.js`) for non-travelling elements, on
+            // morphs and on Exit (a folding or rolling-up wall sweeps across the row). Items the
+            // wall crosses fade out before it reaches them; they never blur.
             let hidden = st.a.x <= 1e-3;
-            if !reduced && !(st.travelling && in_pres) && !pres_hidden {
+            if !reduced && !(st.travelling && in_pres) {
                 let contact = if hidden {
                     f32::INFINITY
                 } else {
@@ -2568,4 +2608,56 @@ mod tests {
         let centre = first(Origin::Centre);
         assert!(centre.width() < rest.width() && centre.width() > rest.width() * 0.93);
     }
+
+    #[test]
+    fn nothing_vanishes_from_visible_opacity_in_one_frame() {
+        let rec = |chips| Pres::Recording {
+            chips,
+            has_iphone: true,
+            stroke_count: 0,
+        };
+        let hold = |mode| Pres::Selecting {
+            mode,
+            hold: true,
+            has_iphone: true,
+        };
+        let scenes = vec![
+            vec![hold(SelectionMode::Screen), rec(false), Pres::Hidden],
+            vec![rec(true), rec(false), Pres::Processing, Pres::Completed { label: "Copied".into() }, Pres::Hidden],
+            vec![
+                rec(true),
+                Pres::Selecting {
+                    mode: SelectionMode::Area,
+                    hold: false,
+                    has_iphone: true,
+                },
+                Pres::Hidden,
+            ],
+        ];
+        for opts in all_opts() {
+            for steps in &scenes {
+                let mut m = PillModel::new(Metrics::default());
+                m.opts = opts;
+                let mut last: Vec<(ElemId, f32)> = Vec::new();
+                for pres in steps {
+                    m.set_pres(pres.clone());
+                    for _ in 0..90 {
+                        m.advance(FRAME_DT);
+                        let f = m.frame();
+                        for &(id, a) in &last {
+                            let now = f.elems.iter().find(|e| e.id == id).map_or(0.0, |e| e.alpha);
+                            // The collapse wait bounds a leaving item's fade to ~40 ms + the time
+                            // until the wall reaches it; it must ramp, never cut.
+                            assert!(
+                                a - now < 0.25,
+                                "{id:?} cut from {a:.2} to {now:.2} in one frame ({opts:?}, -> {pres:?})"
+                            );
+                        }
+                        last = f.elems.iter().map(|e| (e.id, e.alpha)).collect();
+                    }
+                }
+            }
+        }
+    }
+
 }

@@ -851,7 +851,7 @@ impl PillRuntimeState {
                 [ox + hx, oy + hy, hw, hh],
                 hl.alpha,
                 hh * 0.5,
-                Some("row"),
+                Some("indicator"),
                 Some(shell),
             );
         }
