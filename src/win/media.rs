@@ -483,7 +483,10 @@ impl Recorder {
             pool_size.Width.max(1) as u32,
             pool_size.Height.max(1) as u32,
         );
-        let out = capture_size(target, long_edge);
+        // H.264 encoders and decoders work in 16 px macroblocks and pad rows to match; a size
+        // off that grid comes back sheared.
+        let (w, h) = capture_size(target, long_edge);
+        let out = ((w & !15).max(16), (h & !15).max(16));
         let video = match video_path {
             Some(path) => {
                 let scaler = Scaler::new(&gpu, input, out.0, out.1, DXGI_FORMAT_NV12)?;

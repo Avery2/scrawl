@@ -639,12 +639,54 @@ target/debug/scrawl-helper shrink recording.mov --out /tmp/small.mov --max-edge 
 target/debug/scrawl-helper export plan.json   # the plan `scrawl export` writes (src/export)
 ```
 
+## Windows
+
+Scrawl runs on Windows 10 (2004) and later as the same app: the same capsule, picker, overlay,
+review window and welcome tour, from the same GPUI code. Only the parts the operating system owns
+differ:
+
+| | macOS | Windows |
+|---|---|---|
+| Shortcut | `⌥⇧S`, `⌥⇧V` | `Alt+Shift+S`, `Alt+Shift+V` |
+| Menu | Menu bar item | Notification area icon (left or right click) |
+| Screen and window capture | ScreenCaptureKit | Windows.Graphics.Capture, H.264 through Media Foundation |
+| Clicks, keys, Shift ink | CGEventTap and HID state | Low-level hooks and key state |
+| Ink overlay | Metal panel | Click-through GPUI window, left out of recordings |
+| Transcription | SpeechAnalyzer, or Hex | Parakeet on device (`transcribe.cpp`), from the model Hex installed |
+| Movie decoding | `scrawl-helper` (AVFoundation) | Media Foundation, in process |
+| Paste | `⌘V` | `Ctrl+V` |
+| Captures | `~/Library/Application Support/scrawl/captures` | `%LOCALAPPDATA%\scrawl\captures` |
+| Log | `~/Library/Logs/Scrawl/scrawl.log` | `%LOCALAPPDATA%\Scrawl\Logs\scrawl.log` |
+
+- **Permissions:** none, apart from the microphone switch in Settings › Privacy & security, which
+  the welcome tour checks. Screen capture, input hooks and pasting need no grant on Windows.
+- **Transcription:** install [Hex](https://github.com/anomalyco/hex) and download a model in it;
+  Scrawl loads it from `%APPDATA%\voice-control\models` with measured word timings, so spoken cues
+  ("look here") cut keyframes as on macOS. Scrawl never downloads a model. Without one, captures
+  have no transcript.
+- **Not on Windows:** the cabled iPhone (it needs AVFoundation's screen capture devices), video
+  export, Sparkle updates (**Check for Updates…** opens the releases page) and the dev-site tab URL
+  (`/sdk.js` registrations still route).
+
+Build with the MSVC toolchain, CMake and the Windows SDK (Visual Studio Build Tools with the C++
+workload). Release builds also need GPUI's shader compiler: set `GPUI_FXC_PATH` to the SDK's
+`fxc.exe` (for example `C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe`).
+
+```powershell
+cargo build --release
+.\target\release\scrawl.exe app
+```
+
 ## Testing
 
 ```sh
 taskpolicy -c utility cargo test -j 3 --offline -- --test-threads=2
 ./scripts/install-app.sh
 ```
+
+On Windows, `cargo test`; then run `scrawl.exe app` and record with `Alt+Shift+S`.
+`SCRAWL_SHOW_OWN_WINDOWS=1` keeps Scrawl's own windows (capsule, overlay, picker) in screenshots,
+which normally leave them out.
 
 - **iPhone:** connect a phone, hold `⌥⇧` and press `S` three times, release, talk, draw over the mirror, press M,
   Finish. Inspect the bundle's `summary.md`, `scrawl.json` (`source`, `device`), contact sheet, and

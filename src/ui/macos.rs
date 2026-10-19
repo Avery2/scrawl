@@ -698,7 +698,7 @@ pub(super) fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
 
     let item = NSStatusBar::systemStatusBar().statusItemWithLength(-1.0);
     if let Some(button) = item.button(mtm) {
-        let mb_bytes = include_bytes!("../assets/menubar-icon@2x.png");
+        let mb_bytes = include_bytes!("../../assets/menubar-icon@2x.png");
         let mb_data = NSData::with_bytes(mb_bytes);
         if let Some(img) = NSImage::initWithData(NSImage::alloc(), &mb_data) {
             img.setSize(NSSize::new(18.0, 18.0));
@@ -708,7 +708,7 @@ pub(super) fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
             button.setTitle(&NSString::from_str("✎"));
         }
     }
-    let app_bytes = include_bytes!("../assets/app-icon.png");
+    let app_bytes = include_bytes!("../../assets/app-icon.png");
     let app_data = NSData::with_bytes(app_bytes);
     if let Some(app_img) = NSImage::initWithData(NSImage::alloc(), &app_data) {
         unsafe {
