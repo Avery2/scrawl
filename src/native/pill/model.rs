@@ -1741,9 +1741,11 @@ impl PillModel {
 
             max_blur = max_blur.max(blur * alpha);
             max_alpha = max_alpha.max(alpha);
-            if id.mode().is_some() {
-                chip_alpha = chip_alpha.max(alpha);
-                chip_blur = chip_blur.max(blur);
+            // The highlight is as visible as the chip it is heading for, so it never shows
+            // ahead of that chip (e.g. at the end of a capsule still unrolling).
+            if self.hl_id == Some(id) {
+                chip_alpha = alpha;
+                chip_blur = blur;
             }
             elems.push(FrameElem {
                 id,
@@ -2619,6 +2621,42 @@ mod tests {
         assert!((lead.l - rest.l).abs() < 0.5 && lead.width() < ISLAND_H + 6.0, "lead starts as its end cap");
         let centre = first(Origin::Centre);
         assert!(centre.width() < rest.width() && centre.width() > rest.width() * 0.93);
+    }
+
+    #[test]
+    fn highlight_is_never_brighter_than_its_chip() {
+        let steps = [
+            Pres::Recording {
+                chips: true,
+                has_iphone: true,
+                stroke_count: 0,
+            },
+            Pres::Selecting {
+                mode: SelectionMode::Area,
+                hold: false,
+                has_iphone: true,
+            },
+            Pres::Hidden,
+        ];
+        for opts in all_opts() {
+            let mut m = PillModel::new(Metrics::default());
+            m.opts = opts;
+            for pres in &steps {
+                m.set_pres(pres.clone());
+                for _ in 0..120 {
+                    m.advance(FRAME_DT);
+                    let f = m.frame();
+                    let Some(hl) = f.highlight else { continue };
+                    let chip = m.hl_id.and_then(|id| f.elems.iter().find(|e| e.id == id));
+                    let chip_alpha = chip.map_or(0.0, |e| e.alpha);
+                    assert!(
+                        hl.alpha <= chip_alpha + 1e-4,
+                        "highlight {:.2} over chip {chip_alpha:.2} ({opts:?}, {pres:?})",
+                        hl.alpha
+                    );
+                }
+            }
+        }
     }
 
     #[test]
