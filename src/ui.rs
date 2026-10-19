@@ -1650,7 +1650,12 @@ impl ScrawlCoordinator {
             progress.save();
         }
         let listen = |g: &crate::onboarding::Grants| g.granted(Permission::InputMonitoring);
-        if self.grants.as_ref().is_some_and(|old| !listen(old)) && listen(grants) {
+        // Before the first read, no tap means the grant wasn't there at launch.
+        let was_off = match &self.grants {
+            Some(old) => !listen(old),
+            None => !self.telemetry.has_event_tap(),
+        };
+        if was_off && listen(grants) {
             crate::capture::restart_input_tap(&self.telemetry);
         }
         self.grants = Some(grants.clone());

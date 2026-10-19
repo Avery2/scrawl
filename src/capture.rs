@@ -2019,6 +2019,8 @@ pub struct SharedCaptureTelemetry {
     tap_port: AtomicU64,
     /// The event tap thread's run loop (retained), so `restart_input_tap` can stop it.
     tap_run_loop: AtomicU64,
+    /// `spawn_event_tap` has run (its thread fills `tap_port` a moment later).
+    tap_started: AtomicBool,
     /// A Screen recording started straight from the shortcut: the overlay flashes an edge glow.
     pub start_glow: AtomicBool,
     /// Whether the event tap is delivering. It can't be enabled without Input Monitoring, and
@@ -2061,6 +2063,7 @@ impl SharedCaptureTelemetry {
             passthrough_window_ids: Mutex::new(Vec::new()),
             tap_port: AtomicU64::new(0),
             tap_run_loop: AtomicU64::new(0),
+            tap_started: AtomicBool::new(false),
             tap_live: AtomicBool::new(false),
             start_glow: AtomicBool::new(false),
             last_shortcut_ms: AtomicU64::new(0),
@@ -2317,6 +2320,11 @@ impl SharedCaptureTelemetry {
         crate::windows::owned_window_at(&windows, x, y, std::process::id() as i32, &passthrough)
     }
 
+    /// An event tap has been asked for (it may not be delivering).
+    pub fn has_event_tap(&self) -> bool {
+        self.tap_started.load(Ordering::Acquire)
+    }
+
     /// Re-enables the event tap if macOS turned it off, and notes whether it is delivering.
     fn check_tap(&self) -> bool {
         let tap = self.tap_port.load(Ordering::Acquire) as *mut c_void;
@@ -2425,19 +2433,26 @@ impl SharedCaptureTelemetry {
     }
 }
 
+/// The event tap waits for Input Monitoring (`restart_input_tap` makes it once that's on): making
+/// a key tap without the grant adds Scrawl to the Input Monitoring and Accessibility lists,
+/// switched off, before the user has been asked for either.
 pub fn start_global_input_tap(telemetry: Arc<SharedCaptureTelemetry>) {
     let hid_telemetry = Arc::clone(&telemetry);
     let _ = thread::Builder::new()
         .name("scrawl-hid-poller".into())
         .spawn(move || run_global_hid_poller(hid_telemetry));
-    spawn_event_tap(telemetry);
+    if unsafe { CGPreflightListenEventAccess() } {
+        spawn_event_tap(telemetry);
+    } else {
+        scrawl_log("event tap waits for Input Monitoring; clicks come from polling the mouse buttons");
+    }
 }
 
 /// Makes the event tap again after Input Monitoring is granted while Scrawl runs, instead of
 /// asking for a relaunch: a tap made without the grant never gets key events, and macOS doesn't
-/// upgrade it.
+/// upgrade it. Also makes the first tap, which `start_global_input_tap` holds back until then.
 pub fn restart_input_tap(telemetry: &Arc<SharedCaptureTelemetry>) {
-    scrawl_log("Input Monitoring granted; making the event tap again");
+    scrawl_log("Input Monitoring granted; making the event tap");
     telemetry.tap_port.store(0, Ordering::Release);
     let old = telemetry.tap_run_loop.swap(0, Ordering::AcqRel) as *mut c_void;
     if !old.is_null() {
@@ -2450,6 +2465,7 @@ pub fn restart_input_tap(telemetry: &Arc<SharedCaptureTelemetry>) {
 }
 
 fn spawn_event_tap(telemetry: Arc<SharedCaptureTelemetry>) {
+    telemetry.tap_started.store(true, Ordering::Release);
     let _ = thread::Builder::new()
         .name("scrawl-event-tap".into())
         .spawn(move || {
