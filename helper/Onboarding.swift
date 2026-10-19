@@ -906,8 +906,14 @@ final class Onboarding: NSObject, NSApplicationDelegate, NSWindowDelegate {
             } else {
               self.apply(state)
             }
-          case "request": Permissions.request(permission)
-          case "open-settings": Permissions.openSettings(permission, from: self.screenFrame(of: permission))
+          // The user has moved on to another row: answering an earlier question mustn't pull
+          // this window over the System Settings pane they're working in.
+          case "request":
+            self.followUp?.invalidate()
+            Permissions.request(permission)
+          case "open-settings":
+            self.followUp?.invalidate()
+            Permissions.openSettings(permission, from: self.screenFrame(of: permission))
           case "hide": self.window?.orderOut(nil)
           case "show": self.present()
           case "close":
@@ -927,8 +933,8 @@ final class Onboarding: NSObject, NSApplicationDelegate, NSWindowDelegate {
   /// Comes forward once macOS has stopped asking. A Screen Recording grant brings System
   /// Settings' own "Quit & Reopen" alert and ScreenCaptureKit's window picker question, and
   /// answering one hands the keys back to System Settings, so for five minutes after a grant the
-  /// window comes forward again each time the last question on screen is answered (never
-  /// otherwise, so it doesn't fight the user going elsewhere).
+  /// window comes forward again each time the last question on screen is answered, until the
+  /// user presses another row (never otherwise, so it doesn't fight the user going elsewhere).
   private func returnAfterGrant() {
     followUp?.invalidate()
     let started = Date()
