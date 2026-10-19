@@ -2,6 +2,7 @@ mod audio;
 mod autocrop;
 mod autocrop_lab;
 mod capture;
+mod command_line;
 mod delivery;
 mod export;
 mod handoff;
@@ -152,7 +153,7 @@ enum TuneCommand {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Launch the GPUI menu-bar and review application (default).
+    /// Launch the GPUI menu-bar and review application (the default when macOS opens Scrawl.app).
     App {
         /// Start a capture session immediately on launch.
         #[arg(long)]
@@ -483,7 +484,12 @@ enum Command {
         #[arg(long)]
         no_opencode: bool,
     },
+    /// Print the agent skill that teaches coding agents to read captures and use this CLI (`bunx skills add kitlangton/scrawl` installs it).
+    Skill,
 }
+
+/// `skills/scrawl/SKILL.md`, the same text `bunx skills add kitlangton/scrawl` installs.
+const SKILL: &str = include_str!("../skills/scrawl/SKILL.md");
 
 pub fn now_epoch_ms() -> u64 {
     SystemTime::now()
@@ -1356,10 +1362,22 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::App {
-        record: false,
-        iphone: false,
-    }) {
+    let command = match cli.command {
+        Some(command) => command,
+        // `scrawl` typed in a terminal (on PATH through Settings › Agents or Homebrew) would
+        // start a second menu-bar app. macOS opens the app with stdin on /dev/null.
+        // On Windows `scrawl.exe` is a console program and Explorer gives it a console too, so a
+        // bare launch always starts the app.
+        None if cfg!(target_os = "macos") && std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
+            <Cli as clap::CommandFactory>::command().print_help()?;
+            return Ok(());
+        }
+        None => Command::App {
+            record: false,
+            iphone: false,
+        },
+    };
+    match command {
         Command::App { record, iphone } => {
             #[cfg(target_os = "windows")]
             win::shell::release_own_console();
@@ -2123,6 +2141,10 @@ fn main() -> Result<()> {
             usb,
             no_opencode,
         } => phone::run_ingest_server(port, usb, no_opencode),
+        Command::Skill => {
+            print!("{SKILL}");
+            Ok(())
+        }
     }
 }
 

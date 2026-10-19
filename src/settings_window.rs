@@ -152,6 +152,7 @@ struct ViewState {
     captures_size: Option<String>,
     permissions: Vec<PermissionRow>,
     updates: bool,
+    skill_command: String,
 }
 
 impl ViewState {
@@ -252,6 +253,7 @@ fn pane_title(pane: Pane) -> &'static str {
         Pane::Recording => "Recording",
         Pane::Storage => "Storage",
         Pane::Permissions => "Permissions",
+        Pane::Agents => "Agents",
         Pane::About => "About",
     }
 }
@@ -262,6 +264,7 @@ fn pane_icon(pane: Pane) -> (&'static str, Tint) {
         Pane::Recording => (crate::icons::RECORD, RED),
         Pane::Storage => (crate::icons::DRIVE, BLUE),
         Pane::Permissions => (crate::icons::HAND, GREEN),
+        Pane::Agents => (crate::icons::TERMINAL, (0x5c5c5c, 0x2e2e2e)),
         Pane::About => (crate::icons::INFO, GREY),
     }
 }
@@ -285,6 +288,8 @@ pub struct SettingsWindow {
     live: gpui::Modifiers,
     menu: Option<Menu>,
     icon: Arc<Image>,
+    /// The skill command was just copied (the button says Copied for a moment).
+    copied: bool,
 }
 
 fn open(request: Request, cx: &mut App) {
@@ -381,6 +386,7 @@ fn open(request: Request, cx: &mut App) {
                         ImageFormat::Png,
                         include_bytes!("../assets/app-icon.png").to_vec(),
                     )),
+                    copied: false,
                 }
             })
         },
@@ -775,7 +781,8 @@ impl SettingsWindow {
                             .gap(px(2.0))
                             .child(self.item(theme, Pane::Recording, cx))
                             .child(self.item(theme, Pane::Storage, cx))
-                            .child(self.item(theme, Pane::Permissions, cx)),
+                            .child(self.item(theme, Pane::Permissions, cx))
+                            .child(self.item(theme, Pane::Agents, cx)),
                     )
                     .child(section("Scrawl"))
                     .child(self.item(theme, Pane::About, cx)),
@@ -820,6 +827,7 @@ impl SettingsWindow {
             Pane::Recording => self.recording_pane(theme, state, cx),
             Pane::Storage => self.storage(theme, state, cx),
             Pane::Permissions => self.permissions(theme, state, cx),
+            Pane::Agents => self.agents(theme, state, cx),
             Pane::About => self.about(theme, state, cx),
         };
         div()
@@ -1307,6 +1315,61 @@ impl SettingsWindow {
                     ),
             )
             .child(trailing)
+    }
+
+    /// The agent skill's install command, with Copy. `scrawl.exe` is a console program, so the
+    /// CLI needs no install step on Windows (macOS links it onto PATH here).
+    fn agents(&self, theme: Theme, state: &ViewState, cx: &mut Context<Self>) -> Div {
+        let command = state.skill_command.clone();
+        let line = div()
+            .h(px(ROW))
+            .px(px(12.0))
+            .flex()
+            .items_center()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(12.0))
+                    .font_family("Consolas")
+                    .text_color(theme.text())
+                    .child(command.clone()),
+            )
+            .child(
+                button(
+                    theme,
+                    "settings-copy-skill",
+                    if self.copied { "Copied" } else { "Copy" },
+                    true,
+                )
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    if crate::handoff::copy_string_to_clipboard(&command).is_ok() {
+                        view.copied = true;
+                        cx.notify();
+                        cx.spawn(async move |view, cx| {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_millis(1500))
+                                .await;
+                            let _ = view.update(cx, |view, cx| {
+                                view.copied = false;
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    }
+                })),
+            )
+            .into_any_element();
+        div()
+            .flex()
+            .flex_col()
+            .child(header(theme, "Agent skill"))
+            .child(group(theme, vec![line]))
+            .child(caption(
+                theme,
+                "Run it in a terminal. It teaches Claude Code, OpenCode, Codex and other agents to read your captures and use scrawl.",
+                false,
+            ))
     }
 
     fn about(&self, theme: Theme, state: &ViewState, cx: &mut Context<Self>) -> Div {

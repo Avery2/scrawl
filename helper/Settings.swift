@@ -18,7 +18,7 @@ import SwiftUI
 // "keyCode":15,"modifiers":6144,"key":"r","reserved":false}, {"action":"cancel-shortcut"},
 // {"action":"reset-shortcut","kind":"paste"}, {"action":"grant","permission":"camera"},
 // {"action":"reopen"}, {"action":"show-captures"}, {"action":"check-for-updates"},
-// {"action":"tour"}, {"action":"close"}.
+// {"action":"tour"}, {"action":"install-cli"}, {"action":"uninstall-cli"}, {"action":"close"}.
 
 // MARK: State
 
@@ -83,6 +83,15 @@ struct SettingsPermission: Decodable, Equatable, Identifiable {
   var granted: Bool { status == "granted" }
 }
 
+struct SettingsCommandLine: Decodable, Equatable {
+  var path: String?
+  /// "install", "uninstall", or none.
+  var button: String? = "install"
+  var enabled = true
+  var caption = "Links scrawl into /opt/homebrew/bin, so agents and your terminal can run it."
+  var error = false
+}
+
 struct SettingsState: Decodable, Equatable {
   var version = "0.3.2"
   var login = SettingsLogin()
@@ -98,13 +107,15 @@ struct SettingsState: Decodable, Equatable {
   var permissions: [SettingsPermission] = ["screen-recording", "microphone", "accessibility", "camera"]
     .map { SettingsPermission(permission: $0, required: ["screen-recording", "microphone", "accessibility"].contains($0)) }
   var updates = true
+  var commandLine = SettingsCommandLine()
+  var skillCommand = "bunx skills add kitlangton/scrawl"
 
   var pasteLabel: String { shortcuts.first { $0.kind == "paste" }?.label ?? "⌥⇧V" }
   var recording: String? { shortcuts.first(where: \.recording)?.kind }
 }
 
 enum SettingsPane: String, CaseIterable {
-  case general, recording, storage, permissions, about
+  case general, recording, storage, permissions, agents, about
 
   var title: String {
     switch self {
@@ -112,6 +123,7 @@ enum SettingsPane: String, CaseIterable {
     case .recording: "Recording"
     case .storage: "Storage"
     case .permissions: "Permissions"
+    case .agents: "Agents"
     case .about: "About"
     }
   }
@@ -122,6 +134,7 @@ enum SettingsPane: String, CaseIterable {
     case .recording: "record.circle"
     case .storage: "internaldrive.fill"
     case .permissions: "hand.raised.fill"
+    case .agents: "terminal.fill"
     case .about: "info"
     }
   }
@@ -133,6 +146,7 @@ enum SettingsPane: String, CaseIterable {
     case .recording: (Color(red: 1, green: 0.42, blue: 0.38), Color(red: 0.92, green: 0.2, blue: 0.17))
     case .storage: (Color(red: 0.36, green: 0.66, blue: 1), Color(red: 0.16, green: 0.45, blue: 0.95))
     case .permissions: (Color(red: 0.36, green: 0.82, blue: 0.56), Color(red: 0.16, green: 0.66, blue: 0.4))
+    case .agents: (Color(white: 0.36), Color(white: 0.18))
     }
   }
 }
@@ -581,6 +595,7 @@ struct SettingsView: View {
         item(.recording)
         item(.storage)
         item(.permissions)
+        item(.agents)
       }
       section("Scrawl")
       item(.about)
@@ -647,6 +662,7 @@ struct SettingsView: View {
       case .recording: recording
       case .storage: storage
       case .permissions: permissions
+      case .agents: agents
       case .about: about
       }
       Spacer(minLength: 0)
@@ -758,6 +774,40 @@ struct SettingsView: View {
     }
   }
 
+  private var agents: some View {
+    let theme = SettingsTheme(scheme)
+    let cli = state.commandLine
+    return VStack(spacing: 0) {
+      SettingsGroup {
+        HStack(spacing: 12) {
+          VStack(alignment: .leading, spacing: 1) {
+            Text("Command-line tool").font(.system(size: 14)).foregroundStyle(theme.text)
+            if let path = cli.path {
+              Text(path)
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(theme.secondary)
+                .truncationMode(.head)
+            }
+          }
+          .lineLimit(1)
+          Spacer(minLength: 8)
+          if let button = cli.button {
+            SettingsButton(title: button == "uninstall" ? "Uninstall" : "Install", enabled: cli.enabled) {
+              model.act(button == "uninstall" ? "uninstall-cli" : "install-cli")
+            }
+          }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: cli.path == nil ? SettingsMetrics.row : 52)
+      }
+      SettingsCaption(text: cli.caption, error: cli.error)
+        .animation(SettingsMotion.state, value: cli)
+      SettingsHeader("Agent skill")
+      SettingsGroup { CopyLine(text: state.skillCommand) }
+      SettingsCaption(text: "Run it in a terminal. It teaches Claude Code, OpenCode, Codex and other agents to read your captures and use scrawl.")
+    }
+  }
+
   private var about: some View {
     let theme = SettingsTheme(scheme)
     return VStack(spacing: 0) {
@@ -806,6 +856,33 @@ struct SettingsView: View {
       .contentShape(Rectangle())
     }
     .buttonStyle(.plain)
+  }
+}
+
+/// A command in monospace with a Copy button that says Copied for a moment.
+struct CopyLine: View {
+  @Environment(\.settingsTheme) private var theme
+  let text: String
+  @State private var copied = false
+
+  var body: some View {
+    HStack(spacing: 12) {
+      Text(text)
+        .font(.system(size: 12, design: .monospaced))
+        .foregroundStyle(theme.text)
+        .lineLimit(1)
+        .textSelection(.enabled)
+      Spacer(minLength: 8)
+      SettingsButton(title: copied ? "Copied" : "Copy") {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        copied = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+      }
+      .animation(SettingsMotion.state, value: copied)
+    }
+    .padding(.horizontal, 12)
+    .frame(height: SettingsMetrics.row)
   }
 }
 
@@ -1082,6 +1159,24 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
     missing.permissions[2].requested = true
     var noUpdates = base
     noUpdates.updates = false
+    var cliInstalled = base
+    cliInstalled.commandLine = SettingsCommandLine(
+      path: "/opt/homebrew/bin/scrawl", button: "uninstall",
+      caption: "Agents and your terminal can run scrawl to read captures, zoom into a moment and export video.")
+    var cliLocal = base
+    cliLocal.commandLine = SettingsCommandLine(
+      path: "~/.local/bin/scrawl", button: "uninstall",
+      caption: "If your shell can't find scrawl, add ~/.local/bin to your PATH.")
+    var cliHomebrew = base
+    cliHomebrew.commandLine = SettingsCommandLine(
+      path: "/opt/homebrew/bin/scrawl", button: nil,
+      caption: "Installed with Homebrew. Agents and your terminal can run scrawl to read captures, zoom into a moment and export video.")
+    var cliTaken = base
+    cliTaken.commandLine = SettingsCommandLine(
+      button: nil, caption: "/usr/local/bin/scrawl is another program, so Scrawl leaves it alone.", error: true)
+    var cliDev = base
+    cliDev.commandLine = SettingsCommandLine(
+      enabled: false, caption: "The command-line tool works in the installed Scrawl.app.")
     let samples: [(String, SettingsPane, SettingsState, NSEvent.ModifierFlags)] = [
       ("general", .general, base, []),
       ("general-custom", .general, custom, []),
@@ -1092,6 +1187,12 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
       ("storage", .storage, base, []),
       ("permissions", .permissions, base, []),
       ("permissions-missing", .permissions, missing, []),
+      ("agents", .agents, base, []),
+      ("agents-installed", .agents, cliInstalled, []),
+      ("agents-local", .agents, cliLocal, []),
+      ("agents-homebrew", .agents, cliHomebrew, []),
+      ("agents-taken", .agents, cliTaken, []),
+      ("agents-dev", .agents, cliDev, []),
       ("about", .about, base, []),
       ("about-dev", .about, noUpdates, []),
     ]
