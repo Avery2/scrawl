@@ -1,8 +1,9 @@
 name: Release (Windows)
 
 # Builds the Windows zip for a version tag and attaches it to that tag's GitHub release
-# (creating the release if the Mac side hasn't yet). A release/** branch only builds it. Run it by hand with a tag to rebuild one,
-# or without a tag to only build and keep the zip as a workflow artifact.
+# (creating the release if the Mac side hasn't yet). A release/** branch only builds it, as a
+# dry run. Run it by hand with a tag to rebuild one, or without a tag to only build the zip and
+# keep it as a workflow artifact.
 
 on:
   push:

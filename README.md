@@ -15,6 +15,12 @@ brew install --cask kitlangton/tap/scrawl
 
 The app updates itself (Sparkle), so Homebrew leaves updates to it.
 
+On Windows 10 (2004) or later (x64), download the zip from the same page or the
+[latest GitHub release](https://github.com/kitlangton/scrawl/releases/latest), unzip it and run
+`scrawl.exe`. The Windows build is a preview and isn't signed yet, so Windows may say "Windows
+protected your PC": click **More info**, then **Run anyway**. It doesn't update itself yet; see
+[Windows](#windows).
+
 ## Agents
 
 Install the agent skill for Claude Code, OpenCode, Codex and other agents:
@@ -765,7 +771,7 @@ system owns differ:
 | Screen and window capture | ScreenCaptureKit | Windows.Graphics.Capture, H.264 through Media Foundation |
 | Clicks, keys, Shift ink | Mouse monitor, Accessibility key tap, modifier state | Low-level hooks and key state |
 | Ink overlay | Metal panel | Click-through GPUI window, left out of recordings |
-| Transcription | SpeechAnalyzer, or Hex | Parakeet on device (`transcribe.cpp`), from the model Hex installed |
+| Transcription | SpeechAnalyzer, or Hex | Parakeet on device (`transcribe.cpp`), Hex's model or Scrawl's own copy |
 | Movie decoding | `scrawl-helper` (AVFoundation) | Media Foundation, in process |
 | Paste | `⌘V` | `Ctrl+V` |
 | Settings and welcome tour | SwiftUI (`scrawl-helper`) | GPUI windows in process, same panes and protocol |
@@ -780,10 +786,12 @@ system owns differ:
 - **Shortcuts:** both are recorded in Settings › General like on macOS, as `Ctrl`, `Alt`, `Win` and
   `Shift` combinations. Scrawl turns down `Ctrl` with one key (apps use those), `Win` with a key
   (Windows uses those), and `Alt+Tab`, `Alt+F4` and `Alt+Space`.
-- **Transcription:** install [Hex](https://github.com/anomalyco/hex) and download a model in it;
-  Scrawl loads it from `%APPDATA%\voice-control\models` with measured word timings, so spoken cues
-  ("look here") cut keyframes as on macOS. Scrawl never downloads a model. Without one, captures
-  have no transcript.
+- **Transcription:** Parakeet runs on device with measured word timings, so spoken cues ("look
+  here") cut keyframes as on macOS. If [Hex](https://github.com/anomalyco/hex) has installed a
+  model (`%APPDATA%\voice-control\models`), Scrawl uses it. Otherwise the first launch downloads
+  Hex's Parakeet Unified English (730 MB, checked against its SHA-256) into
+  `%LOCALAPPDATA%\Scrawl\models` in the background; Settings › Recording shows the progress, and
+  captures made before it finishes get their transcript once it lands.
 - **Command-line tool:** **Install** in Settings › Agents writes a `scrawl.cmd` shim into
   `%LOCALAPPDATA%\Microsoft\WindowsApps`, which is on every user's PATH, so agents and terminals
   can run `scrawl`.
@@ -792,6 +800,9 @@ system owns differ:
 - **Not on Windows:** the cabled iPhone (it needs AVFoundation's screen capture devices), video
   export, Sparkle updates (**Check for Updates…** opens the releases page) and the dev-site tab URL
   (`/sdk.js` registrations still route).
+- **Releases:** a `v*` tag builds `Scrawl-<version>-windows-x64.zip` on GitHub Actions
+  (`.github/workflows/release-windows.yml`) and attaches it to the release. It isn't code-signed
+  yet; signing and automatic updates are planned.
 
 Build with the MSVC toolchain, CMake and the Windows SDK (Visual Studio Build Tools with the C++
 workload). Release builds also need GPUI's shader compiler: set `GPUI_FXC_PATH` to the SDK's
