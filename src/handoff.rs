@@ -334,6 +334,9 @@ pub struct Config {
     /// Read leniently (`lenient_experiments`), so a stray value never fails the file.
     #[serde(default, deserialize_with = "lenient_experiments")]
     pub experiments: std::collections::BTreeMap<String, bool>,
+    /// The microphone Mac captures record from (`mic`); absent follows the macOS default.
+    #[serde(default)]
+    pub microphone: Option<crate::mic::Choice>,
 }
 
 /// `true`/`false`, `"yes"`/`"on"`/`"1"` and their opposites, or a number (non-zero is on). Other
@@ -587,15 +590,20 @@ pub fn pill_style() -> crate::native::pill::PillStyle {
         .unwrap_or(crate::native::pill::PillStyle::Black)
 }
 
-/// Sets one top-level key in `path`, keeping the rest (and its `0600` mode, since it holds the
-/// ingest token).
+/// Sets one top-level key in `path` (`null` removes it), keeping the rest (and its `0600` mode,
+/// since it holds the ingest token).
 pub fn set_config_value_in(path: &Path, key: &str, value: serde_json::Value) -> Result<()> {
     let mut config = fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::json!({}));
-    config[key] = value;
+    match (value, config.as_object_mut()) {
+        (serde_json::Value::Null, Some(map)) => {
+            map.remove(key);
+        }
+        (value, _) => config[key] = value,
+    }
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
