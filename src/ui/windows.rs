@@ -13,7 +13,7 @@ use gpui::{
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use tray_icon::menu::{
-    CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
+    IsMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem,
 };
 use tray_icon::{MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::Foundation::HWND;
@@ -205,6 +205,9 @@ pub(super) fn raise_window(window: &mut Window) {
     }
 }
 
+/// `scrawl lab`'s backdrop stays an ordinary popup on Windows.
+pub(super) fn configure_lab_backdrop(_w: f32, _h: f32) {}
+
 struct KeepAlive;
 
 impl gpui::Render for KeepAlive {
@@ -253,8 +256,9 @@ pub(crate) fn style_floating(hwnd: HWND, activates: bool) {
     win::overlay::exclude_from_capture(hwnd);
 }
 
-/// The picker: on top of everything over the whole primary display, taking clicks and keys.
-pub(super) fn configure_picker_window(window: &mut Window) -> Option<u32> {
+/// The picker: on top of everything over the whole primary display, taking clicks and keys
+/// (in `scrawl lab` replays too: a window made click-through after its first frame stops drawing).
+pub(super) fn configure_picker_window(window: &mut Window, _lab: bool) -> Option<u32> {
     let hwnd = hwnd_of(window)?;
     style_floating(hwnd, true);
     if let Some(monitor) = win::primary_monitor() {
@@ -324,6 +328,21 @@ impl PillChrome {
         }
     }
 
+    /// Motion traces need the native shell's geometry, which Windows doesn't have.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn trace(
+        &self,
+        _width: f32,
+        _scale: f32,
+        _y_offset: f32,
+        _opacity: f32,
+        _content_alpha: f32,
+        _blur_radius: f32,
+        _content_shrink: f32,
+    ) -> Option<super::motion::Xf> {
+        None
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn apply(
         &mut self,
@@ -385,33 +404,21 @@ pub(super) fn capture_own_window_screenshot(
 const ID_TOGGLE: &str = "toggle-capture";
 const ID_CHOOSE: &str = "choose-target";
 const ID_OPEN_LATEST: &str = "open-latest";
-const ID_DEMO: &str = "run-demo";
 const ID_EXPORT: &str = "export-video";
-const ID_SHOW: &str = "show-captures";
-const ID_AUTO_SEND: &str = "auto-send";
-const ID_WELCOME: &str = "welcome";
+const ID_SETTINGS: &str = "settings";
 const ID_UPDATES: &str = "check-updates";
 const ID_QUIT: &str = "quit";
-const ID_ENGINE_APPLE: &str = "engine-apple";
-const ID_ENGINE_HEX: &str = "engine-hex";
-const KEEP_PREFIX: &str = "keep:";
 const INBOX_PREFIX: &str = "inbox:";
-const HEX_MODEL_PREFIX: &str = "hex-model:";
 
 struct Tray {
     icon: TrayIcon,
     menu: Menu,
     toggle: MenuItem,
     export: MenuItem,
-    keep: Vec<CheckMenuItem>,
-    keep_size: MenuItem,
-    engine_apple: CheckMenuItem,
-    engine_hex: CheckMenuItem,
-    transcription: Submenu,
-    /// Inbox rows and Hex model rows, replaced each time the menu opens.
+    /// Whether `export` is in the menu (`"videoExport"` can change while Scrawl runs).
+    export_shown: bool,
+    /// Inbox rows, replaced each time the menu opens.
     dynamic: Vec<Box<dyn IsMenuItem>>,
-    hex_rows: Vec<Box<dyn IsMenuItem>>,
-    auto_send: CheckMenuItem,
     status: Option<String>,
     inbox: usize,
 }
@@ -453,10 +460,10 @@ fn tray_icon_image() -> Option<tray_icon::Icon> {
                 }
             }
             let o = &mut out[(y * size + x) * 4..][..4];
-            if acc[3] > 0 {
-                o[0] = (acc[0] / acc[3]) as u8;
-                o[1] = (acc[1] / acc[3]) as u8;
-                o[2] = (acc[2] / acc[3]) as u8;
+            if let Some(alpha) = std::num::NonZeroU64::new(acc[3]) {
+                o[0] = (acc[0] / alpha) as u8;
+                o[1] = (acc[1] / alpha) as u8;
+                o[2] = (acc[2] / alpha) as u8;
             }
             o[3] = (acc[3] / n.max(1)) as u8;
         }
@@ -464,10 +471,11 @@ fn tray_icon_image() -> Option<tray_icon::Icon> {
     tray_icon::Icon::from_rgba(out, size as u32, size as u32).ok()
 }
 
+/// "Record Screen" with the record shortcut as it is now (Settings can change it).
 fn record_title() -> String {
     format!(
         "Record Screen\t{}",
-        crate::capture::ShortcutConfig::load().label
+        crate::settings::Shortcuts::load().record.label
     )
 }
 
@@ -478,45 +486,6 @@ pub(super) fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
     let menu = Menu::new();
     let toggle = MenuItem::with_id(ID_TOGGLE, record_title(), true, None);
     let export = MenuItem::with_id(ID_EXPORT, "Export Last Capture as Video…", true, None);
-    let keep: Vec<CheckMenuItem> = crate::retention::Preset::ALL
-        .iter()
-        .enumerate()
-        .map(|(index, preset)| {
-            CheckMenuItem::with_id(
-                format!("{KEEP_PREFIX}{index}"),
-                preset.label(),
-                true,
-                false,
-                None,
-            )
-        })
-        .collect();
-    let keep_size = MenuItem::new("Captures use …", false, None);
-    let keep_menu = Submenu::new("Keep Recordings", true);
-    for item in &keep {
-        let _ = keep_menu.append(item);
-    }
-    let _ = keep_menu.append(&PredefinedMenuItem::separator());
-    let _ = keep_menu.append(&keep_size);
-    let engine_apple = CheckMenuItem::with_id(
-        ID_ENGINE_APPLE,
-        crate::transcribe::LOCAL_ENGINE_TITLE,
-        true,
-        false,
-        None,
-    );
-    let engine_hex = CheckMenuItem::with_id(ID_ENGINE_HEX, "Hex", true, false, None);
-    let transcription = Submenu::new("Transcription", true);
-    let _ = transcription.append(&engine_apple);
-    let _ = transcription.append(&engine_hex);
-    let auto_send = CheckMenuItem::with_id(
-        ID_AUTO_SEND,
-        "Send Dev Site Captures to OpenCode",
-        true,
-        crate::handoff::auto_send(),
-        None,
-    );
-
     let _ = menu.append(&toggle);
     let _ = menu.append(&MenuItem::with_id(
         ID_CHOOSE,
@@ -524,38 +493,19 @@ pub(super) fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
         true,
         None,
     ));
+    let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&MenuItem::with_id(
         ID_OPEN_LATEST,
-        "Open Latest Bundle",
+        "Open Latest Capture",
         true,
         None,
     ));
-    let _ = menu.append(&MenuItem::with_id(
-        ID_DEMO,
-        "Generate Demo Bundle",
-        true,
-        None,
-    ));
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    if crate::handoff::video_export() {
+    let export_shown = crate::handoff::video_export();
+    if export_shown {
         let _ = menu.append(&export);
     }
-    let _ = menu.append(&MenuItem::with_id(
-        ID_SHOW,
-        format!("Show Captures in {FILE_MANAGER}"),
-        true,
-        None,
-    ));
-    let _ = menu.append(&keep_menu);
-    let _ = menu.append(&transcription);
-    let _ = menu.append(&auto_send);
     let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append(&MenuItem::with_id(
-        ID_WELCOME,
-        "Welcome to Scrawl…",
-        true,
-        None,
-    ));
+    let _ = menu.append(&MenuItem::with_id(ID_SETTINGS, "Settings…", true, None));
     let _ = menu.append(&MenuItem::with_id(
         ID_UPDATES,
         "Check for Updates…",
@@ -569,7 +519,7 @@ pub(super) fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
             let _ = sender.try_send(action);
         }
     }));
-    // Both buttons open the menu, rebuilt first so its rows and ticks are current.
+    // Both buttons open the menu, rebuilt first so its rows are current.
     TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
         if let TrayIconEvent::Click {
             button_state: MouseButtonState::Up,
@@ -596,14 +546,8 @@ pub(super) fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
             menu,
             toggle,
             export,
-            keep,
-            keep_size,
-            engine_apple,
-            engine_hex,
-            transcription,
+            export_shown,
             dynamic: Vec::new(),
-            hex_rows: Vec::new(),
-            auto_send,
             status: None,
             inbox: 0,
         });
@@ -618,27 +562,11 @@ fn menu_action(id: &MenuId) -> Option<MenuAction> {
         ID_TOGGLE => MenuAction::ToggleCapture,
         ID_CHOOSE => MenuAction::ChooseTarget,
         ID_OPEN_LATEST => MenuAction::OpenLatest,
-        ID_DEMO => MenuAction::RunDemo,
         ID_EXPORT => MenuAction::ExportVideo,
-        ID_SHOW => MenuAction::ShowCaptures,
-        ID_AUTO_SEND => MenuAction::ToggleAutoSend,
-        ID_WELCOME => MenuAction::Welcome,
+        ID_SETTINGS => MenuAction::Settings,
         ID_UPDATES => MenuAction::CheckForUpdates,
         ID_QUIT => MenuAction::Quit,
-        ID_ENGINE_APPLE => MenuAction::SetTranscriber(crate::transcribe::Engine::Apple),
-        ID_ENGINE_HEX => MenuAction::SetTranscriber(crate::transcribe::Engine::Hex),
-        _ => {
-            if let Some(index) = id.strip_prefix(KEEP_PREFIX) {
-                let preset = *crate::retention::Preset::ALL.get(index.parse::<usize>().ok()?)?;
-                MenuAction::KeepRecordings(preset)
-            } else if let Some(path) = id.strip_prefix(INBOX_PREFIX) {
-                MenuAction::OpenInbox(PathBuf::from(path))
-            } else if let Some(model) = id.strip_prefix(HEX_MODEL_PREFIX) {
-                MenuAction::SetHexModel(model.to_owned())
-            } else {
-                return None;
-            }
-        }
+        _ => MenuAction::OpenInbox(PathBuf::from(id.strip_prefix(INBOX_PREFIX)?)),
     })
 }
 
@@ -647,6 +575,16 @@ fn refresh(tray: &mut Tray) {
     tray.toggle.set_text(record_title());
     for item in tray.dynamic.drain(..) {
         let _ = tray.menu.remove(item.as_ref());
+    }
+    let export = crate::handoff::video_export();
+    if export != tray.export_shown {
+        if export {
+            // After Open Latest Capture: the record rows, a separator, then Open Latest.
+            let _ = tray.menu.insert(&tray.export, 4);
+        } else {
+            let _ = tray.menu.remove(&tray.export);
+        }
+        tray.export_shown = export;
     }
     let inbox = crate::inbox::Inbox::load_default();
     if inbox.len() > 0 {
@@ -667,53 +605,6 @@ fn refresh(tray: &mut Tray) {
         }
         tray.dynamic = rows;
     }
-
-    let current = crate::retention::Policy::load().preset();
-    for (item, preset) in tray.keep.iter().zip(crate::retention::Preset::ALL) {
-        item.set_checked(current == Some(preset));
-    }
-    let size = crate::retention::captures_size(&crate::handoff::default_captures_dir());
-    tray.keep_size.set_text(format!(
-        "Captures use {}",
-        crate::retention::format_bytes(size)
-    ));
-
-    let status = crate::hex::cached_status();
-    crate::hex::refresh_in_background();
-    let state = crate::transcribe::menu_state(
-        crate::transcribe::Engine::configured(),
-        status.as_ref(),
-        crate::handoff::hex_model().as_deref(),
-    );
-    tray.engine_apple.set_checked(state.apple_checked);
-    tray.engine_hex.set_text(state.hex_title);
-    tray.engine_hex.set_enabled(state.hex_enabled);
-    tray.engine_hex.set_checked(state.hex_checked);
-    for item in tray.hex_rows.drain(..) {
-        let _ = tray.transcription.remove(item.as_ref());
-    }
-    if !state.models.is_empty() {
-        let mut rows: Vec<Box<dyn IsMenuItem>> = vec![
-            Box::new(PredefinedMenuItem::separator()),
-            Box::new(MenuItem::new("Hex model", false, None)),
-        ];
-        for (id, title, chosen) in &state.models {
-            rows.push(Box::new(CheckMenuItem::with_id(
-                format!("{HEX_MODEL_PREFIX}{id}"),
-                title,
-                true,
-                *chosen,
-                None,
-            )));
-        }
-        for row in &rows {
-            let _ = tray.transcription.append(row.as_ref());
-        }
-        tray.hex_rows = rows;
-    }
-
-    tray.auto_send.set_checked(crate::handoff::auto_send());
-    let _ = &tray.export;
 }
 
 /// Called from the UI loop: opens the menu when the icon was clicked.

@@ -693,7 +693,7 @@ impl OnboardingWindow {
                 format!(
                     "Press {} for you when you use {}",
                     crate::capture::system_paste_label(),
-                    crate::capture::paste_shortcut_label()
+                    crate::settings::paste_label()
                 ),
             ),
             Permission::Camera => (
@@ -835,11 +835,11 @@ impl OnboardingWindow {
             (
                 format!(
                     "Accessibility, for {}",
-                    crate::capture::paste_shortcut_label()
+                    crate::settings::paste_label()
                 ),
                 format!(
                     "{} pastes a capture into the app in front by pressing {} for you, and that needs Accessibility. Pressing {} yourself works without it.",
-                    crate::capture::paste_shortcut_label(),
+                    crate::settings::paste_label(),
                     crate::capture::system_paste_label(),
                     crate::capture::system_paste_label()
                 ),
@@ -938,6 +938,7 @@ impl OnboardingWindow {
                 Some((if state.fix { "Not now" } else { "Set up later" }, "later"))
             }
             Step::TryIt => Some(("Close", "continue")),
+            Step::Done => Some(("Open Settings", "settings")),
             _ => None,
         };
         let show_dots = state.step != Step::Done && !state.fix;

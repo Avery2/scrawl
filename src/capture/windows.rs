@@ -32,8 +32,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::{
     CARBON_CMD_KEY, CARBON_CONTROL_KEY, CARBON_OPTION_KEY, CARBON_SHIFT_KEY, LiveOverlayEvent,
-    Sampler, SharedCaptureTelemetry, ShortcutConfig, clean_label, pick_display, poll_clicks,
-    scrawl_log, shortcut_label, track_shift_ink,
+    Sampler, SharedCaptureTelemetry, ShortcutConfig, ShortcutKind, clean_label, hotkey_combos,
+    layout_default_keycode, pick_display, poll_clicks, scrawl_log, shortcut_label, shortcut_matches,
+    track_shift_ink,
 };
 use crate::model::{CaptureMode, InteractionEvent, TargetFrame, TargetInfo};
 use crate::win;
@@ -44,7 +45,7 @@ pub const MAX_CAPTURE_SCALE: f64 = 1.0;
 /// `VK_S`. Windows maps virtual keys through the active layout, so the key that types S is
 /// `VK_S` on Dvorak too.
 pub const KEY_S: u16 = 0x53;
-const KEY_V: u16 = 0x56;
+pub const KEY_V: u16 = 0x56;
 const KEY_Z: u16 = 0x5A;
 /// An unassigned virtual key, sent around Alt or Win coming up after a shortcut so the app in
 /// front doesn't open its menu bar (or the Start menu) on the lone modifier release.
@@ -60,8 +61,19 @@ pub fn main_display_id() -> u32 {
     0
 }
 
+/// The virtual key that types `ch` on the active layout.
+pub fn key_code_for_char(ch: char) -> Option<u16> {
+    let scan = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::VkKeyScanW(ch as u16) };
+    // The low byte is the key; -1 means no key types it.
+    (scan != -1).then_some((scan as u16) & 0xFF)
+}
+
 pub fn layout_s_keycode() -> u16 {
-    KEY_S
+    key_code_for_char('s').unwrap_or(KEY_S)
+}
+
+pub fn layout_v_keycode() -> u16 {
+    key_code_for_char('v').unwrap_or(KEY_V)
 }
 
 /// Windows asks nobody for screen recording.
@@ -486,51 +498,94 @@ fn hot_key_modifiers(carbon: u32) -> HOT_KEY_MODIFIERS {
     mods
 }
 
-/// The fixed chords: ⌥⇧ and the variants with Ctrl or Win added, and Ctrl+Alt+Win.
-const CHORDS: [u32; 4] = [
-    CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
-    CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
-    CARBON_CMD_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
-    CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_CMD_KEY,
-];
-
-fn register(id: i32, carbon: u32, vk: u16, name: &str) -> bool {
-    let ok = unsafe { RegisterHotKey(None, id, hot_key_modifiers(carbon), u32::from(vk)) }.is_ok();
-    scrawl_log(format!(
-        "RegisterHotKey({}) -> {}",
-        shortcut_label(carbon, name),
-        if ok { "ok" } else { "taken" }
-    ));
-    ok
+/// What the hotkey thread is asked to do. Hotkeys belong to the thread that registers them,
+/// so every change goes through it.
+enum HotkeyRequest {
+    /// Replace every registered hotkey with these (record, paste); answers with the refused one.
+    Register(
+        ShortcutConfig,
+        ShortcutConfig,
+        std::sync::mpsc::Sender<Result<(), ShortcutKind>>,
+    ),
+    /// Unregister everything, so Settings' recorder gets the keys.
+    Pause(std::sync::mpsc::Sender<Result<(), ShortcutKind>>),
 }
 
-fn register_toggle(config: &ShortcutConfig) {
-    let _ = unsafe { UnregisterHotKey(None, HOTKEY_ID_TOGGLE) };
-    let fixed = config.key_code == u32::from(KEY_S) && CHORDS.contains(&config.carbon_modifiers);
-    if !fixed {
-        let ok = unsafe {
-            RegisterHotKey(
-                None,
-                HOTKEY_ID_TOGGLE,
-                hot_key_modifiers(config.carbon_modifiers),
-                config.key_code,
-            )
-        }
-        .is_ok();
-        scrawl_log(format!(
-            "update_global_shortcut({}) -> {}",
-            config.label,
-            if ok { "ok" } else { "taken" }
-        ));
+static HOTKEY_REQUESTS: OnceLock<Mutex<std::sync::mpsc::Sender<HotkeyRequest>>> = OnceLock::new();
+
+fn hotkey_id(kind: ShortcutKind, index: usize) -> i32 {
+    match (kind, index) {
+        (ShortcutKind::Record, 0) => HOTKEY_ID_TOGGLE,
+        (ShortcutKind::Record, i) => HOTKEY_ID_ALT1 + i as i32,
+        (ShortcutKind::Paste, i) => HOTKEY_ID_PASTE_BASE + i as i32,
     }
 }
 
-/// Registers ⌥⇧S (and its variants) and ⌥⇧V system-wide on a thread of their own, which
-/// receives `WM_HOTKEY`. A registered shortcut doesn't reach the app in front.
+/// Replaces every registered hotkey with `record`'s and `paste`'s. Fails with the shortcut whose
+/// own combo Windows refused (another app holds it); its aliases are best effort.
+fn register_shortcuts(
+    ids: &mut Vec<i32>,
+    record: &ShortcutConfig,
+    paste: &ShortcutConfig,
+) -> Result<(), ShortcutKind> {
+    unregister_all(ids);
+    let mut failed = None;
+    for (kind, cfg) in [(ShortcutKind::Record, record), (ShortcutKind::Paste, paste)] {
+        for (i, (code, mods)) in hotkey_combos(kind, cfg).into_iter().enumerate() {
+            let id = hotkey_id(kind, i);
+            let ok = unsafe { RegisterHotKey(None, id, hot_key_modifiers(mods), code) }.is_ok();
+            scrawl_log(format!(
+                "RegisterHotKey({kind:?} {}) -> {}",
+                if i == 0 {
+                    cfg.label.clone()
+                } else {
+                    shortcut_label(mods, cfg.key_label())
+                },
+                if ok { "ok" } else { "taken" }
+            ));
+            if ok {
+                ids.push(id);
+            } else if i == 0 && failed.is_none() {
+                failed = Some(kind);
+            }
+        }
+    }
+    failed.map_or(Ok(()), Err)
+}
+
+fn unregister_all(ids: &mut Vec<i32>) {
+    for id in ids.drain(..) {
+        let _ = unsafe { UnregisterHotKey(None, id) };
+    }
+}
+
+/// Hands a request to the hotkey thread and waits for its answer; `None` before it runs.
+fn ask_hotkey_thread(
+    request: impl FnOnce(std::sync::mpsc::Sender<Result<(), ShortcutKind>>) -> HotkeyRequest,
+) -> Option<Result<(), ShortcutKind>> {
+    let thread_id = HOTKEY_THREAD.load(Ordering::Acquire);
+    let requests = HOTKEY_REQUESTS.get()?;
+    if thread_id == 0 {
+        return None;
+    }
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .send(request(reply_tx))
+        .ok()?;
+    unsafe { PostThreadMessageW(thread_id, WM_UPDATE_SHORTCUT, WPARAM(0), LPARAM(0)) }.ok()?;
+    reply_rx.recv_timeout(Duration::from_secs(2)).ok()
+}
+
+/// Registers both shortcuts (and the default's aliases) system-wide on a thread of their own,
+/// which receives `WM_HOTKEY`. A registered shortcut doesn't reach the app in front.
 pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
     if HOTKEY_TELEMETRY.set(Arc::clone(telemetry)).is_err() {
         return;
     }
+    let (request_tx, request_rx) = std::sync::mpsc::channel::<HotkeyRequest>();
+    let _ = HOTKEY_REQUESTS.set(Mutex::new(request_tx));
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let spawned = thread::Builder::new()
         .name("scrawl-hotkeys".into())
@@ -542,16 +597,13 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
             let Some(telemetry) = HOTKEY_TELEMETRY.get() else {
                 return;
             };
-            for (index, &chord) in CHORDS.iter().enumerate() {
-                register(HOTKEY_ID_ALT1 + index as i32, chord, KEY_S, "S");
-                register(HOTKEY_ID_PASTE_BASE + index as i32, chord, KEY_V, "V");
+            let mut ids = Vec::new();
+            let (record, paste) = telemetry.shortcuts();
+            if let Err(kind) = register_shortcuts(&mut ids, &record, &paste) {
+                scrawl_log(format!(
+                    "install_global_hotkeys: {kind:?} shortcut could not be registered"
+                ));
             }
-            register_toggle(
-                &telemetry
-                    .shortcut
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
             let _ = ready_tx.send(());
             loop {
                 let status = unsafe { GetMessageW(&mut msg, None, 0, 0) };
@@ -568,12 +620,19 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
                             telemetry.emit_capture_shortcut();
                         }
                     }
-                    WM_UPDATE_SHORTCUT => register_toggle(
-                        &telemetry
-                            .shortcut
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    ),
+                    WM_UPDATE_SHORTCUT => {
+                        while let Ok(request) = request_rx.try_recv() {
+                            match request {
+                                HotkeyRequest::Register(record, paste, reply) => {
+                                    let _ = reply.send(register_shortcuts(&mut ids, &record, &paste));
+                                }
+                                HotkeyRequest::Pause(reply) => {
+                                    unregister_all(&mut ids);
+                                    let _ = reply.send(Ok(()));
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -583,15 +642,53 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
     }
 }
 
-pub fn update_global_shortcut(telemetry: &SharedCaptureTelemetry, config: ShortcutConfig) {
-    config.save();
+/// Sets both shortcuts and registers them. If Windows refuses either, the old ones are put back
+/// and the refused one is returned. Nothing is saved here (`crate::settings` does that).
+pub fn set_shortcuts(
+    telemetry: &SharedCaptureTelemetry,
+    record: ShortcutConfig,
+    paste: ShortcutConfig,
+) -> Result<(), ShortcutKind> {
+    let (old_record, old_paste) = telemetry.shortcuts();
+    if !telemetry.shortcuts_paused.load(Ordering::Acquire)
+        && let Some(Err(kind)) = ask_hotkey_thread(|reply| {
+            HotkeyRequest::Register(record.clone(), paste.clone(), reply)
+        })
+    {
+        let _ = ask_hotkey_thread(|reply| HotkeyRequest::Register(old_record, old_paste, reply));
+        return Err(kind);
+    }
     *telemetry
         .shortcut
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
-    let thread_id = HOTKEY_THREAD.load(Ordering::Acquire);
-    if thread_id != 0 {
-        let _ = unsafe { PostThreadMessageW(thread_id, WM_UPDATE_SHORTCUT, WPARAM(0), LPARAM(0)) };
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = record;
+    *telemetry
+        .paste_shortcut
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = paste;
+    Ok(())
+}
+
+/// While Settings records a new shortcut, Scrawl's own stop answering, so pressing the current
+/// combo reaches the recorder instead of starting a capture.
+pub fn pause_shortcuts(telemetry: &SharedCaptureTelemetry, paused: bool) {
+    if telemetry.shortcuts_paused.swap(paused, Ordering::AcqRel) == paused {
+        return;
+    }
+    if paused {
+        let _ = ask_hotkey_thread(HotkeyRequest::Pause);
+    } else {
+        let (record, paste) = telemetry.shortcuts();
+        let _ = ask_hotkey_thread(|reply| HotkeyRequest::Register(record, paste, reply));
+    }
+}
+
+/// The review window's own recorder: sets and saves the record shortcut.
+pub fn update_global_shortcut(telemetry: &SharedCaptureTelemetry, config: ShortcutConfig) {
+    let (_, paste) = telemetry.shortcuts();
+    match set_shortcuts(telemetry, config.clone(), paste) {
+        Ok(()) => crate::settings::save_shortcut(ShortcutKind::Record, &config),
+        Err(kind) => scrawl_log(format!("update_global_shortcut: {kind:?} refused")),
     }
 }
 
@@ -696,7 +793,17 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
 fn handle_hook_event(telemetry: &SharedCaptureTelemetry, event: HookEvent) {
     match event {
         HookEvent::KeyDown { vk, repeat, mods } => {
-            if telemetry.matches_shortcut(vk, mods.win, mods.ctrl, mods.alt, mods.shift) {
+            // Settings is recording a shortcut: the keys are for it, and the menu-mask key
+            // tapped below would reach it as a key press of its own.
+            if telemetry.shortcuts_paused.load(Ordering::Acquire) {
+                return;
+            }
+            let (record, paste) = telemetry.shortcuts();
+            let hit = |kind: ShortcutKind, cfg: &ShortcutConfig| {
+                let layout = layout_default_keycode(kind);
+                shortcut_matches(kind, cfg, layout, vk, mods.win, mods.ctrl, mods.alt, mods.shift)
+            };
+            if hit(ShortcutKind::Record, &record) {
                 if !repeat {
                     if mods.alt || mods.win {
                         mask_menu_key();
@@ -705,7 +812,7 @@ fn handle_hook_event(telemetry: &SharedCaptureTelemetry, event: HookEvent) {
                 }
                 return;
             }
-            if vk == KEY_V && mods.alt && (mods.shift || (mods.ctrl && mods.win)) {
+            if hit(ShortcutKind::Paste, &paste) {
                 if !repeat && !telemetry.active.load(Ordering::Acquire) {
                     mask_menu_key();
                     telemetry.emit_paste_shortcut();
@@ -867,26 +974,24 @@ fn run_key_poller(telemetry: Arc<SharedCaptureTelemetry>) {
             await_shift_release = true;
         }
 
-        let cfg_keycode = telemetry
-            .shortcut
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .key_code as u16;
-        let key_s = key_down(KEY_S);
-        let key_cfg = if cfg_keycode == KEY_S {
-            key_s
-        } else {
-            key_down(cfg_keycode)
+        let (record_cfg, paste_cfg) = telemetry.shortcuts();
+        // Whether `kind`'s shortcut is down: its own key, or for a default its alias keys.
+        let shortcut_down = |kind: ShortcutKind, cfg: &ShortcutConfig| {
+            let mut codes = vec![cfg.key_code as u16];
+            if cfg.is_default_for(kind) {
+                codes.extend([layout_default_keycode(kind), kind.ansi_code()]);
+            }
+            codes.into_iter().any(|code| {
+                key_down(code) && shortcut_matches(kind, cfg, code, code, win, ctrl, alt, shift)
+            })
         };
-        let shortcut_now = (key_cfg
-            && telemetry.matches_shortcut(cfg_keycode, win, ctrl, alt, shift))
-            || (key_s && telemetry.matches_shortcut(KEY_S, win, ctrl, alt, shift));
+        let shortcut_now = shortcut_down(ShortcutKind::Record, &record_cfg);
         if shortcut_now && !prev_shortcut {
             telemetry.emit_capture_shortcut();
         }
         prev_shortcut = shortcut_now;
 
-        let paste_now = key_down(KEY_V) && alt && (shift || (ctrl && win));
+        let paste_now = shortcut_down(ShortcutKind::Paste, &paste_cfg);
         if paste_now && !prev_paste && !telemetry.active.load(Ordering::Acquire) {
             telemetry.emit_paste_shortcut();
         }

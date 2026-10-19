@@ -16,8 +16,16 @@ pub const CLICK: &str = "icons/click.svg";
 pub const LOCK: &str = "icons/lock.svg";
 pub const PERSON: &str = "icons/person.svg";
 pub const SPINNER: &str = "icons/spinner.svg";
+pub const GEAR: &str = "icons/gear.svg";
+pub const RECORD: &str = "icons/record.svg";
+pub const DRIVE: &str = "icons/drive.svg";
+pub const HAND: &str = "icons/hand.svg";
+pub const INFO: &str = "icons/info.svg";
+pub const CHEVRONS: &str = "icons/chevrons.svg";
+pub const RESET: &str = "icons/reset.svg";
+pub const ARROW_UP_RIGHT: &str = "icons/arrow-up-right.svg";
 
-const ICONS: [(&str, &[u8]); 12] = [
+const ICONS: [(&str, &[u8]); 20] = [
     (SPINNER, include_bytes!("../assets/icons/spinner.svg")),
     (AREA, include_bytes!("../assets/icons/area.svg")),
     (WINDOW, include_bytes!("../assets/icons/window.svg")),
@@ -33,6 +41,17 @@ const ICONS: [(&str, &[u8]); 12] = [
     (CLICK, include_bytes!("../assets/icons/click.svg")),
     (LOCK, include_bytes!("../assets/icons/lock.svg")),
     (PERSON, include_bytes!("../assets/icons/person.svg")),
+    (GEAR, include_bytes!("../assets/icons/gear.svg")),
+    (RECORD, include_bytes!("../assets/icons/record.svg")),
+    (DRIVE, include_bytes!("../assets/icons/drive.svg")),
+    (HAND, include_bytes!("../assets/icons/hand.svg")),
+    (INFO, include_bytes!("../assets/icons/info.svg")),
+    (CHEVRONS, include_bytes!("../assets/icons/chevrons.svg")),
+    (RESET, include_bytes!("../assets/icons/reset.svg")),
+    (
+        ARROW_UP_RIGHT,
+        include_bytes!("../assets/icons/arrow-up-right.svg"),
+    ),
 ];
 
 pub struct Assets;

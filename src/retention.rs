@@ -120,25 +120,9 @@ impl Policy {
             .unwrap_or_default()
     }
 
-    pub fn save(&self) -> Result<()> {
-        self.save_to(&crate::handoff::default_config_path())
-    }
-
-    /// Writes `"retention"`, keeping the rest of the config as it is.
+    /// Writes `"retention"`, keeping the rest of the config (and its `0600` mode) as it is.
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        let mut config = std::fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .filter(serde_json::Value::is_object)
-            .unwrap_or_else(|| serde_json::json!({}));
-        config["retention"] = serde_json::to_value(self)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&config)?)?;
-        std::fs::rename(tmp, path)?;
-        Ok(())
+        crate::handoff::set_config_value_in(path, "retention", serde_json::to_value(self)?)
     }
 }
 

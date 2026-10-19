@@ -663,6 +663,7 @@ struct OnboardingView: View {
     switch state.step {
     case "permissions": return state.fix ? "Not now" : "Set up later"
     case "try-it": return "Close"
+    case "done": return "Open Settings"
     default: return nil
     }
   }
@@ -674,7 +675,7 @@ struct OnboardingView: View {
       }
       if let secondary {
         QuietButton(title: secondary) {
-          model.send(state.step == "try-it" ? "continue" : "later")
+          model.send(state.step == "try-it" ? "continue" : state.step == "done" ? "settings" : "later")
         }
       } else {
         Spacer().frame(height: 22)

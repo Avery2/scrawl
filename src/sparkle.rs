@@ -147,6 +147,11 @@ fn start_inner() -> Result<()> {
     Ok(())
 }
 
+/// Whether this copy can check for updates (a development build has no Sparkle).
+pub fn available() -> bool {
+    UPDATE_STATUS.load(Ordering::Acquire) != UpdateStatus::Unavailable as u8
+}
+
 pub fn check_for_updates() {
     let Some(mtm) = MainThreadMarker::new() else {
         return;

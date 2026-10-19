@@ -123,6 +123,8 @@ pub enum LiveOverlayEvent {
     PhoneEnded,
     /// The welcome window: a button, fresh permission states, or the helper exiting.
     Onboarding(crate::onboarding::Event),
+    /// The Settings window: an action, fresh permission states, or the helper exiting.
+    Settings(crate::settings::Event),
     /// A ScrawlKit recording was ingested from an iPhone and compiled into a `.scrawl` bundle.
     IngestedBundle {
         dir: PathBuf,
@@ -137,7 +139,7 @@ pub const CARBON_SHIFT_KEY: u32 = 1 << 9;
 pub const CARBON_OPTION_KEY: u32 = 1 << 11;
 pub const CARBON_CONTROL_KEY: u32 = 1 << 12;
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShortcutConfig {
     pub key_code: u32,
     pub carbon_modifiers: u32,
@@ -146,12 +148,99 @@ pub struct ShortcutConfig {
 
 impl Default for ShortcutConfig {
     fn default() -> Self {
+        Self::default_record()
+    }
+}
+
+/// Scrawl's two global shortcuts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShortcutKind {
+    /// Start, switch or finish a recording (⌥⇧S).
+    Record,
+    /// Paste the latest capture into the app in front (⌥⇧V).
+    Paste,
+}
+
+impl ShortcutKind {
+    pub const ALL: [Self; 2] = [Self::Record, Self::Paste];
+
+    pub fn default_config(self) -> ShortcutConfig {
+        match self {
+            Self::Record => ShortcutConfig::default_record(),
+            Self::Paste => ShortcutConfig::default_paste(),
+        }
+    }
+
+    /// The letter of the default, on the active layout (Dvorak's S is not ANSI's).
+    fn default_char(self) -> char {
+        match self {
+            Self::Record => 's',
+            Self::Paste => 'v',
+        }
+    }
+
+    pub(crate) fn ansi_code(self) -> u16 {
+        match self {
+            Self::Record => KEY_S,
+            Self::Paste => KEY_V,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Record => "Record",
+            Self::Paste => "Paste last capture",
+        }
+    }
+}
+
+impl ShortcutConfig {
+    pub fn default_record() -> Self {
         Self {
             key_code: u32::from(layout_s_keycode()),
             carbon_modifiers: CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
             label: shortcut_label(CARBON_OPTION_KEY | CARBON_SHIFT_KEY, "S"),
         }
     }
+
+    pub fn default_paste() -> Self {
+        Self {
+            key_code: u32::from(layout_v_keycode()),
+            carbon_modifiers: CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
+            label: shortcut_label(CARBON_OPTION_KEY | CARBON_SHIFT_KEY, "V"),
+        }
+    }
+
+    /// Whether this is `kind`'s default, which also answers to its aliases (⌃⌥⇧, ⌘⌥⇧, ⌃⌥⌘
+    /// and the ANSI key).
+    pub fn is_default_for(&self, kind: ShortcutKind) -> bool {
+        self.carbon_modifiers == CARBON_OPTION_KEY | CARBON_SHIFT_KEY
+            && shortcut_parts(&self.label).1 == kind.default_char().to_ascii_uppercase().to_string()
+    }
+
+    pub fn key_label(&self) -> &str {
+        shortcut_parts(&self.label).1
+    }
+}
+
+/// `⌃⌥⇧⌘` in the order macOS writes them, for Carbon modifier bits; on Windows the same
+/// modifiers as `Ctrl+Win+Alt+Shift+` (ready to take a key).
+pub fn modifier_symbols(carbon_modifiers: u32) -> String {
+    if cfg!(target_os = "windows") {
+        let label = shortcut_label(carbon_modifiers, "");
+        return label;
+    }
+    [
+        (CARBON_CONTROL_KEY, '⌃'),
+        (CARBON_OPTION_KEY, '⌥'),
+        (CARBON_SHIFT_KEY, '⇧'),
+        (CARBON_CMD_KEY, '⌘'),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| carbon_modifiers & bit != 0)
+    .map(|(_, symbol)| symbol)
+    .collect()
 }
 
 /// A shortcut as this platform writes it: `⌥⇧S` on macOS, `Alt+Shift+S` on Windows.
@@ -188,11 +277,6 @@ pub fn shortcut_label(carbon_modifiers: u32, key: &str) -> String {
     }
 }
 
-/// The paste shortcut's label: `⌥⇧V` on macOS, `Alt+Shift+V` on Windows.
-pub fn paste_shortcut_label() -> String {
-    shortcut_label(CARBON_OPTION_KEY | CARBON_SHIFT_KEY, "V")
-}
-
 /// The system paste keystroke: `⌘V` on macOS, `Ctrl+V` on Windows.
 pub fn system_paste_label() -> &'static str {
     if cfg!(target_os = "windows") {
@@ -218,38 +302,6 @@ pub fn shortcut_keys(label: &str) -> Vec<String> {
         keys
     } else {
         label.chars().map(String::from).collect()
-    }
-}
-
-impl ShortcutConfig {
-    fn config_path() -> PathBuf {
-        crate::handoff::default_captures_dir()
-            .parent()
-            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
-            .join("config.json")
-    }
-
-    pub fn load() -> Self {
-        let mut cfg: Self = std::fs::read_to_string(Self::config_path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        if cfg.label == "⌃⌥⇧S" || cfg.label.is_empty() {
-            cfg = Self::default();
-        } else if cfg.label.ends_with('S') && cfg.key_code == u32::from(KEY_S) {
-            cfg.key_code = u32::from(layout_s_keycode());
-        }
-        cfg
-    }
-
-    pub fn save(&self) {
-        let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(bytes) = serde_json::to_vec_pretty(self) {
-            let _ = std::fs::write(path, bytes);
-        }
     }
 }
 
@@ -290,11 +342,37 @@ pub fn shortcut_parts(label: &str) -> (&str, &str) {
     label.split_at(split)
 }
 
-/// Whether a key press is the capture shortcut: the configured one, or ⌥⇧S (also with ⌃ or ⌘)
-/// and ⌃⌥⌘S on the active layout's S key or the ANSI one.
+/// Whether a key press is the record shortcut. A custom one matches exactly; the default ⌥⇧S
+/// also answers with ⌃ or ⌘ added and as ⌃⌥⌘S, on the active layout's S key (`s_code`) or the
+/// ANSI one.
 pub fn is_capture_shortcut(
     cfg: &ShortcutConfig,
     s_code: u16,
+    keycode: u16,
+    cmd: bool,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+) -> bool {
+    shortcut_matches(
+        ShortcutKind::Record,
+        cfg,
+        s_code,
+        keycode,
+        cmd,
+        ctrl,
+        alt,
+        shift,
+    )
+}
+
+/// `is_capture_shortcut` for any of Scrawl's shortcuts; `layout_code` is the default key on the
+/// active layout.
+#[allow(clippy::too_many_arguments)]
+pub fn shortcut_matches(
+    kind: ShortcutKind,
+    cfg: &ShortcutConfig,
+    layout_code: u16,
     keycode: u16,
     cmd: bool,
     ctrl: bool,
@@ -305,13 +383,47 @@ pub fn is_capture_shortcut(
     let want_ctrl = (cfg.carbon_modifiers & CARBON_CONTROL_KEY) != 0;
     let want_alt = (cfg.carbon_modifiers & CARBON_OPTION_KEY) != 0;
     let want_shift = (cfg.carbon_modifiers & CARBON_SHIFT_KEY) != 0;
-    let custom = u32::from(keycode) == cfg.key_code
+    let exact = u32::from(keycode) == cfg.key_code
         && cmd == want_cmd
         && ctrl == want_ctrl
         && alt == want_alt
         && shift == want_shift;
-    let is_s_key = keycode == s_code || keycode == KEY_S;
-    custom || (is_s_key && alt && (shift || (ctrl && cmd)))
+    if exact {
+        return true;
+    }
+    let is_key = keycode == layout_code || keycode == kind.ansi_code();
+    cfg.is_default_for(kind) && is_key && alt && (shift || (ctrl && cmd))
+}
+
+/// The active layout's key for `kind`'s default letter.
+pub fn layout_default_keycode(kind: ShortcutKind) -> u16 {
+    key_code_for_char(kind.default_char()).unwrap_or(kind.ansi_code())
+}
+
+/// The key codes and Carbon modifiers `cfg` registers: itself, plus for a default its aliases
+/// (⌃⌥⇧, ⌘⌥⇧, ⌃⌥⌘) on the active layout's key and the ANSI one.
+pub(crate) fn hotkey_combos(kind: ShortcutKind, cfg: &ShortcutConfig) -> Vec<(u32, u32)> {
+    let mut combos = vec![(cfg.key_code, cfg.carbon_modifiers)];
+    if !cfg.is_default_for(kind) {
+        return combos;
+    }
+    let mut codes = vec![cfg.key_code];
+    if cfg.key_code != u32::from(kind.ansi_code()) {
+        codes.push(u32::from(kind.ansi_code()));
+    }
+    for code in codes {
+        for mods in [
+            CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
+            CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
+            CARBON_CMD_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
+            CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_CMD_KEY,
+        ] {
+            if !combos.contains(&(code, mods)) {
+                combos.push((code, mods));
+            }
+        }
+    }
+    combos
 }
 
 /// No-op: do not register a global Escape hotkey because Karabiner maps CapsLock (Control)
@@ -531,7 +643,11 @@ pub struct SharedCaptureTelemetry {
     pub selecting: AtomicBool,
     pub shift_held: AtomicBool,
     pub capture_mode: AtomicU64,
+    /// The record shortcut (`crate::settings` loads and saves it).
     pub shortcut: Mutex<ShortcutConfig>,
+    pub paste_shortcut: Mutex<ShortcutConfig>,
+    /// Settings is recording a new shortcut: none of Scrawl's fire (`pause_shortcuts`).
+    pub shortcuts_paused: AtomicBool,
     pub started_at: Mutex<Instant>,
     pub picker_started_at: Mutex<Instant>,
     pub picker_rect: Mutex<Option<([f32; 4], u8)>>,
@@ -565,12 +681,16 @@ pub struct SharedCaptureTelemetry {
 
 impl SharedCaptureTelemetry {
     pub fn new(ui_sender: flume::Sender<LiveOverlayEvent>) -> Arc<Self> {
+        let shortcuts = crate::settings::Shortcuts::load();
+        crate::settings::note_paste_label(&shortcuts.paste.label);
         Arc::new(Self {
             active: AtomicBool::new(false),
             selecting: AtomicBool::new(false),
             shift_held: AtomicBool::new(false),
             capture_mode: AtomicU64::new(0),
-            shortcut: Mutex::new(ShortcutConfig::load()),
+            shortcut: Mutex::new(shortcuts.record),
+            paste_shortcut: Mutex::new(shortcuts.paste),
+            shortcuts_paused: AtomicBool::new(false),
             started_at: Mutex::new(Instant::now()),
             picker_started_at: Mutex::new(Instant::now()),
             picker_rect: Mutex::new(None),
@@ -602,6 +722,9 @@ impl SharedCaptureTelemetry {
     /// Each source (Carbon, the event tap, the HID poller) reports the same press within a few
     /// ms; a press after that is a new one, as when S is pressed again to switch modes.
     pub fn emit_capture_shortcut(&self) {
+        if self.shortcuts_paused.load(Ordering::Acquire) {
+            return;
+        }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -619,6 +742,9 @@ impl SharedCaptureTelemetry {
     }
 
     pub fn emit_paste_shortcut(&self) {
+        if self.shortcuts_paused.load(Ordering::Acquire) {
+            return;
+        }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -651,6 +777,16 @@ impl SharedCaptureTelemetry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         is_capture_shortcut(&cfg, layout_s_keycode(), keycode, cmd, ctrl, alt, shift)
+    }
+
+    /// The record and paste shortcuts.
+    pub fn shortcuts(&self) -> (ShortcutConfig, ShortcutConfig) {
+        let lock = |m: &Mutex<ShortcutConfig>| {
+            m.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        (lock(&self.shortcut), lock(&self.paste_shortcut))
     }
 
     pub fn set_capture_mode(&self, mode: CaptureMode) {
@@ -1270,6 +1406,56 @@ mod tests {
         assert!(hit(&custom, 15, (false, true, true, false)));
         assert!(!hit(&custom, 15, (true, true, true, false)));
         assert!(!hit(&custom, 15, (false, false, true, false)));
+        // Once changed, ⌥⇧S and its aliases are free for other apps.
+        assert!(!hit(&custom, s, (false, false, true, true)), "⌥⇧S");
+        assert!(!hit(&custom, KEY_S, (true, true, true, true)), "hyper S");
+        assert_eq!(
+            hotkey_combos(ShortcutKind::Record, &custom),
+            [(15, custom.carbon_modifiers)]
+        );
+        assert_eq!(
+            hotkey_combos(ShortcutKind::Record, &default).len(),
+            if u32::from(KEY_S) == default.key_code { 4 } else { 8 },
+            "⌥⇧S and three aliases, on the layout's key and the ANSI one"
+        );
+
+        // The paste shortcut works the same way.
+        let v = 9_u16;
+        let paste = ShortcutConfig {
+            key_code: u32::from(v),
+            carbon_modifiers: CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
+            label: "⌥⇧V".into(),
+        };
+        let paste_hit = |cfg: &ShortcutConfig, key, (cmd, ctrl, alt, shift)| {
+            shortcut_matches(ShortcutKind::Paste, cfg, v, key, cmd, ctrl, alt, shift)
+        };
+        assert!(paste_hit(&paste, v, (false, false, true, true)), "⌥⇧V");
+        assert!(paste_hit(&paste, v, (true, true, true, false)), "⌃⌥⌘V");
+        assert!(
+            !paste_hit(&paste, s, (false, false, true, true)),
+            "⌥⇧S isn't paste"
+        );
+        let paste_custom = ShortcutConfig {
+            key_code: 35,
+            carbon_modifiers: CARBON_CONTROL_KEY | CARBON_OPTION_KEY,
+            label: "⌃⌥P".into(),
+        };
+        assert!(paste_hit(&paste_custom, 35, (false, true, true, false)));
+        assert!(!paste_hit(&paste_custom, v, (false, false, true, true)));
+        assert!(
+            paste.is_default_for(ShortcutKind::Paste)
+                && !paste.is_default_for(ShortcutKind::Record)
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            modifier_symbols(CARBON_CMD_KEY | CARBON_CONTROL_KEY | CARBON_SHIFT_KEY),
+            "⌃⇧⌘"
+        );
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            modifier_symbols(CARBON_CMD_KEY | CARBON_CONTROL_KEY | CARBON_SHIFT_KEY),
+            "Ctrl+Win+Shift+"
+        );
 
         assert_eq!(shortcut_parts("⌥⇧S"), ("⌥⇧", "S"));
         assert_eq!(shortcut_parts("⌃⌥⌘R"), ("⌃⌥⌘", "R"));

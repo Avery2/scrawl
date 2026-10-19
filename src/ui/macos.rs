@@ -19,7 +19,7 @@ use objc2_foundation::{MainThreadMarker, NSData, NSObject, NSSize, NSString};
 use screencapturekit::prelude::*;
 use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
 
-use super::{ISLAND_H, LaserOverlay, MenuAction, PILL_WINDOW_H, PILL_WINDOW_W};
+use super::{ISLAND_H, LaserOverlay, MenuAction, PILL_WINDOW_H, PILL_WINDOW_W, motion};
 use crate::capture::SharedCaptureTelemetry;
 
 /// Where the file browser is called in buttons ("Show in Finder").
@@ -64,6 +64,19 @@ pub(super) fn caption_buttons() -> Option<AnyElement> {
 /// Window levels keep the pill above the picker above the overlay.
 pub(super) fn raise_window(_window: &mut Window) {}
 
+/// `scrawl lab`'s backdrop (`w` × `h` points): borderless, under the capsule, letting clicks through.
+pub(super) fn configure_lab_backdrop(w: f32, h: f32) {
+    if let Some(mtm) = MainThreadMarker::new() {
+        for win in NSApplication::sharedApplication(mtm).windows() {
+            let f = win.frame().size;
+            if (f.width - f64::from(w)).abs() < 1.0 && (f.height - f64::from(h)).abs() < 1.0 {
+                win.setStyleMask(NSWindowStyleMask::Borderless);
+                configure_floating_window(&win, true, 4);
+            }
+        }
+    }
+}
+
 /// AppKit keeps an accessory app running without windows.
 pub(super) fn keep_alive(_cx: &mut App) {}
 
@@ -94,11 +107,12 @@ pub(super) fn open_overlay(
 }
 
 /// The picker: borderless at status level + 1 over the whole screen (menu bar included),
-/// taking clicks. Returns its window number, to leave out of the recording.
-pub(super) fn configure_picker_window(_window: &mut Window) -> Option<u32> {
+/// taking clicks (`scrawl lab` replays let them through). Returns its window number, to leave out
+/// of the recording.
+pub(super) fn configure_picker_window(_window: &mut Window, lab: bool) -> Option<u32> {
     let ns_win = find_picker_ns_window()?;
     ns_win.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
-    configure_floating_window(&ns_win, false, 1);
+    configure_floating_window(&ns_win, lab, 1);
     if let Some(screen) = ns_win.screen() {
         ns_win.setFrame_display(screen.frame(), true);
     }
@@ -162,6 +176,31 @@ impl PillChrome {
             ns_win.setLevel(NSStatusWindowLevel + 3);
             ns_win.orderFrontRegardless();
         }
+    }
+
+    /// One motion-trace frame for the capsule (`SCRAWL_MOTION_TRACE`), mapping its children.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn trace(
+        &self,
+        width: f32,
+        scale: f32,
+        y_offset: f32,
+        opacity: f32,
+        content_alpha: f32,
+        blur_radius: f32,
+        content_shrink: f32,
+    ) -> Option<super::motion::Xf> {
+        let ns_win = self.ns_window.as_ref()?;
+        Some(trace_capsule(
+            ns_win,
+            width,
+            scale,
+            y_offset,
+            opacity,
+            content_alpha,
+            blur_radius,
+            content_shrink,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -250,67 +289,9 @@ objc2::define_class!(
             let _ = self.ivars().sender.try_send(MenuAction::ChooseTarget);
         }
 
-        #[unsafe(method(recordIphone:))]
-        fn record_iphone(&self, _sender: &AnyObject) {
-            let _ = self.ivars().sender.try_send(MenuAction::RecordIphone);
-        }
-
         #[unsafe(method(openLatest:))]
         fn open_latest(&self, _sender: &AnyObject) {
             let _ = self.ivars().sender.try_send(MenuAction::OpenLatest);
-        }
-
-        #[unsafe(method(runDemo:))]
-        fn run_demo(&self, _sender: &AnyObject) {
-            let _ = self.ivars().sender.try_send(MenuAction::RunDemo);
-        }
-
-        #[unsafe(method(welcome:))]
-        fn welcome(&self, _sender: &AnyObject) {
-            let _ = self.ivars().sender.try_send(MenuAction::Welcome);
-        }
-
-        #[unsafe(method(keepRecordings:))]
-        fn keep_recordings(&self, sender: &NSMenuItem) {
-            let index = usize::try_from(sender.tag() - KEEP_MENU_TAG - 1).unwrap_or(usize::MAX);
-            if let Some(&preset) = crate::retention::Preset::ALL.get(index) {
-                let _ = self
-                    .ivars()
-                    .sender
-                    .try_send(MenuAction::KeepRecordings(preset));
-            }
-        }
-
-        #[unsafe(method(toggleAutoSend:))]
-        fn toggle_auto_send(&self, _sender: &AnyObject) {
-            let _ = self.ivars().sender.try_send(MenuAction::ToggleAutoSend);
-        }
-
-        #[unsafe(method(useAppleSpeech:))]
-        fn use_apple_speech(&self, _sender: &AnyObject) {
-            let _ = self
-                .ivars()
-                .sender
-                .try_send(MenuAction::SetTranscriber(crate::transcribe::Engine::Apple));
-        }
-
-        #[unsafe(method(useHex:))]
-        fn use_hex(&self, _sender: &AnyObject) {
-            let _ = self
-                .ivars()
-                .sender
-                .try_send(MenuAction::SetTranscriber(crate::transcribe::Engine::Hex));
-        }
-
-        #[unsafe(method(pickHexModel:))]
-        fn pick_hex_model(&self, sender: &NSMenuItem) {
-            let model = sender
-                .representedObject()
-                .and_then(|object| object.downcast::<NSString>().ok())
-                .map(|model| model.to_string());
-            if let Some(model) = model {
-                let _ = self.ivars().sender.try_send(MenuAction::SetHexModel(model));
-            }
         }
 
         #[unsafe(method(exportVideo:))]
@@ -318,9 +299,9 @@ objc2::define_class!(
             let _ = self.ivars().sender.try_send(MenuAction::ExportVideo);
         }
 
-        #[unsafe(method(showCaptures:))]
-        fn show_captures(&self, _sender: &AnyObject) {
-            let _ = self.ivars().sender.try_send(MenuAction::ShowCaptures);
+        #[unsafe(method(openSettings:))]
+        fn open_settings(&self, _sender: &AnyObject) {
+            let _ = self.ivars().sender.try_send(MenuAction::Settings);
         }
 
         #[unsafe(method(checkForUpdates:))]
@@ -349,10 +330,8 @@ objc2::define_class!(
         #[unsafe(method(menuNeedsUpdate:))]
         fn menu_needs_update(&self, menu: &NSMenu) {
             rebuild_inbox_menu_items(menu, self);
-            refresh_keep_menu(menu);
-            refresh_transcription_menu(menu, self);
-            if let Some(item) = menu.itemWithTag(AUTO_SEND_MENU_TAG) {
-                item.setState(if crate::handoff::auto_send() { 1 } else { 0 });
+            if let Some(item) = menu.itemWithTag(RECORD_MENU_TAG) {
+                item.setTitle(&NSString::from_str(&record_menu_title()));
             }
             if let Some(item) = menu.itemWithTag(EXPORT_VIDEO_MENU_TAG) {
                 item.setHidden(!crate::handoff::video_export());
@@ -363,109 +342,17 @@ objc2::define_class!(
 
 /// Tag on the status menu's inbox rows, so each open can replace them.
 const INBOX_MENU_TAG: isize = 0x5c4a;
-/// Tag on the Keep Recordings item; its choices are tagged one past it, in `Preset::ALL` order.
-const KEEP_MENU_TAG: isize = 0x5c50;
 /// Tag on **Export Last Capture as Video…**, shown only with `"videoExport": true`.
 const EXPORT_VIDEO_MENU_TAG: isize = 0x5c4e;
-/// Tag on the Transcription item; Apple is one past it, Hex two past, and the Hex model rows
-/// (header, separator and one per ready model) sit from `TRANSCRIBE_MODELS_TAG` up.
-const TRANSCRIBE_MENU_TAG: isize = 0x5c60;
-const TRANSCRIBE_MODELS_TAG: isize = TRANSCRIBE_MENU_TAG + 10;
-/// Tag on the toggle for sending dev-site captures to their session (`crate::routing`).
-const AUTO_SEND_MENU_TAG: isize = 0x5c4f;
+/// Tag on **Record Screen**, whose title carries the record shortcut.
+const RECORD_MENU_TAG: isize = 0x5c4d;
 
-/// Ticks the current Keep Recordings choice and shows how much the captures take up.
-fn refresh_keep_menu(menu: &NSMenu) {
-    let Some(submenu) = menu
-        .itemWithTag(KEEP_MENU_TAG)
-        .and_then(|item| item.submenu())
-    else {
-        return;
-    };
-    let current = crate::retention::Policy::load().preset();
-    for (index, preset) in crate::retention::Preset::ALL.into_iter().enumerate() {
-        if let Some(item) = submenu.itemWithTag(KEEP_MENU_TAG + 1 + index as isize) {
-            item.setState(if current == Some(preset) { 1 } else { 0 });
-        }
-    }
-    if let Some(item) = submenu.itemWithTag(KEEP_MENU_TAG + 100) {
-        let size = crate::retention::captures_size(&crate::handoff::default_captures_dir());
-        item.setTitle(&NSString::from_str(&format!(
-            "Captures use {}",
-            crate::retention::format_bytes(size)
-        )));
-    }
-}
-
-/// Ticks the engine recordings would use now, greys out Hex while it isn't connected (from the
-/// last background check, so opening the menu never waits on it) and lists Hex's ready models.
-fn refresh_transcription_menu(menu: &NSMenu, target: &ScrawlMenuTarget) {
-    let Some(mtm) = MainThreadMarker::new() else {
-        return;
-    };
-    let Some(submenu) = menu
-        .itemWithTag(TRANSCRIBE_MENU_TAG)
-        .and_then(|item| item.submenu())
-    else {
-        return;
-    };
-    let status = crate::hex::cached_status();
-    crate::hex::refresh_in_background();
-    let state = crate::transcribe::menu_state(
-        crate::transcribe::Engine::configured(),
-        status.as_ref(),
-        crate::handoff::hex_model().as_deref(),
-    );
-    if let Some(item) = submenu.itemWithTag(TRANSCRIBE_MENU_TAG + 1) {
-        item.setState(isize::from(state.apple_checked));
-    }
-    if let Some(item) = submenu.itemWithTag(TRANSCRIBE_MENU_TAG + 2) {
-        item.setTitle(&NSString::from_str(state.hex_title));
-        item.setEnabled(state.hex_enabled);
-        item.setState(isize::from(state.hex_checked));
-    }
-    for index in (0..submenu.numberOfItems()).rev() {
-        if submenu
-            .itemAtIndex(index)
-            .is_some_and(|item| item.tag() >= TRANSCRIBE_MODELS_TAG)
-        {
-            submenu.removeItemAtIndex(index);
-        }
-    }
-    if state.models.is_empty() {
-        return;
-    }
-    let separator = NSMenuItem::separatorItem(mtm);
-    separator.setTag(TRANSCRIBE_MODELS_TAG);
-    submenu.addItem(&separator);
-    let header = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Hex model"),
-            None,
-            &NSString::new(),
-        )
-    };
-    header.setEnabled(false);
-    header.setTag(TRANSCRIBE_MODELS_TAG + 1);
-    submenu.addItem(&header);
-    for (index, (id, title, chosen)) in state.models.iter().enumerate() {
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(title),
-                Some(sel!(pickHexModel:)),
-                &NSString::new(),
-            )
-        };
-        unsafe {
-            item.setTarget(Some(target));
-            item.setRepresentedObject(Some(&NSString::from_str(id)));
-        }
-        item.setTag(TRANSCRIBE_MODELS_TAG + 2 + index as isize);
-        item.setState(isize::from(*chosen));
-        submenu.addItem(&item);
-    }
+/// "Record Screen" with the record shortcut as it is now (Settings can change it).
+fn record_menu_title() -> String {
+    format!(
+        "Record Screen  {}",
+        crate::settings::Shortcuts::load().record.label
+    )
 }
 
 /// Lists unhandled iPhone captures at the top of the status menu, read fresh from disk so the
@@ -606,93 +493,28 @@ pub(super) fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
         menu.addItem(&item);
     };
 
-    let shortcut = crate::capture::ShortcutConfig::load().label;
-    add(&format!("Record Screen  {shortcut}"), sel!(toggleCapture:));
+    add(&record_menu_title(), sel!(toggleCapture:));
+    if let Some(item) = menu.itemAtIndex(menu.numberOfItems() - 1) {
+        item.setTag(RECORD_MENU_TAG);
+    }
     add("Choose What to Record…", sel!(chooseTarget:));
-    add("Record iPhone", sel!(recordIphone:));
-    add("Open Latest Bundle", sel!(openLatest:));
-    add("Generate Demo Bundle", sel!(runDemo:));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add("Open Latest Capture", sel!(openLatest:));
     add("Export Last Capture as Video…", sel!(exportVideo:));
     if let Some(item) = menu.itemAtIndex(menu.numberOfItems() - 1) {
         item.setTag(EXPORT_VIDEO_MENU_TAG);
         item.setHidden(!crate::handoff::video_export());
     }
-    add("Show Captures in Finder", sel!(showCaptures:));
-    let keep = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Keep Recordings"));
-    for (index, preset) in crate::retention::Preset::ALL.into_iter().enumerate() {
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(preset.label()),
-                Some(sel!(keepRecordings:)),
-                &NSString::new(),
-            )
-        };
-        unsafe { item.setTarget(Some(&target)) };
-        item.setTag(KEEP_MENU_TAG + 1 + index as isize);
-        keep.addItem(&item);
-    }
-    keep.addItem(&NSMenuItem::separatorItem(mtm));
-    let size_row = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Captures use …"),
-            None,
-            &NSString::new(),
-        )
-    };
-    size_row.setEnabled(false);
-    size_row.setTag(KEEP_MENU_TAG + 100);
-    keep.addItem(&size_row);
-    let keep_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Keep Recordings"),
-            None,
-            &NSString::new(),
-        )
-    };
-    keep_item.setTag(KEEP_MENU_TAG);
-    keep_item.setSubmenu(Some(&keep));
-    menu.addItem(&keep_item);
-    let transcription =
-        NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Transcription"));
-    for (offset, title, action) in [
-        (1, "Apple Speech", sel!(useAppleSpeech:)),
-        (2, "Hex", sel!(useHex:)),
-    ] {
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(title),
-                Some(action),
-                &NSString::new(),
-            )
-        };
-        unsafe { item.setTarget(Some(&target)) };
-        item.setTag(TRANSCRIBE_MENU_TAG + offset);
-        transcription.addItem(&item);
-    }
-    let transcription_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Transcription"),
-            None,
-            &NSString::new(),
-        )
-    };
-    transcription_item.setTag(TRANSCRIBE_MENU_TAG);
-    transcription_item.setSubmenu(Some(&transcription));
-    menu.addItem(&transcription_item);
-    add("Send Dev Site Captures to OpenCode", sel!(toggleAutoSend:));
-    if let Some(item) = menu.itemAtIndex(menu.numberOfItems() - 1) {
-        item.setTag(AUTO_SEND_MENU_TAG);
-    }
     menu.addItem(&NSMenuItem::separatorItem(mtm));
-    add("Welcome to Scrawl…", sel!(welcome:));
+    add("Settings…", sel!(openSettings:));
+    if let Some(item) = menu.itemAtIndex(menu.numberOfItems() - 1) {
+        item.setKeyEquivalent(&NSString::from_str(","));
+    }
     add("Check for Updates…", sel!(checkForUpdates:));
     add("Quit Scrawl", sel!(quitApp:));
+    if let Some(item) = menu.itemAtIndex(menu.numberOfItems() - 1) {
+        item.setKeyEquivalent(&NSString::from_str("q"));
+    }
 
     menu.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*target)));
 
@@ -732,7 +554,8 @@ fn find_hud_pill_ns_window() -> Option<Retained<NSWindow>> {
     let app = NSApplication::sharedApplication(mtm);
     for win in app.windows() {
         let size = win.frame().size;
-        if (size.width - f64::from(PILL_WINDOW_W)).abs() < 8.0
+        if ((size.width - f64::from(PILL_WINDOW_W)).abs() < 8.0
+            || (size.width - f64::from(crate::native::pill::model::PANEL_W)).abs() < 8.0)
             && (size.height - f64::from(PILL_WINDOW_H)).abs() < 8.0
         {
             return Some(win);
@@ -766,6 +589,7 @@ fn find_picker_ns_window() -> Option<Retained<NSWindow>> {
         }
         let size = win.frame().size;
         if size.width >= 600.0
+            && size.height >= 200.0
             && (size.width - 1120.0).abs() > 8.0
             && (size.width - f64::from(PILL_WINDOW_W)).abs() > 8.0
         {
@@ -943,8 +767,7 @@ fn apply_pill_layer_effect(
     );
 
     // Content scales subtly (`0.93 .. 1.0`) inside the crisp outer shell during morphs.
-    let content_s =
-        (s * (1.0 - f64::from(blur_radius).min(5.0) * f64::from(content_shrink))).clamp(0.85, 1.06);
+    let content_s = content_scale(scale, blur_radius, content_shrink);
     let transform = CATransform3D {
         m11: content_s,
         m12: 0.0,
@@ -1020,6 +843,61 @@ fn apply_pill_layer_effect(
     }
     CATransaction::commit();
 }
+/// The content layer's scale: the capsule's, less a little per px of blur.
+fn content_scale(scale: f32, blur_radius: f32, content_shrink: f32) -> f64 {
+    let s = f64::from(scale.clamp(0.50, 1.15));
+    (s * (1.0 - f64::from(blur_radius).min(5.0) * f64::from(content_shrink))).clamp(0.85, 1.06)
+}
+
+/// The pill window's frame in screen points with a top-left origin (the primary display's).
+fn top_left_frame(ns_window: &NSWindow) -> [f32; 4] {
+    let f = ns_window.frame();
+    let primary_h = MainThreadMarker::new()
+        .and_then(|mtm| objc2_app_kit::NSScreen::screens(mtm).firstObject())
+        .map_or(0.0, |screen| screen.frame().size.height);
+    [
+        f.origin.x as f32,
+        (primary_h - f.origin.y - f.size.height) as f32,
+        f.size.width as f32,
+        f.size.height as f32,
+    ]
+}
+
+/// One trace frame for the capsule (`SCRAWL_MOTION_TRACE`): its window, the shell as drawn, the
+/// content's blur and opacity. Returns the mapping for the content's children.
+#[allow(clippy::too_many_arguments)]
+fn trace_capsule(
+    ns_window: &NSWindow,
+    width: f32,
+    scale: f32,
+    y_off: f32,
+    opacity: f32,
+    content_alpha: f32,
+    blur_radius: f32,
+    content_shrink: f32,
+) -> motion::Xf {
+    let win = top_left_frame(ns_window);
+    let (cx, cy) = (win[2] * 0.5, win[3] * 0.5);
+    let s = scale.clamp(0.50, 1.15);
+    let (w, h) = (width * s, ISLAND_H * s);
+    let shell = [win[0] + cx - w * 0.5, win[1] + cy - h * 0.5 + y_off, w, h];
+    motion::trace_element("window", win, 0.0, 0.0, None, None);
+    motion::trace_element("shell", shell, opacity, h * 0.5, None, None);
+    motion::trace_channel("content.blur", "level", blur_radius);
+    motion::trace_channel("content.alpha", "level", content_alpha);
+    motion::trace_channel("shell.width", "position", width);
+    motion::Xf {
+        s: content_scale(scale, blur_radius, content_shrink) as f32,
+        cx,
+        cy,
+        ty: y_off,
+        ox: win[0],
+        oy: win[1],
+        alpha: opacity * content_alpha,
+        clip: shell,
+    }
+}
+
 
 pub(super) fn capture_own_window_screenshot(
     window_num: Option<isize>,

@@ -19,8 +19,8 @@ use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
 use super::{
     CANDIDATE_EDGE, CANDIDATE_EDGE_NO_VIDEO, CARBON_CMD_KEY, CARBON_CONTROL_KEY, CARBON_OPTION_KEY,
     CARBON_SHIFT_KEY, FRAME_SAMPLE_INTERVAL, LiveOverlayEvent, Sampler, SharedCaptureTelemetry,
-    ShortcutConfig, capture_size, clean_label, pick_display, poll_clicks, scrawl_log,
-    track_shift_ink,
+    ShortcutConfig, ShortcutKind, capture_size, clean_label, hotkey_combos, layout_default_keycode,
+    pick_display, poll_clicks, scrawl_log, shortcut_matches, track_shift_ink,
 };
 use crate::model::{CaptureMode, InteractionEvent, RgbaFrame, TargetFrame, TargetInfo};
 
@@ -69,7 +69,7 @@ const FLAG_COMMAND: u64 = 1 << 20;
 pub const KEY_S: u16 = 1;
 const KEY_ESCAPE: u16 = 53;
 const KEY_Z: u16 = 6;
-const KEY_V: u16 = 9;
+pub const KEY_V: u16 = 9;
 
 // Carbon HIToolbox global hotkey constants (requires zero TCC permissions).
 const K_EVENT_CLASS_KEYBOARD: u32 = u32::from_be_bytes(*b"keyb");
@@ -310,8 +310,9 @@ pub fn layout_v_keycode() -> u16 {
     key_code_for_char('v').unwrap_or(KEY_V)
 }
 
+/// The registered Carbon hotkeys, so a change can replace all of them.
 struct CarbonHotKeyState {
-    toggle_ref: usize,
+    refs: Vec<usize>,
 }
 
 static CARBON_HOTKEYS: std::sync::OnceLock<Mutex<CarbonHotKeyState>> = std::sync::OnceLock::new();
@@ -413,149 +414,135 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
                     "InstallEventHandler(app_target) -> rc={rc} handler_ref={app_handler_ref:p}"
                 ));
             }
-            let target = if !app_target.is_null() {
-                app_target
-            } else {
-                dispatcher
-            };
-            let mut next_alt_id = HOTKEY_ID_ALT1;
-            let mut codes = vec![s_code];
-            if s_code != u32::from(KEY_S) {
-                codes.push(u32::from(KEY_S));
-            }
-            for &code in &codes {
-                for (mods, name) in [
-                    (CARBON_OPTION_KEY | CARBON_SHIFT_KEY, "⌥⇧S"),
-                    (
-                        CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
-                        "⌃⌥⇧S",
-                    ),
-                    (
-                        CARBON_CMD_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
-                        "⌘⌥⇧S",
-                    ),
-                    (
-                        CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_CMD_KEY,
-                        "⌃⌥⌘S",
-                    ),
-                ] {
-                    let id = next_alt_id;
-                    next_alt_id += 1;
-                    let mut r: *mut c_void = ptr::null_mut();
-                    let rc = RegisterEventHotKey(
-                        code,
-                        mods,
-                        EventHotKeyID {
-                            signature: HOTKEY_SIG,
-                            id,
-                        },
-                        target,
-                        0,
-                        &raw mut r,
-                    );
-                    scrawl_log(format!(
-                        "RegisterEventHotKey({name}, code={code}, mods={mods}) -> rc={rc} ref={r:p}"
-                    ));
-                }
-            }
-            // Register ⌥⇧V (plus ⌃⌥⇧V, ⌘⌥⇧V, ⌃⌥⌘V) for pasting both Image + Text of the latest capture.
-            let v_code = u32::from(layout_v_keycode());
-            let mut v_codes = vec![v_code];
-            if v_code != u32::from(KEY_V) {
-                v_codes.push(u32::from(KEY_V));
-            }
-            let mut paste_id = HOTKEY_ID_PASTE_BASE;
-            for &code in &v_codes {
-                for (mods, name) in [
-                    (CARBON_OPTION_KEY | CARBON_SHIFT_KEY, "⌥⇧V"),
-                    (
-                        CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
-                        "⌃⌥⇧V",
-                    ),
-                    (
-                        CARBON_CMD_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
-                        "⌘⌥⇧V",
-                    ),
-                    (
-                        CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_CMD_KEY,
-                        "⌃⌥⌘V",
-                    ),
-                ] {
-                    let mut r: *mut c_void = ptr::null_mut();
-                    let rc = RegisterEventHotKey(
-                        code,
-                        mods,
-                        EventHotKeyID {
-                            signature: HOTKEY_SIG,
-                            id: paste_id,
-                        },
-                        target,
-                        0,
-                        &raw mut r,
-                    );
-                    scrawl_log(format!(
-                        "RegisterEventHotKey({name}, code={code}, mods={mods}) -> rc={rc} ref={r:p}"
-                    ));
-                    paste_id += 1;
-                }
-            }
         }
-        Mutex::new(CarbonHotKeyState { toggle_ref: 0 })
+        Mutex::new(CarbonHotKeyState { refs: Vec::new() })
     });
-    let shortcut = telemetry
-        .shortcut
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    let _ = state_mutex;
-    update_global_shortcut(telemetry, shortcut);
+    let (record, paste) = telemetry.shortcuts();
+    if let Err(kind) = register_shortcuts(state_mutex, &record, &paste) {
+        scrawl_log(format!(
+            "install_global_hotkeys: {kind:?} shortcut could not be registered"
+        ));
+    }
 }
 
-pub fn update_global_shortcut(telemetry: &SharedCaptureTelemetry, config: ShortcutConfig) {
-    config.save();
-    *telemetry
-        .shortcut
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = config.clone();
+fn hotkey_target() -> *mut c_void {
+    unsafe {
+        let a = GetApplicationEventTarget();
+        if a.is_null() {
+            GetEventDispatcherTarget()
+        } else {
+            a
+        }
+    }
+}
 
-    let Some(state_mutex) = CARBON_HOTKEYS.get() else {
-        return;
-    };
+fn unregister_all(state: &mut CarbonHotKeyState) {
+    for r in state.refs.drain(..) {
+        unsafe { UnregisterEventHotKey(r as *mut c_void) };
+    }
+}
+
+/// Replaces every registered hotkey with `record`'s and `paste`'s. Fails with the shortcut whose
+/// own combo macOS refused (another app may hold it); its aliases are best effort.
+fn register_shortcuts(
+    state_mutex: &Mutex<CarbonHotKeyState>,
+    record: &ShortcutConfig,
+    paste: &ShortcutConfig,
+) -> Result<(), ShortcutKind> {
     let mut state = state_mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if state.toggle_ref != 0 {
-        unsafe { UnregisterEventHotKey(state.toggle_ref as *mut c_void) };
-        state.toggle_ref = 0;
-    }
-    let mut new_ref: *mut c_void = ptr::null_mut();
-    let target = unsafe {
-        let a = GetApplicationEventTarget();
-        if !a.is_null() {
-            a
-        } else {
-            GetEventDispatcherTarget()
+    unregister_all(&mut state);
+    let target = hotkey_target();
+    let mut failed = None;
+    for (kind, cfg) in [(ShortcutKind::Record, record), (ShortcutKind::Paste, paste)] {
+        for (i, (code, mods)) in hotkey_combos(kind, cfg).into_iter().enumerate() {
+            let mut r: *mut c_void = ptr::null_mut();
+            let id = match (kind, i) {
+                (ShortcutKind::Record, 0) => HOTKEY_ID_TOGGLE,
+                (ShortcutKind::Record, i) => HOTKEY_ID_ALT1 + i as u32,
+                (ShortcutKind::Paste, i) => HOTKEY_ID_PASTE_BASE + i as u32,
+            };
+            let rc = unsafe {
+                RegisterEventHotKey(
+                    code,
+                    mods,
+                    EventHotKeyID {
+                        signature: HOTKEY_SIG,
+                        id,
+                    },
+                    target,
+                    0,
+                    &raw mut r,
+                )
+            };
+            scrawl_log(format!(
+                "RegisterEventHotKey({kind:?} {}, code={code}, mods={mods}) -> rc={rc} ref={r:p}",
+                if i == 0 { cfg.label.as_str() } else { "alias" }
+            ));
+            if rc == 0 && !r.is_null() {
+                state.refs.push(r as usize);
+            } else if i == 0 && failed.is_none() {
+                failed = Some(kind);
+            }
         }
+    }
+    failed.map_or(Ok(()), Err)
+}
+
+/// Sets both shortcuts and registers them. If macOS refuses either, the old ones are put back
+/// and the refused one is returned. Nothing is saved here (`crate::settings` does that).
+pub fn set_shortcuts(
+    telemetry: &SharedCaptureTelemetry,
+    record: ShortcutConfig,
+    paste: ShortcutConfig,
+) -> Result<(), ShortcutKind> {
+    let (old_record, old_paste) = telemetry.shortcuts();
+    if let Some(state) = CARBON_HOTKEYS.get()
+        && !telemetry.shortcuts_paused.load(Ordering::Acquire)
+        && let Err(kind) = register_shortcuts(state, &record, &paste)
+    {
+        let _ = register_shortcuts(state, &old_record, &old_paste);
+        return Err(kind);
+    }
+    *telemetry
+        .shortcut
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = record;
+    *telemetry
+        .paste_shortcut
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = paste;
+    Ok(())
+}
+
+/// While Settings records a new shortcut, Scrawl's own stop answering, so pressing the current
+/// combo reaches the recorder instead of starting a capture.
+pub fn pause_shortcuts(telemetry: &SharedCaptureTelemetry, paused: bool) {
+    if telemetry.shortcuts_paused.swap(paused, Ordering::AcqRel) == paused {
+        return;
+    }
+    let Some(state) = CARBON_HOTKEYS.get() else {
+        return;
     };
-    let status = unsafe {
-        RegisterEventHotKey(
-            config.key_code,
-            config.carbon_modifiers,
-            EventHotKeyID {
-                signature: HOTKEY_SIG,
-                id: HOTKEY_ID_TOGGLE,
-            },
-            target,
-            0,
-            &raw mut new_ref,
-        )
-    };
-    scrawl_log(format!(
-        "update_global_shortcut({}, key={}, mods={}) -> status={status} ref={new_ref:p}",
-        config.label, config.key_code, config.carbon_modifiers
-    ));
-    if status == 0 && !new_ref.is_null() {
-        state.toggle_ref = new_ref as usize;
+    if paused {
+        unregister_all(
+            &mut state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    } else {
+        let (record, paste) = telemetry.shortcuts();
+        let _ = register_shortcuts(state, &record, &paste);
+    }
+}
+
+/// The review window's own recorder: sets and saves the record shortcut.
+pub fn update_global_shortcut(telemetry: &SharedCaptureTelemetry, config: ShortcutConfig) {
+    let (_, paste) = telemetry.shortcuts();
+    match set_shortcuts(telemetry, config.clone(), paste) {
+        Ok(()) => crate::settings::save_shortcut(ShortcutKind::Record, &config),
+        Err(kind) => scrawl_log(format!("update_global_shortcut: {kind:?} refused")),
     }
 }
 
@@ -1510,47 +1497,34 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
         let mod_mask =
             (u8::from(cmd) << 3) | (u8::from(ctrl) << 2) | (u8::from(alt) << 1) | u8::from(shift);
 
-        let s_code = layout_s_keycode();
         let z_code = layout_z_keycode();
-        let v_code = layout_v_keycode();
-        let cfg_keycode = telemetry
-            .shortcut
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .key_code as u16;
-        let key_s = unsafe {
-            CGEventSourceKeyState(1, s_code)
-                || CGEventSourceKeyState(0, s_code)
-                || CGEventSourceKeyState(1, KEY_S)
-        };
-        let key_v = unsafe {
-            CGEventSourceKeyState(1, v_code)
-                || CGEventSourceKeyState(0, v_code)
-                || CGEventSourceKeyState(1, KEY_V)
-        };
-        let key_cfg = if cfg_keycode == s_code {
-            key_s
-        } else {
-            unsafe {
-                CGEventSourceKeyState(1, cfg_keycode) || CGEventSourceKeyState(0, cfg_keycode)
+        let (record_cfg, paste_cfg) = telemetry.shortcuts();
+        let key_down =
+            |code: u16| unsafe { CGEventSourceKeyState(1, code) || CGEventSourceKeyState(0, code) };
+        // Whether `kind`'s shortcut is down: its own key, or for a default its alias keys.
+        let shortcut_down = |kind: ShortcutKind, cfg: &ShortcutConfig| {
+            let mut codes = vec![cfg.key_code as u16];
+            if cfg.is_default_for(kind) {
+                codes.extend([layout_default_keycode(kind), kind.ansi_code()]);
             }
+            codes.into_iter().any(|code| {
+                key_down(code) && shortcut_matches(kind, cfg, code, code, cmd, ctrl, alt, shift)
+            })
         };
-        let key_state = (mod_mask, key_s, key_cfg);
+        let shortcut_now = shortcut_down(ShortcutKind::Record, &record_cfg);
+        let paste_now = shortcut_down(ShortcutKind::Paste, &paste_cfg);
+        let key_state = (mod_mask, shortcut_now, paste_now);
         if key_state != prev_mod_mask {
             scrawl_log(format!(
-                "hid_poller: cmd={cmd} ctrl={ctrl} alt={alt} shift={shift} key_s={key_s} key_cfg={key_cfg}"
+                "hid_poller: cmd={cmd} ctrl={ctrl} alt={alt} shift={shift} record={shortcut_now} paste={paste_now}"
             ));
             prev_mod_mask = key_state;
         }
-        let shortcut_now = (key_cfg
-            && telemetry.matches_shortcut(cfg_keycode, cmd, ctrl, alt, shift))
-            || (key_s && telemetry.matches_shortcut(s_code, cmd, ctrl, alt, shift));
         if shortcut_now && !prev_shortcut {
             telemetry.emit_capture_shortcut();
         }
         prev_shortcut = shortcut_now;
 
-        let paste_now = key_v && alt && (shift || (ctrl && cmd));
         if paste_now && !prev_paste && !telemetry.active.load(Ordering::Acquire) {
             telemetry.emit_paste_shortcut();
         }
