@@ -76,6 +76,7 @@ struct SettingsTranscriber: Decodable, Equatable {
   var hexTitle = "Hex (not running)"
   var hexEnabled = false
   var models: [SettingsModelOption] = []
+  var speech: SpeechStatus?
 }
 
 struct SettingsOption: Decodable, Equatable {
@@ -845,6 +846,9 @@ struct SettingsView: View {
       SettingsCaption(text: t.hexEnabled || t.engine == "hex"
         ? "Apple Speech times each word. Hex uses a model you have in Hex, and its word times are estimates."
         : "Apple Speech runs on this Mac and times each word. Hex shows up here while Hex is running.")
+      if t.engine == "apple", let line = t.speech?.line {
+        SettingsCaption(text: line)
+      }
       SettingsHeader("Experimental")
       SettingsGroup {
         SettingsRow(title: "Video export") {
@@ -1298,6 +1302,8 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
       SettingsModelOption(id: "whisper-large-v3-turbo", title: "Whisper Large v3 Turbo", chosen: false),
     ])
     hex.videoExport = true
+    var downloading = base
+    downloading.transcriber.speech = SpeechStatus(state: "downloading", locale: "en_US", progress: 0.42)
     var missing = base
     missing.permissions[0].status = "granted"
     missing.permissions[0].relaunch = true
@@ -1343,6 +1349,7 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
       ("recording-mic-chosen", .recording, micChosen, []),
       ("recording-mic-missing", .recording, micMissing, []),
       ("recording-mic-not-allowed", .recording, micNotAllowed, []),
+      ("recording-downloading", .recording, downloading, []),
       ("storage", .storage, base, []),
       ("permissions", .permissions, base, []),
       ("permissions-missing", .permissions, missing, []),

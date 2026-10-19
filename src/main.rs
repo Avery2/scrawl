@@ -29,6 +29,7 @@ mod screens;
 mod settings;
 mod sketch;
 mod sparkle;
+mod speech_model;
 mod transcribe;
 mod ui;
 mod web;
@@ -247,6 +248,13 @@ enum Command {
         /// Keep trying for this many seconds without restarting.
         #[arg(long)]
         watch: Option<u64>,
+    },
+    /// Transcribe a bundle's audio again with Apple Speech, in place: its transcript, each
+    /// keyframe's words, `scrawl.json` and `summary.md`. Scrawl does this by itself for captures
+    /// made while the speech model was still downloading.
+    Retranscribe {
+        /// Path to `.scrawl` bundle directory or `latest`.
+        bundle: PathBuf,
     },
     /// Rebuild a bundle from its own video, audio, and input log with the current transcriber
     /// and keyframe rules.
@@ -895,6 +903,13 @@ pub fn finalize_capture_bundle(
     )
 }
 
+/// A bundle without its transcript yet (the speech model was still downloading) gets it later.
+fn mark_transcript_pending(bundle_dir: &Path, bundle: &ScrawlBundle) {
+    if bundle.transcript.missing.as_ref().is_some_and(|m| m.retry) {
+        speech_model::mark_pending(bundle_dir);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_bundle_from_parts(
     bundle_dir: &Path,
@@ -1052,6 +1067,7 @@ pub fn build_bundle_from_parts(
             format!("total {total_ms}ms"),
         ]);
         capture::scrawl_log(format!("finish timings: {}", parts.join(" · ")));
+        mark_transcript_pending(bundle_dir, &bundle);
         return Ok((bundle_dir.to_path_buf(), bundle, summary));
     }
     // Only the first candidate is needed from here on (auto-crop's baseline); free the rest
@@ -1224,6 +1240,7 @@ pub fn build_bundle_from_parts(
         }
     }
 
+    mark_transcript_pending(bundle_dir, &bundle);
     Ok((bundle_dir.to_path_buf(), bundle, summary))
 }
 
@@ -1386,6 +1403,7 @@ pub fn generate_demo_bundle(out: Option<PathBuf>) -> Result<(PathBuf, ScrawlBund
             WordTiming { t0: 7_800, t1: 9_400, text: "feels too tight.".into() },
         ],
         estimated: false,
+        missing: None,
     };
 
     build_bundle_from_parts(
@@ -1541,6 +1559,15 @@ fn main() -> Result<()> {
             }
             print!("{summary}");
             Ok(())
+        }
+        Command::Retranscribe { bundle } => {
+            let (dir, _) = handoff::load_bundle(&bundle)?;
+            if speech_model::transcribe_again(&dir)? {
+                print!("{}", std::fs::read_to_string(dir.join("summary.md"))?);
+                Ok(())
+            } else {
+                anyhow::bail!("No speech model yet; try again once it has downloaded")
+            }
         }
         Command::Reprocess {
             bundle,
