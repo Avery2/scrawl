@@ -20,6 +20,8 @@ impl NativePill {
         0
     }
 
+    pub fn place_on(&self, _point: [f64; 2]) {}
+
     pub fn sync(&self, _snapshot: PillSnapshot) {}
 
     pub fn drain_actions(&self) -> Vec<PillAction> {

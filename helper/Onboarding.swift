@@ -696,6 +696,51 @@ final class FirstClickHostingView<Content: View>: NSHostingView<Content> {
   override func acceptsFirstMouse(for _: NSEvent?) -> Bool { true }
 }
 
+/// The keyboard for a helper window (onboarding, Settings). These helpers are menu bar
+/// (accessory) apps with no main menu, so ⌘W would do nothing, and when one exits macOS picks
+/// some app to come forward. This closes on ⌘W and gives the keyboard back to the app that was
+/// in front when the window came up: Scrawl if its review window opened Settings, else the app
+/// the user was in.
+final class HelperWindowKeys {
+  private var monitor: Any?
+  private var previous: NSRunningApplication?
+
+  /// ⌘W closes the window while `enabled` (Settings turns it off while a shortcut recorder
+  /// listens, so ⌘W can be recorded).
+  init(window: @escaping () -> NSWindow?, enabled: @escaping () -> Bool = { true }) {
+    monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+      let flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
+      guard flags == .command, event.charactersIgnoringModifiers?.lowercased() == "w", enabled(),
+            let window = window()
+      else { return event }
+      window.performClose(nil)
+      return nil
+    }
+  }
+
+  /// Brings the window forward with the keys. The cooperative `NSApp.activate()` is refused
+  /// when Scrawl isn't the active app (opened from its status menu, say), which left the window
+  /// behind the app in front, taking that app's keys; gpui's `cx.activate(true)` uses the same
+  /// call as here. The app in front is remembered on every show, so a Settings window shown
+  /// again from the review window returns there.
+  func bringForward(_ window: NSWindow?) {
+    if let front = NSWorkspace.shared.frontmostApplication,
+       front.processIdentifier != ProcessInfo.processInfo.processIdentifier
+    {
+      previous = front
+    }
+    window?.orderFrontRegardless()
+    window?.makeKey()
+    NSApp.activate(ignoringOtherApps: true)
+  }
+
+  /// Before the helper exits.
+  func handBack() {
+    guard NSApp.isActive, let previous, !previous.isTerminated else { return }
+    previous.activate(options: [])
+  }
+}
+
 final class Onboarding: NSObject, NSApplicationDelegate, NSWindowDelegate {
   static func run(arguments: [String]) -> Never {
     let model = OnboardingModel(
@@ -725,6 +770,7 @@ final class Onboarding: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
   let model: OnboardingModel
   var window: NSWindow?
+  private lazy var keys = HelperWindowKeys(window: { [weak self] in self?.window })
 
   init(model: OnboardingModel) {
     self.model = model
@@ -750,6 +796,7 @@ final class Onboarding: NSObject, NSApplicationDelegate, NSWindowDelegate {
     window.contentView = FirstClickHostingView(rootView: OnboardingView(model: model))
     window.center()
     self.window = window
+    _ = keys
     model.send = { action in emit(["action": action]) }
     model.grant = { permission in emit(["action": "grant", "permission": permission]) }
     readCommands()
@@ -757,13 +804,12 @@ final class Onboarding: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
   func windowWillClose(_: Notification) {
     emit(["action": "close"])
+    keys.handBack()
     exit(0)
   }
 
   private func present() {
-    window?.orderFrontRegardless()
-    window?.makeKey()
-    NSApp.activate()
+    keys.bringForward(window)
   }
 
   private func apply(_ state: OnboardingState) {
@@ -807,7 +853,9 @@ final class Onboarding: NSObject, NSApplicationDelegate, NSWindowDelegate {
           case "open-settings": Permissions.openSettings(permission, from: self.screenFrame(of: permission))
           case "hide": self.window?.orderOut(nil)
           case "show": self.present()
-          case "close": exit(0)
+          case "close":
+            self.keys.handBack()
+            exit(0)
           default: break
           }
         }

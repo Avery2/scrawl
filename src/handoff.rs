@@ -809,47 +809,77 @@ pub(crate) fn query_escape(value: &str) -> String {
     result
 }
 
-pub fn list_opencode_sessions() -> Result<Vec<OpenCodeSession>> {
-    list_sessions_from("/api/session")
+/// One `GET` against OpenCode's API, returning the body. Swapped for a fake in tests.
+pub type ApiGet<'a> = dyn FnMut(&str) -> Result<Vec<u8>> + 'a;
+
+pub fn api_get(path: &str) -> Result<Vec<u8>> {
+    opencode_api("get", path, None)
 }
 
-/// Root sessions only (the server filters them), newest first.
-pub fn list_root_sessions() -> Result<Vec<OpenCodeSession>> {
-    list_sessions_from("/api/session?parentID=null&limit=100")
+/// How many pages of root sessions (100 each, newest first) a search reads before giving up.
+/// Each page is an `opencode2 api` process, plus an SSH connection with `agentHost`.
+pub const ROOT_SEARCH_PAGES: usize = 5;
+const ROOT_PAGE: usize = 100;
+
+/// One session by ID (`GET /api/session/{id}`).
+pub fn get_session(get: &mut ApiGet, id: &str) -> Result<OpenCodeSession> {
+    let response: serde_json::Value =
+        serde_json::from_slice(&get(&format!("/api/session/{}", query_escape(id)))?)
+            .context("Invalid OpenCode session response")?;
+    let session = response.get("data").unwrap_or(&response).clone();
+    Ok(serde_json::from_value(session)?)
 }
 
-fn list_sessions_from(first: &str) -> Result<Vec<OpenCodeSession>> {
-    let mut sessions = Vec::new();
-    let mut path = first.to_owned();
+/// What a root-session search does with each open root session it reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scan {
+    Skip,
+    Take,
+    Stop,
+}
+
+/// Reads open root sessions newest first (`query` adds filters, e.g. `&directory=…`) and returns
+/// the first that `scan` takes, reading at most `max_pages` pages.
+pub fn find_root_session(
+    get: &mut ApiGet,
+    query: &str,
+    max_pages: usize,
+    mut scan: impl FnMut(&OpenCodeSession) -> Scan,
+) -> Result<Option<OpenCodeSession>> {
+    let mut path = format!("/api/session?parentID=null&limit={ROOT_PAGE}{query}");
     let mut cursors = std::collections::HashSet::new();
-    loop {
+    for _ in 0..max_pages {
         let response: serde_json::Value =
-            serde_json::from_slice(&opencode_api("get", &path, None)?)
-                .context("Invalid OpenCode session response")?;
+            serde_json::from_slice(&get(&path)?).context("Invalid OpenCode session response")?;
         let data = response
             .as_array()
             .or_else(|| response.get("data").and_then(|data| data.as_array()))
             .context("Missing OpenCode session list")?;
         for session in data {
-            sessions.push(serde_json::from_value::<OpenCodeSession>(session.clone())?);
+            let session = serde_json::from_value::<OpenCodeSession>(session.clone())?;
+            // The API has no archived filter.
+            if !session.is_open_root() {
+                continue;
+            }
+            match scan(&session) {
+                Scan::Skip => {}
+                Scan::Take => return Ok(Some(session)),
+                Scan::Stop => return Ok(None),
+            }
         }
         let Some(next) = response.pointer("/cursor/next").and_then(|v| v.as_str()) else {
             break;
         };
-        ensure!(
-            cursors.insert(next.to_owned()),
-            "OpenCode returned a repeated session cursor"
+        if data.is_empty() || !cursors.insert(next.to_owned()) {
+            break;
+        }
+        // The cursor carries the filters.
+        path = format!(
+            "/api/session?cursor={}&limit={ROOT_PAGE}",
+            query_escape(next)
         );
-        path = format!("/api/session?cursor={}", query_escape(next));
     }
-    sessions.sort_by(|a, b| {
-        b.time
-            .updated
-            .cmp(&a.time.updated)
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    sessions.dedup_by(|a, b| a.id == b.id);
-    Ok(sessions)
+    Ok(None)
 }
 
 fn normalize_slug(text: &str) -> String {
@@ -924,56 +954,58 @@ pub fn resolve_opencode_session(
     session_id: Option<&str>,
     app_name: Option<&str>,
 ) -> Result<(String, String)> {
-    let app_slug = app_name.map(normalize_slug).filter(|s| !s.is_empty());
+    let env_session = std::env::var("OPENCODE_SESSION_ID").ok();
+    resolve_opencode_session_with(&mut api_get, session_id, app_name, env_session.as_deref())
+}
 
-    let (session, session_title) = if let Some(id) = session_id.filter(|s| !s.trim().is_empty()) {
-        let title = list_opencode_sessions()
+/// [`resolve_opencode_session`] with the API and `OPENCODE_SESSION_ID` passed in. An explicit ID
+/// costs one request; an app title match reads the newest [`ROOT_SEARCH_PAGES`] pages of root
+/// sessions at most.
+pub fn resolve_opencode_session_with(
+    get: &mut ApiGet,
+    session_id: Option<&str>,
+    app_name: Option<&str>,
+    env_session: Option<&str>,
+) -> Result<(String, String)> {
+    if let Some(id) = session_id.filter(|s| !s.trim().is_empty()) {
+        let title = get_session(get, id)
             .ok()
-            .and_then(|list| list.into_iter().find(|s| s.id == id).map(|s| s.title))
+            .map(|s| s.title)
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| id.to_owned());
-        (id.to_owned(), title)
-    } else {
-        let roots: Vec<OpenCodeSession> = list_opencode_sessions()?
-            .into_iter()
-            .filter(|session| session.parent_id.is_none() && session.time.archived.is_none())
-            .collect();
-        let matched = app_slug
-            .as_deref()
-            .and_then(|slug| {
-                // Match against the last component if bundle identifier was passed (e.g. com.kitlangton.UpDown -> updown).
-                let short = app_name
-                    .and_then(|a| a.rsplit('.').next())
-                    .map(normalize_slug)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| slug.to_owned());
-                roots.iter().find(|s| {
-                    let title_slug = normalize_slug(&s.title);
-                    !title_slug.is_empty()
-                        && (title_slug.contains(&short) || short.contains(&title_slug))
-                })
-            })
-            .cloned()
-            .or_else(|| {
-                if let Some(id) = std::env::var("OPENCODE_SESSION_ID")
-                    .ok()
-                    .filter(|id| !id.trim().is_empty())
-                {
-                    roots.iter().find(|s| s.id == id).cloned()
-                } else {
-                    None
-                }
-            })
-            .or_else(|| roots.into_iter().next())
-            .context("No root OpenCode session found; pass a session ID")?;
-        let title = if matched.title.is_empty() {
-            matched.id.clone()
-        } else {
-            matched.title
+        return Ok((id.to_owned(), title));
+    }
+
+    // Match against the last component if a bundle identifier was passed (com.kitlangton.UpDown -> updown).
+    let short = app_name
+        .and_then(|a| a.rsplit('.').next())
+        .map(normalize_slug)
+        .filter(|s| !s.is_empty())
+        .or_else(|| app_name.map(normalize_slug).filter(|s| !s.is_empty()));
+    let mut newest = None;
+    let matched = find_root_session(get, "", ROOT_SEARCH_PAGES, |s| {
+        if newest.is_none() {
+            newest = Some(s.clone());
+        }
+        let Some(short) = short.as_deref() else {
+            return Scan::Stop;
         };
-        (matched.id, title)
-    };
-    Ok((session, session_title))
+        let title_slug = normalize_slug(&s.title);
+        if !title_slug.is_empty() && (title_slug.contains(short) || short.contains(&title_slug)) {
+            Scan::Take
+        } else {
+            Scan::Skip
+        }
+    })?;
+    let matched = matched
+        .or_else(|| {
+            let id = env_session.filter(|id| !id.trim().is_empty())?;
+            get_session(get, id).ok().filter(OpenCodeSession::is_open_root)
+        })
+        .or(newest)
+        .context("No root OpenCode session found; pass a session ID")?;
+    let title = matched.label().to_owned();
+    Ok((matched.id, title))
 }
 
 /// Queues a bundle's summary and pointers into an OpenCode session.
@@ -1485,5 +1517,171 @@ mod sync_live_check {
         }
         let _ = super::ssh("pro").arg(format!("rm -rf {}", super::shell_quote(&base.to_string_lossy()))).status();
         assert!(out.contains("8000000") && out.contains("frame-01.png") && !out.contains(super::MEDIA_PENDING), "{out}");
+    }
+}
+
+/// A stand-in for OpenCode's session API.
+#[cfg(test)]
+pub(crate) mod fake_api {
+    use super::*;
+
+    pub fn session(id: &str, title: &str, dir: &str, updated: u64) -> OpenCodeSession {
+        OpenCodeSession {
+            id: id.into(),
+            title: title.into(),
+            parent_id: None,
+            time: OpenCodeSessionTime {
+                updated,
+                archived: None,
+            },
+            location: Some(OpenCodeSessionLocation {
+                directory: Some(dir.into()),
+            }),
+            directory: None,
+        }
+    }
+
+    fn decode(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                out.push(u8::from_str_radix(&text[i + 1..i + 3], 16).unwrap());
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Answers `GET /api/session/{id}` and `GET /api/session?…` like OpenCode 2: newest first,
+    /// `parentID=null`, exact `directory`, `limit` (default 50), and a cursor carrying the filters.
+    pub fn serve(sessions: &[OpenCodeSession], path: &str) -> Result<Vec<u8>> {
+        let (route, query) = path.split_once('?').unwrap_or((path, ""));
+        if let Some(id) = route.strip_prefix("/api/session/") {
+            let session = sessions
+                .iter()
+                .find(|s| s.id == decode(id))
+                .context("404 Not Found")?;
+            return Ok(serde_json::to_vec(&serde_json::json!({ "data": session }))?);
+        }
+        assert_eq!(route, "/api/session");
+        let mut params: std::collections::HashMap<String, String> = query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(k, v)| (k.to_owned(), decode(v)))
+            .collect();
+        let mut offset = 0;
+        if let Some(cursor) = params.remove("cursor") {
+            let cursor: serde_json::Value = serde_json::from_str(&cursor)?;
+            offset = cursor["offset"].as_u64().unwrap() as usize;
+            for key in ["parentID", "directory"] {
+                if let Some(v) = cursor[key].as_str() {
+                    params.insert(key.into(), v.into());
+                }
+            }
+        }
+        let limit: usize = params.get("limit").map_or(50, |l| l.parse().unwrap());
+        let mut matching: Vec<_> = sessions
+            .iter()
+            .filter(|s| params.get("parentID").is_none_or(|_| s.parent_id.is_none()))
+            .filter(|s| {
+                params
+                    .get("directory")
+                    .is_none_or(|d| s.directory() == Some(d.as_str()))
+            })
+            .collect();
+        matching.sort_by(|a, b| b.time.updated.cmp(&a.time.updated));
+        let page: Vec<_> = matching.iter().skip(offset).take(limit).collect();
+        let next = (offset + limit < matching.len()).then(|| {
+            serde_json::json!({
+                "offset": offset + limit,
+                "parentID": params.get("parentID"),
+                "directory": params.get("directory"),
+            })
+            .to_string()
+        });
+        Ok(serde_json::to_vec(
+            &serde_json::json!({ "data": page, "cursor": { "next": next } }),
+        )?)
+    }
+}
+
+#[cfg(test)]
+mod session_lookup {
+    use super::fake_api::{serve, session};
+    use super::*;
+
+    fn many(count: usize) -> Vec<OpenCodeSession> {
+        (0..count)
+            .map(|i| session(&format!("ses_{i:05}"), &format!("Chat {i}"), "/p/x", 100_000 - i as u64))
+            .collect()
+    }
+
+    /// Runs `f` against `sessions` and returns its result with the paths it requested.
+    fn counting<T>(
+        sessions: &[OpenCodeSession],
+        f: impl FnOnce(&mut ApiGet) -> T,
+    ) -> (T, Vec<String>) {
+        let mut paths = Vec::new();
+        let result = f(&mut |path: &str| {
+            paths.push(path.to_owned());
+            serve(sessions, path)
+        });
+        (result, paths)
+    }
+
+    #[test]
+    fn an_explicit_id_is_one_request() {
+        let mut sessions = many(5_000);
+        sessions[4_000].title = "THE ONE".into();
+        let (result, paths) = counting(&sessions, |get| {
+            resolve_opencode_session_with(get, Some("ses_04000"), None, None).unwrap()
+        });
+        assert_eq!(result, ("ses_04000".into(), "THE ONE".into()));
+        assert_eq!(paths, ["/api/session/ses_04000"]);
+        // Unknown to the server: still sent, titled by its ID.
+        let (result, _) = counting(&sessions, |get| {
+            resolve_opencode_session_with(get, Some("ses_gone"), None, None).unwrap()
+        });
+        assert_eq!(result, ("ses_gone".into(), "ses_gone".into()));
+    }
+
+    #[test]
+    fn the_newest_open_root_is_one_page() {
+        let mut sessions = many(5_000);
+        sessions[0].time.archived = Some(1);
+        sessions[1].parent_id = Some("ses_00002".into());
+        let (result, paths) = counting(&sessions, |get| {
+            resolve_opencode_session_with(get, None, None, None).unwrap()
+        });
+        assert_eq!(result.0, "ses_00002");
+        assert_eq!(paths, ["/api/session?parentID=null&limit=100"]);
+    }
+
+    #[test]
+    fn an_app_match_stops_at_the_first_hit_and_the_search_is_capped() {
+        let mut sessions = many(5_000);
+        sessions[150].title = "UP DOWN APP".into();
+        sessions[300].title = "updown older".into();
+        let (result, paths) = counting(&sessions, |get| {
+            resolve_opencode_session_with(get, None, Some("com.kitlangton.UpDown"), None).unwrap()
+        });
+        assert_eq!(result, ("ses_00150".into(), "UP DOWN APP".into()));
+        assert_eq!(paths.len(), 2);
+
+        // No match: OPENCODE_SESSION_ID if it's an open root, else the newest; never every page.
+        let (result, paths) = counting(&sessions, |get| {
+            resolve_opencode_session_with(get, None, Some("Nothing"), Some("ses_04321")).unwrap()
+        });
+        assert_eq!(result.0, "ses_04321");
+        assert_eq!(paths.len(), ROOT_SEARCH_PAGES + 1);
+        let (result, _) = counting(&sessions, |get| {
+            resolve_opencode_session_with(get, None, Some("Nothing"), None).unwrap()
+        });
+        assert_eq!(result.0, "ses_00000");
     }
 }

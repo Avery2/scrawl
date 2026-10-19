@@ -43,9 +43,52 @@ pub(super) fn points_per_pixel(window: &Window) -> f32 {
     1.0 / window.scale_factor().max(0.25)
 }
 
-pub(super) fn primary_display_rect(_cx: &App) -> Option<[f32; 4]> {
-    win::primary_monitor().map(|m| m.rect.map(|v| v as f32))
+/// The GPUI display for the monitor at `frame` (global pixels), else the primary one.
+pub(super) fn display_at(
+    frame: [f32; 4],
+    cx: &App,
+) -> Option<std::rc::Rc<dyn gpui::PlatformDisplay>> {
+    let [x, y, w, h] = frame.map(f64::from);
+    win::monitor_at(x + w / 2.0, y + h / 2.0)
+        .and_then(|monitor| gpui_display_for(&monitor, cx))
+        .or_else(|| cx.primary_display())
 }
+
+/// GPUI lays displays out in DIPs: the one whose origin, scaled, is the monitor's.
+pub(crate) fn gpui_display_for(
+    monitor: &win::Monitor,
+    cx: &App,
+) -> Option<std::rc::Rc<dyn gpui::PlatformDisplay>> {
+    let s = monitor.scale as f32;
+    cx.displays().into_iter().find(|d| {
+        let b = d.bounds();
+        (f32::from(b.origin.x) * s - monitor.rect[0] as f32).abs() < 2.0
+            && (f32::from(b.origin.y) * s - monitor.rect[1] as f32).abs() < 2.0
+    })
+}
+
+/// The open picker's window, to move it when it follows the pointer to another display.
+static PICKER_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Moves the open picker to cover the monitor at `frame` (global pixels).
+pub(super) fn move_picker_window(frame: [f64; 4]) {
+    let id = PICKER_HWND.load(std::sync::atomic::Ordering::Acquire);
+    if id == 0 {
+        return;
+    }
+    let hwnd = win::hwnd(id);
+    if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(hwnd)) }.as_bool() {
+        return;
+    }
+    let [x, y, w, h] = frame.map(|v| v.round() as i32);
+    let _ = unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE) };
+}
+
+/// The picker takes the keys itself (`configure_picker_window`); the review window opens in front.
+pub(super) fn take_keys(_cx: &mut App) {}
+
+/// Windows activates the window below when Scrawl's closes.
+pub(super) fn hand_back_keys(_cx: &mut App) {}
 
 /// Pressing a region drags its window (`HTCAPTION`), with Aero Snap.
 pub(super) fn window_drag_region(region: Div) -> Div {
@@ -124,8 +167,6 @@ pub(super) fn reduce_motion() -> bool {
     };
     ok.is_ok() && !enabled.as_bool()
 }
-
-pub(super) fn activate_app() {}
 
 /// Updates come from GitHub releases on Windows; the menu item opens the page.
 pub(super) fn start_updates() {}
@@ -256,16 +297,20 @@ pub(crate) fn style_floating(hwnd: HWND, activates: bool) {
     win::overlay::exclude_from_capture(hwnd);
 }
 
-/// The picker: on top of everything over the whole primary display, taking clicks and keys
-/// (in `scrawl lab` replays too: a window made click-through after its first frame stops drawing).
-pub(super) fn configure_picker_window(window: &mut Window, _lab: bool) -> Option<u32> {
+/// The picker: on top of everything over the whole display at `frame` (global pixels), taking
+/// clicks and keys (in `scrawl lab` replays too: a window made click-through after its first
+/// frame stops drawing).
+pub(super) fn configure_picker_window(
+    window: &mut Window,
+    _lab: bool,
+    frame: [f64; 4],
+) -> Option<u32> {
     let hwnd = hwnd_of(window)?;
     style_floating(hwnd, true);
-    if let Some(monitor) = win::primary_monitor() {
-        let [x, y, w, h] = monitor.rect.map(|v| v.round() as i32);
-        let _ = unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_SHOWWINDOW) };
-    }
+    let [x, y, w, h] = frame.map(|v| v.round() as i32);
+    let _ = unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_SHOWWINDOW) };
     let _ = unsafe { SetForegroundWindow(hwnd) };
+    PICKER_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Release);
     Some(hwnd.0 as usize as u32)
 }
 

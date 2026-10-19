@@ -6,8 +6,8 @@
 //! Also the Win32 window helpers Scrawl's other popups use.
 
 use std::ffi::c_void;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use gpui::{
     App, Bounds, Context, Corners, Edges, Hsla, IntoElement, PathBuilder, PathStyle, Pixels, Point,
@@ -170,9 +170,17 @@ pub fn capture_window(id: isize) -> anyhow::Result<RgbaFrame> {
     }
 }
 
+/// The display an overlay covers: its rect in global pixels and its scale.
+#[derive(Clone, Copy)]
+struct Placement {
+    rect: [f64; 4],
+    scale: f32,
+}
+
 /// The overlay for one display. Dropping it closes the window.
 pub struct InkOverlay {
     hwnd: isize,
+    placement: Arc<Mutex<Placement>>,
 }
 
 impl InkOverlay {
@@ -186,16 +194,7 @@ impl InkOverlay {
             .and_then(|[x, y, w, h]| super::monitor_at(x + w / 2.0, y + h / 2.0))
             .or_else(super::primary_monitor)
             .ok_or("No display")?;
-        let display_id = cx
-            .displays()
-            .into_iter()
-            .find(|d| {
-                let b = d.bounds();
-                let s = monitor.scale as f32;
-                (f32::from(b.origin.x) * s - monitor.rect[0] as f32).abs() < 2.0
-                    && (f32::from(b.origin.y) * s - monitor.rect[1] as f32).abs() < 2.0
-            })
-            .map(|d| d.id());
+        let display_id = crate::ui::gpui_display_for(&monitor, cx).map(|d| d.id());
         let scale = monitor.scale as f32;
         let bounds = Bounds {
             origin: point(
@@ -207,8 +206,9 @@ impl InkOverlay {
                 px(monitor.rect[3] as f32 / scale),
             ),
         };
-        let origin = [monitor.rect[0] as f32, monitor.rect[1] as f32];
         let rect = monitor.rect;
+        let placement = Arc::new(Mutex::new(Placement { rect, scale }));
+        let view_placement = Arc::clone(&placement);
         let handle = cx
             .open_window(
                 WindowOptions {
@@ -244,8 +244,7 @@ impl InkOverlay {
                     }
                     cx.new(|_| OverlayView {
                         telemetry,
-                        origin,
-                        scale,
+                        placement: view_placement,
                     })
                 },
             )
@@ -258,44 +257,81 @@ impl InkOverlay {
         // Resized on the next turn of the event loop: called from inside an update, GPUI's
         // resize callback can't reach the app and the window keeps its default layout size.
         let id = hwnd.0 as isize;
-        cx.spawn(async move |_, _| {
-            let hwnd = super::hwnd(id);
-            let [x, y, w, h] = rect.map(|v| v.round() as i32);
-            let _ = unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE) };
-            // GPUI keeps a resize frame around the client area; grow the window by it so the
-            // client area (what GPUI draws) covers the display exactly.
-            let (mut client, mut origin) = (RECT::default(), POINT::default());
-            let placed = unsafe {
-                GetClientRect(hwnd, &mut client).is_ok()
-                    && ClientToScreen(hwnd, &mut origin).as_bool()
-            };
-            if placed {
-                let (left, top) = (origin.x - x, origin.y - y);
-                let right = w - left - client.right;
-                let bottom = h - top - client.bottom;
-                let _ = unsafe {
-                    SetWindowPos(
-                        hwnd,
-                        Some(HWND_TOPMOST),
-                        x - left,
-                        y - top,
-                        w + left + right,
-                        h + top + bottom,
-                        SWP_NOACTIVATE,
-                    )
-                };
-            }
-            let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
-        })
-        .detach();
+        cx.spawn(async move |_, _| place(id, rect)).detach();
         Ok(Self {
             hwnd: hwnd.0 as isize,
+            placement,
         })
     }
 
     pub fn window_number(&self) -> u32 {
         self.hwnd as usize as u32
     }
+
+    /// The display it covers, global pixels.
+    pub fn screen(&self) -> [f64; 4] {
+        self.placement
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rect
+    }
+
+    /// Moves to the display holding the centre of `rect` (global pixels). Returns whether it
+    /// moved: false when it's on that display already or there's none there.
+    pub fn move_to(&mut self, rect: [f64; 4]) -> bool {
+        let [x, y, w, h] = rect;
+        let Some(monitor) = super::monitor_at(x + w / 2.0, y + h / 2.0) else {
+            return false;
+        };
+        {
+            let mut placement = self
+                .placement
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if (0..4).all(|i| (placement.rect[i] - monitor.rect[i]).abs() < 1.0) {
+                return false;
+            }
+            *placement = Placement {
+                rect: monitor.rect,
+                scale: monitor.scale as f32,
+            };
+        }
+        // Off the UI thread: this runs inside a GPUI update, where the resize callback can't
+        // reach the app (see `open`); the window's thread handles the move from its loop.
+        let id = self.hwnd;
+        std::thread::spawn(move || place(id, monitor.rect));
+        true
+    }
+}
+
+/// Puts the overlay window over `rect` (global pixels) on top, and shows it.
+fn place(id: isize, rect: [f64; 4]) {
+    let hwnd = super::hwnd(id);
+    let [x, y, w, h] = rect.map(|v| v.round() as i32);
+    let _ = unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE) };
+    // GPUI keeps a resize frame around the client area; grow the window by it so the
+    // client area (what GPUI draws) covers the display exactly.
+    let (mut client, mut origin) = (RECT::default(), POINT::default());
+    let placed = unsafe {
+        GetClientRect(hwnd, &mut client).is_ok() && ClientToScreen(hwnd, &mut origin).as_bool()
+    };
+    if placed {
+        let (left, top) = (origin.x - x, origin.y - y);
+        let right = w - left - client.right;
+        let bottom = h - top - client.bottom;
+        let _ = unsafe {
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                x - left,
+                y - top,
+                w + left + right,
+                h + top + bottom,
+                SWP_NOACTIVATE,
+            )
+        };
+    }
+    let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
 }
 
 impl Drop for InkOverlay {
@@ -307,9 +343,8 @@ impl Drop for InkOverlay {
 
 struct OverlayView {
     telemetry: Arc<SharedCaptureTelemetry>,
-    /// The display's top-left in global pixels, and its scale.
-    origin: [f32; 2],
-    scale: f32,
+    /// The display it covers (moved by `InkOverlay::move_to`).
+    placement: Arc<Mutex<Placement>>,
 }
 
 /// One frame's geometry, in the window's points.
@@ -366,8 +401,12 @@ impl OverlayView {
         } else {
             1.0
         };
-        let k = 1.0 / self.scale;
-        let [ox, oy] = self.origin;
+        let placement = *self
+            .placement
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let k = 1.0 / placement.scale;
+        let [ox, oy] = [placement.rect[0] as f32, placement.rect[1] as f32];
         let local = |x: f32, y: f32| [(x - ox) * k, (y - oy) * k];
         let picker = if selecting {
             *t.picker_rect

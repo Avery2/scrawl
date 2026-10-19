@@ -254,7 +254,10 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
   // MARK: Window
 
   private func showWindow(title: String, orderFront: Bool) {
-    guard let screen = NSScreen.screens.first ?? NSScreen.main else { return }
+    // The display under the pointer, where the picker and capsule are.
+    let mouse = NSEvent.mouseLocation
+    guard let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) })
+      ?? NSScreen.main ?? NSScreen.screens.first else { return }
     let visible = screen.visibleFrame
     let height = (visible.height * 0.76).rounded()
     let width = (height / aspect).rounded()
@@ -293,6 +296,23 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
       panel.orderFrontRegardless()
       emitRect()
     }
+  }
+
+  /// Shown again (the picker's iPhone mode) on another display than the pointer's: centred on
+  /// the pointer's display, where the picker and capsule are.
+  private func moveToPointerScreen() {
+    guard let window else { return }
+    let mouse = NSEvent.mouseLocation
+    guard let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }),
+      !screen.frame.contains(NSPoint(x: window.frame.midX, y: window.frame.midY))
+    else { return }
+    let visible = screen.visibleFrame
+    var frame = window.frame
+    if frame.height > visible.height {
+      frame.size = NSSize(width: (visible.height * 0.76 / aspect).rounded(), height: (visible.height * 0.76).rounded())
+    }
+    frame.origin = NSPoint(x: (visible.midX - frame.width / 2).rounded(), y: (visible.midY - frame.height / 2).rounded())
+    window.setFrame(frame, display: true)
   }
 
   private func fitWindow() {
@@ -341,6 +361,7 @@ final class Mirror: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCapture
             self.cancel()
           } else if command == "show" {
             self.hiddenPreview = false
+            self.moveToPointerScreen()
             self.window?.orderFrontRegardless()
             self.emitRect()
           } else if command == "hide" {

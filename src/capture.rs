@@ -479,7 +479,18 @@ pub fn region_target(
     let mid_y = y + height * 0.5;
     let hit = selectable_window_at(windows, mid_x, mid_y);
     let frontmost = frontmost_app_info();
-    let display_id = main_display_id();
+    // One display per recording: the area's (by its centre), trimmed to that display and at
+    // least `MIN_AREA` a side inside it, so this frame is exactly the recorded `sourceRect`.
+    let screens = crate::screens::displays();
+    let (display_id, scale, [x, y, width, height]) =
+        crate::screens::area_on_display(&screens, [x, y, width, height]).map_or_else(
+            || {
+                let min = crate::screens::MIN_AREA;
+                let rect = [x, y, width.max(min), height.max(min)];
+                (main_display_id(), MAX_CAPTURE_SCALE, rect)
+            },
+            |(i, rect)| (screens[i].id, screens[i].scale, rect),
+        );
     TargetInfo {
         mode: CaptureMode::Region,
         app: hit
@@ -494,18 +505,20 @@ pub fn region_target(
         frame: TargetFrame {
             x,
             y,
-            width: width.max(32.0),
-            height: height.max(32.0),
-            scale: 2.0,
+            width,
+            height,
+            scale,
         },
     }
 }
 
-/// The capture size for `target` with its long edge at most `long_edge` px (and at most
-/// `MAX_CAPTURE_SCALE`× its size: 2× its points on macOS, its own pixels on Windows).
+/// The capture size for `target` with its long edge at most `long_edge` px (and at most its
+/// display's pixels: a 1x display isn't upscaled, and on Windows frames are pixels already,
+/// `MAX_CAPTURE_SCALE`).
 pub fn capture_size(target: &TargetInfo, long_edge: f64) -> (u32, u32) {
     let max_dim = target.frame.width.max(target.frame.height).max(1.0);
-    let scale = (long_edge / max_dim).min(MAX_CAPTURE_SCALE);
+    let native = target.frame.scale.clamp(1.0, MAX_CAPTURE_SCALE);
+    let scale = (long_edge / max_dim).min(native);
     (
         ((target.frame.width * scale).round() as u32).max(48) & !1,
         ((target.frame.height * scale).round() as u32).max(48) & !1,
@@ -1492,6 +1505,78 @@ mod tests {
         assert_eq!(pick_display(&displays, None, focused), 1);
         assert_eq!(pick_display(&displays, Some([-50.0, 0.0]), focused), 1);
         assert_eq!(pick_display(&displays, None, None), 0);
+        // A display left of the laptop, at negative x.
+        let left = [[0.0, 0.0, 1728.0, 1117.0], [-1920.0, 37.0, 1920.0, 1080.0]];
+        assert_eq!(pick_display(&left, Some([-5.0, 600.0]), None), 1);
+        // One above it, at negative y.
+        let above = [[0.0, 0.0, 1728.0, 1117.0], [0.0, -1440.0, 2560.0, 1440.0]];
+        assert_eq!(pick_display(&above, Some([10.0, -1.0]), None), 1);
+        assert_eq!(pick_display(&above, Some([10.0, 0.0]), None), 0);
+    }
+
+    /// Clicks and ink on a display left of, right of or above the laptop normalize into that
+    /// display, and land on the recording's pixels at its own scale.
+    #[test]
+    fn input_on_an_external_display_normalizes_into_it() {
+        let (sender, _receiver) = flume::unbounded();
+        let telemetry = SharedCaptureTelemetry::new(sender);
+        let left = [-1920.0, 37.0, 1920.0, 1080.0];
+        let right = [1728.0, 0.0, 1920.0, 1080.0];
+        let above = [0.0, -1440.0, 2560.0, 1440.0];
+        let small_left = [-1280.0, -100.0, 1280.0, 800.0];
+        let below = [0.0, 1117.0, 1920.0, 1080.0];
+        // (display, scale, global point, expected normalized point, recording size)
+        let cases = [
+            // 1x displays are recorded at their own pixels
+            (left, 1.0, [-960.0, 577.0], (0.5, 0.5), (1920, 1080)),
+            (right, 1.0, [2208.0, 270.0], (0.25, 0.25), (1920, 1080)),
+            (below, 1.0, [480.0, 1387.0], (0.25, 0.25), (1920, 1080)),
+            // 2x ones at the 2560 px long edge
+            (above, 2.0, [640.0, -360.0], (0.25, 0.75), (2560, 1440)),
+            (small_left, 2.0, [-320.0, 500.0], (0.75, 0.75), (2560, 1600)),
+        ];
+        for (rect, scale, point, expected, size) in cases {
+            let frame = crate::screens::with_scale(rect, scale);
+            let target = TargetInfo {
+                mode: CaptureMode::Display,
+                app: None,
+                bundle_id: None,
+                window_title: None,
+                window_id: None,
+                display_id: 2,
+                frame,
+            };
+            // Windows frames are pixels already and never upscaled.
+            if cfg!(target_os = "macos") {
+                assert_eq!(capture_size(&target, 2560.0), size, "{rect:?}");
+            }
+            telemetry.reset_for_session(frame);
+            assert!(telemetry.contains_screen_point(point[0], point[1]));
+            // The laptop's centre is outside this target.
+            assert!(!telemetry.contains_screen_point(864.0, 558.0));
+            let (nx, ny, fw, fh) = telemetry.normalize_point(point[0], point[1]);
+            assert_eq!((nx, ny), expected, "{rect:?}");
+            assert_eq!((fw, fh), (rect[2] as u32, rect[3] as u32));
+            // A click there is recorded at those coordinates.
+            telemetry.pointer_down(10, point[0], point[1]);
+            telemetry.pointer_up(20, point[0], point[1], false);
+            let (events, _) = telemetry.finish_session();
+            assert!(
+                matches!(events[..], [InteractionEvent::Click { x, y, .. }] if (x, y) == (nx, ny)),
+                "{events:?}"
+            );
+        }
+        // In recording pixels: the left 1x display's centre is (960, 540).
+        let frame = crate::screens::with_scale([-1920.0, 37.0, 1920.0, 1080.0], 1.0);
+        telemetry.reset_for_session(frame);
+        let (nx, ny, _, _) = telemetry.normalize_point(-960.0, 577.0);
+        assert_eq!((nx * 1920.0, ny * 1080.0), (960.0, 540.0));
+        // Above 2x: (640, -360) is a quarter in → (640, 1080) px of 2560×1440.
+        let frame = crate::screens::with_scale([0.0, -1440.0, 2560.0, 1440.0], 2.0);
+        telemetry.reset_for_session(frame);
+        let (nx, ny, _, _) = telemetry.normalize_point(640.0, -360.0);
+        assert_eq!((nx * 2560.0, ny * 1440.0), (640.0, 1080.0));
+        telemetry.finish_session();
     }
 
     #[test]
@@ -1564,6 +1649,23 @@ mod tests {
             assert_eq!(capture_size(&display, 2560.0), (2560, 1654));
             assert_eq!(capture_size(&region, 1280.0), (960, 640));
         }
+
+        // A 1x external display is recorded at its own pixels, never upscaled.
+        let external = |mode, width, height| TargetInfo {
+            frame: crate::screens::with_scale([-1920.0, 37.0, width, height], 1.0),
+            ..target(mode, width, height)
+        };
+        let screen = external(CaptureMode::Display, 1920.0, 1080.0);
+        assert_eq!(capture_size(&screen, 2560.0), (1920, 1080));
+        assert_eq!(capture_size(&screen, CANDIDATE_EDGE), (480, 270));
+        let region = external(CaptureMode::Region, 480.0, 320.0);
+        assert_eq!(capture_size(&region, 1280.0), (480, 320));
+        // A 2x one above the laptop keeps the 2560 px long edge.
+        let above = TargetInfo {
+            frame: crate::screens::with_scale([0.0, -1440.0, 2560.0, 1440.0], 2.0),
+            ..target(CaptureMode::Display, 2560.0, 1440.0)
+        };
+        assert_eq!(capture_size(&above, 2560.0), (2560, 1440));
     }
 
     #[test]

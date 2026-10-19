@@ -22,7 +22,7 @@ use super::{
     ShortcutConfig, ShortcutKind, capture_size, clean_label, hotkey_combos, pick_display,
     poll_clicks, scrawl_log, track_shift_ink,
 };
-use crate::model::{CaptureMode, InteractionEvent, RgbaFrame, TargetFrame, TargetInfo};
+use crate::model::{CaptureMode, InteractionEvent, RgbaFrame, TargetInfo};
 
 /// Recordings may hold up to twice a frame's size in points (Retina pixels).
 pub const MAX_CAPTURE_SCALE: f64 = 2.0;
@@ -748,6 +748,7 @@ pub fn discover_target(window_query: Option<&str>) -> TargetInfo {
 /// Like `discover_target`, recording the display under `point` (see `pick_display`).
 pub fn discover_target_at(window_query: Option<&str>, point: Option<[f64; 2]>) -> TargetInfo {
     let frontmost = frontmost_app_info();
+    let screens = crate::screens::displays();
     if let Ok(content) = SCShareableContent::get() {
         let our_pid = std::process::id() as i32;
         if let Some(query) = window_query {
@@ -766,13 +767,10 @@ pub fn discover_target_at(window_query: Option<&str>, point: Option<[f64; 2]>) -
                             .as_ref()
                             .is_some_and(|a| a.application_name().to_lowercase().contains(&q)))
             }) {
-                let frame = win.frame();
+                let f = win.frame();
+                let rect = [f.origin.x, f.origin.y, f.size.width, f.size.height];
                 let owner = win.owning_application();
-                let display_id = content
-                    .displays()
-                    .first()
-                    .map(|d| d.display_id())
-                    .unwrap_or_else(|| unsafe { CGMainDisplayID() });
+                let (display_id, scale) = display_of(&screens, rect);
                 return TargetInfo {
                     mode: CaptureMode::Window,
                     app: owner.as_ref().map(|a| a.application_name()),
@@ -780,13 +778,7 @@ pub fn discover_target_at(window_query: Option<&str>, point: Option<[f64; 2]>) -
                     window_title: win.title(),
                     window_id: Some(win.window_id()),
                     display_id,
-                    frame: TargetFrame {
-                        x: frame.origin.x,
-                        y: frame.origin.y,
-                        width: frame.size.width.max(1.0),
-                        height: frame.size.height.max(1.0),
-                        scale: 2.0,
-                    },
+                    frame: crate::screens::with_scale(rect, scale),
                 };
             }
         }
@@ -813,8 +805,13 @@ pub fn discover_target_at(window_query: Option<&str>, point: Option<[f64; 2]>) -
             [f.origin.x, f.origin.y, f.size.width, f.size.height]
         });
         if let Some(display) = displays.get(pick_display(&rects, point, focused)) {
-            let frame = display.frame();
+            let f = display.frame();
+            let rect = [f.origin.x, f.origin.y, f.size.width, f.size.height];
             let window_title = front_window.as_ref().and_then(|w| w.title());
+            let scale = screens
+                .iter()
+                .find(|s| s.id == display.display_id())
+                .map_or_else(|| display_of(&screens, rect).1, |s| s.scale);
             return TargetInfo {
                 mode: CaptureMode::Display,
                 app: frontmost.as_ref().map(|(_, name, _)| name.clone()),
@@ -822,20 +819,22 @@ pub fn discover_target_at(window_query: Option<&str>, point: Option<[f64; 2]>) -
                 window_title,
                 window_id: None,
                 display_id: display.display_id(),
-                frame: TargetFrame {
-                    x: frame.origin.x,
-                    y: frame.origin.y,
-                    width: frame.size.width.max(1.0),
-                    height: frame.size.height.max(1.0),
-                    scale: 2.0,
-                },
+                frame: crate::screens::with_scale(rect, scale),
             };
         }
     }
 
-    let display_id = unsafe { CGMainDisplayID() };
-    let width = (unsafe { CGDisplayPixelsWide(display_id) } as f64).max(1440.0);
-    let height = (unsafe { CGDisplayPixelsHigh(display_id) } as f64).max(900.0);
+    // No ScreenCaptureKit: the display under `point` from CoreGraphics.
+    let rects: Vec<[f64; 4]> = screens.iter().map(|s| s.frame).collect();
+    let (display_id, frame) = screens.get(pick_display(&rects, point, None)).map_or_else(
+        || {
+            let id = unsafe { CGMainDisplayID() };
+            let w = (unsafe { CGDisplayPixelsWide(id) } as f64).max(1440.0);
+            let h = (unsafe { CGDisplayPixelsHigh(id) } as f64).max(900.0);
+            (id, crate::screens::with_scale([0.0, 0.0, w, h], 2.0))
+        },
+        |s| (s.id, crate::screens::with_scale(s.frame, s.scale)),
+    );
     TargetInfo {
         mode: CaptureMode::Display,
         app: frontmost.as_ref().map(|(_, name, _)| name.clone()),
@@ -843,14 +842,16 @@ pub fn discover_target_at(window_query: Option<&str>, point: Option<[f64; 2]>) -
         window_title: None,
         window_id: None,
         display_id,
-        frame: TargetFrame {
-            x: 0.0,
-            y: 0.0,
-            width,
-            height,
-            scale: 2.0,
-        },
+        frame,
     }
+}
+
+/// The display a global rect is on (its centre, else most of it) and that display's scale.
+fn display_of(screens: &[crate::screens::Screen], rect: [f64; 4]) -> (u32, f64) {
+    crate::screens::index_for_rect(screens, rect).map_or_else(
+        || (unsafe { CGMainDisplayID() }, 2.0),
+        |i| (screens[i].id, screens[i].scale),
+    )
 }
 
 /// Lists all on-screen normal (`window_layer == 0`) windows in front-to-back order for the Window picker.
@@ -859,11 +860,7 @@ pub fn list_selectable_windows() -> Vec<TargetInfo> {
         return Vec::new();
     };
     let our_pid = std::process::id() as i32;
-    let display_id = content
-        .displays()
-        .first()
-        .map(|d| d.display_id())
-        .unwrap_or_else(|| unsafe { CGMainDisplayID() });
+    let screens = crate::screens::displays();
 
     content
         .windows()
@@ -880,6 +877,8 @@ pub fn list_selectable_windows() -> Vec<TargetInfo> {
         })
         .map(|w| {
             let f = w.frame();
+            let rect = [f.origin.x, f.origin.y, f.size.width, f.size.height];
+            let (display_id, scale) = display_of(&screens, rect);
             let owner = w.owning_application();
             TargetInfo {
                 mode: CaptureMode::Window,
@@ -891,13 +890,7 @@ pub fn list_selectable_windows() -> Vec<TargetInfo> {
                 window_title: w.title().map(|t| clean_label(&t)).filter(|t| !t.is_empty()),
                 window_id: Some(w.window_id()),
                 display_id,
-                frame: TargetFrame {
-                    x: f.origin.x,
-                    y: f.origin.y,
-                    width: f.size.width.max(1.0),
-                    height: f.size.height.max(1.0),
-                    scale: 2.0,
-                },
+                frame: crate::screens::with_scale(rect, scale),
             }
         })
         .collect()
@@ -1151,12 +1144,21 @@ fn sck_config(target: &TargetInfo, long_edge: f64) -> SCStreamConfiguration {
         .with_height(height)
         .with_shows_cursor(true);
     if target.mode == CaptureMode::Region {
-        config.set_source_rect(CGRect::new(
+        // `sourceRect` is in the display's own points, not global ones.
+        let b = core_graphics::display::CGDisplay::new(target.display_id).bounds();
+        let display = [b.origin.x, b.origin.y, b.size.width, b.size.height];
+        let area = [
             target.frame.x,
             target.frame.y,
-            target.frame.width.max(32.0),
-            target.frame.height.max(32.0),
-        ));
+            target.frame.width,
+            target.frame.height,
+        ];
+        let [x, y, w, h] = if display[2] > 0.0 && display[3] > 0.0 {
+            crate::screens::source_rect(area, display)
+        } else {
+            area
+        };
+        config.set_source_rect(CGRect::new(x, y, w, h));
     }
     config
 }
@@ -1698,6 +1700,7 @@ fn shortcut_key_name(keycode: u16) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TargetFrame;
 
     /// The mouse monitor's AppKit calls pass objc2's encoding checks (which debug builds, the
     /// installed app included, run on every message), and a monitored click is recorded.

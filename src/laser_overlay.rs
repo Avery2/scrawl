@@ -8,8 +8,8 @@ use core_video::base::{CVOptionFlags, CVTimeStamp};
 use core_video::display_link::{CVDisplayLink, CVDisplayLinkRef};
 use core_video::r#return::CVReturn;
 use metal::{
-    MTLLoadAction, MTLPixelFormat, MTLPrimitiveType, MTLStoreAction, MetalLayer,
-    RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState,
+    MTLLoadAction, MTLPixelFormat, MTLPrimitiveType, MTLResourceOptions, MTLStoreAction,
+    MetalLayer, RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState,
 };
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
@@ -67,41 +67,42 @@ pub struct MetalLaserOverlay {
     window: Retained<NSPanel>,
     display_link: CVDisplayLink,
     display_link_context: *const SharedMetalOverlay,
+    /// The screen it covers, global points.
+    screen: [f64; 4],
+}
+
+/// The screen for a rect in global points: the one holding its centre (else most of it), else
+/// the one under the pointer. Returns it with its AppKit frame, scale and display.
+fn pick_screen(
+    mtm: MainThreadMarker,
+    on: Option<[f64; 4]>,
+) -> Option<(crate::screens::Screen, NSRect)> {
+    let screens = crate::screens::current();
+    let index = on
+        .and_then(|r| crate::screens::index_for_rect(&screens, r))
+        .or_else(|| crate::screens::pointer().and_then(|p| crate::screens::index_at(&screens, p)))
+        .or(if screens.is_empty() { None } else { Some(0) })?;
+    let screen = screens[index];
+    let primary_h = NSScreen::screens(mtm).firstObject()?.frame().size.height;
+    let [x, y, w, h] = crate::screens::flip(screen.frame, primary_h);
+    Some((
+        screen,
+        NSRect::new(NSPoint::new(x, y), objc2_foundation::NSSize::new(w, h)),
+    ))
 }
 
 impl MetalLaserOverlay {
     /// Opens over the screen holding the centre of `on` (global points, top-left origin, like
-    /// capture targets), else the main screen.
+    /// capture targets), else the screen under the pointer.
     pub fn open(
         telemetry: Arc<SharedCaptureTelemetry>,
         on: Option<[f64; 4]>,
     ) -> Result<Self, String> {
         let mtm = MainThreadMarker::new().ok_or("Metal overlay requires the main thread")?;
-        let screens = NSScreen::screens(mtm);
-        let primary_h = screens.firstObject().map_or(0.0, |s| s.frame().size.height);
-        // AppKit frames have a bottom-left origin on the primary screen; capture frames top-left.
-        let top_left = |f: NSRect| {
-            [
-                f.origin.x,
-                primary_h - f.origin.y - f.size.height,
-                f.size.width,
-                f.size.height,
-            ]
-        };
-        let screen = on
-            .and_then(|[x, y, w, h]| {
-                let (cx, cy) = (x + w / 2.0, y + h / 2.0);
-                screens.iter().find(|s| {
-                    let [sx, sy, sw, sh] = top_left(s.frame());
-                    cx >= sx && cx < sx + sw && cy >= sy && cy < sy + sh
-                })
-            })
-            .or_else(|| NSScreen::mainScreen(mtm))
-            .or_else(|| screens.firstObject())
-            .ok_or("No screen available for Metal overlay")?;
-        let frame = screen.frame();
-        let scale = (screen.backingScaleFactor() as f32).max(1.0);
-        let [ox, oy, _, _] = top_left(frame);
+        let (screen, frame) =
+            pick_screen(mtm, on).ok_or("No screen available for Metal overlay")?;
+        let scale = (screen.scale as f32).max(1.0);
+        let [ox, oy, _, _] = screen.frame;
 
         let shared = Arc::new(SharedMetalOverlay::new(
             telemetry,
@@ -152,6 +153,9 @@ impl MetalLaserOverlay {
 
         let display_link = CVDisplayLink::from_active_cg_displays()
             .map_err(|status| format!("Could not create CVDisplayLink: {status}"))?;
+        if screen.id != 0 {
+            let _ = display_link.set_current_cg_display(screen.id);
+        }
         let display_link_context = Arc::into_raw(shared);
         unsafe {
             display_link.set_output_callback(
@@ -166,12 +170,52 @@ impl MetalLaserOverlay {
             window,
             display_link,
             display_link_context,
+            screen: screen.frame,
         })
     }
 
     pub fn window_number(&self) -> u32 {
         self.window.windowNumber().max(0) as u32
     }
+
+    /// The screen it covers, global points.
+    pub fn screen(&self) -> [f64; 4] {
+        self.screen
+    }
+
+    /// Moves to the screen `rect` (global points) belongs to, taking its size, scale and origin.
+    /// Returns whether it moved.
+    pub fn move_to(&mut self, rect: [f64; 4]) -> bool {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return false;
+        };
+        let Some((screen, frame)) = pick_screen(mtm, Some(rect)) else {
+            return false;
+        };
+        if same_rect(screen.frame, self.screen) {
+            return false;
+        }
+        // Window first: AppKit sets the layer's contentsScale for the new screen as it moves,
+        // and `place` then sets the size and scale the shader draws at.
+        self.window.setFrame_display(frame, true);
+        let shared = unsafe { &*self.display_link_context };
+        shared.place(
+            [screen.frame[0] as f32, screen.frame[1] as f32],
+            frame.size.width as f32,
+            frame.size.height as f32,
+            (screen.scale as f32).max(1.0),
+        );
+        if screen.id != 0 {
+            let _ = self.display_link.set_current_cg_display(screen.id);
+        }
+        self.screen = screen.frame;
+        shared.draw();
+        true
+    }
+}
+
+fn same_rect(a: [f64; 4], b: [f64; 4]) -> bool {
+    (0..4).all(|i| (a[i] - b[i]).abs() < 1.0)
 }
 
 impl Drop for MetalLaserOverlay {
@@ -202,8 +246,6 @@ extern "C" fn display_link_callback(
 
 struct SharedMetalOverlay {
     telemetry: Arc<SharedCaptureTelemetry>,
-    /// The screen's top-left in global points: telemetry is global, the shader draws locally.
-    origin: [f32; 2],
     renderer: Mutex<MetalLaserRenderer>,
 }
 
@@ -212,8 +254,11 @@ unsafe impl Sync for SharedMetalOverlay {}
 
 struct MetalLaserRenderer {
     layer: MetalLayer,
+    device: metal::Device,
     command_queue: metal::CommandQueue,
     pipeline: RenderPipelineState,
+    /// The screen's top-left in global points: telemetry is global, the shader draws locally.
+    origin: [f32; 2],
     width: f32,
     height: f32,
     scale: f32,
@@ -240,45 +285,45 @@ impl SharedMetalOverlay {
             f64::from(height * scale),
         ));
 
-        let library = device
-            .new_library_with_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/laser_overlay.metallib"
-            )))
-            .map_err(|e| format!("Could not load laser shader library: {e}"))?;
-        let vertex = library
-            .get_function("laser_vertex", None)
-            .map_err(|e| format!("Could not load laser_vertex: {e}"))?;
-        let fragment = library
-            .get_function("laser_fragment", None)
-            .map_err(|e| format!("Could not load laser_fragment: {e}"))?;
-
-        let descriptor = RenderPipelineDescriptor::new();
-        descriptor.set_vertex_function(Some(&vertex));
-        descriptor.set_fragment_function(Some(&fragment));
-        let attachment = descriptor
-            .color_attachments()
-            .object_at(0)
-            .ok_or("Missing color attachment")?;
-        attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        attachment.set_blending_enabled(false);
-
-        let pipeline = device
-            .new_render_pipeline_state(&descriptor)
-            .map_err(|e| format!("Could not create laser pipeline: {e}"))?;
+        let pipeline = overlay_pipeline(&device)?;
 
         Ok(Self {
             telemetry,
-            origin,
             renderer: Mutex::new(MetalLaserRenderer {
                 command_queue: device.new_command_queue(),
+                device,
                 layer,
                 pipeline,
+                origin,
                 width,
                 height,
                 scale,
             }),
         })
+    }
+
+    /// Takes another screen's origin, size and scale (`MetalLaserOverlay::move_to`).
+    fn place(&self, origin: [f32; 2], width: f32, height: f32, scale: f32) {
+        let mut renderer = self
+            .renderer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        renderer.origin = origin;
+        renderer.width = width;
+        renderer.height = height;
+        renderer.scale = scale;
+        renderer.layer.set_contents_scale(f64::from(scale));
+        renderer.layer.set_drawable_size(CGSize::new(
+            f64::from(width * scale),
+            f64::from(height * scale),
+        ));
+    }
+
+    fn origin(&self) -> [f32; 2] {
+        self.renderer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .origin
     }
 
     fn layer_ptr(&self) -> *const metal::MetalLayerRef {
@@ -347,7 +392,7 @@ impl SharedMetalOverlay {
             let constrained = mode > 0.5 && tx > -10_000.0;
             (tx, ty, tw, th, constrained, mode)
         };
-        let [ox, oy] = self.origin;
+        let [ox, oy] = self.origin();
         let (tx, ty) = (tx - ox, ty - oy);
         let to_screen = |nx: f32, ny: f32| -> [f32; 2] { [tx + nx * tw, ty + ny * th] };
 
@@ -519,33 +564,181 @@ impl SharedMetalOverlay {
             };
 
             let cmd = renderer.command_queue.new_command_buffer();
-            let enc = cmd.new_render_command_encoder(pass);
-            enc.set_render_pipeline_state(&renderer.pipeline);
-            enc.set_fragment_bytes(
-                0,
-                size_of::<LaserUniforms>() as u64,
-                (&raw const uniforms).cast(),
+            encode_overlay(
+                cmd,
+                pass,
+                &renderer.device,
+                &renderer.pipeline,
+                &uniforms,
+                &segments,
+                &pins,
             );
-            enc.set_fragment_bytes(
-                1,
-                (segments.len() * size_of::<PathSegment>()) as u64,
-                segments.as_ptr().cast(),
-            );
-            enc.set_fragment_bytes(
-                2,
-                (pins.len() * size_of::<PinMarker>()) as u64,
-                pins.as_ptr().cast(),
-            );
-            enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
-            enc.end_encoding();
             cmd.present_drawable(drawable);
             cmd.commit();
         });
     }
 }
 
+fn overlay_pipeline(device: &metal::DeviceRef) -> Result<RenderPipelineState, String> {
+    let library = device
+        .new_library_with_data(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/laser_overlay.metallib"
+        )))
+        .map_err(|e| format!("Could not load laser shader library: {e}"))?;
+    let vertex = library
+        .get_function("laser_vertex", None)
+        .map_err(|e| format!("Could not load laser_vertex: {e}"))?;
+    let fragment = library
+        .get_function("laser_fragment", None)
+        .map_err(|e| format!("Could not load laser_fragment: {e}"))?;
+
+    let descriptor = RenderPipelineDescriptor::new();
+    descriptor.set_vertex_function(Some(&vertex));
+    descriptor.set_fragment_function(Some(&fragment));
+    let attachment = descriptor
+        .color_attachments()
+        .object_at(0)
+        .ok_or("Missing color attachment")?;
+    attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+    attachment.set_blending_enabled(false);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .map_err(|e| format!("Could not create laser pipeline: {e}"))
+}
+
+fn encode_overlay(
+    cmd: &metal::CommandBufferRef,
+    pass: &metal::RenderPassDescriptorRef,
+    device: &metal::DeviceRef,
+    pipeline: &RenderPipelineState,
+    uniforms: &LaserUniforms,
+    segments: &[PathSegment],
+    pins: &[PinMarker],
+) {
+    let enc = cmd.new_render_command_encoder(pass);
+    enc.set_render_pipeline_state(pipeline);
+    enc.set_fragment_bytes(
+        0,
+        size_of::<LaserUniforms>() as u64,
+        std::ptr::from_ref(uniforms).cast(),
+    );
+    // Up to MAX_SEGMENTS * 32 B = 48 KB, past the 4 KB `set_fragment_bytes` limit (128
+    // segments), so segments go in a fresh buffer each frame. The command buffer retains it
+    // until the GPU is done, so a frame never overwrites one still being read.
+    let segment_buffer = device.new_buffer_with_data(
+        segments.as_ptr().cast(),
+        (segments.len() * size_of::<PathSegment>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    enc.set_fragment_buffer(1, Some(&segment_buffer), 0);
+    enc.set_fragment_bytes(
+        2,
+        (pins.len() * size_of::<PinMarker>()) as u64,
+        pins.as_ptr().cast(),
+    );
+    enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
+    enc.end_encoding();
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// `setFragmentBytes` aborts in the driver past 4 KB.
+    const SET_BYTES_LIMIT: usize = 4096;
+
+    /// Uniforms and pins still go through `set_fragment_bytes`; segments don't fit and use a buffer.
+    #[test]
+    fn inline_fragment_bytes_fit_the_metal_limit() {
+        assert!(size_of::<LaserUniforms>() <= SET_BYTES_LIMIT);
+        assert!(MAX_PINS * size_of::<PinMarker>() <= SET_BYTES_LIMIT);
+    }
+
+    /// Renders the real shader offscreen with `MAX_SEGMENTS` segments (48 KB, which aborted in
+    /// `setFragmentBytes`). Only the last segment is on screen, so the ink shows only if the
+    /// shader read the whole array.
+    #[test]
+    fn renders_a_full_segment_buffer() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let pipeline = overlay_pipeline(&device).expect("pipeline");
+        let size = 64;
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_width(size);
+        descriptor.set_height(size);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+        let texture = device.new_texture(&descriptor);
+
+        let off_screen = PathSegment {
+            a: [-500.0, -500.0],
+            b: [-400.0, -500.0],
+            w0: 1.0,
+            w1: 1.0,
+            kind: 1.0,
+            width: 1.0,
+        };
+        let mut segments = vec![off_screen; MAX_SEGMENTS];
+        segments[MAX_SEGMENTS - 1] = PathSegment {
+            a: [0.0, 32.0],
+            b: [64.0, 32.0],
+            ..off_screen
+        };
+        let uniforms = LaserUniforms {
+            resolution: [size as f32, size as f32],
+            scale: 1.0,
+            now_sec: 1.0,
+            tail_duration: 1.0,
+            tip_active: 0.0,
+            tip_pos: [0.0, 0.0],
+            segment_count: MAX_SEGMENTS as u32,
+            pin_count: 0,
+            constrain_rect: 0.0,
+            _pad1: 0.0,
+            target_rect: [0.0, 0.0, size as f32, size as f32],
+            glow: [0.0; 4],
+        };
+
+        let pass = RenderPassDescriptor::new();
+        let attachment = pass.color_attachments().object_at(0).unwrap();
+        attachment.set_texture(Some(&texture));
+        attachment.set_load_action(MTLLoadAction::Clear);
+        attachment.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0));
+        attachment.set_store_action(MTLStoreAction::Store);
+        let queue = device.new_command_queue();
+        let cmd = queue.new_command_buffer();
+        encode_overlay(
+            cmd,
+            pass,
+            &device,
+            &pipeline,
+            &uniforms,
+            &segments,
+            &[PinMarker::default()],
+        );
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let mut pixels = vec![0u8; (size * size * 4) as usize];
+        texture.get_bytes(
+            pixels.as_mut_ptr().cast(),
+            size * 4,
+            metal::MTLRegion::new_2d(0, 0, size, size),
+            0,
+        );
+        let bgra = |x: u64, y: u64| {
+            let i = ((y * size + x) * 4) as usize;
+            [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+        };
+        let [b, g, r, a] = bgra(32, 32);
+        assert!(a > 200 && r > 200 && g < 100 && b < 100, "stroke pixel {:?}", [b, g, r, a]);
+        assert_eq!(bgra(32, 4)[3], 0, "nothing drawn away from the stroke");
+    }
+
     /// The shader must load on the oldest macOS Scrawl supports (`LSMinimumSystemVersion` 26.0).
     /// Without `-mmacosx-version-min`, `xcrun metal` targets the build machine's macOS and the
     /// overlay (ink, laser, edge glow) silently fails to open on older systems.

@@ -35,14 +35,43 @@ pub(super) fn points_per_pixel(_window: &Window) -> f32 {
     1.0
 }
 
-pub(super) fn primary_display_rect(cx: &App) -> Option<[f32; 4]> {
-    let b = cx.primary_display()?.bounds();
-    Some([
-        f32::from(b.origin.x),
-        f32::from(b.origin.y),
-        f32::from(b.size.width),
-        f32::from(b.size.height),
-    ])
+/// The GPUI display that is the screen at `frame` (global points), else the primary one.
+pub(super) fn display_at(
+    frame: [f32; 4],
+    cx: &App,
+) -> Option<std::rc::Rc<dyn gpui::PlatformDisplay>> {
+    let screens = crate::screens::displays();
+    let id = crate::screens::index_for_rect(&screens, frame.map(f64::from)).map(|i| screens[i].id);
+    id.and_then(|id| cx.displays().into_iter().find(|d| u32::from(d.id()) == id))
+        .or_else(|| cx.primary_display())
+}
+
+/// Moves a window to cover the screen at `frame` (global points).
+fn move_window_to_screen(ns_win: &NSWindow, frame: [f64; 4]) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Some(primary_h) = objc2_app_kit::NSScreen::screens(mtm)
+        .firstObject()
+        .map(|s| s.frame().size.height)
+    else {
+        return;
+    };
+    let [x, y, w, h] = crate::screens::flip(frame, primary_h);
+    ns_win.setFrame_display(
+        objc2_foundation::NSRect::new(
+            objc2_foundation::NSPoint::new(x, y),
+            objc2_foundation::NSSize::new(w, h),
+        ),
+        true,
+    );
+}
+
+/// Moves the open picker to cover the screen at `frame` (global points).
+pub(super) fn move_picker_window(frame: [f64; 4]) {
+    if let Some(ns_win) = find_picker_ns_window() {
+        move_window_to_screen(&ns_win, frame);
+    }
 }
 
 /// Dragging a region moves its window.
@@ -77,16 +106,74 @@ pub(super) fn configure_lab_backdrop(w: f32, h: f32) {
     }
 }
 
-/// AppKit keeps an accessory app running without windows.
-pub(super) fn keep_alive(_cx: &mut App) {}
+/// AppKit keeps an accessory app running without windows. Info.plist's `LSUIElement` starts
+/// Scrawl as one with no Dock icon, but gpui 0.2.2 sets the regular activation policy once
+/// launched, so this puts it back (`stay_out_of_dock`).
+pub(super) fn keep_alive(_cx: &mut App) {
+    stay_out_of_dock();
+}
+
+/// Keeps Scrawl a menu bar app with no Dock icon.
+fn stay_out_of_dock() {
+    use objc2_app_kit::NSApplicationActivationPolicy;
+    if let Some(mtm) = MainThreadMarker::new() {
+        NSApplication::sharedApplication(mtm)
+            .setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    }
+}
 
 /// AppKit gives every window the app's icon.
 pub(super) fn decorate_app_window(_window: &mut Window) {}
 
-/// The accessory app comes forward so the review window gets focus.
-pub(super) fn activate_app() {
-    if let Some(mtm) = MainThreadMarker::new() {
-        NSApplication::sharedApplication(mtm).activate();
+/// The app that was in front when Scrawl activated itself for the picker or the review window
+/// (0: none).
+static PREVIOUS_FRONT_APP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Called just before Scrawl activates itself to take the keys. Scrawl in front already (one
+/// key window opening over another) keeps the app remembered first.
+fn remember_front_app() {
+    use objc2_app_kit::NSWorkspace;
+    let front = NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .map_or(0, |app| app.processIdentifier());
+    if front > 0 && front != std::process::id() as i32 {
+        PREVIOUS_FRONT_APP.store(front, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// A menu bar (accessory) app isn't active when its menu or capsule is used, and keys only
+/// reach its windows while it is: remember the app in front, then activate ignoring other apps
+/// (the cooperative `NSApp.activate()` may leave the window behind the app in front).
+pub(super) fn take_keys(cx: &mut App) {
+    remember_front_app();
+    cx.activate(true);
+}
+
+/// Run (deferred) after any window closes: once neither a picker nor a review window is left,
+/// the app that was in front before gets the keys back. `NSApp.deactivate()` isn't enough: a
+/// menu bar (accessory) app stays frontmost with no windows, and keys go nowhere. Deferred, a
+/// picker replacing another one is open again by the time this looks.
+pub(super) fn hand_back_keys(cx: &mut App) {
+    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+    if cx.windows().iter().any(|handle| {
+        handle.downcast::<super::TargetPickerWindow>().is_some()
+            || handle.downcast::<super::BundleReviewWindow>().is_some()
+    }) {
+        return;
+    }
+    let previous = PREVIOUS_FRONT_APP.swap(0, std::sync::atomic::Ordering::AcqRel);
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    if !app.isActive() {
+        return;
+    }
+    let reactivated = previous > 0
+        && NSRunningApplication::runningApplicationWithProcessIdentifier(previous)
+            .is_some_and(|prev| prev.activateWithOptions(NSApplicationActivationOptions::empty()));
+    if !reactivated {
+        app.deactivate();
     }
 }
 
@@ -106,15 +193,22 @@ pub(super) fn open_overlay(
     LaserOverlay::open(telemetry, on)
 }
 
-/// The picker: borderless at status level + 1 over the whole screen (menu bar included),
-/// taking clicks (`scrawl lab` replays let them through). Returns its window number, to leave out
-/// of the recording.
-pub(super) fn configure_picker_window(_window: &mut Window, lab: bool) -> Option<u32> {
+/// The picker: borderless at status level + 1 over the whole screen at `frame` (global points,
+/// menu bar included), taking clicks (`scrawl lab` replays let them through). Returns its window
+/// number, to leave out of the recording.
+pub(super) fn configure_picker_window(
+    _window: &mut Window,
+    lab: bool,
+    frame: [f64; 4],
+) -> Option<u32> {
     let ns_win = find_picker_ns_window()?;
     ns_win.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
     configure_floating_window(&ns_win, lab, 1);
-    if let Some(screen) = ns_win.screen() {
-        ns_win.setFrame_display(screen.frame(), true);
+    move_window_to_screen(&ns_win, frame);
+    // gpui made it key before the style change above; make it key again so it takes the keys
+    // once Scrawl is active (`take_keys`).
+    if !lab {
+        ns_win.makeKeyAndOrderFront(None);
     }
     let num = ns_win.windowNumber().max(0) as u32;
     (num > 0).then_some(num)
