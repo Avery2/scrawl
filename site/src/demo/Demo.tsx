@@ -2,7 +2,7 @@ import { type ComponentType, type CSSProperties, useCallback, useEffect, useLayo
 import { flushSync } from "react-dom"
 import { MacWindow, PhoneMirror } from "./apps"
 import type { StageGpuOverlay as StageGpuOverlayType } from "./gpu-fx"
-import { afterLoad, useHydrated } from "../idle"
+import { afterLoad, useAfterLoad, useHydrated } from "../idle"
 import { INK_SHADOW, InkPath, inkPath } from "./ink"
 import { measureAnchors, sameAnchors } from "./measure"
 import { motion, motionControls, motionServer } from "./motion"
@@ -187,8 +187,8 @@ export function Demo() {
   const actionsRef = useRef<HTMLDivElement>(null)
   const titleRef = useRef<HTMLHeadingElement>(null)
   const [scale, setScale] = useState(1)
-  const hydrated = useHydrated()
-  const lens = hydrated ? LENS_DATA_URL : null
+  const lens = useHydrated() ? LENS_DATA_URL : null
+  const ready = useAfterLoad(wrapRef)
   const [anchors, setAnchors] = useState<Anchors | null>(null)
   const [user, setUser] = useState<UserStroke[]>([])
   const [shiftDown, setShiftDown] = useState(false)
@@ -295,7 +295,7 @@ export function Demo() {
     }
     measure()
     document.fonts?.ready.then(measure)
-  }, [mode, broken])
+  }, [mode, broken, ready])
 
   useEffect(() => {
     const down = (e: PointerEvent) => {
@@ -512,8 +512,8 @@ export function Demo() {
           aria-hidden
           inert
         >
-          {hydrated && (
-            <>
+          {ready && (
+            <div className="stage-live">
               <MenuBar t={t} />
               {mode === "mac" ? (
                 <MacWindow fix={fix} sheen={look.sheen} refs={refs} inactive={terminalActive(t)} />
@@ -536,7 +536,7 @@ export function Demo() {
               )}
               {GpuOverlay && <GpuOverlay t={t} script={script} intensity={look.inkSheen} stageRef={stageRef} />}
               {cursor && <Cursor c={cursor} crosshair={mode === "mac" && t >= T.select && t < T.record} ibeam={overTerminal && t >= T.promptClick - 400 && t < T.paste + 120} />}
-            </>
+            </div>
           )}
         </div>
         {!started && (
