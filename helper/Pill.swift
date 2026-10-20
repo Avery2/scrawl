@@ -225,15 +225,16 @@ final class PillViewModel: ObservableObject {
       return
     }
 
-    // A morph between two visible states. The shape leads and the content follows: widening,
-    // the chips ride a slightly longer spring than the wall; narrowing, the leaving chips fade
-    // before the wall reaches them (`model::COLLAPSE_WAIT_S`).
+    // A morph between two visible states, as the Dynamic Island does it: one spring per change,
+    // the shape leads and the content follows a beat behind it. Narrowing, the leaving chips
+    // start fading first so the wall never cuts one that's still bright (`model::COLLAPSE_WAIT_S`).
     let narrowing = rest.width < shell.width - 1
     let spec = narrowing ? opts.morphClose : opts.morphOpen
     let morph = spring(spec)
-    let follow = spring(PillSpringSpec(spec.duration * (narrowing ? 1 : 1.12), spec.bounce))
     let leavingIDs = Set(items.map(\.id)).subtracting(s.items.map(\.id))
-    let shellMorph = narrowing && !leavingIDs.isEmpty && !reduced ? morph.delay(0.06 / timeScale) : morph
+    let waitForLeaving = narrowing && !leavingIDs.isEmpty && !reduced
+    let shellMorph = waitForLeaving ? morph.delay(0.06 / timeScale) : morph
+    let follow = narrowing || reduced ? morph : morph.delay(0.025 / timeScale)
     if abs(rest.width - shell.width) > 1, !reduced {
       morphDuration = spec.duration / timeScale
       morphs &+= 1
