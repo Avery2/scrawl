@@ -17,7 +17,7 @@ pub mod smart;
 pub const SMART_ROUTING: &str = "smartRouting";
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -181,13 +181,25 @@ pub fn browser_tab_url(bundle_id: &str) -> Option<String> {
 }
 
 fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<std::process::Output> {
-    crate::handoff::output_within(command, timeout)
-        .inspect_err(|err| {
-            if err.downcast_ref::<crate::handoff::TimedOut>().is_some() {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
                 scrawl_log("routing: gave up waiting on a subprocess");
+                return None;
             }
-        })
-        .ok()
+        }
+    }
 }
 
 /// The URL a capture was of: the browser in front when it finished, else the captured window's

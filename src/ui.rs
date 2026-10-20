@@ -736,9 +736,9 @@ pub struct ScrawlCoordinator {
     /// A smart-routed capture waiting out its undo window before it's sent; ✕ or Paste on the
     /// Completed island cancels it.
     pending_send: Option<PathBuf>,
-    /// Local captures copied while their route is still being worked out; ✕ or Paste on the
-    /// Completed island takes one out, keeping it on the clipboard whatever the route says.
-    routing: std::collections::HashSet<PathBuf>,
+    /// A local capture copied while its route is still being worked out; ✕ or Paste clears it,
+    /// keeping the capture on the clipboard whatever the route says.
+    routing: Option<PathBuf>,
     /// When this Mac last finished a capture, so ⌥⇧V prefers it over older inbox items.
     last_local_capture_ms: u64,
     inbox: crate::inbox::Inbox,
@@ -826,7 +826,7 @@ impl ScrawlCoordinator {
             completed_dir: None,
             completed_note: None,
             pending_send: None,
-            routing: std::collections::HashSet::new(),
+            routing: None,
             last_local_capture_ms: 0,
             inbox: crate::inbox::Inbox::load_default(),
             last_mode: SelectionMode::load_last_used(),
@@ -899,6 +899,7 @@ impl ScrawlCoordinator {
             return;
         }
         let dir = self.take_paste_target();
+        self.keep_pending_send(&dir);
         if matches!(self.island_phase, IslandPhase::Completed { .. }) {
             self.dismiss_island(cx);
         }
@@ -2125,11 +2126,6 @@ impl ScrawlCoordinator {
                     return;
                 }
                 coord.pending_send = None;
-                if let Err(err) = crate::handoff::load_bundle(&dir).and_then(|(_, mut bundle)| {
-                    crate::routing::record_destination(&dir, &mut bundle, dest.clone())
-                }) {
-                    scrawl_log(format!("routing: couldn't record the destination: {err:#}"));
-                }
                 coord.send_completed(dir, dest, cx);
                 cx.notify();
             });
@@ -2137,9 +2133,10 @@ impl ScrawlCoordinator {
         .detach();
     }
 
-    /// Cancels a smart send of `dir` that is still in its undo window.
+    /// Cancels an automatic send of `dir` (while its route is worked out or during its undo window).
     fn keep_pending_send(&mut self, dir: &std::path::Path) {
-        if self.routing.remove(dir) {
+        if self.routing.as_deref() == Some(dir) {
+            self.routing = None;
             scrawl_log(format!(
                 "routing: kept {} on the clipboard while its route was worked out",
                 dir.display()
@@ -2179,6 +2176,11 @@ impl ScrawlCoordinator {
         let spawned = std::thread::Builder::new()
             .name("scrawl-send".into())
             .spawn(move || {
+                if let Err(err) = crate::handoff::load_bundle(&send_dir).and_then(|(_, mut bundle)| {
+                    crate::routing::record_destination(&send_dir, &mut bundle, dest.clone())
+                }) {
+                    scrawl_log(format!("routing: couldn't record the destination: {err:#}"));
+                }
                 let _ = sender.send(crate::delivery::deliver(
                     &send_dir,
                     &dest.session,
@@ -2950,8 +2952,8 @@ impl ScrawlCoordinator {
                         coord.completed_dir = Some(dir.clone());
                         coord.last_local_capture_ms = crate::now_epoch_ms();
                         if route.is_some() || look.is_some() {
-                            coord.routing.insert(dir.clone());
-                            routed = Some((dir.clone(), bundle.clone()));
+                            coord.routing = Some(dir.clone());
+                            routed = Some((dir.clone(), look.is_some().then(|| bundle.clone())));
                         }
                         coord.set_review_bundle((dir, bundle), coord.completed_note.clone());
                     }
@@ -2967,30 +2969,24 @@ impl ScrawlCoordinator {
                 .ok()
                 .flatten();
             let copied_ms = finish_started.elapsed().as_millis();
-            let Some((dir, mut bundle)) = routed else {
+            let Some((dir, bundle)) = routed else {
                 return;
             };
             let route_dir = dir.clone();
             let route = cx
                 .background_executor()
                 .spawn(async move {
-                    let dir = route_dir;
-                    let dest = route
-                        .and_then(|route| route.join().ok().flatten())
-                        .and_then(|dest| {
-                            crate::routing::record_destination(&dir, &mut bundle, dest.clone())
-                                .inspect_err(|err| {
-                                    scrawl_log(format!(
-                                        "routing: couldn't record the destination: {err:#}"
-                                    ));
-                                })
-                                .ok()
-                                .map(|()| dest)
-                        });
-                    let judged = look
-                        .and_then(|look| look.join().ok().flatten())
-                        .map(|live| crate::routing::judge_capture(&dir, &bundle, live));
-                    (dest, judged)
+                    if let Some(dest) = route.and_then(|route| route.join().ok().flatten()) {
+                        return RouteOutcome::Send(dest);
+                    }
+                    if let (Some(bundle), Some(live)) =
+                        (bundle, look.and_then(|look| look.join().ok().flatten()))
+                    {
+                        let (judgement, url) =
+                            crate::routing::judge_capture(&route_dir, &bundle, live);
+                        return RouteOutcome::Judged(judgement, url);
+                    }
+                    RouteOutcome::None
                 })
                 .await;
             scrawl_log(format!(
@@ -3007,14 +3003,11 @@ impl ScrawlCoordinator {
     fn route_arrived(
         &mut self,
         dir: PathBuf,
-        (dest, judged): (
-            Option<crate::model::Destination>,
-            Option<(crate::routing::smart::Judgement, Option<String>)>,
-        ),
+        route: RouteOutcome,
         cx: &mut Context<Self>,
     ) {
-        if !self.routing.remove(&dir) {
-            if dest.is_some() || judged.is_some() {
+        if self.routing.as_deref() != Some(dir.as_path()) {
+            if !matches!(route, RouteOutcome::None) {
                 scrawl_log(format!(
                     "routing: {} was kept on the clipboard before its route arrived",
                     dir.display()
@@ -3022,14 +3015,20 @@ impl ScrawlCoordinator {
             }
             return;
         }
-        if let Some(dest) = dest {
-            self.send_completed(dir.clone(), dest, cx);
-        }
-        if let Some((judgement, url)) = judged {
-            self.act_on_route(dir, judgement, url, cx);
+        self.routing = None;
+        match route {
+            RouteOutcome::None => return,
+            RouteOutcome::Send(dest) => self.send_completed(dir, dest, cx),
+            RouteOutcome::Judged(judgement, url) => self.act_on_route(dir, judgement, url, cx),
         }
         cx.notify();
     }
+}
+
+enum RouteOutcome {
+    None,
+    Send(crate::model::Destination),
+    Judged(crate::routing::smart::Judgement, Option<String>),
 }
 
 pub struct HudPillWindow {
