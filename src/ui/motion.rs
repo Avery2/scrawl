@@ -686,8 +686,11 @@ struct Trace {
     queued_events: Vec<String>,
 }
 
-thread_local! {
-    static TRACE: RefCell<Option<Trace>> = const { RefCell::new(None) };
+/// Shared by every thread: the native capsule draws on its display link's thread.
+static TRACE: std::sync::Mutex<Option<Trace>> = std::sync::Mutex::new(None);
+
+fn with_trace<R>(f: impl FnOnce(&mut Option<Trace>) -> R) -> R {
+    f(&mut TRACE.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
 fn trace_target() -> Option<&'static PathBuf> {
@@ -705,7 +708,7 @@ pub(crate) fn tracing() -> bool {
 /// Opens the trace (once): a motion-lint header sized to the main display in points.
 pub(crate) fn trace_open(launch: &str, display: [f32; 2]) {
     let Some(path) = trace_target() else { return };
-    TRACE.with_borrow_mut(|slot| {
+    with_trace(|slot| {
         if slot.is_some() {
             return;
         }
@@ -743,7 +746,7 @@ pub(crate) fn trace_event(event: impl Into<String>) {
     if !tracing() {
         return;
     }
-    TRACE.with_borrow_mut(|slot| {
+    with_trace(|slot| {
         if let Some(trace) = slot.as_mut() {
             trace.queued_events.push(event.into());
         }
@@ -754,7 +757,7 @@ pub(crate) fn trace_event(event: impl Into<String>) {
 /// Ends the frame in progress without starting one: what is drawn until the next
 /// `trace_frame` isn't recorded (a new window's first frame, drawn fully transparent).
 pub(crate) fn trace_skip_frame() {
-    TRACE.with_borrow_mut(|slot| {
+    with_trace(|slot| {
         if let Some(trace) = slot.as_mut() {
             trace.flush_pending();
         }
@@ -762,7 +765,7 @@ pub(crate) fn trace_skip_frame() {
 }
 
 pub(crate) fn trace_frame() {
-    TRACE.with_borrow_mut(|slot| {
+    with_trace(|slot| {
         let Some(trace) = slot.as_mut() else { return };
         trace.flush_pending();
         trace.pending = Some(Pending {
@@ -783,7 +786,7 @@ pub(crate) fn trace_element(
     parent: Option<&'static str>,
     clip: Option<[f32; 4]>,
 ) {
-    TRACE.with_borrow_mut(|slot| {
+    with_trace(|slot| {
         if let Some(pending) = slot.as_mut().and_then(|t| t.pending.as_mut()) {
             pending
                 .elements
@@ -806,7 +809,7 @@ fn visible(rect: [f32; 4], clip: [f32; 4]) -> Option<[f32; 4]> {
 /// A scalar per frame: `kind` is motion-lint's `level`, `phase` or `position`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn trace_channel(name: &'static str, kind: &'static str, value: f32) {
-    TRACE.with_borrow_mut(|slot| {
+    with_trace(|slot| {
         if let Some(pending) = slot.as_mut().and_then(|t| t.pending.as_mut()) {
             pending.channels.push((name, kind, value));
         }
@@ -815,7 +818,7 @@ pub(crate) fn trace_channel(name: &'static str, kind: &'static str, value: f32) 
 
 /// Writes the last frame and closes the file.
 pub(crate) fn trace_close() {
-    TRACE.with_borrow_mut(|slot| {
+    with_trace(|slot| {
         if let Some(mut trace) = slot.take() {
             trace.flush_pending();
             // An empty closing frame so the last change has a frame after it.

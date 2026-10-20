@@ -7,13 +7,16 @@ For each run of consecutive frames (a morph), every frame should reach the scree
 refresh after the one before and its springs should have advanced by exactly that interval.
 Reports, over all runs in a log:
 
+  Hz         the compositor's refresh (from presentation times) / the display link's
   frames     frames drawn while animating
-  dropped    refreshes inside a run that showed no new frame (a stall), from presentation times
-  doubled    frames presented on the same refresh as the one before (one was never seen)
-  lost       frames drawn but never presented
+  dropped    compositor refreshes inside a run that showed no new frame (a stall)
+  doubled    frames presented on the same refresh as the one before
+  replaced   frames drawn but never presented (a newer one replaced it: expected when the
+             compositor runs slower than the link, e.g. ProMotion in Low Power Mode)
   skipped    display link ticks inside a run that drew nothing
   worst      longest gap between presented frames (ms)
-  jitter     RMS of (spring step - on-screen step) per frame (ms): how unevenly the motion moves
+  jitter     RMS of (spring time advanced - on-screen time advanced) between consecutive
+             presented frames (ms): how unevenly the motion moves
   worst-err  largest such per-frame error (ms)
   late       95th percentile of draw start - link tick (ms), the wait for the drawing thread
 """
@@ -61,31 +64,42 @@ def pct(values, p):
 def analyze(path, scale):
     frames, presented = load(path)
     periods = [f["period"] for f in frames if f["period"] > 0]
-    period = pct(periods, 50) or 1 / 60
-    stats = dict(frames=0, dropped=0, doubled=0, lost=0, skipped=0, worst=0.0, errs=[], late=[])
+    link = pct(periods, 50) or 1 / 60
+    stats = dict(frames=0, dropped=0, doubled=0, superseded=0, skipped=0, worst=0.0, errs=[], late=[])
+    gaps = []
     for run in runs(frames):
         stats["frames"] += len(run)
-        stats["lost"] += sum(1 for f in run if f["n"] not in presented and f["start"] > 0)
+        shown = []
         for a, b in zip(run, run[1:]):
             stats["skipped"] += max(0, b["tick"] - a["tick"] - 1)
             stats["late"].append((b["start"] - b["linkNow"]) * 1000 if b["linkNow"] else 0.0)
-            pa, pb = presented.get(a["n"]), presented.get(b["n"])
-            if pa is None or pb is None or pa <= 0 or pb <= 0:
-                continue
-            gap = pb - pa
-            k = round(gap / period)
-            if k == 0:
-                stats["doubled"] += 1
-            elif k > 1:
-                stats["dropped"] += k - 1
-            stats["worst"] = max(stats["worst"], gap * 1000)
-            stats["errs"].append((b["dt"] / scale - gap) * 1000)
+        for f in run:
+            at = presented.get(f["n"], 0.0)
+            if at > 0:
+                shown.append((f, at))
+            else:
+                # Drawn, then replaced by a newer frame before the compositor took it.
+                stats["superseded"] += 1
+        for (fa, pa), (fb, pb) in zip(shown, shown[1:]):
+            gaps.append((pb - pa, (fb["t"] - fa["t"]) / scale))
+    # The compositor's refresh: the usual gap, as a whole number of link periods.
+    shortest = pct([g for g, _ in gaps if g > link * 0.5], 50) if gaps else link
+    period = max(1, round(shortest / link)) * link
+    for gap, step in gaps:
+        k = round(gap / period)
+        if k == 0:
+            stats["doubled"] += 1
+        elif k > 1:
+            stats["dropped"] += k - 1
+        stats["worst"] = max(stats["worst"], gap * 1000)
+        stats["errs"].append((step - gap) * 1000)
     errs = stats.pop("errs")
     late = stats.pop("late")
     stats["jitter"] = math.sqrt(sum(e * e for e in errs) / len(errs)) if errs else 0.0
     stats["worst_err"] = max((abs(e) for e in errs), default=0.0)
     stats["late_p95"] = pct(late, 95)
-    stats["hz"] = round(1 / period) if period else 0
+    stats["link_hz"] = round(1 / link)
+    stats["hz"] = round(1 / period)
     return stats
 
 
@@ -103,12 +117,12 @@ def main(argv):
     if as_json:
         print(json.dumps(results, indent=2))
         return
-    head = f"{'log':<28} {'Hz':>3} {'frames':>6} {'dropped':>7} {'doubled':>7} {'lost':>4} {'skipped':>7} {'worst ms':>8} {'jitter ms':>9} {'worst-err':>9} {'late p95':>8}"
+    head = f"{'log':<28} {'Hz':>7} {'frames':>6} {'dropped':>7} {'doubled':>7} {'replaced':>8} {'skipped':>7} {'worst ms':>8} {'jitter ms':>9} {'worst-err':>9} {'late p95':>8}"
     print(head)
     for path, s in results.items():
         name = path.rsplit("/", 1)[-1].removesuffix(".jsonl")
         print(
-            f"{name:<28} {s['hz']:>3} {s['frames']:>6} {s['dropped']:>7} {s['doubled']:>7} {s['lost']:>4} {s['skipped']:>7} "
+            f"{name:<28} {str(s['hz']) + '/' + str(s['link_hz']):>7} {s['frames']:>6} {s['dropped']:>7} {s['doubled']:>7} {s['superseded']:>8} {s['skipped']:>7} "
             f"{s['worst']:>8.1f} {s['jitter']:>9.2f} {s['worst_err']:>9.2f} {s['late_p95']:>8.2f}"
         )
 

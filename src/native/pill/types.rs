@@ -28,8 +28,25 @@ impl PillStyle {
         }
     }
 
-    /// Resolves the active `PillStyle` from `SCRAWL_PILL_STYLE`, `tune.json`, or `config.json`.
+    /// Resolves the active `PillStyle` from `SCRAWL_PILL_STYLE`, `tune.json`, or `config.json`,
+    /// read at most twice a second: it's asked for on every capsule tick, and `config.json` is a
+    /// file read and a JSON parse.
     pub fn current() -> Self {
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+        static CACHE: Mutex<Option<(Instant, PillStyle)>> = Mutex::new(None);
+        let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, style)) = *cache
+            && at.elapsed() < Duration::from_millis(500)
+        {
+            return style;
+        }
+        let style = Self::resolve();
+        *cache = Some((Instant::now(), style));
+        style
+    }
+
+    fn resolve() -> Self {
         if let Ok(env) = std::env::var("SCRAWL_PILL_STYLE")
             && let Some(style) = Self::from_str_opt(&env)
         {

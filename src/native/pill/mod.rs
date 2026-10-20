@@ -283,15 +283,32 @@ impl MetalPipelines {
     }
 }
 
-struct PillRuntimeState {
+/// What a frame is drawn from: the model, Metal and the frame clock. The display link's thread
+/// draws from it; the main thread changes it in `sync` under the same lock.
+struct RenderState {
     model: PillModel,
     pipelines: MetalPipelines,
+    style: PillStyle,
+    /// An `NSGlassEffectView` exists (macOS 26+), so the glass style can be drawn.
+    has_glass: bool,
+    screen_origin_top_left: [f32; 2],
+    /// Animation seconds per real second (`motion::time_scale`), copied in by the main thread.
+    time_scale: f32,
+    /// The refresh the last step was sampled for (host seconds); `None` after a pause.
+    last_out: Option<f64>,
+    dirty: bool,
+}
+
+impl RenderState {
+    fn use_glass(&self) -> bool {
+        self.style == PillStyle::Glass && self.has_glass
+    }
+}
+
+/// The panel and pointer state, touched only on the main thread.
+struct MainState {
     window: Retained<NSPanel>,
     glass_view: Option<Retained<NSView>>,
-    screen_origin_top_left: [f32; 2],
-    style: PillStyle,
-    last_tick_now: f64,
-    dirty: bool,
     ignores_mouse: bool,
     was_mouse_down: bool,
     press_down_elem: Option<ElemId>,
@@ -299,11 +316,18 @@ struct PillRuntimeState {
     action_tx: flume::Sender<PillAction>,
 }
 
-// Accessed only on the main thread (guarded by `MainThreadMarker::new()` in `tick_main`).
-unsafe impl Send for PillRuntimeState {}
+// Locked only on the main thread (`MainThreadMarker` checks at every use).
+unsafe impl Send for MainState {}
 
 struct SharedNativePill {
-    state: Mutex<PillRuntimeState>,
+    render: Mutex<RenderState>,
+    main: Mutex<MainState>,
+    /// The glass style draws on the main thread, since its view moves in the same transaction
+    /// as the Metal frame. Otherwise frames are drawn on the display link's thread.
+    main_draws: AtomicBool,
+    /// Low Power Mode is on, which holds a ProMotion display's compositor to 60 Hz while the
+    /// display link still ticks at 120.
+    low_power: AtomicBool,
     tick_queued: AtomicBool,
     alive: AtomicBool,
     /// Display link callbacks so far, and the latest one's now / output time / period (f64 bits).
@@ -317,6 +341,8 @@ pub struct NativePill {
     shared: Arc<SharedNativePill>,
     display_link: Option<CVDisplayLink>,
     display_link_ctx: Option<*const SharedNativePill>,
+    /// The link runs only while the capsule is on screen.
+    link_running: std::cell::Cell<bool>,
     action_rx: flume::Receiver<PillAction>,
     window_num: u32,
 }
@@ -331,8 +357,10 @@ impl NativePill {
             .iter()
             .map(|s| s.scale as f32)
             .fold(2.0_f32, f32::max);
-        let [top_left_x, top_left_y] = panel_origin(&screens, crate::screens::pointer())
+        let screen = panel_screen(&screens, crate::screens::pointer())
             .ok_or("No screen available for NativePill")?;
+        let [top_left_x, top_left_y] = panel_origin(screen);
+        let display_id = screen.id;
         let panel_rect = panel_appkit_rect(mtm, [top_left_x, top_left_y]);
 
         let pipelines = MetalPipelines::new(scale)?;
@@ -402,22 +430,36 @@ impl NativePill {
         }
         let window_num = window.windowNumber().max(0) as u32;
 
+        let style = PillStyle::current();
+        let has_glass = glass_view.is_some();
+        let render = RenderState {
+            model,
+            pipelines,
+            style,
+            has_glass,
+            screen_origin_top_left: [top_left_x, top_left_y],
+            time_scale: motion::time_scale(),
+            last_out: None,
+            dirty: true,
+        };
+        let main_draws = render.use_glass();
+        render
+            .pipelines
+            .layer
+            .set_presents_with_transaction(main_draws || present_mode() == PresentMode::Transaction);
         let shared = Arc::new(SharedNativePill {
-            state: Mutex::new(PillRuntimeState {
-                model,
-                pipelines,
+            render: Mutex::new(render),
+            main: Mutex::new(MainState {
                 window: window.clone(),
                 glass_view,
-                screen_origin_top_left: [top_left_x, top_left_y],
-                style: PillStyle::current(),
-                last_tick_now: motion::now(),
-                dirty: true,
                 ignores_mouse: true,
                 was_mouse_down: false,
                 press_down_elem: None,
                 paste_drag_start_screen: None,
                 action_tx,
             }),
+            main_draws: AtomicBool::new(main_draws),
+            low_power: AtomicBool::new(low_power_mode()),
             tick_queued: AtomicBool::new(false),
             alive: AtomicBool::new(true),
             ticks: AtomicU64::new(0),
@@ -427,7 +469,7 @@ impl NativePill {
         });
 
         // Draw initial transparent frame synchronously.
-        shared.tick_main();
+        shared.draw_main(pacing::host_now());
 
         let mut display_link = None;
         let mut display_link_ctx = None;
@@ -441,7 +483,8 @@ impl NativePill {
             }
             .is_ok()
             {
-                let _ = dl.start();
+                // Tick with the display the capsule is on, not whichever the link picked.
+                let _ = dl.set_current_cg_display(display_id);
                 display_link = Some(dl);
                 display_link_ctx = Some(ctx);
             } else {
@@ -453,6 +496,7 @@ impl NativePill {
             shared,
             display_link,
             display_link_ctx,
+            link_running: std::cell::Cell::new(false),
             action_rx,
             window_num,
         })
@@ -469,10 +513,11 @@ impl NativePill {
             return;
         };
         let screens = crate::screens::current();
-        let Some(origin) = panel_origin(&screens, Some(point)) else {
+        let Some(screen) = panel_screen(&screens, Some(point)) else {
             return;
         };
-        let Ok(mut st) = self.shared.state.lock() else {
+        let origin = panel_origin(screen);
+        let (Ok(mut st), Ok(main)) = (self.shared.render.lock(), self.shared.main.lock()) else {
             return;
         };
         if (st.screen_origin_top_left[0] - origin[0]).abs() < 0.5
@@ -481,7 +526,7 @@ impl NativePill {
             return;
         }
         st.screen_origin_top_left = origin;
-        st.window
+        main.window
             .setFrame_display(panel_appkit_rect(mtm, origin), true);
         // On a 1x screen AppKit resets the layer's contentsScale; keep the scale it's drawn at.
         let scale = st.pipelines.scale;
@@ -491,18 +536,43 @@ impl NativePill {
             f64::from(PANEL_H * scale),
         ));
         st.dirty = true;
+        if let Some(ref dl) = self.display_link
+            && dl.get_current_cg_display() != screen.id
+        {
+            let _ = dl.set_current_cg_display(screen.id);
+            // The new display's refreshes are on another timeline.
+            st.last_out = None;
+        }
     }
 
-    /// Synchronizes coordinator state into the native pill model; the next `CVDisplayLink` tick
-    /// advances springs and renders on the display refresh cadence (with main-loop fallback if
-    /// `CVDisplayLink` is paused).
+    /// Synchronizes coordinator state into the native pill model and polls the pointer. Frames
+    /// are drawn by the display link (on its own thread, or for the glass style on the main
+    /// thread), each sampled at the refresh it will be shown on.
     pub fn sync(&self, snapshot: PillSnapshot) {
-        let mut needs_fallback_tick = self.display_link.is_none();
-        if let Ok(mut st) = self.shared.state.lock() {
+        let Some(_mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let mut became_visible = false;
+        let hidden;
+        {
+            let (Ok(mut st), Ok(mut main)) = (self.shared.render.lock(), self.shared.main.lock())
+            else {
+                return;
+            };
             if st.style != snapshot.style {
                 st.style = snapshot.style;
                 st.dirty = true;
+                let main_draws = st.use_glass();
+                st.pipelines
+                    .layer
+                    .set_presents_with_transaction(main_draws || present_mode() == PresentMode::Transaction);
+                self.shared.main_draws.store(main_draws, Ordering::Release);
+                if !main_draws && let Some(ref gv) = main.glass_view {
+                    gv.setHidden(true);
+                }
             }
+            st.time_scale = motion::time_scale();
+            self.shared.low_power.store(low_power_mode(), Ordering::Relaxed);
             st.model.reduced = snapshot.reduced_motion;
             st.model.set_opts(motion::tune().pill_opts());
             if st.model.clock != snapshot.clock {
@@ -522,16 +592,33 @@ impl NativePill {
                 st.model.set_pres(snapshot.pres);
                 st.dirty = true;
                 if was_hidden {
-                    st.window.setLevel(NSStatusWindowLevel + 5);
-                    st.window.orderFrontRegardless();
+                    main.window.setLevel(NSStatusWindowLevel + 5);
+                    main.window.orderFrontRegardless();
+                    became_visible = true;
                 }
             }
-            if (motion::now() - st.last_tick_now) >= f64::from(0.045 * motion::time_scale()) {
-                needs_fallback_tick = true;
-            }
+            main.poll_pointer_and_input(&mut st);
+            hidden = st.model.is_fully_hidden();
         }
-        if needs_fallback_tick {
-            self.shared.tick_main();
+        // Start and stop the link without holding the lock its callback takes.
+        match &self.display_link {
+            Some(dl) if hidden && self.link_running.get() => {
+                let _ = dl.stop();
+                self.link_running.set(false);
+            }
+            Some(dl) if !hidden && !self.link_running.get() => {
+                if let Ok(mut st) = self.shared.render.lock() {
+                    st.last_out = None;
+                }
+                let _ = dl.start();
+                self.link_running.set(true);
+            }
+            Some(_) => {}
+            None => {
+                if !hidden || became_visible {
+                    self.shared.draw_main(pacing::host_now());
+                }
+            }
         }
     }
 
@@ -541,16 +628,16 @@ impl NativePill {
 
     pub fn is_fully_hidden(&self) -> bool {
         self.shared
-            .state
+            .render
             .lock()
             .map_or(true, |st| st.model.is_fully_hidden())
     }
 
     pub fn pointer_on_pill(&self) -> bool {
         self.shared
-            .state
+            .main
             .lock()
-            .map_or(false, |st| !st.ignores_mouse)
+            .map_or(false, |main| !main.ignores_mouse)
     }
 }
 
@@ -560,9 +647,9 @@ impl Drop for NativePill {
         if let Some(ref dl) = self.display_link {
             let _ = dl.stop();
         }
-        if let Ok(st) = self.shared.state.lock() {
-            st.window.orderOut(None);
-            st.window.close();
+        if let Ok(main) = self.shared.main.lock() {
+            main.window.orderOut(None);
+            main.window.close();
         }
         if let Some(ctx) = self.display_link_ctx {
             unsafe { drop(Arc::from_raw(ctx)) };
@@ -570,17 +657,25 @@ impl Drop for NativePill {
     }
 }
 
-/// The panel's top-left (global points) on the screen holding `point`, else the primary one.
-fn panel_origin(screens: &[crate::screens::Screen], point: Option<[f64; 2]>) -> Option<[f32; 2]> {
+/// The screen holding `point` (global points), else the primary one.
+fn panel_screen(
+    screens: &[crate::screens::Screen],
+    point: Option<[f64; 2]>,
+) -> Option<&crate::screens::Screen> {
     let index = point
         .and_then(|p| crate::screens::index_at(screens, p))
         .or(if screens.is_empty() { None } else { Some(0) })?;
+    screens.get(index)
+}
+
+/// The panel's top-left (global points) on `screen`.
+fn panel_origin(screen: &crate::screens::Screen) -> [f32; 2] {
     let [x, y] = crate::screens::pill_origin(
-        &screens[index],
+        screen,
         f64::from(PANEL_W),
         f64::from(model::PANEL_Y),
     );
-    Some([x as f32, y as f32])
+    [x as f32, y as f32]
 }
 
 /// The panel's AppKit frame for a top-left origin in global points.
@@ -635,6 +730,8 @@ fn create_glass_views(root_view: &NSView, bounds: NSRect) -> Option<Retained<NSV
 }
 
 /// Logs when the drawable reaches the screen (`SCRAWL_PILL_PACING`).
+/// Logs when the drawable reaches the screen (`SCRAWL_PILL_PACING`); a frame replaced before
+/// it was shown reports 0.
 fn watch_presented(drawable: &metal::MetalDrawableRef, n: u64) {
     let block = block2::RcBlock::new(move |d: *mut AnyObject| {
         let at: f64 = unsafe { msg_send![d, presentedTime] };
@@ -646,6 +743,54 @@ fn watch_presented(drawable: &metal::MetalDrawableRef, n: u64) {
     }
 }
 
+/// How a frame drawn off the main thread reaches the screen (`SCRAWL_PILL_PRESENT`, for
+/// measuring): `transaction` (the default) presents inside an explicit `CATransaction`, as the
+/// main thread does, `at` schedules it for its refresh, `asap` as soon as the GPU is done.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PresentMode {
+    Transaction,
+    At,
+    Asap,
+}
+
+fn present_mode() -> PresentMode {
+    static MODE: std::sync::OnceLock<PresentMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("SCRAWL_PILL_PRESENT").as_deref() {
+        Ok("at") => PresentMode::At,
+        Ok("asap") => PresentMode::Asap,
+        _ => PresentMode::Transaction,
+    })
+}
+
+/// Presents `drawable` from the display link's thread for the refresh at `at` (host seconds).
+fn present_off_main(cmd: &metal::CommandBufferRef, drawable: &metal::MetalDrawableRef, at: f64) {
+    use metal::foreign_types::ForeignTypeRef;
+    let cmd_obj = cmd.as_ptr().cast::<AnyObject>();
+    let drawable_obj = drawable.as_ptr().cast::<AnyObject>();
+    match present_mode() {
+        PresentMode::Transaction => {
+            cmd.commit();
+            cmd.wait_until_scheduled();
+            CATransaction::begin();
+            CATransaction::setDisableActions(true);
+            drawable.present();
+            CATransaction::commit();
+        }
+        PresentMode::At => {
+            unsafe {
+                let _: () = msg_send![cmd_obj, presentDrawable: drawable_obj, atTime: at];
+            }
+            cmd.commit();
+        }
+        PresentMode::Asap => {
+            unsafe {
+                let _: () = msg_send![cmd_obj, presentDrawable: drawable_obj];
+            }
+            cmd.commit();
+        }
+    }
+}
+
 extern "C" fn pill_display_link_cb(
     _display_link: CVDisplayLinkRef,
     now: *const CVTimeStamp,
@@ -654,31 +799,40 @@ extern "C" fn pill_display_link_cb(
     _flags_out: *mut CVOptionFlags,
     context: *mut c_void,
 ) -> CVReturn {
-    if !context.is_null() {
-        let shared = unsafe { &*context.cast::<SharedNativePill>() };
-        shared.ticks.fetch_add(1, Ordering::Relaxed);
-        if let (Some(now), Some(out)) = unsafe { (now.as_ref(), output_time.as_ref()) } {
-            shared.link_now.store(pacing::host_seconds(now.hostTime).to_bits(), Ordering::Relaxed);
-            shared.link_out.store(pacing::host_seconds(out.hostTime).to_bits(), Ordering::Relaxed);
-            let period = if out.videoTimeScale > 0 {
-                out.videoRefreshPeriod as f64 / f64::from(out.videoTimeScale)
-            } else {
-                0.0
-            };
-            shared.link_period.store(period.to_bits(), Ordering::Relaxed);
-        }
-        if shared.alive.load(Ordering::Relaxed)
-            && !shared.tick_queued.swap(true, Ordering::AcqRel)
-        {
-            // Retain an Arc reference for the main-queue callback.
-            unsafe {
-                Arc::increment_strong_count(context.cast::<SharedNativePill>());
-                dispatch_async_f(
-                    &_dispatch_main_q,
-                    context,
-                    pill_main_queue_trampoline,
-                );
-            }
+    if context.is_null() {
+        return 0;
+    }
+    let shared = unsafe { &*context.cast::<SharedNativePill>() };
+    if !shared.alive.load(Ordering::Relaxed) {
+        return 0;
+    }
+    shared.ticks.fetch_add(1, Ordering::Relaxed);
+    let Some((now, out)) = (unsafe { now.as_ref().zip(output_time.as_ref()) }) else {
+        return 0;
+    };
+    let out_s = pacing::host_seconds(out.hostTime);
+    shared.link_now.store(pacing::host_seconds(now.hostTime).to_bits(), Ordering::Relaxed);
+    shared.link_out.store(out_s.to_bits(), Ordering::Relaxed);
+    let period = if out.videoTimeScale > 0 {
+        out.videoRefreshPeriod as f64 / f64::from(out.videoTimeScale)
+    } else {
+        0.0
+    };
+    shared.link_period.store(period.to_bits(), Ordering::Relaxed);
+    if !shared.draws_refresh(out_s, period) {
+        return 0;
+    }
+
+    if !shared.main_draws.load(Ordering::Acquire) {
+        // Drawn here, off the main thread, so a busy app can't delay or bunch frames.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            shared.draw(out_s, period, None);
+        }));
+    } else if !shared.tick_queued.swap(true, Ordering::AcqRel) {
+        // Retain an Arc reference for the main-queue callback.
+        unsafe {
+            Arc::increment_strong_count(context.cast::<SharedNativePill>());
+            dispatch_async_f(&_dispatch_main_q, context, pill_main_queue_trampoline);
         }
     }
     0
@@ -686,44 +840,76 @@ extern "C" fn pill_display_link_cb(
 
 extern "C" fn pill_main_queue_trampoline(context: *mut c_void) {
     let shared = unsafe { Arc::from_raw(context.cast::<SharedNativePill>()) };
-    if shared.alive.load(Ordering::Relaxed) {
+    if shared.alive.load(Ordering::Relaxed) && shared.main_draws.load(Ordering::Acquire) {
+        let out = f64::from_bits(shared.link_out.load(Ordering::Relaxed));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            shared.tick_main();
+            shared.draw_main(out);
         }));
     }
     shared.tick_queued.store(false, Ordering::Release);
 }
 
+/// `NSProcessInfo.lowPowerMode`.
+fn low_power_mode() -> bool {
+    let Some(cls) = AnyClass::get(c"NSProcessInfo") else {
+        return false;
+    };
+    unsafe {
+        let info: *mut AnyObject = msg_send![cls, processInfo];
+        !info.is_null() && msg_send![info, isLowPowerModeEnabled]
+    }
+}
+
+/// How many display link ticks the compositor takes per refresh: 2 for a 120 Hz link while Low
+/// Power Mode holds the compositor to 60 Hz, else 1.
+fn refresh_stride(period: f64, low_power: bool) -> i64 {
+    if !low_power || period <= 0.0 {
+        return 1;
+    }
+    ((1.0 / 60.0) / period).round().max(1.0) as i64
+}
+
 impl SharedNativePill {
-    fn tick_main(&self) {
+    /// Whether to draw for the refresh at `out`. When the compositor shows every `stride`th
+    /// tick, drawing every tick makes it pick one of two frames, sometimes the earlier and
+    /// sometimes the later, so the motion advances unevenly. Drawing every `stride`th tick, on
+    /// a fixed phase of the display's clock, gives every frame exactly one refresh.
+    fn draws_refresh(&self, out: f64, period: f64) -> bool {
+        let stride = refresh_stride(period, self.low_power.load(Ordering::Relaxed));
+        stride <= 1 || ((out / period).round() as i64).rem_euclid(stride) == 0
+    }
+
+    /// Draws on the main thread for the refresh at `out` (host seconds), moving the glass view
+    /// with it when the glass style is on.
+    fn draw_main(&self, out: f64) {
         if MainThreadMarker::new().is_none() {
             return;
         }
-        motion::poll_tune();
-        let Ok(mut st) = self.state.lock() else {
+        let Ok(main) = self.main.lock() else {
             return;
         };
+        let period = f64::from_bits(self.link_period.load(Ordering::Relaxed));
+        self.draw(out, period, Some(&main));
+    }
 
-        let live_style = PillStyle::current();
-        if st.style != live_style {
-            st.style = live_style;
-            st.dirty = true;
-        }
-
-        // Poll mouse cursor and button state for hover, press squish, click, and Paste drag.
-        st.poll_pointer_and_input();
-
-        let now = motion::now();
-        let raw_dt = (now - st.last_tick_now).max(0.0) as f32;
-        let min_dt = 0.008 * motion::time_scale();
-        if raw_dt < min_dt {
+    /// Advances the springs to the refresh at `out` (host seconds; `period` apart) and, when
+    /// anything moved, draws and presents that frame. Every step is the time between the
+    /// refreshes it's drawn for, so the motion moves the same amount each frame, and a refresh
+    /// that was missed is caught up rather than slowing the motion down.
+    fn draw(&self, out: f64, period: f64, main: Option<&MainState>) {
+        let Ok(mut st) = self.render.lock() else {
             return;
-        }
-        st.last_tick_now = now;
-        let dt = raw_dt.min(0.025 * motion::time_scale());
+        };
+        let step = match st.last_out {
+            Some(prev) if out <= prev + 1e-4 => return,
+            Some(prev) => out - prev,
+            None if period > 0.0 => period,
+            None => 1.0 / 60.0,
+        };
+        st.last_out = Some(out);
+        let dt = step as f32 * st.time_scale;
 
-        let animating = !st.model.is_at_rest()
-            || matches!(st.model.pres, Pres::Processing);
+        let animating = !st.model.is_at_rest() || matches!(st.model.pres, Pres::Processing);
         if !animating && !st.dirty {
             if motion::tracing() && !st.model.is_fully_hidden() {
                 let frame = st.model.frame();
@@ -733,10 +919,7 @@ impl SharedNativePill {
         }
 
         let start = pacing::host_now();
-        st.model.set_opts(motion::tune().pill_opts());
-        if dt > 0.0 {
-            st.model.advance(dt);
-        }
+        st.model.advance(dt);
         st.dirty = false;
 
         let frame = st.model.frame();
@@ -744,30 +927,31 @@ impl SharedNativePill {
             st.emit_trace(&frame);
         }
         let n = if pacing::enabled() { pacing::next_frame() } else { 0 };
-        st.render_frame(&frame, n);
+        let glass = main.and_then(|m| m.glass_view.as_deref()).filter(|_| st.use_glass());
+        st.render_frame(&frame, glass, out, n);
         if n > 0 {
             let bits = |a: &AtomicU64| f64::from_bits(a.load(Ordering::Relaxed));
             pacing::frame(&pacing::Frame {
                 n,
                 tick: self.ticks.load(Ordering::Relaxed),
                 link_now: bits(&self.link_now),
-                link_out: bits(&self.link_out),
-                period: bits(&self.link_period),
+                link_out: out,
+                period,
                 start,
                 end: pacing::host_now(),
                 model_t: st.model.t,
                 dt,
                 l: st.model.l.x,
                 r: st.model.r.x,
-                main: true,
+                main: main.is_some(),
             });
         }
     }
 }
 
-impl PillRuntimeState {
-    fn poll_pointer_and_input(&mut self) {
-        if self.model.is_fully_hidden() {
+impl MainState {
+    fn poll_pointer_and_input(&mut self, st: &mut RenderState) {
+        if st.model.is_fully_hidden() {
             if !self.ignores_mouse {
                 self.ignores_mouse = true;
                 self.window.setIgnoresMouseEvents(true);
@@ -786,27 +970,27 @@ impl PillRuntimeState {
         let local_x = (mouse_ns.x - win_frame.origin.x) as f32;
         let local_y = (win_frame.size.height - (mouse_ns.y - win_frame.origin.y)) as f32;
         let screen_pt = [
-            self.screen_origin_top_left[0] + local_x,
-            self.screen_origin_top_left[1] + local_y,
+            st.screen_origin_top_left[0] + local_x,
+            st.screen_origin_top_left[1] + local_y,
         ];
 
-        let inside_island = self.model.hit_island(local_x, local_y);
+        let inside_island = st.model.hit_island(local_x, local_y);
         let should_ignore = !inside_island && self.press_down_elem.is_none();
         if self.ignores_mouse != should_ignore {
             self.ignores_mouse = should_ignore;
             self.window.setIgnoresMouseEvents(should_ignore);
         }
 
-        let prev_hover = self.model.hovered;
-        let prev_press = self.model.pressed;
+        let prev_hover = st.model.hovered;
+        let prev_press = st.model.pressed;
         let pos_opt = inside_island.then_some([local_x, local_y]);
-        self.model.set_pointer(pos_opt, mouse_down);
-        if self.model.hovered != prev_hover || self.model.pressed != prev_press {
-            self.dirty = true;
+        st.model.set_pointer(pos_opt, mouse_down);
+        if st.model.hovered != prev_hover || st.model.pressed != prev_press {
+            st.dirty = true;
         }
 
         if mouse_down && !self.was_mouse_down {
-            let hit = pos_opt.and_then(|[x, y]| self.model.hit_element(x, y));
+            let hit = pos_opt.and_then(|[x, y]| st.model.hit_element(x, y));
             self.press_down_elem = hit;
             if hit == Some(ElemId::Paste) {
                 self.paste_drag_start_screen = Some(screen_pt);
@@ -815,7 +999,7 @@ impl PillRuntimeState {
             }
         } else if !mouse_down && self.was_mouse_down {
             if let Some(down_elem) = self.press_down_elem.take() {
-                let up_elem = pos_opt.and_then(|[x, y]| self.model.hit_element(x, y));
+                let up_elem = pos_opt.and_then(|[x, y]| st.model.hit_element(x, y));
                 if down_elem == ElemId::Paste {
                     if up_elem == Some(ElemId::Paste) {
                         let _ = self.action_tx.try_send(PillAction::Paste(None));
@@ -826,7 +1010,7 @@ impl PillRuntimeState {
                         }
                     }
                 } else if up_elem == Some(down_elem) {
-                    self.dispatch_click(down_elem);
+                    self.dispatch_click(&st.model, down_elem);
                 }
             }
             self.paste_drag_start_screen = None;
@@ -834,8 +1018,8 @@ impl PillRuntimeState {
         self.was_mouse_down = mouse_down;
     }
 
-    fn dispatch_click(&self, elem: ElemId) {
-        let is_selecting = matches!(self.model.pres, Pres::Selecting { .. });
+    fn dispatch_click(&self, model: &PillModel, elem: ElemId) {
+        let is_selecting = matches!(model.pres, Pres::Selecting { .. });
         let action = match elem {
             ElemId::ChipArea => {
                 if is_selecting {
@@ -870,7 +1054,7 @@ impl PillRuntimeState {
             ElemId::Cancel => PillAction::Cancel,
             ElemId::Finish => PillAction::Finish,
             ElemId::Close => {
-                if matches!(self.model.pres, Pres::Completed { .. }) {
+                if matches!(model.pres, Pres::Completed { .. }) {
                     PillAction::DismissCompleted
                 } else {
                     PillAction::Cancel
@@ -882,7 +1066,9 @@ impl PillRuntimeState {
         };
         let _ = self.action_tx.try_send(action);
     }
+}
 
+impl RenderState {
     fn emit_trace(&self, frame: &FrameState) {
         motion::trace_frame();
         let [ox, oy] = self.screen_origin_top_left;
@@ -924,8 +1110,14 @@ impl PillRuntimeState {
         }
     }
 
-    fn render_frame(&mut self, frame: &FrameState, n: u64) {
-        let use_glass = self.style == PillStyle::Glass && self.glass_view.is_some();
+    fn render_frame(
+        &mut self,
+        frame: &FrameState,
+        glass: Option<&NSView>,
+        out: f64,
+        n: u64,
+    ) {
+        let use_glass = self.use_glass();
 
         let mut prims: Vec<TilePrim> = Vec::with_capacity(frame.elems.len() * 3);
         let mut blur_boxes: Vec<BlurBox> = Vec::with_capacity(frame.elems.len());
@@ -1146,41 +1338,46 @@ impl PillRuntimeState {
             enc.end_encoding();
         }
 
+        let Some(gv) = glass else {
+            // Off the main thread: no transaction, presented on the refresh it was sampled for.
+            if n > 0 {
+                watch_presented(drawable, n);
+            }
+            present_off_main(cmd, drawable, out);
+            return;
+        };
         // Synchronize `NSGlassEffectView` geometry and Metal drawable presentation in one CATransaction.
         CATransaction::begin();
         CATransaction::setDisableActions(true);
-        if let Some(ref gv) = self.glass_view {
-            if use_glass && frame.shape.alpha > 0.005 {
-                gv.setHidden(false);
-                let gx = f64::from(frame.shape.l);
-                let gy = f64::from(PANEL_H - frame.shape.b);
-                let gw = f64::from(frame.shape.width());
-                let gh = f64::from(frame.shape.height());
-                gv.setFrame(NSRect::new(NSPoint::new(gx, gy), NSSize::new(gw, gh)));
-                gv.setAlphaValue(f64::from(frame.shape.alpha));
-                unsafe {
-                    if msg_send![&**gv, respondsToSelector: sel!(setCornerRadius:)] {
-                        let _: () =
-                            msg_send![&**gv, setCornerRadius: f64::from(frame.shape.radius)];
-                    }
-                    if msg_send![&**gv, respondsToSelector: sel!(setTintColor:)] {
-                        let tint = if frame.is_completed {
-                            NSColor::colorWithSRGBRed_green_blue_alpha(0.04, 0.14, 0.09, 0.28)
-                        } else {
-                            NSColor::colorWithSRGBRed_green_blue_alpha(0.06, 0.07, 0.10, 0.22)
-                        };
-                        let _: () = msg_send![&**gv, setTintColor: Some(&*tint)];
-                    }
+        if frame.shape.alpha > 0.005 {
+            gv.setHidden(false);
+            let gx = f64::from(frame.shape.l);
+            let gy = f64::from(PANEL_H - frame.shape.b);
+            let gw = f64::from(frame.shape.width());
+            let gh = f64::from(frame.shape.height());
+            gv.setFrame(NSRect::new(NSPoint::new(gx, gy), NSSize::new(gw, gh)));
+            gv.setAlphaValue(f64::from(frame.shape.alpha));
+            unsafe {
+                if msg_send![gv, respondsToSelector: sel!(setCornerRadius:)] {
+                    let _: () = msg_send![gv, setCornerRadius: f64::from(frame.shape.radius)];
                 }
-                gv.setNeedsLayout(true);
-                gv.layoutSubtreeIfNeeded();
-            } else {
-                gv.setHidden(true);
+                if msg_send![gv, respondsToSelector: sel!(setTintColor:)] {
+                    let tint = if frame.is_completed {
+                        NSColor::colorWithSRGBRed_green_blue_alpha(0.04, 0.14, 0.09, 0.28)
+                    } else {
+                        NSColor::colorWithSRGBRed_green_blue_alpha(0.06, 0.07, 0.10, 0.22)
+                    };
+                    let _: () = msg_send![gv, setTintColor: Some(&*tint)];
+                }
             }
+            gv.setNeedsLayout(true);
+            gv.layoutSubtreeIfNeeded();
+        } else {
+            gv.setHidden(true);
         }
         if n > 0 {
-            watch_presented(drawable, n);
-        }
+                watch_presented(drawable, n);
+            }
         cmd.commit();
         cmd.wait_until_scheduled();
         drawable.present();
@@ -1235,7 +1432,7 @@ impl PillRuntimeState {
             text_at(sp, ox + (bw - sp.size_pt[0]) * 0.5 + TEXT_PAD_PT)
         };
 
-        let is_glass = self.style == PillStyle::Glass && self.glass_view.is_some();
+        let is_glass = self.use_glass();
 
         match elem.id {
             ElemId::ChipArea | ElemId::ChipWindow | ElemId::ChipScreen | ElemId::ChipIphone => {
