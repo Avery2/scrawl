@@ -72,6 +72,9 @@ impl Held {
 
 struct Reader {
     held: Mutex<Held>,
+    /// Keys and buttons that went down since the poller last looked (`take_held`): a click
+    /// can be over before the next poll.
+    pressed: Mutex<HashSet<u16>>,
 }
 
 static READER: OnceLock<Option<Reader>> = OnceLock::new();
@@ -173,6 +176,7 @@ pub fn start() -> bool {
                 .ok()?;
             Some(Reader {
                 held: Mutex::new(Held::default()),
+                pressed: Mutex::new(HashSet::new()),
             })
         })
         .is_some()
@@ -182,6 +186,24 @@ pub fn start() -> bool {
 /// has moved it since.
 pub fn absolute_pointer() -> Option<[f64; 2]> {
     held()?.absolute
+}
+
+/// What is held, counting what was pressed and let go since the last call, for the one poller.
+pub fn take_held() -> Option<Held> {
+    let reader = READER.get()?.as_ref()?;
+    let mut held = reader
+        .held
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    held.keys.extend(
+        reader
+            .pressed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(),
+    );
+    Some(held)
 }
 
 /// What is held, when the devices are being read.
@@ -238,6 +260,11 @@ fn read_loop(fds: Vec<OwnedFd>) {
                     (EV_KEY, _) if value != 2 => {
                         if value == 1 {
                             held.keys.insert(code);
+                            reader
+                                .pressed
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(code);
                         } else {
                             held.keys.remove(&code);
                         }

@@ -173,8 +173,17 @@ fn from_devices() -> bool {
 }
 
 fn held_now() -> Held {
+    held_from(input::held())
+}
+
+/// What the poller sees: like `held_now`, with presses too short to last until the next poll.
+fn held_polled() -> Held {
+    held_from(input::take_held())
+}
+
+fn held_from(devices: Option<input::Held>) -> Held {
     if linux::wayland_session()
-        && let Some(devices) = input::held()
+        && let Some(devices) = devices
     {
         return Held {
             mods: Modifiers {
@@ -967,7 +976,7 @@ fn run_key_poller(telemetry: Arc<SharedCaptureTelemetry>) {
             check_tap(&telemetry);
             last_tap_check = Instant::now();
         }
-        let held = held_now();
+        let held = held_polled();
         let mods = held.mods;
         if !mods.shift {
             await_shift_release = false;
