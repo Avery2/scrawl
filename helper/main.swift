@@ -16,6 +16,7 @@
 //   scrawl-helper permission-panel --permission P [--from X,Y,W,H]   drag-to-allow card (PermissionPanel.swift)
 //   scrawl-helper onboarding [--shortcut L] [--render DIR]   the welcome window (Onboarding.swift)
 //   scrawl-helper settings [--pane P] [--render DIR]         the Settings window (Settings.swift)
+//   scrawl-helper pill                                  the SwiftUI recording capsule, driven over stdin (Pill.swift)
 //
 // Every timestamp in the output is integer milliseconds. Scrawl drives the long-running
 // `mirror` command over stdin (`stop`, `cancel`) and reads its events from stdout.
@@ -161,11 +162,13 @@ case "onboarding":
   Onboarding.run(arguments: arguments)
 case "settings":
   SettingsWindow.run(arguments: arguments)
+case "pill":
+  PillWindow.run(arguments: arguments)
 case "qr":
   guard arguments.count >= 2, let qr = renderQR(arguments[1]) else {
     fail("qr needs a text argument")
   }
   emit(["qr": qr])
 default:
-  fail("usage: scrawl-helper devices|mirror|transcribe|transcribe-stream|speech-model|frames|audio|probe|export|shrink|permission-panel|permissions|sck-probe|onboarding|settings|qr …")
+  fail("usage: scrawl-helper devices|mirror|transcribe|transcribe-stream|speech-model|frames|audio|probe|export|shrink|permission-panel|permissions|sck-probe|onboarding|settings|pill|qr …")
 }

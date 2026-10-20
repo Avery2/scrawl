@@ -399,6 +399,9 @@ pub struct Config {
     /// Visual style of the native recording pill: `"black"` (default) or `"glass"` (`NSGlassEffectView`).
     #[serde(default)]
     pub pill_style: Option<String>,
+    /// Which native capsule draws: `"metal"` (default) or `"swiftui"` (`scrawl-helper pill`).
+    #[serde(default)]
+    pub pill_renderer: Option<String>,
     /// Behaviour Kit tries locally before it ships (`{"agentContext": true}`); see `experiment`.
     /// Read leniently (`lenient_experiments`), so a stray value never fails the file.
     #[serde(default, deserialize_with = "lenient_experiments")]
@@ -663,6 +666,22 @@ pub fn native_pill() -> bool {
         }
     }
     config().native_pill.unwrap_or(true)
+}
+
+/// Which native capsule draws (`SCRAWL_PILL_RENDERER` or `pillRenderer` in `config.json`,
+/// default Metal).
+pub fn pill_renderer() -> crate::native::pill::PillRenderer {
+    use crate::native::pill::PillRenderer;
+    if let Ok(val) = std::env::var("SCRAWL_PILL_RENDERER")
+        && let Some(renderer) = PillRenderer::from_str_opt(&val)
+    {
+        return renderer;
+    }
+    config()
+        .pill_renderer
+        .as_deref()
+        .and_then(PillRenderer::from_str_opt)
+        .unwrap_or_default()
 }
 
 /// Configured capsule style (`pillStyle` in `config.json`, default `"black"`).

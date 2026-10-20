@@ -7,7 +7,7 @@ pub mod model;
 #[path = "types.rs"]
 mod types;
 
-pub use self::types::{PillAction, PillSnapshot, PillStyle};
+pub use self::types::{PillAction, PillRenderer, PillSnapshot, PillStyle};
 
 pub struct NativePill;
 
