@@ -50,6 +50,35 @@ jobs:
       # transcribe.cpp builds against the DLL C runtime, so the Visual C++ runtime DLLs scrawl.exe
       # imports go beside it in the zip (app-local, as Microsoft allows): a fresh Windows has no
       # Visual C++ redistributable.
+      # A fresh runner has no Scrawl config, so the app opens the welcome window. Scrawl leaves its
+      # own windows out of screen captures unless SCRAWL_SHOW_OWN_WINDOWS is set.
+      - name: The welcome window opens on a fresh profile
+        shell: pwsh
+        env:
+          SCRAWL_SHOW_OWN_WINDOWS: "1"
+        run: |
+          $app = Start-Process -FilePath $env:EXE -ArgumentList "app" -PassThru
+          Start-Sleep -Seconds 12
+          if ($app.HasExited) { throw "Scrawl exited with code $($app.ExitCode)" }
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+          [System.Drawing.Graphics]::FromImage($bitmap).CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $bitmap.Save("dist\welcome.png")
+          Stop-Process -Id $app.Id -Force
+          $log = Join-Path $env:LOCALAPPDATA "Scrawl\Logs\scrawl.log"
+          if (Test-Path $log) { Get-Content $log -Tail 40 }
+          if ((Test-Path $log) -and (Select-String -Path $log -Pattern "onboarding: could not decode state" -Quiet)) {
+            throw "the welcome window rejected the onboarding state"
+          }
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: welcome-window
+          path: dist/welcome.png
+          if-no-files-found: warn
+
       - name: Collect the Visual C++ runtime DLLs
         shell: pwsh
         run: |
