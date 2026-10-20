@@ -709,42 +709,79 @@ fn draw_laser(frame: &mut RgbaFrame, stroke: &Stroke, time: u64) {
     }
 }
 
+const CLICK_BLUE: Color = [0, 136, 255, 255];
+
+/// Where a click landed, without hiding what's under it: a thin translucent ring with a hairline
+/// white edge (so it reads on dark and on blue) and a small centre dot. No fill.
 fn draw_click_ripple(frame: &mut RgbaFrame, p: [f32; 2], k: f32) {
-    circle(frame, p, 14.0 * k, [0, 136, 255, 68]);
-    ring(frame, p, 15.0 * k, 1.75 * k, WHITE);
-    ring(frame, p, 17.5 * k, 1.75 * k, [0, 136, 255, 235]);
+    let r = 9.0 * k;
+    ring(frame, p, r + 1.1 * k, 0.9 * k, opacity(WHITE, 0.4));
+    ring(frame, p, r, 1.3 * k, opacity(CLICK_BLUE, 0.8));
+    circle(frame, p, 2.0 * k, opacity(WHITE, 0.5));
+    circle(frame, p, 1.3 * k, opacity(CLICK_BLUE, 0.9));
 }
 
-/// A finger's path: a haloed blue line from a small start dot to a ring where it lifted.
+/// A finger's path: a thin translucent blue line from a small dot to a slightly larger one where
+/// it lifted (a tap's ring there, when the keyframe has one, stays the only ring).
 fn draw_touch_trail(frame: &mut RgbaFrame, points: &[[f32; 2]], k: f32) {
     let (Some(&start), Some(&end)) = (points.first(), points.last()) else {
         return;
     };
-    for pair in points.windows(2) {
-        line(
-            frame,
-            pair[0],
-            pair[1],
-            4.5 * k,
-            4.5 * k,
-            [255, 255, 255, 150],
-        );
+    polyline(frame, points, 1.5 * k, opacity(WHITE, 0.22));
+    polyline(frame, points, 0.8 * k, opacity(CLICK_BLUE, 0.7));
+    for (point, r) in [(start, 1.3 * k), (end, 2.2 * k)] {
+        circle(frame, point, r + 0.7 * k, opacity(WHITE, 0.5));
+        circle(frame, point, r, opacity(CLICK_BLUE, 0.9));
     }
-    for pair in points.windows(2) {
-        line(
-            frame,
-            pair[0],
-            pair[1],
-            2.6 * k,
-            2.6 * k,
-            [0, 136, 255, 230],
-        );
+}
+
+/// A round-capped polyline of half-width `radius`, blended once per pixel so a translucent line
+/// doesn't darken where its segments meet.
+fn polyline(frame: &mut RgbaFrame, points: &[[f32; 2]], radius: f32, color: Color) {
+    if points.is_empty() || points.iter().flatten().any(|v| !v.is_finite()) {
+        return;
     }
-    circle(frame, start, 5.0 * k, WHITE);
-    circle(frame, start, 3.5 * k, [0, 136, 255, 255]);
-    circle(frame, end, 12.0 * k, [0, 136, 255, 60]);
-    ring(frame, end, 13.0 * k, 1.75 * k, WHITE);
-    ring(frame, end, 15.5 * k, 1.75 * k, [0, 136, 255, 235]);
+    let reach = radius + 1.0;
+    let (mut lo, mut hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+    for p in points {
+        for i in 0..2 {
+            lo[i] = lo[i].min(p[i] - reach);
+            hi[i] = hi[i].max(p[i] + reach);
+        }
+    }
+    let x0 = (lo[0].floor() as i32).max(0);
+    let x1 = (hi[0].ceil() as i32).min(frame.width as i32);
+    let y0 = (lo[1].floor() as i32).max(0);
+    let y1 = (hi[1].ceil() as i32).min(frame.height as i32);
+    let segments: Vec<([f32; 2], [f32; 2])> = if points.len() == 1 {
+        vec![(points[0], points[0])]
+    } else {
+        points.windows(2).map(|w| (w[0], w[1])).collect()
+    };
+    for py in y0..y1 {
+        let y = py as f32 + 0.5;
+        for px in x0..x1 {
+            let x = px as f32 + 0.5;
+            let mut d = f32::INFINITY;
+            for &(a, b) in &segments {
+                if x < a[0].min(b[0]) - reach
+                    || x > a[0].max(b[0]) + reach
+                    || y < a[1].min(b[1]) - reach
+                    || y > a[1].max(b[1]) + reach
+                {
+                    continue;
+                }
+                let ab = [b[0] - a[0], b[1] - a[1]];
+                let len2 = (ab[0] * ab[0] + ab[1] * ab[1]).max(1e-6);
+                let t = (((x - a[0]) * ab[0] + (y - a[1]) * ab[1]) / len2).clamp(0.0, 1.0);
+                d = d.min((x - a[0] - ab[0] * t).hypot(y - a[1] - ab[1] * t));
+            }
+            let coverage = (radius + 0.5 - d).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                blend(frame, px, py, color, coverage);
+            }
+        }
+    }
 }
 
 pub fn render_contact_sheet(
@@ -1995,6 +2032,41 @@ mod tests {
         later.t = 6000;
         let stale = render_annotated_keyframe(&base, &later, &[], &[], &[swipe]);
         assert_eq!(blue(&stale), 0, "an old swipe should not be drawn");
+    }
+
+    /// A click is marked by a thin ring and a small dot: what was clicked stays visible.
+    #[test]
+    fn click_marks_leave_what_they_mark_visible() {
+        let base = solid(1280, 800, [240, 240, 240, 255]);
+        let mut keyframe = key(1);
+        keyframe.reason = KeyframeReason::Click;
+        keyframe.cursor = Some([0.5, 0.5]);
+        let after = render_annotated_keyframe(&base, &keyframe, &[], &[], &[]);
+        let changed: Vec<(usize, usize)> = (0..800)
+            .flat_map(|y| (0..1280).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let i = (y * 1280 + x) * 4;
+                after.rgba[i..i + 4] != base.rgba[i..i + 4]
+            })
+            .filter(|&(x, y)| x > 600 && x < 680 && y > 360 && y < 440)
+            .collect();
+        assert!(!changed.is_empty(), "click mark missing");
+        // A quarter of the filled 18 px disc it replaces, and the band between dot and ring is
+        // left alone.
+        assert!(changed.len() < 260, "{} px painted", changed.len());
+        for (x, y) in [(645, 400), (640, 395), (636, 400)] {
+            let i = (y * 1280 + x) * 4;
+            assert_eq!(
+                after.rgba[i..i + 4],
+                base.rgba[i..i + 4],
+                "({x}, {y}) covered"
+            );
+        }
+        // Nothing is opaque: the screen shows through every pixel of the mark.
+        for (x, y) in changed {
+            let i = (y * 1280 + x) * 4;
+            assert!(after.rgba[i] > 20, "({x}, {y}) hides the screen");
+        }
     }
 
     #[test]

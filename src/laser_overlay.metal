@@ -33,10 +33,11 @@ struct PathSegment {
     float width;
 };
 
+// A pin's brief live pulse: a thin ring at `radius`, `alpha` opaque.
 struct PinMarker {
     float2 pos;
     float radius;
-    float _pad;
+    float alpha;
 };
 
 struct VertexOutput {
@@ -73,7 +74,6 @@ fragment float4 laser_fragment(
     float laser_core_cov = 0.0;
     float laser_body_cov = 0.0;
     float laser_glow_cov = 0.0;
-    float ink_halo_cov = 0.0;
     float ink_red_cov = 0.0;
 
     uint tile_count = u.tile_cols * u.tile_rows;
@@ -115,16 +115,14 @@ fragment float4 laser_fragment(
         }
     }
 
-    // Pin markers
+    // Pin pulses: a 1.5 pt ring, no fill, so nothing under it is hidden.
     uint pcount = min(u.pin_count, 64u);
     for (uint i = 0; i < pcount; ++i) {
         PinMarker pin = pins[i];
-        float d = length(p - pin.pos);
-        if (d < pin.radius + 3.5) {
-            float halo = smoothstep(pin.radius + 2.0, pin.radius + 0.8, d);
-            float fill = smoothstep(pin.radius + 0.75, pin.radius - 0.75, d);
-            ink_halo_cov = max(ink_halo_cov, halo);
-            ink_red_cov = max(ink_red_cov, fill);
+        float off = abs(length(p - pin.pos) - pin.radius);
+        if (off < 2.0) {
+            float ring = smoothstep(1.25, 0.25, off) * pin.alpha;
+            ink_red_cov = max(ink_red_cov, ring);
         }
     }
 
@@ -211,12 +209,7 @@ fragment float4 laser_fragment(
         out.a = 0.32 * intro_fade;
     }
 
-    // 1. Composite persistent ink (white halo + red fill)
-    if (ink_halo_cov > 0.001) {
-        float a = ink_halo_cov * 0.82;
-        out.rgb = float3(1.0) * a + out.rgb * (1.0 - a);
-        out.a = a + out.a * (1.0 - a);
-    }
+    // 1. Composite ink (red fill)
     if (ink_red_cov > 0.001) {
         float3 ink_col = float3(1.0, 0.23, 0.19);
         float a = ink_red_cov;

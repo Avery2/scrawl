@@ -209,7 +209,7 @@ Preview every pane, dark and light, with the recorder listening and a combinatio
 - `⌥⇧V`: Paste both `contact-sheet.png` and `summary.md` into the active app or terminal (`⌃⌥⇧V` also works while it's the default)
 - **Normal pointer**: Clicks and scrolls pass straight through to the app underneath
 - **Hold `⇧` (Shift) + move**: Draw a persistent red marker stroke (`#ff3b30`) on screen that fades out after release
-- **`⇧`-click**: Drop a numbered pin where you click (a press that moves under 12 pt and lets go within 1 s; longer is ink)
+- **`⇧`-click**: Drop a numbered pin where you click (a press that moves under 12 pt and lets go within 1 s; longer is ink). It shows as a brief red pulse, not a lasting dot, and lands on the keyframes. A click after you've drawn in the same `⇧` hold is part of the drawing and drops no pin
 - **`⌘Z`**: Undo the last stroke
 - **`Esc`**: Cancel the active selection or capture
 

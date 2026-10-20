@@ -26,6 +26,9 @@ use crate::sketch::{slice_laser_window, smooth_ink_points, smooth_laser_points};
 const TAIL_DURATION_SEC: f32 = 0.42;
 const MAX_SEGMENTS: usize = 16_384;
 const MAX_PINS: usize = 64;
+/// A ⇧-click pin shows live only as a brief ring at the click, gone in this long; the pin itself
+/// stays data (keyframes, summary). Ordinary clicks draw nothing live.
+const PIN_PULSE_MS: u64 = 350;
 /// Side of a culling tile, in points. Each pixel runs only the segments binned into its tile.
 const TILE_PT: f32 = 32.0;
 /// How far a segment can colour a pixel, in points. They must stay at or past the shader's
@@ -71,7 +74,18 @@ struct PathSegment {
 struct PinMarker {
     pos: [f32; 2],
     radius: f32,
-    _pad: f32,
+    alpha: f32,
+}
+
+/// The live pulse for a pin dropped `age_ms` ago: a thin ring's radius (points) and opacity. It
+/// grows out fast and slows (ease-out cubic) while it fades to nothing.
+fn pin_pulse(age_ms: u64) -> Option<(f32, f32)> {
+    if age_ms >= PIN_PULSE_MS {
+        return None;
+    }
+    let p = age_ms as f32 / PIN_PULSE_MS as f32;
+    let grow = 1.0 - (1.0 - p).powi(3);
+    Some((4.0 + 10.0 * grow, 0.55 * (1.0 - p) * (1.0 - p)))
 }
 
 pub struct MetalLaserOverlay {
@@ -441,12 +455,13 @@ impl SharedMetalOverlay {
         for (stroke, is_live) in &strokes {
             if stroke.pin.is_some() {
                 if let Some([nx, ny]) = stroke.normalized_points().first().copied()
+                    && let Some((radius, alpha)) = pin_pulse(now_ms.saturating_sub(stroke.t1))
                     && pins.len() < MAX_PINS
                 {
                     pins.push(PinMarker {
                         pos: to_screen(nx, ny),
-                        radius: 11.5,
-                        _pad: 0.0,
+                        radius,
+                        alpha,
                     });
                 }
                 continue;
@@ -739,6 +754,18 @@ mod tests {
     /// `setFragmentBytes` aborts in the driver past 4 KB.
     const SET_BYTES_LIMIT: usize = 4096;
 
+    /// A pin pulses once and is gone: nothing click-related stays on screen while recording.
+    #[test]
+    fn a_pin_pulse_grows_fades_and_ends() {
+        let (r0, a0) = pin_pulse(0).unwrap();
+        let (r1, a1) = pin_pulse(PIN_PULSE_MS / 2).unwrap();
+        let (r2, a2) = pin_pulse(PIN_PULSE_MS - 1).unwrap();
+        assert!(r0 < r1 && r1 < r2 && r2 <= 14.0);
+        assert!(a0 > a1 && a1 > a2 && a2 < 0.01 && a0 <= 0.55);
+        assert_eq!(pin_pulse(PIN_PULSE_MS), None);
+        assert_eq!(pin_pulse(60_000), None);
+    }
+
     /// Uniforms and pins still go through `set_fragment_bytes`; segments don't fit and use a buffer.
     #[test]
     fn inline_fragment_bytes_fit_the_metal_limit() {
@@ -831,6 +858,111 @@ mod tests {
         let [b, g, r, a] = bgra(32, 32);
         assert!(a > 200 && r > 200 && g < 100 && b < 100, "stroke pixel {:?}", [b, g, r, a]);
         assert_eq!(bgra(32, 4)[3], 0, "nothing drawn away from the stroke");
+    }
+
+    /// The real shader draws a pin's pulse as a faint ring with nothing inside it, and draws
+    /// nothing once the pulse is over. `SCRAWL_PULSE_DUMP=dir` writes each moment as a PNG.
+    #[test]
+    fn a_pin_pulse_is_a_faint_ring_then_nothing() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let pipeline = overlay_pipeline(&device).expect("pipeline");
+        let (size, scale) = (80_u64, 2.0_f32);
+        let points = size as f32 / scale;
+        let render = |pin: PinMarker| {
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_width(size);
+            descriptor.set_height(size);
+            descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+            descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+            let texture = device.new_texture(&descriptor);
+            let uniforms = LaserUniforms {
+                resolution: [size as f32, size as f32],
+                scale,
+                now_sec: 1.0,
+                tail_duration: 1.0,
+                pin_count: u32::from(pin.radius > 0.0),
+                target_rect: [0.0, 0.0, points, points],
+                tile_cols: 1,
+                tile_rows: 1,
+                tile_size: TILE_PT,
+                ..Default::default()
+            };
+            let pass = RenderPassDescriptor::new();
+            let attachment = pass.color_attachments().object_at(0).unwrap();
+            attachment.set_texture(Some(&texture));
+            attachment.set_load_action(MTLLoadAction::Clear);
+            attachment.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0));
+            attachment.set_store_action(MTLStoreAction::Store);
+            let queue = device.new_command_queue();
+            let cmd = queue.new_command_buffer();
+            encode_overlay(
+                cmd,
+                pass,
+                &device,
+                &pipeline,
+                &uniforms,
+                &[PathSegment::default()],
+                &[pin],
+            );
+            cmd.commit();
+            cmd.wait_until_completed();
+            let mut pixels = vec![0u8; (size * size * 4) as usize];
+            texture.get_bytes(
+                pixels.as_mut_ptr().cast(),
+                size * 4,
+                metal::MTLRegion::new_2d(0, 0, size, size),
+                0,
+            );
+            pixels
+        };
+        let centre = points / 2.0;
+        let dump = std::env::var_os("SCRAWL_PULSE_DUMP").map(std::path::PathBuf::from);
+        for age in [0, 40, 90, 150, 220, 300, PIN_PULSE_MS] {
+            let pin = pin_pulse(age).map_or(PinMarker::default(), |(radius, alpha)| PinMarker {
+                pos: [centre, centre],
+                radius,
+                alpha,
+            });
+            let pixels = render(pin);
+            let max_alpha = pixels.chunks_exact(4).map(|p| p[3]).max().unwrap_or(0);
+            let mid = ((size / 2 * size + size / 2) * 4 + 3) as usize;
+            if age >= PIN_PULSE_MS {
+                assert_eq!(max_alpha, 0, "pulse still showing at {age} ms");
+            } else {
+                assert!(max_alpha > 0, "no pulse at {age} ms");
+                assert!(
+                    max_alpha <= 141,
+                    "pulse too strong at {age} ms: {max_alpha}"
+                );
+                if pin.radius > 2.0 {
+                    assert_eq!(pixels[mid], 0, "pulse fills its centre at {age} ms");
+                }
+            }
+            if let Some(dir) = &dump {
+                let straight = |c: u8, a: u8| (u32::from(c) * 255 / u32::from(a.max(1))) as u8;
+                let rgba: Vec<u8> = pixels
+                    .chunks_exact(4)
+                    .flat_map(|p| {
+                        [
+                            straight(p[2], p[3]),
+                            straight(p[1], p[3]),
+                            straight(p[0], p[3]),
+                            p[3],
+                        ]
+                    })
+                    .collect();
+                let frame = crate::model::RgbaFrame::new(0, size as u32, size as u32, rgba);
+                std::fs::create_dir_all(dir).unwrap();
+                std::fs::write(
+                    dir.join(format!("pulse-{age:03}ms.png")),
+                    crate::render::encode_png(&frame).unwrap(),
+                )
+                .unwrap();
+            }
+        }
     }
 
     /// Tiles only skip work: the frame matches one where every pixel runs every segment, as
