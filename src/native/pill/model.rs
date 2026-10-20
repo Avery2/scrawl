@@ -23,10 +23,15 @@ use crate::ui::SelectionMode;
 // ─── Geometry (pt in the fixed 640 × 84 panel) ──────────────────────────────────────────────
 
 pub const PANEL_W: f32 = 640.0;
-pub const PANEL_H: f32 = 84.0;
+/// Tall enough for the capsule's drop shadow to fade out inside it (`SHADOW_REACH`, `SHADOW_DROP`).
+pub const PANEL_H: f32 = 92.0;
 pub const PANEL_Y: f32 = 34.0;
 /// How far outside the drawn outline the capsule still takes the pointer (points).
 pub const HIT_SLOP: f32 = 4.0;
+/// How far the shader's drop shadow reaches past the outline, and how far down it's offset
+/// (`pill.metal`), so the fixed panel can hold it.
+pub const SHADOW_REACH: f32 = 22.0;
+pub const SHADOW_DROP: f32 = 4.0;
 pub const CX: f32 = PANEL_W * 0.5;
 /// Top edge of the resting 40 pt capsule inside the 84 pt panel (vertical centre y = 42, screen y = 76).
 pub const TOP: f32 = 22.0;
@@ -2045,6 +2050,19 @@ mod tests {
     }
 
     fn assert_frame_room_invariants(model: &PillModel, f: &FrameState) {
+        // The panel never moves or resizes, so every frame, shadow included, is drawn inside it.
+        let sh = &f.shape;
+        if sh.alpha > 0.01 && sh.width() > 0.5 {
+            assert!(
+                sh.l - SHADOW_REACH >= 0.0
+                    && sh.r + SHADOW_REACH <= PANEL_W
+                    && sh.t - SHADOW_REACH + SHADOW_DROP >= 0.0
+                    && sh.b + SHADOW_REACH + SHADOW_DROP <= PANEL_H,
+                "outline {:?} (with its shadow) leaves the {PANEL_W}x{PANEL_H} panel in {:?}",
+                [sh.l, sh.t, sh.r, sh.b],
+                model.pres
+            );
+        }
         assert!(f.shape.l.is_finite() && f.shape.r.is_finite() && f.shape.b.is_finite());
         // Outline never bounces upward above TOP.
         assert!(

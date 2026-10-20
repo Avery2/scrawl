@@ -1,6 +1,6 @@
 //! Native AppKit `NSPanel` + `CAMetalLayer` + Metal renderer for the Scrawl recording pill.
 //!
-//! Replaces the GPUI `HudPillWindow` with a single fixed-size `NSPanel` (`640 × 84 pt` at `y = 34`
+//! Replaces the GPUI `HudPillWindow` with a single fixed-size `NSPanel` (`640 × 92 pt` at `y = 34`
 //! below the menu bar) that never resizes or moves during morphs. Supports two backdrop looks via
 //! `pillStyle: "black" | "glass"`:
 //! - `"black"`: Analytic SDF rounded-rect silhouette + shadow + specular border in Metal.
