@@ -313,6 +313,15 @@ enum PillColor {
   static let accent = Color(red: 0.231, green: 0.361, blue: 0.965)
   static let accentHover = Color(red: 0.294, green: 0.420, blue: 1.0)
   static let smoke = Color(red: 0.06, green: 0.07, blue: 0.10)
+  /// The black capsule's hairline: lit from above, fading down the sides.
+  static let rim = LinearGradient(
+    stops: [
+      .init(color: .white.opacity(0.15), location: 0),
+      .init(color: .white.opacity(0.07), location: 0.45),
+      .init(color: .white.opacity(0.04), location: 1),
+    ],
+    startPoint: .top, endPoint: .bottom
+  )
 }
 
 /// A value SwiftUI interpolates on its own, so two of them can follow different springs.
@@ -380,24 +389,25 @@ struct PillRoot: View {
           .glassEffect(.regular.tint(PillColor.smoke.opacity(0.22)), in: Capsule())
           .overlay(Capsule().strokeBorder(PillColor.green.opacity(completed ? 0.42 : 0), lineWidth: 1))
       } else {
-        // Each morph kicks `energy` to 1 and lets it settle with the shape: the rim lights up
-        // and the walls get a touch of motion blur, both in Metal on the shape's own pixels.
+        // The rim is a plain gradient hairline (crisp at any size, lit from above); a morph
+        // kicks `energy` to 1 and lets it settle with the shape, a soft glow inside the edge.
         let settle = max(model.morphDuration, 0.2)
         capsule
           .foregroundStyle(PillColor.shell.opacity(0.96))
           .keyframeAnimator(initialValue: 0.0, trigger: model.morphs) { view, energy in
             view.visualEffect { content, proxy in
-              content
-                .colorEffect(PillShaders.rim(size: proxy.size, energy: energy, completed: completed))
-                .layerEffect(
-                  PillShaders.morphBlur(radius: 0.5 * energy),
-                  maxSampleOffset: CGSize(width: 1.5, height: 0),
-                  isEnabled: energy > 0.01
-                )
+              content.colorEffect(PillShaders.edgeGlow(size: proxy.size, energy: energy))
             }
           } keyframes: { _ in
             LinearKeyframe(1.0, duration: 0.05)
             SpringKeyframe(0.0, duration: settle, spring: Spring(duration: settle, bounce: 0))
+          }
+          .overlay {
+            ZStack {
+              Capsule().strokeBorder(PillColor.rim, lineWidth: 0.5)
+              Capsule().strokeBorder(PillColor.green.opacity(0.5), lineWidth: 0.75)
+                .opacity(completed ? 1 : 0)
+            }
           }
           .shadow(color: .black.opacity(0.28), radius: 9, y: 4)
       }
@@ -566,7 +576,7 @@ struct PillItemView: View {
   private var lead: some View {
     ZStack(alignment: .leading) {
       if model.glass { smoke(0.24) }
-      RecordingDot().frame(width: 32, height: 32)
+      RecordingDot(reduced: model.reduced).frame(width: 32, height: 32)
       Text(model.clock)
         .font(.system(size: 13, weight: .semibold).monospacedDigit())
         .foregroundStyle(PillColor.text)
@@ -608,22 +618,19 @@ struct PillItemView: View {
 /// The red dot breathes and sends out a ripple every 1.6 s: repeating animations whose values
 /// drive a Metal shader (core, glow, ring).
 struct RecordingDot: View {
-  @State private var ripple = 0.0
-  @State private var breath = 0.0
+  var reduced = false
 
   var body: some View {
-    Animated(value: ripple) { r in
-      Animated(value: breath) { b in
-        Rectangle()
-          .fill(.white)
-          .colorEffect(PillShaders.dot(size: CGSize(width: 32, height: 32), breath: b, ripple: r))
-      }
+    // Read off the animation clock each frame (as the Metal capsule does), so nothing can stop
+    // it: one 1.6 s cycle drives the ripple and the breath.
+    TimelineView(.animation(paused: reduced)) { context in
+      let t = context.date.timeIntervalSinceReferenceDate
+      let phase = reduced ? 1 : (t / 1.6).truncatingRemainder(dividingBy: 1)
+      Rectangle()
+        .fill(.white)
+        .colorEffect(PillShaders.dot(size: CGSize(width: 32, height: 32), phase: phase))
     }
     .frame(width: 32, height: 32)
-    .onAppear {
-      withAnimation(.linear(duration: 1.6).repeatForever(autoreverses: false)) { ripple = 1 }
-      withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) { breath = 1 }
-    }
   }
 }
 
@@ -653,12 +660,12 @@ enum PillShaders {
   static let library: ShaderLibrary =
     Data(base64Encoded: pillShaderLibraryBase64).map { ShaderLibrary(data: $0) } ?? .default
 
-  static func rim(size: CGSize, energy: Double, completed: Bool) -> Shader {
-    library.pillRim(.float2(size), .float(energy), .float(completed ? 1 : 0))
+  static func edgeGlow(size: CGSize, energy: Double) -> Shader {
+    library.pillEdgeGlow(.float2(size), .float(energy))
   }
 
-  static func dot(size: CGSize, breath: Double, ripple: Double) -> Shader {
-    library.pillDot(.float2(size), .float(breath), .float(ripple))
+  static func dot(size: CGSize, phase: Double) -> Shader {
+    library.pillDot(.float2(size), .float(phase))
   }
 
   static func highlight(size: CGSize) -> Shader {
@@ -667,10 +674,6 @@ enum PillShaders {
 
   static func shimmer(size: CGSize, phase: Double) -> Shader {
     library.pillShimmer(.float2(size), .float(phase))
-  }
-
-  static func morphBlur(radius: Double) -> Shader {
-    library.pillMorphBlur(.float(radius))
   }
 }
 
@@ -815,13 +818,71 @@ final class PillHostingView: NSHostingView<PillRoot> {
 }
 
 final class PillWindow: NSObject, NSApplicationDelegate {
-  static func run(arguments _: [String]) -> Never {
+  static func run(arguments: [String]) -> Never {
+    if let dir = option("--render", in: arguments), let states = option("--states", in: arguments) {
+      MainActor.assumeIsolated { render(states: URL(filePath: states), to: URL(filePath: dir)) }
+      exit(0)
+    }
     let app = NSApplication.shared
     let delegate = PillWindow()
     app.setActivationPolicy(.accessory)
     app.delegate = delegate
     withExtendedLifetime(delegate) { app.run() }
     exit(0)
+  }
+
+  /// `--render DIR --states FILE`: each state line (as Rust sends them) drawn at rest at 2x over a
+  /// dark, a light and a wallpaper backdrop, to `DIR/NN-phase-style-backdrop.png`.
+  @MainActor static func render(states: URL, to dir: URL) {
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let lines = (try? String(contentsOf: states, encoding: .utf8))?.split(separator: "\n") ?? []
+    let backdrops: [(String, AnyView)] = [
+      ("dark", AnyView(Color(red: 0.11, green: 0.11, blue: 0.12))),
+      ("light", AnyView(Color(red: 0.82, green: 0.82, blue: 0.84))),
+      ("wall", AnyView(LinearGradient(colors: [Color(red: 0.45, green: 0.47, blue: 0.62), Color(red: 0.13, green: 0.13, blue: 0.15)], startPoint: .top, endPoint: .bottom))),
+    ]
+    // The recording dot through one cycle, at 4x.
+    let dots = HStack(spacing: 0) {
+      ForEach(0 ..< 8) { k in
+        Rectangle().fill(.white)
+          .colorEffect(PillShaders.dot(size: CGSize(width: 32, height: 32), phase: Double(k) / 8))
+          .frame(width: 32, height: 32)
+      }
+    }
+    .background(PillColor.shell)
+    let dotRenderer = ImageRenderer(content: dots)
+    dotRenderer.scale = 4
+    if let image = dotRenderer.nsImage, let tiff = image.tiffRepresentation,
+       let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
+      try? png.write(to: dir.appending(path: "dot-cycle.png"))
+    }
+    for (n, line) in lines.enumerated() {
+      guard let state = try? JSONDecoder().decode(PillState.self, from: Data(line.utf8)) else { continue }
+      let model = PillViewModel()
+      model.opts = state.opts
+      model.style = state.style
+      model.phase = state.phase
+      model.shell = CGRect(x: state.shell[0], y: state.shell[1], width: state.shell[2], height: state.shell[3])
+      model.restShell = model.shell
+      model.shellAlpha = 1
+      model.items = state.items
+      model.clock = state.clock
+      model.label = state.label
+      for (name, backdrop) in backdrops {
+        let view = ZStack(alignment: .topLeading) {
+          backdrop
+          PillRoot(model: model)
+        }
+        .frame(width: PillMetrics.width, height: PillMetrics.height)
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 2
+        guard let image = renderer.nsImage, let tiff = image.tiffRepresentation,
+              let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:])
+        else { continue }
+        let file = dir.appending(path: String(format: "%02d-%@-%@-%@.png", n, state.phase, state.style, name))
+        try? png.write(to: file)
+      }
+    }
   }
 
   let model = PillViewModel()

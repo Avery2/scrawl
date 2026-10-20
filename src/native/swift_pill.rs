@@ -604,3 +604,33 @@ mod tests {
         assert!(!keyed(&Pres::Hidden, &hold(SelectionMode::Screen)));
     }
 }
+
+#[cfg(test)]
+mod render_states {
+    use super::*;
+    use crate::native::pill::PillStyle;
+    use crate::ui::SelectionMode;
+
+    /// Prints a state line per capsule state, for `scrawl-helper pill --render DIR --states FILE`.
+    #[test]
+    #[ignore = "prints fixtures"]
+    fn print_render_states() {
+        let metrics = atlas::measure_metrics();
+        let states = [
+            Pres::Recording { chips: false, has_iphone: false, stroke_count: 1 },
+            Pres::Recording { chips: true, has_iphone: false, stroke_count: 0 },
+            Pres::Selecting { mode: SelectionMode::Window, hold: false, has_iphone: true },
+            Pres::Processing,
+            Pres::Completed { label: "Copied".into() },
+        ];
+        for pres in states {
+            for style in [PillStyle::Black, PillStyle::Glass] {
+                let snap = PillSnapshot { pres: pres.clone(), clock: "0:13".into(), reduced_motion: false, style };
+                let w = atlas::measure_text_pt("Copied", model::HUD_TEXT, atlas::WEIGHT_SEMIBOLD, false);
+                let mut v = state_message(&snap, &PillOpts::default(), &metrics, w, false, 1.0);
+                v["seq"] = 1.into();
+                println!("STATE {v}");
+            }
+        }
+    }
+}

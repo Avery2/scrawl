@@ -28,6 +28,16 @@ impl Renderer {
     }
 }
 
+/// The SwiftUI capsule's window (0 when Metal draws). It belongs to `scrawl-helper`, so the
+/// capture filter's "Scrawl's own floating windows" rule (by pid) misses it, and a session clears
+/// `excluded_window_ids` when it starts; captures check this too.
+static HELPER_WINDOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether `id` is the SwiftUI capsule's window, which recordings must leave out.
+pub fn is_helper_window(id: u32) -> bool {
+    id != 0 && HELPER_WINDOW.load(std::sync::atomic::Ordering::Relaxed) == id
+}
+
 /// How often `sync` (called every few ms) re-reads `pillRenderer` from `config.json`.
 const RENDERER_POLL: Duration = Duration::from_millis(500);
 
@@ -101,6 +111,10 @@ impl Capsule {
 
     fn exclude_window(&self) {
         let num = self.window_number();
+        HELPER_WINDOW.store(
+            if self.is_swift() { num } else { 0 },
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if num > 0 {
             let mut ids = self
                 .excluded

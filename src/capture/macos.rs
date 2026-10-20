@@ -1144,6 +1144,7 @@ fn build_sck_filter_and_config(
             .into_iter()
             .filter(|w| {
                 excluded_window_ids.contains(&w.window_id())
+                    || crate::native::capsule::is_helper_window(w.window_id())
                     || (w
                         .owning_application()
                         .as_ref()
