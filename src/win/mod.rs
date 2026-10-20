@@ -9,7 +9,6 @@ pub mod media;
 pub mod overlay;
 pub mod privacy;
 pub mod shell;
-pub use crate::speech;
 pub mod uia;
 
 use std::ffi::c_void;
