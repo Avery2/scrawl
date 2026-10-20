@@ -66,6 +66,29 @@ struct PillOptions: Decodable, Equatable {
   var hlLead = PillSpringSpec(0.18, 0)
   var hlTrail = PillSpringSpec(0.25, 0)
   var punch: Double = 2
+  /// `pill.follow`: opening, sliding content takes this many times the walls' duration.
+  var follow: Double = 1.15
+
+  enum CodingKeys: String, CodingKey {
+    case origin, blur, shellBlur, enter, exit, morphOpen, morphClose, hlLead, hlTrail, punch, follow
+  }
+
+  init() {}
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    origin = try c.decode(Int.self, forKey: .origin)
+    blur = try c.decode(Double.self, forKey: .blur)
+    shellBlur = try c.decode(Double.self, forKey: .shellBlur)
+    enter = try c.decode(PillSpringSpec.self, forKey: .enter)
+    exit = try c.decode(PillSpringSpec.self, forKey: .exit)
+    morphOpen = try c.decode(PillSpringSpec.self, forKey: .morphOpen)
+    morphClose = try c.decode(PillSpringSpec.self, forKey: .morphClose)
+    hlLead = try c.decode(PillSpringSpec.self, forKey: .hlLead)
+    hlTrail = try c.decode(PillSpringSpec.self, forKey: .hlTrail)
+    punch = try c.decode(Double.self, forKey: .punch)
+    follow = try c.decodeIfPresent(Double.self, forKey: .follow) ?? 1.15
+  }
 }
 
 struct PillState: Decodable {
@@ -225,16 +248,19 @@ final class PillViewModel: ObservableObject {
       return
     }
 
-    // A morph between two visible states, as the Dynamic Island does it: one spring per change,
-    // the shape leads and the content follows a beat behind it. Narrowing, the leaving chips
-    // start fading first so the wall never cuts one that's still bright (`model::COLLAPSE_WAIT_S`).
+    // A morph between two visible states, as the Dynamic Island does it: the shape leads and the
+    // content follows. Opening, sliding chips take `pill.follow` times the walls' duration (the
+    // Metal capsule's knob); closing, they ride the walls' own spring. Narrowing, the leaving
+    // chips start fading first so the wall never cuts one that's still bright
+    // (`model::COLLAPSE_WAIT_S`).
     let narrowing = rest.width < shell.width - 1
     let spec = narrowing ? opts.morphClose : opts.morphOpen
     let morph = spring(spec)
     let leavingIDs = Set(items.map(\.id)).subtracting(s.items.map(\.id))
     let waitForLeaving = narrowing && !leavingIDs.isEmpty && !reduced
     let shellMorph = waitForLeaving ? morph.delay(0.06 / timeScale) : morph
-    let follow = narrowing || reduced ? morph : morph.delay(0.025 / timeScale)
+    let follow = narrowing || reduced ? morph
+      : spring(PillSpringSpec(max(spec.duration * opts.follow, 0.22), spec.bounce))
     if abs(rest.width - shell.width) > 1, !reduced {
       morphDuration = spec.duration / timeScale
       morphs &+= 1

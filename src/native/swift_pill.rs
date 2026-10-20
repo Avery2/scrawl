@@ -185,6 +185,7 @@ pub fn state_message(
             "hlLead": spring(opts.highlight_lead),
             "hlTrail": spring(opts.highlight_trail),
             "punch": round3(opts.punch),
+            "follow": round3(opts.follow),
         },
     })
 }
@@ -487,6 +488,7 @@ mod tests {
         assert_eq!(v["opts"]["morphOpen"], json!([0.42, 0.16]));
         assert_eq!(v["opts"]["origin"], 1);
         assert_eq!(v["opts"]["punch"], 2.0);
+        assert_eq!(v["opts"]["follow"], 1.15);
     }
 
     #[test]
