@@ -440,7 +440,6 @@ pub enum Pres {
     },
     Selecting {
         mode: SelectionMode,
-        hold: bool,
         has_iphone: bool,
     },
     Processing,
@@ -470,19 +469,13 @@ impl Pres {
             (
                 Self::Selecting {
                     mode: ma,
-                    hold: ha,
                     has_iphone: ia,
                 },
                 Self::Selecting {
                     mode: mb,
-                    hold: hb,
                     has_iphone: ib,
                 },
-            ) => {
-                ha == hb
-                    && (ia == ib || *ha)
-                    && ((*ma).shows_record() && !*ha) == ((*mb).shows_record() && !*hb)
-            }
+            ) => ia == ib && ma.shows_record() == mb.shows_record(),
             (Self::Completed { label: a }, Self::Completed { label: b }) => a == b,
             _ => false,
         }
@@ -606,12 +599,8 @@ pub fn layout_of(
         Pres::Hidden => {
             return (Layout::centered(IDLE_W, IDLE_H), Vec::new());
         }
-        Pres::Selecting {
-            mode,
-            hold,
-            has_iphone,
-        } => {
-            for &seg in SelectionMode::available(*has_iphone || *hold) {
+        Pres::Selecting { mode, has_iphone } => {
+            for &seg in SelectionMode::available(*has_iphone) {
                 raw.push((
                     ElemId::from_mode(seg),
                     m.segment_width(seg),
@@ -620,7 +609,7 @@ pub fn layout_of(
                     true,
                 ));
             }
-            if mode.shows_record() && !*hold {
+            if mode.shows_record() {
                 raw.push((
                     ElemId::Record,
                     Metrics::chip_width(m.record),
@@ -1694,7 +1683,6 @@ mod tests {
                     1.2,
                     Pres::Selecting {
                         mode: SelectionMode::Area,
-                        hold: false,
                         has_iphone: false,
                     },
                 ),
@@ -1714,7 +1702,6 @@ mod tests {
                     1.2,
                     Pres::Selecting {
                         mode: SelectionMode::Window,
-                        hold: false,
                         has_iphone: false,
                     },
                 ),
@@ -1740,49 +1727,38 @@ mod tests {
                 ),
                 (2.4, Pres::Hidden),
             ],
-            // hold-switcher
+            // hold-then-pick
             vec![
                 (
                     0.0,
                     Pres::Selecting {
                         mode: SelectionMode::Screen,
-                        hold: true,
-                        has_iphone: true,
+                        has_iphone: false,
                     },
                 ),
                 (
-                    0.6,
+                    0.9,
                     Pres::Selecting {
-                        mode: SelectionMode::Window,
-                        hold: true,
-                        has_iphone: true,
-                    },
-                ),
-                (
-                    1.2,
-                    Pres::Selecting {
-                        mode: SelectionMode::Iphone,
-                        hold: true,
-                        has_iphone: true,
+                        mode: SelectionMode::Area,
+                        has_iphone: false,
                     },
                 ),
                 (
                     1.8,
                     Pres::Selecting {
                         mode: SelectionMode::Screen,
-                        hold: true,
-                        has_iphone: true,
+                        has_iphone: false,
                     },
                 ),
                 (
-                    2.4,
+                    2.7,
                     Pres::Recording {
                         chips: false,
-                        has_iphone: true,
+                        has_iphone: false,
                         stroke_count: 0,
                     },
                 ),
-                (3.6, Pres::Hidden),
+                (3.9, Pres::Hidden),
             ],
             // finish
             vec![
@@ -1853,7 +1829,6 @@ mod tests {
         // Retarget mid-expansion to Selecting(Area): position and velocity must carry over unchanged.
         m.set_pres(Pres::Selecting {
             mode: SelectionMode::Area,
-            hold: false,
             has_iphone: false,
         });
         assert_eq!((m.l.x, m.l.v, m.r.x, m.r.v, m.b.x, m.b.v), before);
@@ -1880,12 +1855,10 @@ mod tests {
             },
             Pres::Selecting {
                 mode: SelectionMode::Area,
-                hold: false,
                 has_iphone: false,
             },
             Pres::Selecting {
                 mode: SelectionMode::Screen,
-                hold: false,
                 has_iphone: true,
             },
             Pres::Processing,
@@ -2114,7 +2087,6 @@ mod tests {
         let w0 = m.frame().shape.width();
         m.set_pres(Pres::Selecting {
             mode: SelectionMode::Area,
-            hold: false,
             has_iphone: false,
         });
         m.advance(FRAME_DT);
