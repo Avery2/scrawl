@@ -1,0 +1,18 @@
+[package]
+name = "pill-wasm"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Its own workspace, so it never joins the app's build.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

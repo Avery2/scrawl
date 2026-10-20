@@ -1,0 +1,20 @@
+{
+  "name": "scrawl-pill-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "wasm": "sh ./build-wasm.sh",
+    "dev": "sh ./build-wasm.sh && vite",
+    "build": "sh ./build-wasm.sh && vite build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "knobs": "npm:@kitlangton/knobs@^0.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@webgpu/types": "^0.1.74",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4"
+  }
+}

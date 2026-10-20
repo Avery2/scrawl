@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Scrawl pill · WebGPU playground</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <strong>Scrawl pill</strong>
+        <span class="sub">model.rs in wasm · pill.metal in WGSL</span>
+        <span id="status" class="status"></span>
+      </header>
+
+      <section id="stage" class="lab">
+        <div id="wallpaper"></div>
+        <div id="labstrip"></div>
+        <div id="menubar"><span></span><span class="clock"></span></div>
+        <div id="panel-wrap">
+          <div id="glass"></div>
+          <canvas id="pill"></canvas>
+          <div id="panel-outline"></div>
+        </div>
+        <div id="nogpu" hidden>
+          <p><strong>WebGPU isn't available here.</strong></p>
+          <p>Use Brave, Chrome or Safari 18+ with hardware acceleration on (brave://settings/system), then reload.</p>
+        </div>
+        <div class="stage-tools">
+          <div class="seg" id="backdrop">
+            <button data-v="lab">Lab</button><button data-v="dark">Dark</button><button data-v="light">Light</button><button data-v="wall">Wallpaper</button><button data-v="image">Image…</button>
+          </div>
+          <div class="seg" id="zoom">
+            <button data-v="1">1×</button><button data-v="2">2×</button><button data-v="3">3×</button>
+          </div>
+          <label class="chk"><input type="checkbox" id="pixelated" /> pixels</label>
+          <label class="chk"><input type="checkbox" id="outline" /> panel</label>
+          <div class="seg" id="compare" title="Show the real Metal pill under the web one, in the same state">
+            <button data-v="off">Compare</button><button data-v="chips">chips</button><button data-v="area">picker</button><button data-v="rec">recording</button><button data-v="done">done</button>
+          </div>
+          <input type="file" id="image-input" accept="image/*" hidden />
+        </div>
+        <figure id="reference" hidden>
+          <img alt="Screenshot of the real Metal pill" />
+          <figcaption>↑ WebGPU · ↓ real Metal pill (<code>scrawl lab pill</code>, default tune)</figcaption>
+        </figure>
+      </section>
+
+      <section id="controls">
+        <div class="row">
+          <span class="lbl">States</span>
+          <button data-act="tap" data-key="T">Tap · rec + chips</button>
+          <button data-act="record" data-key="↵">Recording</button>
+          <button data-act="chip:Area" data-key="1">Area</button>
+          <button data-act="chip:Window" data-key="2">Window</button>
+          <button data-act="chip:Screen" data-key="3">Screen</button>
+          <button data-act="chip:iPhone" data-key="4">iPhone</button>
+          <button data-act="holdOpen" data-key="H">Hold</button>
+          <button data-act="holdStep" data-key="J">S step</button>
+          <button data-act="holdRelease" data-key="K">Release</button>
+          <button data-act="finish" data-key="F">Finish</button>
+          <button data-act="goto:processing" data-key="P">Processing</button>
+          <button data-act="goto:completed" data-key="C">Completed</button>
+          <button data-act="cancel" data-key="Esc">Cancel</button>
+          <button data-act="mark" data-key="M">Mark</button>
+          <button data-act="undo" data-key="Z">Undo</button>
+        </div>
+        <div class="row">
+          <span class="lbl">Scenes</span>
+          <span id="scenes"></span>
+          <label class="chk"><input type="checkbox" id="loop" /> loop <kbd>L</kbd></label>
+          <label class="chk"><input type="checkbox" id="iphone" /> iPhone cabled <kbd>I</kbd></label>
+          <label class="chk"><input type="checkbox" id="autofold" checked /> chips fold after 3.5 s</label>
+          <label class="chk"><input type="checkbox" id="reduced" /> Reduce Motion</label>
+        </div>
+        <div class="row">
+          <span class="lbl">Playback</span>
+          <div class="seg" id="speed">
+            <button data-v="1">1×</button><button data-v="0.5">0.5×</button><button data-v="0.25">0.25×</button><button data-v="0.1">0.1×</button>
+          </div>
+          <button id="pause"><kbd>Space</kbd> Pause</button>
+          <button id="prev"><kbd>←</kbd></button>
+          <button id="next"><kbd>→</kbd></button>
+          <button id="replay"><kbd>0</kbd> Replay take</button>
+          <label class="chk" title="Like the Metal tick: the model only advances while it animates or something changed"><input type="checkbox" id="gating" checked /> Metal tick gating</label>
+          <span id="playinfo" class="mono"></span>
+        </div>
+      </section>
+
+      <section id="timeline-wrap">
+        <canvas id="timeline"></canvas>
+        <div class="fg-row"><span class="lbl">rAF</span><canvas id="framegraph"></canvas></div>
+      </section>
+
+      <aside id="side">
+        <div id="knobs"></div>
+        <div class="exports">
+          <button id="copy-json">Copy tune.json</button>
+          <button id="copy-rust">Copy Rust <code>Tune::DEFAULT</code></button>
+          <button id="apply" class="primary">Apply to my Scrawl</button>
+          <button id="load">Load from my Scrawl</button>
+          <pre id="export-out" class="mono"></pre>
+        </div>
+      </aside>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
