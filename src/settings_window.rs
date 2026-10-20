@@ -121,7 +121,6 @@ struct Transcriber {
     hex_enabled: bool,
     models: Vec<ModelOption>,
     speech: Speech,
-    speech_model: Option<SpeechModel>,
 }
 
 /// `speech_model::Status`: the local model's download.
@@ -131,15 +130,6 @@ struct Speech {
     state: String,
     progress: f64,
     error: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-struct SpeechModel {
-    installed: bool,
-    progress: Option<f32>,
-    caption: String,
-    error: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -1101,58 +1091,23 @@ impl SettingsWindow {
                 .into_any_element(),
             );
         }
-        if let Some(model) = &t.speech_model {
-            let trailing: AnyElement = if let Some(progress) = model.progress {
-                div()
-                    .text_size(px(12.0))
-                    .text_color(theme.secondary())
-                    .child(format!("{:.0}%", progress * 100.0))
-                    .into_any_element()
-            } else if model.installed {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(5.0))
-                    .text_size(px(12.0))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme.secondary())
-                    .child(icon(crate::icons::CHECK_CIRCLE, 14.0, theme.positive()))
-                    .child("Installed")
-                    .into_any_element()
-            } else {
-                button(theme, "settings-download-model", "Download", true)
-                    .on_click(cx.listener(|view, _, _, _| view.act(Action::DownloadSpeechModel)))
-                    .into_any_element()
-            };
-            return div()
-                .flex()
-                .flex_col()
-                .child(group(
-                    theme,
-                    vec![
-                        row(theme, "Transcription", true, div().text_size(px(13.0)).text_color(theme.secondary()).child(local)).into_any_element(),
-                        row(theme, "Speech model", true, trailing).into_any_element(),
-                    ],
-                ))
-                .child(caption(theme, &model.caption, model.error))
-                .child(self.experimental(theme, state, cx));
-        }
-        let note = match (WINDOWS, t.hex_enabled || hex) {
-            (true, true) => {
-                "Parakeet runs on this PC and times each word. Hex uses a model you have in Hex, and its word times are estimates."
-            }
-            (true, false) => {
-                "Parakeet runs on this PC and times each word. Scrawl downloads its 730 MB model once, unless Hex already has it. Hex shows up here while Hex is running."
-            }
+        let here = if LINUX { "this computer" } else { "this PC" };
+        let note = match (WINDOWS || LINUX, t.hex_enabled || hex) {
+            (true, true) => format!(
+                "Parakeet runs on {here} and times each word. Hex uses a model you have in Hex, and its word times are estimates."
+            ),
+            (true, false) => format!(
+                "Parakeet runs on {here} and times each word. Scrawl downloads its 730 MB model once, unless Hex already has it. Hex shows up here while Hex is running."
+            ),
             (false, true) => {
-                "Apple Speech times each word. Hex uses a model you have in Hex, and its word times are estimates."
+                "Apple Speech times each word. Hex uses a model you have in Hex, and its word times are estimates.".to_owned()
             }
             (false, false) => {
-                "Apple Speech runs on this Mac and times each word. Hex shows up here while Hex is running."
+                "Apple Speech runs on this Mac and times each word. Hex shows up here while Hex is running.".to_owned()
             }
         };
         let speech = match t.speech.state.as_str() {
-            _ if !WINDOWS || hex => None,
+            _ if !(WINDOWS || LINUX) || hex => None,
             "downloading" => Some((
                 format!(
                     "Downloading the speech model: {:.0}%",
@@ -1173,22 +1128,15 @@ impl SettingsWindow {
             )),
             _ => None,
         };
-        div()
-            .flex()
-            .flex_col()
-            .child(group(theme, rows))
-            .child(caption(theme, note, false))
-            .when_some(speech, |pane, (text, error)| {
-                pane.child(caption(theme, &text, error))
-            })
-            .child(self.experimental(theme, state, cx))
-    }
-
-    fn experimental(&self, theme: Theme, state: &ViewState, cx: &mut Context<Self>) -> Div {
         let video = state.video_export;
         div()
             .flex()
             .flex_col()
+            .child(group(theme, rows))
+            .child(caption(theme, &note, false))
+            .when_some(speech, |pane, (text, error)| {
+                pane.child(caption(theme, &text, error))
+            })
             .child(header(theme, "Experimental"))
             .child(group(
                 theme,

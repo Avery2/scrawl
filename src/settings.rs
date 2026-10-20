@@ -855,65 +855,6 @@ pub struct TranscriberView {
     pub hex_enabled: bool,
     pub language: String,
     pub models: Vec<ModelView>,
-    /// Linux: the Parakeet model Scrawl downloads itself (there's no Hex to install one).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub speech_model: Option<SpeechModelView>,
-}
-
-/// The "Speech model" row: installed, downloading, or a Download button.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SpeechModelView {
-    pub installed: bool,
-    /// 0–1 while downloading.
-    pub progress: Option<f32>,
-    pub caption: String,
-    pub error: bool,
-}
-
-#[cfg(target_os = "linux")]
-fn speech_model_view() -> Option<SpeechModelView> {
-    use crate::retention::format_bytes;
-    use crate::speech::{DEFAULT_MODEL, Download};
-    let size = format_bytes(DEFAULT_MODEL.bytes);
-    let state = crate::speech::download_state();
-    if let Download::Running { have, total } = state {
-        return Some(SpeechModelView {
-            installed: false,
-            progress: Some(have as f32 / total.max(1) as f32),
-            caption: format!("Downloading… {} of {size}.", format_bytes(have)),
-            error: false,
-        });
-    }
-    let installed = !crate::speech::installed_models().is_empty();
-    Some(match state {
-        Download::Failed(error) if !installed => SpeechModelView {
-            installed,
-            progress: None,
-            caption: format!("The download failed: {error}."),
-            error: true,
-        },
-        _ if installed => SpeechModelView {
-            installed,
-            progress: None,
-            caption: "Parakeet transcribes on this computer and times each word.".to_owned(),
-            error: false,
-        },
-        _ => SpeechModelView {
-            installed,
-            progress: None,
-            caption: format!(
-                "Captures need Parakeet ({size}, once) to turn your voice into text. It runs on \
-                 this computer."
-            ),
-            error: false,
-        },
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn speech_model_view() -> Option<SpeechModelView> {
-    None
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1044,8 +985,6 @@ pub enum Action {
     /// Link `scrawl` into a folder on PATH, or remove that link.
     InstallCli,
     UninstallCli,
-    /// Linux: download the Parakeet speech model.
-    DownloadSpeechModel,
     Close,
 }
 
@@ -1166,11 +1105,6 @@ impl Panel {
             Action::UninstallCli => {
                 let result = crate::command_line::uninstall(&host.command_line());
                 self.note_cli("uninstall", result);
-                Effect::None
-            }
-            Action::DownloadSpeechModel => {
-                #[cfg(target_os = "linux")]
-                crate::speech::start_download();
                 Effect::None
             }
             Action::Close => {
@@ -1365,7 +1299,6 @@ impl Panel {
                     .into_iter()
                     .map(|(id, title, chosen)| ModelView { id, title, chosen })
                     .collect(),
-                speech_model: speech_model_view(),
             },
             video_export: config.video_export.unwrap_or(false),
             retention: RetentionView {

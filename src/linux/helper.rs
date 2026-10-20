@@ -49,15 +49,10 @@ pub struct SpeechModelLine {
     pub error: Option<String>,
 }
 
-/// Apple's speech model doesn't exist here: the Parakeet model is downloaded from Settings
-/// (`crate::speech::start_download`), which then transcribes the bundles that waited for it.
-pub fn install_speech_model(mut line: impl FnMut(SpeechModelLine)) -> Result<()> {
-    let installed = !crate::speech::installed_models().is_empty();
-    line(SpeechModelLine {
-        status: if installed { "installed" } else { "unsupported" }.into(),
-        ..Default::default()
-    });
-    Ok(())
+/// Linux transcribes with Parakeet (`speech`): Hex's installed model, else Scrawl's own copy,
+/// downloaded and checked here.
+pub fn install_speech_model(line: impl FnMut(SpeechModelLine)) -> Result<()> {
+    crate::speech::install(line)
 }
 
 /// On-device transcription with measured word timings (Parakeet through `transcribe.cpp`).
