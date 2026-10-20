@@ -369,7 +369,6 @@ impl GlyphAtlas {
             ("Processing…", HUD_TEXT, WEIGHT_SEMIBOLD),
             ("Paste", HUD_TEXT, WEIGHT_SEMIBOLD),
             ("Inspect", HUD_TEXT, WEIGHT_MEDIUM),
-            ("Esc", 11.0, WEIGHT_MEDIUM),
         ] {
             let (w, h, size_pt, baseline_pt, bytes) =
                 rasterize_text(text, size_pt, weight, false, scale);
