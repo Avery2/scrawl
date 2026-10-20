@@ -846,15 +846,34 @@ mod tests {
         assert!(MAX_PINS * size_of::<PinMarker>() <= SET_BYTES_LIMIT);
     }
 
+    /// Which shader an offscreen frame runs through.
+    #[derive(Clone, Copy)]
+    enum Shader {
+        /// The variant the overlay picks for the frame (`OverlayPipelines::for_frame`).
+        Picked,
+        /// The general shader, correct for any frame.
+        General,
+    }
+
+    /// Renders one frame offscreen at `uniforms.resolution` and returns its BGRA bytes, or
+    /// `None` without a Metal device.
     fn render_offscreen(
-        w: u64,
-        h: u64,
+        shader: Shader,
         uniforms: &LaserUniforms,
         segments: &[PathSegment],
         pins: &[PinMarker],
     ) -> Option<Vec<u8>> {
         let device = metal::Device::system_default()?;
-        let pipeline = overlay_pipeline(&device).expect("pipeline");
+        let pipelines = OverlayPipelines::new(&device).expect("pipelines");
+        let general;
+        let pipeline = match shader {
+            Shader::Picked => pipelines.for_frame(uniforms),
+            Shader::General => {
+                general = overlay_pipeline(&device).expect("pipeline");
+                &general
+            }
+        };
+        let [w, h] = uniforms.resolution.map(|v| v as u64);
         let descriptor = metal::TextureDescriptor::new();
         descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         descriptor.set_width(w);
@@ -870,7 +889,7 @@ mod tests {
         attachment.set_store_action(MTLStoreAction::Store);
         let queue = device.new_command_queue();
         let cmd = queue.new_command_buffer();
-        encode_overlay(cmd, pass, &device, &pipeline, uniforms, segments, pins);
+        encode_overlay(cmd, pass, &device, pipeline, uniforms, segments, pins);
         cmd.commit();
         cmd.wait_until_completed();
         let mut pixels = vec![0u8; (w * h * 4) as usize];
@@ -916,8 +935,7 @@ mod tests {
             ..Default::default()
         };
         let Some(pixels) = render_offscreen(
-            size,
-            size,
+            Shader::Picked,
             &uniforms,
             &segments,
             &[PinMarker::default()],
@@ -959,8 +977,7 @@ mod tests {
                 ..Default::default()
             };
             let Some(pixels) = render_offscreen(
-                size,
-                size,
+                Shader::Picked,
                 &uniforms,
                 &[PathSegment::default()],
                 &[pin],
@@ -1038,15 +1055,13 @@ mod tests {
             tile_size: TILE_PT,
             ..LaserUniforms::default()
         };
-        let (w, h) = ((width * scale) as u64, (height * scale) as u64);
         let pins = [PinMarker::default()];
-        let Some(tiled) = render_offscreen(w, h, &uniforms, &segments, &pins) else {
+        let Some(tiled) = render_offscreen(Shader::Picked, &uniforms, &segments, &pins) else {
             return;
         };
         // One tile bigger than the screen holds every segment.
         let untiled = render_offscreen(
-            w,
-            h,
+            Shader::Picked,
             &LaserUniforms {
                 tile_cols: 1,
                 tile_rows: 1,
@@ -1161,43 +1176,6 @@ mod tests {
         }
     }
 
-    /// Renders one frame offscreen through `pipeline` and returns its BGRA bytes.
-    fn render_frame(
-        device: &metal::DeviceRef,
-        pipeline: &RenderPipelineState,
-        uniforms: &LaserUniforms,
-        segments: &[PathSegment],
-        pins: &[PinMarker],
-    ) -> Vec<u8> {
-        let [w, h] = uniforms.resolution.map(|v| v as u64);
-        let descriptor = metal::TextureDescriptor::new();
-        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        descriptor.set_width(w);
-        descriptor.set_height(h);
-        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
-        descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
-        let texture = device.new_texture(&descriptor);
-        let pass = RenderPassDescriptor::new();
-        let attachment = pass.color_attachments().object_at(0).unwrap();
-        attachment.set_texture(Some(&texture));
-        attachment.set_load_action(MTLLoadAction::Clear);
-        attachment.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0));
-        attachment.set_store_action(MTLStoreAction::Store);
-        let queue = device.new_command_queue();
-        let cmd = queue.new_command_buffer();
-        encode_overlay(cmd, pass, device, pipeline, uniforms, segments, pins);
-        cmd.commit();
-        cmd.wait_until_completed();
-        let mut pixels = vec![0u8; (w * h * 4) as usize];
-        texture.get_bytes(
-            pixels.as_mut_ptr().cast(),
-            w * 4,
-            metal::MTLRegion::new_2d(0, 0, w, h),
-            0,
-        );
-        pixels
-    }
-
     /// A settled full-screen recording on a `width`×`height` @`scale` screen, with no ink.
     fn recording_uniforms(width: f32, height: f32, scale: f32) -> LaserUniforms {
         LaserUniforms {
@@ -1277,10 +1255,11 @@ mod tests {
             height * 0.15,
             1.05,
         );
+        let (radius, alpha) = pin_pulse(40).expect("pulse showing");
         let pin = vec![PinMarker {
             pos: [width * 0.7, height * 0.3],
-            radius: 11.5,
-            _pad: 0.0,
+            radius,
+            alpha,
         }];
         let none = vec![PathSegment::default()];
         let no_pin = vec![PinMarker::default()];
@@ -1361,16 +1340,17 @@ mod tests {
     /// that missed a frame effect, or an early return that missed a pin or the tip, differs here.
     #[test]
     fn specialised_frames_match_the_general_shader() {
-        let Some(device) = metal::Device::system_default() else {
-            return;
-        };
-        let general = overlay_pipeline(&device).expect("pipeline");
-        let pipelines = OverlayPipelines::new(&device).expect("pipelines");
         for scale in [1.0, 2.0] {
             for (name, uniforms, segments, pins) in frame_kinds(256.0, 192.0, scale) {
-                let specialised = pipelines.for_frame(&uniforms);
-                let expected = render_frame(&device, &general, &uniforms, &segments, &pins);
-                let actual = render_frame(&device, specialised, &uniforms, &segments, &pins);
+                let Some(expected) = render_offscreen(Shader::General, &uniforms, &segments, &pins)
+                else {
+                    return;
+                };
+                let actual = render_offscreen(Shader::Picked, &uniforms, &segments, &pins).unwrap();
+                assert!(
+                    name == "nothing drawn" || expected.iter().any(|&b| b != 0),
+                    "{name} @{scale}x draws something"
+                );
                 let differ = actual
                     .chunks(4)
                     .zip(expected.chunks(4))
@@ -1442,6 +1422,53 @@ mod tests {
             shown == ShownFrame::new(base, &beyond, &pins),
             "segments past the count"
         );
+    }
+
+    /// A pin's pulse redraws at every refresh while it animates, and the first frame after it
+    /// ends is drawn too, clearing its last ring, before identical frames are skipped.
+    #[test]
+    fn a_pin_pulse_animates_then_clears_before_frames_are_skipped() {
+        let base = recording_uniforms(256.0, 192.0, 2.0);
+        let frame_at = |age_ms: u64| {
+            let pin = pin_pulse(age_ms).map(|(radius, alpha)| PinMarker {
+                pos: [128.0, 96.0],
+                radius,
+                alpha,
+            });
+            let uniforms = LaserUniforms {
+                pin_count: u32::from(pin.is_some()),
+                now_sec: 5.0 + age_ms as f32 / 1_000.0,
+                ..base
+            };
+            let pins = [pin.unwrap_or_default()];
+            (ShownFrame::new(uniforms, &[PathSegment::default()], &pins), uniforms, pins)
+        };
+        let refresh_ms = 8;
+        let mut shown = frame_at(0).0;
+        let mut drawn = Vec::new();
+        for age in (refresh_ms..crate::sketch::PIN_PULSE_MS + 200).step_by(refresh_ms as usize) {
+            let frame = frame_at(age).0;
+            if frame != shown {
+                drawn.push(age);
+                shown = frame;
+            }
+        }
+        let pulse_frames = (crate::sketch::PIN_PULSE_MS - 1) / refresh_ms;
+        let last = *drawn.last().expect("the pulse draws");
+        assert_eq!(drawn.len() as u64, pulse_frames + 1, "drawn at {drawn:?}");
+        assert!(last >= crate::sketch::PIN_PULSE_MS, "the frame after the pulse is drawn");
+        assert!(
+            last < crate::sketch::PIN_PULSE_MS + refresh_ms,
+            "nothing drawn once it's cleared: {drawn:?}"
+        );
+
+        let (_, uniforms, pins) = frame_at(last);
+        let Some(pixels) =
+            render_offscreen(Shader::Picked, &uniforms, &[PathSegment::default()], &pins)
+        else {
+            return;
+        };
+        assert!(pixels.iter().all(|&b| b == 0), "the frame after the pulse is clear");
     }
 
     /// GPU time per kind of frame on a 5120×2160 display, the general shader (every frame before
