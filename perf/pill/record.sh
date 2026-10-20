@@ -24,10 +24,10 @@ if [[ ${#scenes[@]} -eq 0 ]]; then
 fi
 
 here=$(cd "$(dirname "$0")" && pwd)
+"$here/../screen-guard.sh"
 motion_lint=${MOTION_LINT:-$HOME/code/open-source/motion-lint/cli/motion-lint.ts}
 
 for scene in "${scenes[@]}"; do
-  caffeinate -u -t 20 >/dev/null 2>&1 &
   rm -f "$out/$scene.mov"
   mkdir -p "$out/runs/$scene/trace"
   log="$out/.$scene.log"
