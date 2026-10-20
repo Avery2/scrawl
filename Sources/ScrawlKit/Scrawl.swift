@@ -312,7 +312,7 @@
     /// The current recording's recorder.
     @ObservationIgnored private var recorder: (any ScrawlRecorder)?
     /// The recorder is starting (or asking permission) and the overlay is already up.
-    private(set) var isStarting = false
+    public private(set) var isStarting = false
     @ObservationIgnored private var pendingFinish: Bool?
     @ObservationIgnored private let makeRecorder: @MainActor (ScrawlCaptureMethod, Bool) -> any ScrawlRecorder
     /// Optional startup measurements, called on the stage's own queue. Keep the callback cheap.
@@ -432,16 +432,37 @@
       return true
     }
 
+    @ObservationIgnored private var teamEndpoint: (url: URL, token: String)?
+    /// Optional async supplement merged into `timeline.json` before a recording is written.
+    @ObservationIgnored public var timelineSupplement: (@MainActor @Sendable ([String: Any]) async -> [String: Any])?
+    /// Called on the main actor when a finished recording is handed to delivery. Returning `true`
+    /// marks the recording as handled in-process without queuing an outbox upload.
+    @ObservationIgnored public var onRecordingSubmitted: (@MainActor @Sendable (URL, URL) async -> Bool)?
+
+    /// Configures or clears a team-feedback endpoint in memory without altering the device's
+    /// saved personal Scrawl Keychain configuration. Passing `nil` restores the saved config.
+    public func setTeamEndpoint(url: URL?, token: String?) {
+      if let url, let token = token?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
+        teamEndpoint = (url, token)
+        applyConfig(ScrawlConfig(urls: [url], token: token, sessionID: nil))
+      } else {
+        teamEndpoint = nil
+        applyConfig(ScrawlConfig.resolved())
+      }
+    }
+
     private func applyConfig(_ config: ScrawlConfig?) {
-      serverURLs = config?.urls ?? []
-      token = config?.token
-      sessionID = config?.sessionID
+      let effective = teamEndpoint.map { ScrawlConfig(urls: [$0.url], token: $0.token, sessionID: nil) } ?? config
+      serverURLs = effective?.urls ?? []
+      token = effective?.token
+      sessionID = effective?.sessionID
       if !isConfigured {
         if isRecording || isStarting {
           isRecording = false
           isStarting = false
           isDrawing = false
           startedAt = nil
+          pendingFinish = nil
           recorder?.cancel()
           recorder = nil
         }
@@ -887,6 +908,11 @@
           }
           var info = info
           info["audio"] = recorder.recordsAudio
+          if let supplement = self.timelineSupplement {
+            for (key, value) in await supplement(info) {
+              info[key] = value
+            }
+          }
           let timelineData = (try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys])) ?? Data()
           try? timelineData.write(to: timeline)
           let finished = FinishedRecording(
@@ -945,6 +971,12 @@
     }
 
     private func deliver(_ finished: FinishedRecording) async {
+      if let onRecordingSubmitted, await onRecordingSubmitted(finished.recording.timeline, finished.recording.movie) {
+        uploadStatus = .idle
+        Self.delete(finished)
+        await hideOverlayAfterExit()
+        return
+      }
       if hostedURL != nil {
         await deliverHosted(finished)
         return
