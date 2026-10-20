@@ -28,8 +28,8 @@ use x11rb::rust_connection::RustConnection;
 use super::{
     CARBON_CMD_KEY, CARBON_CONTROL_KEY, CARBON_OPTION_KEY, CARBON_SHIFT_KEY, LiveOverlayEvent,
     Sampler, SharedCaptureTelemetry, ShortcutConfig, ShortcutKind, clean_label, hotkey_combos,
-    layout_default_keycode, pick_display, poll_clicks, scrawl_log, shortcut_label, shortcut_matches,
-    track_shift_ink,
+    layout_default_keycode, pick_display, poll_clicks, scrawl_log, shortcut_label,
+    shortcut_matches, track_shift_ink,
 };
 use crate::linux::{self, input, x11};
 use crate::model::{CaptureMode, InteractionEvent, TargetFrame, TargetInfo};
@@ -504,8 +504,7 @@ fn xtest(events: &[(u8, u8)]) -> bool {
         return false;
     };
     for &(kind, detail) in events {
-        if x
-            .conn
+        if x.conn
             .xtest_fake_input(kind, detail, x11rb::CURRENT_TIME, x.root, 0, 0, 0)
             .is_err()
         {
@@ -526,7 +525,9 @@ pub fn post_synthetic_cmd_v() {
     let shift = super::is_frontmost_terminal();
     if linux::wayland_session() {
         if let Err(error) = linux::portal::send_paste(shift) {
-            scrawl_log(format!("paste: the RemoteDesktop portal refused: {error:#}"));
+            scrawl_log(format!(
+                "paste: the RemoteDesktop portal refused: {error:#}"
+            ));
         }
         return;
     }
@@ -587,6 +588,8 @@ enum Backend {
     Portal,
     /// GNOME custom keybindings running `scrawl shortcut …` (`linux::ipc`).
     Gnome,
+    /// Plasma 5's native KGlobalAccel service.
+    Kde,
     /// Polled from the input devices: the press also reaches the app in front.
     Devices,
 }
@@ -595,11 +598,15 @@ static BACKEND: Mutex<Backend> = Mutex::new(Backend::None);
 static HOTKEY_TELEMETRY: OnceLock<Arc<SharedCaptureTelemetry>> = OnceLock::new();
 
 fn backend() -> Backend {
-    *BACKEND.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    *BACKEND
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn set_backend(backend: Backend) {
-    *BACKEND.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = backend;
+    *BACKEND
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = backend;
     scrawl_log(format!("shortcuts: {backend:?}"));
 }
 
@@ -798,13 +805,19 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
             let (record, paste) = telemetry.shortcuts();
             if !linux::wayland_session() {
                 if let Err(kind) = grab_shortcuts(&record, &paste) {
-                    scrawl_log(format!("install_global_hotkeys: {kind:?} shortcut is taken"));
+                    scrawl_log(format!(
+                        "install_global_hotkeys: {kind:?} shortcut is taken"
+                    ));
                 }
                 set_backend(Backend::X11);
                 run_grab_events(telemetry);
                 return;
             }
-            if std::env::var_os("SCRAWL_NO_SHORTCUTS_PORTAL").is_none() {
+            // Plasma 5's portal opens System Settings but never binds the requested keys.
+            // KGlobalAccel consumes the chord; Plasma 6 uses the portal normally.
+            let plasma5 =
+                linux::kde() && std::env::var("KDE_SESSION_VERSION").is_ok_and(|v| v == "5");
+            if !plasma5 && std::env::var_os("SCRAWL_NO_SHORTCUTS_PORTAL").is_none() {
                 let portal_telemetry = Arc::clone(&telemetry);
                 let bound = linux::portal::global_shortcuts(
                     linux::portal::portal_trigger(record.carbon_modifiers, &shortcut_key(&record)),
@@ -824,6 +837,17 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
                 match bind_gnome(&record, &paste, false) {
                     Ok(()) => return set_backend(Backend::Gnome),
                     Err(error) => scrawl_log(format!("GNOME keybindings: {error:#}")),
+                }
+            }
+            if linux::kde() {
+                let keys = Arc::clone(&telemetry);
+                match linux::shortcuts::listen(record.clone(), paste.clone(), move |id| match id {
+                    "record" => emit(&keys, ShortcutKind::Record),
+                    "paste" => emit(&keys, ShortcutKind::Paste),
+                    _ => {}
+                }) {
+                    Ok(()) => return set_backend(Backend::Kde),
+                    Err(error) => scrawl_log(format!("KDE shortcuts: {error:#}")),
                 }
             }
             if input::start() {
@@ -862,6 +886,12 @@ pub fn set_shortcuts(
             Backend::Portal => scrawl_log(
                 "shortcuts: the desktop owns the portal's binding; change it in its settings",
             ),
+            Backend::Kde => {
+                if let Err(kind) = linux::shortcuts::bind(&record, &paste, false) {
+                    let _ = linux::shortcuts::bind(&old_record, &old_paste, false);
+                    return Err(kind);
+                }
+            }
             Backend::Devices | Backend::None => {}
         }
     }
@@ -895,6 +925,9 @@ pub fn pause_shortcuts(telemetry: &SharedCaptureTelemetry, paused: bool) {
         }
         Backend::Gnome => {
             let _ = bind_gnome(&record, &paste, paused);
+        }
+        Backend::Kde => {
+            let _ = linux::shortcuts::bind(&record, &paste, paused);
         }
         Backend::Portal | Backend::Devices | Backend::None => {}
     }
@@ -1090,7 +1123,15 @@ mod tests {
 
     #[test]
     fn virtual_keys_round_trip_through_keysyms() {
-        for vk in [u32::from(KEY_S), u32::from(KEY_V), 0x30, 0x39, 0x70, 0x87, 0x20] {
+        for vk in [
+            u32::from(KEY_S),
+            u32::from(KEY_V),
+            0x30,
+            0x39,
+            0x70,
+            0x87,
+            0x20,
+        ] {
             let sym = keysym_for_vk(vk).expect("bound");
             assert_eq!(vk_for_keysym(sym), Some(vk as u16));
         }

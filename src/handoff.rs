@@ -110,20 +110,16 @@ fn newest_bundle(captures: &Path) -> Result<PathBuf> {
         let entry = entry?;
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "scrawl") && path.is_dir() {
-            // Bundle creation time is stable even after later zoom-frame extraction.
-            let created = fs::read(path.join("scrawl.json"))
+            // A cancelled or still-processing capture has a directory but no manifest.
+            // Never let it hide the last completed capture from paste/inspect latest.
+            let Some(bundle) = fs::read(path.join("scrawl.json"))
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<ScrawlBundle>(&bytes).ok())
-                .map(|bundle| bundle.created_at_ms)
-                .unwrap_or_else(|| {
-                    entry
-                        .metadata()
-                        .ok()
-                        .and_then(|m| m.created().or_else(|_| m.modified()).ok())
-                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map_or(0, |time| time.as_millis() as u64)
-                });
-            candidates.push((created, path));
+            else {
+                continue;
+            };
+            // Bundle creation time is stable even after later zoom-frame extraction.
+            candidates.push((bundle.created_at_ms, path));
         }
     }
     candidates.sort_unstable();
@@ -1626,6 +1622,23 @@ mod tests {
         );
         assert!(resolve_bundle_dir(&fixture.0).is_err());
         assert!(resolve_bundle_dir(&fixture.0.join("missing.scrawl")).is_err());
+    }
+
+    #[test]
+    fn latest_skips_cancelled_and_partial_captures() {
+        let fixture = Fixture::new();
+        let cancelled = fixture.0.join("cancelled.scrawl");
+        fs::create_dir(&cancelled).unwrap();
+        fs::write(cancelled.join("audio.wav"), b"partial recording").unwrap();
+        let partial = fixture.bundle("partial", 300);
+        fs::write(partial.join("scrawl.json"), b"{\"version\":").unwrap();
+        assert!(newest_bundle(&fixture.0).is_err());
+
+        let completed = fixture.bundle("completed", 100);
+        assert_eq!(
+            newest_bundle(&fixture.0).unwrap(),
+            plain_path(completed.canonicalize().unwrap())
+        );
     }
 
     #[test]

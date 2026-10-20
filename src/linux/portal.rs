@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -43,7 +44,7 @@ impl Drop for Stream {
 }
 
 /// Where to record `target` from.
-pub fn source_for(target: &TargetInfo) -> Result<Source> {
+pub fn source_for(target: &TargetInfo, stopping: &AtomicBool) -> Result<Source> {
     let f = target.frame;
     let rect = [f.x, f.y, f.width, f.height];
     if !super::wayland_session() {
@@ -60,12 +61,17 @@ pub fn source_for(target: &TargetInfo) -> Result<Source> {
     }
     if super::gnome() && target.mode != CaptureMode::Window {
         match mutter_area(rect) {
-            Ok(session) => return Ok(Source::PipeWire { session, crop: None }),
+            Ok(session) => {
+                return Ok(Source::PipeWire {
+                    session,
+                    crop: None,
+                });
+            }
             Err(error) => scrawl_log(format!("GNOME screencast unavailable: {error:#}")),
         }
     }
     let window = target.mode == CaptureMode::Window;
-    let session = portal_screencast(window)?;
+    let session = portal_screencast(window, stopping)?;
     // The portal records a whole display: keep the part that was asked for.
     let crop = match (target.mode, session.rect) {
         (CaptureMode::Region, Some([sx, sy, sw, sh])) if sw > 0.0 && sh > 0.0 => Some([
@@ -184,11 +190,15 @@ fn save_token(key: &str, token: Option<&str>) {
 /// A display (or a window, `window`) through the ScreenCast portal. The first time, the
 /// desktop asks which; the answer is remembered (a restore token), so later recordings start
 /// without asking.
-fn portal_screencast(window: bool) -> Result<Stream> {
+fn portal_screencast(window: bool, stopping: &AtomicBool) -> Result<Stream> {
     use ashpd::desktop::PersistMode;
     use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 
-    let key = if window { "screencast-window" } else { "screencast" };
+    let key = if window {
+        "screencast-window"
+    } else {
+        "screencast"
+    };
     let (ready_tx, ready_rx) = flume::bounded::<Result<(u32, OwnedFd, Option<[f64; 4]>)>>(1);
     let (stop_tx, stop_rx) = flume::bounded::<()>(1);
     std::thread::Builder::new()
@@ -198,41 +208,54 @@ fn portal_screencast(window: bool) -> Result<Stream> {
                 let run = async {
                     let proxy = Screencast::new().await?;
                     let session = proxy.create_session().await?;
-                    let token = saved_token(key);
-                    let kind = if window {
-                        SourceType::Window
-                    } else {
-                        SourceType::Monitor
-                    };
-                    proxy
-                        .select_sources(
-                            &session,
-                            CursorMode::Embedded,
-                            kind.into(),
-                            false,
-                            token.as_deref(),
-                            // Windows come and go: ask each time for one.
-                            if window {
-                                PersistMode::DoNot
-                            } else {
-                                PersistMode::ExplicitlyRevoked
-                            },
-                        )
-                        .await?;
-                    let streams = proxy.start(&session, None).await?.response()?;
-                    if !window {
-                        save_token(key, streams.restore_token());
-                    }
-                    let stream = streams.streams().first().context("Nothing was shared")?;
-                    let rect = match (stream.position(), stream.size()) {
-                        (Some((x, y)), Some((w, h))) => {
-                            Some([f64::from(x), f64::from(y), f64::from(w), f64::from(h)])
+                    let request = async {
+                        let token = saved_token(key);
+                        let kind = if window {
+                            SourceType::Window
+                        } else {
+                            SourceType::Monitor
+                        };
+                        proxy
+                            .select_sources(
+                                &session,
+                                CursorMode::Embedded,
+                                kind.into(),
+                                false,
+                                token.as_deref(),
+                                // Windows come and go: ask each time for one.
+                                if window {
+                                    PersistMode::DoNot
+                                } else {
+                                    PersistMode::ExplicitlyRevoked
+                                },
+                            )
+                            .await?;
+                        let streams = proxy.start(&session, None).await?.response()?;
+                        if !window {
+                            save_token(key, streams.restore_token());
                         }
-                        _ => None,
+                        let stream = streams.streams().first().context("Nothing was shared")?;
+                        let rect = match (stream.position(), stream.size()) {
+                            (Some((x, y)), Some((w, h))) => {
+                                Some([f64::from(x), f64::from(y), f64::from(w), f64::from(h)])
+                            }
+                            _ => None,
+                        };
+                        let node = stream.pipe_wire_node_id();
+                        let fd = proxy.open_pipe_wire_remote(&session).await?;
+                        anyhow::Ok((node, fd, rect))
                     };
-                    let node = stream.pipe_wire_node_id();
-                    let fd = proxy.open_pipe_wire_remote(&session).await?;
-                    anyhow::Ok((proxy, session, node, fd, rect))
+                    let cancelled = async {
+                        let _ = stop_rx.recv_async().await;
+                        bail!("Screen sharing was cancelled")
+                    };
+                    match futures_lite::future::race(request, cancelled).await {
+                        Ok((node, fd, rect)) => anyhow::Ok((proxy, session, node, fd, rect)),
+                        Err(error) => {
+                            let _ = session.close().await;
+                            Err(error)
+                        }
+                    }
                 };
                 match run.await {
                     Ok((_proxy, session, node, fd, rect)) => {
@@ -247,14 +270,22 @@ fn portal_screencast(window: bool) -> Result<Stream> {
             });
         })?;
     // The first time the desktop asks which display, so wait for the person to choose.
-    let (node, fd, rect) = ready_rx
-        .recv_timeout(Duration::from_secs(120))
-        .map_err(|_| anyhow!("The screen sharing dialog wasn't answered"))?
-        .map_err(|error| {
-            // A refused or stale token: forget it, so the next try asks again.
-            save_token(key, None);
-            error
-        })?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let (node, fd, rect) = loop {
+        if stopping.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+            let _ = stop_tx.try_send(());
+            bail!("Screen sharing was cancelled or the dialog wasn't answered");
+        }
+        match ready_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(stream)) => break stream,
+            Ok(Err(error)) => {
+                save_token(key, None);
+                return Err(error);
+            }
+            Err(flume::RecvTimeoutError::Timeout) => {}
+            Err(error) => return Err(error.into()),
+        }
+    };
     Ok(Stream {
         node,
         fd: Some(fd),
@@ -288,12 +319,18 @@ pub fn global_shortcuts(
                         NewShortcut::new("paste", "Paste the latest capture")
                             .preferred_trigger(paste_trigger.as_str()),
                     ];
-                    let bound = proxy.bind_shortcuts(&session, &shortcuts, None).await?.response()?;
+                    let bound = proxy
+                        .bind_shortcuts(&session, &shortcuts, None)
+                        .await?
+                        .response()?;
                     // Plasma 5.27 returns success with an empty list. That is not a binding:
-                    // let the caller use evdev rather than silently losing both shortcuts.
-                    if !["record", "paste"].iter().all(|id| {
-                        bound.shortcuts().iter().any(|s| s.id() == *id && !s.trigger_description().is_empty())
-                    }) {
+                    // let the caller try native bindings rather than silently losing shortcuts.
+                    if !shortcuts_bound(
+                        bound
+                            .shortcuts()
+                            .iter()
+                            .map(|s| (s.id(), s.trigger_description())),
+                    ) {
                         let _ = session.close().await;
                         bail!("The desktop did not bind both shortcuts");
                     }
@@ -316,6 +353,14 @@ pub fn global_shortcuts(
     ready_rx
         .recv_timeout(Duration::from_secs(60))
         .map_err(|_| anyhow!("The shortcuts portal didn't answer"))?
+}
+
+fn shortcuts_bound<'a>(shortcuts: impl Iterator<Item = (&'a str, &'a str)> + Clone) -> bool {
+    ["record", "paste"].iter().all(|id| {
+        shortcuts
+            .clone()
+            .any(|(bound, trigger)| bound == *id && !trigger.is_empty())
+    })
 }
 
 /// The portal's trigger syntax for a shortcut (`ALT+SHIFT+s`), from its Carbon bits and key.
@@ -366,9 +411,15 @@ pub fn bind_gnome_keybindings(bindings: &[(&str, String)]) -> Result<()> {
         .map(PathBuf::from)
         .map_or_else(std::env::current_exe, Ok)?;
     let gsettings = |args: &[&str]| -> Result<String> {
-        let out = std::process::Command::new("gsettings").args(args).output()?;
+        let out = std::process::Command::new("gsettings")
+            .args(args)
+            .output()?;
         if !out.status.success() {
-            bail!("gsettings {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
+            bail!(
+                "gsettings {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
     };
@@ -389,7 +440,12 @@ pub fn bind_gnome_keybindings(bindings: &[(&str, String)]) -> Result<()> {
         }
         let schema = format!("{GNOME_KEYS}.custom-keybinding:{path}");
         let command = format!("'{}' shortcut {id}", exe.display());
-        gsettings(&["set", &schema, "name", &gvariant_string(&format!("Scrawl: {id}"))])?;
+        gsettings(&[
+            "set",
+            &schema,
+            "name",
+            &gvariant_string(&format!("Scrawl: {id}")),
+        ])?;
         gsettings(&["set", &schema, "command", &gvariant_string(&command)])?;
         gsettings(&["set", &schema, "binding", &gvariant_string(binding)])?;
     }
@@ -467,11 +523,24 @@ mod tests {
     use crate::capture::{CARBON_OPTION_KEY, CARBON_SHIFT_KEY};
 
     #[test]
+    fn an_empty_success_from_plasma_is_not_a_working_shortcut_backend() {
+        let record = ("record", "Alt+Shift+S");
+        let paste = ("paste", "Alt+Shift+V");
+        assert!(!shortcuts_bound([].into_iter()));
+        assert!(!shortcuts_bound([record].into_iter()));
+        assert!(!shortcuts_bound([record, ("paste", "")].into_iter()));
+        assert!(shortcuts_bound([record, paste].into_iter()));
+    }
+
+    #[test]
     fn shortcuts_are_written_the_way_each_desktop_reads_them() {
         let mods = CARBON_OPTION_KEY | CARBON_SHIFT_KEY;
         assert_eq!(portal_trigger(mods, "S"), "ALT+SHIFT+s");
         assert_eq!(gnome_binding(mods, "S"), "<Alt><Shift>s");
-        assert_eq!(gvariant_string("'/a b/scrawl' shortcut record"), "\"'/a b/scrawl' shortcut record\"");
+        assert_eq!(
+            gvariant_string("'/a b/scrawl' shortcut record"),
+            "\"'/a b/scrawl' shortcut record\""
+        );
         assert_eq!(gvariant_string(r#"say "hi"\"#), r#""say \"hi\"\\""#);
     }
 }

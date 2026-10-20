@@ -625,6 +625,18 @@ pub fn raise(id: u32) {
     }
 }
 
+pub fn set_visible(id: u32, visible: bool) {
+    if let Some(x) = x() {
+        if visible {
+            let _ = x.conn.map_window(id);
+            raise_on(x, id);
+        } else {
+            let _ = x.conn.unmap_window(id);
+        }
+        x.flush();
+    }
+}
+
 /// Asks a window to close (`WM_DELETE_WINDOW`), as its close button would: for GPUI windows
 /// Scrawl holds no handle to.
 pub fn request_close(id: u32) {

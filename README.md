@@ -847,18 +847,20 @@ windows run through XWayland.
 
 | | X11 | Wayland |
 |---|---|---|
-| Shortcut | `Alt+Shift+S`, `Alt+Shift+V` (`XGrabKey`) | The same, as GNOME keybindings or through the GlobalShortcuts portal |
+| Shortcut | `Alt+Shift+S`, `Alt+Shift+V` (`XGrabKey`) | GNOME keybindings, Plasma 5 KGlobalAccel, or the GlobalShortcuts portal |
 | Menu | Tray icon (StatusNotifierItem) | The same (GNOME needs the AppIndicator extension, on by default on Ubuntu) |
 | Screen capture | `ximagesrc` | GNOME's screencast API (no dialog), else the ScreenCast portal (asks once) |
 | Clicks, keys, Shift ink | The X server | The input devices (join the `input` group) |
 | Paste | `Ctrl+V` (`Ctrl+Shift+V` in terminals) through XTEST | The same, through the RemoteDesktop portal (asks once) |
-| Transcription | Parakeet on device (`transcribe.cpp`): **Download** in Settings › Recording (731 MB) | The same |
+| Transcription | Parakeet on device (`transcribe.cpp`): downloads at launch (731 MB); progress in Settings › Recording | The same |
 | Captures | `~/.local/share/scrawl/captures` | The same |
 
 - **Wayland:** reading clicks, keys and Shift ink needs `sudo usermod -aG input $USER` and a new
   login (Settings › Permissions shows it). Click positions are exact over X11 apps and with
   tablets, touchscreens and VMs; with a mouse over a Wayland app they can be stale. Scrawl's pill
   and ink show in the recording (no Linux desktop lets an app leave its windows out).
+- **Window picker:** lists X11/XWayland windows. Use Screen or Area for native Wayland apps.
+  On KDE Wayland, desktop ink hides when Shift is released so clicks reach the app; the bundle keeps it.
 - **Not on Linux:** the cabled iPhone, video export, `agentContext` and Sparkle updates.
 
 See [docs/linux.md](docs/linux.md) for how it works and how to build it.

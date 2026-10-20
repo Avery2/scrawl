@@ -98,7 +98,7 @@ jobs:
           Get-ChildItem runtime | Format-Table Name, Length
 
       - name: Downloads and loads the speech model
-        run: cargo test ${{ env.BUILD }} speech:: -- --ignored --nocapture
+        run: 'cargo test ${{ env.BUILD }} speech:: -- --ignored --nocapture'
 
       - name: Package
         id: package

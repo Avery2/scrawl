@@ -9,7 +9,7 @@
 //! (read from the input devices, `super::input`) the overlay takes the pointer itself
 //! (`take_pointer`): the ink follows it, and clicks land on the overlay rather than the app.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gpui::{
@@ -23,6 +23,7 @@ use crate::ink_view::{OverlayView, Placement};
 
 /// The open overlay's window, for `take_pointer`.
 static OVERLAY: AtomicU32 = AtomicU32::new(0);
+static HIDE_BETWEEN_STROKES: AtomicBool = AtomicBool::new(false);
 
 /// The overlay for one display. Dropping it closes the window.
 pub struct InkOverlay {
@@ -49,6 +50,11 @@ impl InkOverlay {
         };
         let placement = Arc::new(Mutex::new(Placement { rect, scale }));
         let view_placement = Arc::clone(&placement);
+        // KWin 5's XWayland overlay intercepts native Wayland clicks even with an empty
+        // X input shape. Keep it mapped only while drawing, so the sharing dialog and the
+        // app underneath stay usable. The bundle still contains the complete ink.
+        let hide_between_strokes =
+            super::kde() && super::wayland_session() && telemetry.active.load(Ordering::Acquire);
         let handle = cx
             .open_window(
                 WindowOptions {
@@ -72,8 +78,13 @@ impl InkOverlay {
             .ok()
             .flatten()
             .ok_or("The overlay has no X11 window")?;
-        x11::set_click_through(id, true);
         x11::float(id, rect);
+        // KWin rebuilds the input region when a managed window becomes override-redirect.
+        x11::set_click_through(id, true);
+        HIDE_BETWEEN_STROKES.store(hide_between_strokes, Ordering::Release);
+        if hide_between_strokes {
+            x11::set_visible(id, false);
+        }
         OVERLAY.store(id, Ordering::Release);
         Ok(Self { id, placement })
     }
@@ -128,5 +139,8 @@ pub fn take_pointer(take: bool) {
     let id = OVERLAY.load(Ordering::Acquire);
     if id != 0 {
         x11::set_click_through(id, !take);
+        if HIDE_BETWEEN_STROKES.load(Ordering::Acquire) {
+            x11::set_visible(id, take);
+        }
     }
 }

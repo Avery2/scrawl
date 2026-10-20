@@ -37,6 +37,7 @@ cd "$out"
 LDAI_OUTPUT="Scrawl-$arch.AppImage" linuxdeploy \
   --appdir "$appdir" \
   --executable "$binary" \
+  --executable "$(command -v wl-copy)" \
   --desktop-file "$root/packaging/linux/dev.kitlangton.scrawl.desktop" \
   --icon-file "$root/packaging/linux/dev.kitlangton.scrawl.png" \
   --plugin gstreamer \

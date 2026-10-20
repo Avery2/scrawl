@@ -367,7 +367,7 @@ pub fn run_sampler(sampler: Sampler) -> Option<PathBuf> {
         CANDIDATE_EDGE_NO_VIDEO
     };
     let candidate = crate::capture::capture_size(&target, edge);
-    let recorder = super::portal::source_for(&target).and_then(|source| {
+    let recorder = super::portal::source_for(&target, &stopping).and_then(|source| {
         Recorder::new(&source, out, candidate, movie, started_at)
             .map_err(|error| anyhow!("{error:#}"))
             // The source (a portal session) lives as long as the recording.

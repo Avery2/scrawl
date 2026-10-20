@@ -9,5 +9,5 @@ sudo apt-get install -y --no-install-recommends \
   libxcb-shape0-dev libxcb-randr0-dev libxcb-composite0-dev libxcb-xinput-dev \
   libxcb-xtest0-dev libasound2-dev libfontconfig-dev libfreetype-dev libssl-dev \
   libdbus-1-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-  patchelf file gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  patchelf file wl-clipboard gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-pipewire

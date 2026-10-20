@@ -12,23 +12,33 @@ Global coordinates are root-window pixels; X11 has one scale for the screen (`x1
 
 ## What each session can do
 
-| | X11 | GNOME on Wayland | KDE Plasma on Wayland (written, not yet tested) |
+Verified in an Ubuntu 24.04 arm64 VM with GNOME 46 (Wayland and X11) and Plasma 5.27.12 (Wayland). Plasma 6 and GNOME 48+ portal shortcuts still need desktop testing.
+
+| | X11 | GNOME on Wayland | KDE Plasma on Wayland |
 |---|---|---|---|
-| Shortcuts | `XGrabKey` | GNOME custom keybindings running `scrawl shortcut record\|paste` (GNOME 48+: the GlobalShortcuts portal) | GlobalShortcuts portal |
+| Shortcuts | `XGrabKey` | GNOME custom keybindings running `scrawl shortcut record\|paste` (GNOME 48+: the GlobalShortcuts portal) | Plasma 5: native KGlobalAccel; Plasma 6: GlobalShortcuts portal, with KGlobalAccel fallback |
 | Recording a display or area | `ximagesrc` | `org.gnome.Mutter.ScreenCast.RecordArea`, no dialog | ScreenCast portal, asks once (restore token in `~/.local/share/scrawl/portal.json`) |
-| Recording a window | `ximagesrc xid=` | X11 apps by id; other windows through the portal's picker | the portal's picker |
+| Recording a window | `ximagesrc xid=` | X11 apps by id; native Wayland windows are not listed | X11 apps by id; native Wayland windows are not listed |
 | Clicks, keys, ⇧ ink | the X server (pointer and key state, polled) | the input devices (`/dev/input`, needs the `input` group) | same |
 | Pointer position | the X server | XWayland while it's over X11 windows; an absolute pointing device (tablet, touchscreen, VM or remote desktop) from the input devices; the overlay takes the pointer while ⇧ is held | same |
-| App in front | `_NET_ACTIVE_WINDOW` | AT-SPI (`linux::atspi`; `mutter-x11-frames` means an X11 app, asked of XWayland) | AT-SPI |
+| App in front | `_NET_ACTIVE_WINDOW` | AT-SPI when the app exposes it (`linux::atspi`; X11 apps use XWayland) | AT-SPI when available; Kate did not expose context in the test VM |
 | Paste | XTEST `Ctrl+V` | RemoteDesktop portal, asks once | same |
 
 ### Clicks and ink on Wayland
 
-Wayland tells no app where the pointer is over another app's window. Scrawl reads buttons and keys from the input devices (membership of the `input` group: `sudo usermod -aG input $USER`, then log in again; Settings › Permissions shows it as **Input devices**, the Accessibility row on macOS). While ⇧ is held, the ink overlay takes the pointer (`linux::overlay::take_pointer`), so XWayland reports where it is and the ink follows it; a click while ⇧ is held lands on the overlay, not the app.
+Wayland tells no app where the pointer is over another app's window. Scrawl reads buttons and keys from the input devices. In onboarding or Settings › Permissions, **Copy command** copies `sudo usermod -aG input "$USER"`. Run it in a terminal, then log out and back in. Scrawl checks whether it can open actual keyboard/mouse devices, rather than trusting group membership; it retries devices when access changes. This is the **Input devices** row (the Accessibility row on macOS).
+
+While ⇧ is held, the ink overlay takes the pointer (`linux::overlay::take_pointer`), so XWayland reports where it is and the ink follows it; a click while ⇧ is held lands on the overlay, not the app. On KDE Wayland, Scrawl hides the recording overlay between strokes because KWin 5 otherwise blocks clicks into native apps even with an empty X input shape. Ink remains in the bundle, but disappears from the desktop when ⇧ is released.
 
 A click's position is right over X11 apps and with an absolute pointing device. With a mouse or touchpad over a Wayland app, XWayland still has the pointer where it last saw it, so the click's position is stale: the keyframe is cut at the right moment, but its ripple can be in the wrong place. A GNOME Shell extension that reports the pointer would close this gap (see the PR's open questions).
 
 Without the `input` group, a capture on Wayland has no clicks, keys or ⇧ ink outside Scrawl's own windows, and records only the screen and voice.
+
+### Picker and portal limits
+
+Screen and Area work on the tested desktops. The Window picker lists X11/XWayland windows only; use Screen or Area for native Wayland apps. A portal window source exists internally, but the UI does not currently offer it. The held shortcut cycles Screen → Window → Screen, skipping the Mac-only iPhone mode. Screen sharing can ask again if a desktop does not honor the saved restore token. Finishing while the dialog is open cancels the pending session; a failed or empty capture reports an error rather than producing demo imagery, and `latest` skips its unfinished directory.
+
+Plasma 5 can report successful GlobalShortcuts binding with an empty result. Scrawl validates both returned bindings and uses KGlobalAccel directly on Plasma 5, so the shortcut does not also type into the focused app.
 
 ## Scrawl's own windows are in the recording
 
@@ -39,7 +49,7 @@ Neither X11 nor GNOME's or KDE's screencasts let an app leave its windows out, s
 - **Movies:** GStreamer (`linux::media`): the source above, `videorate` to 30 fps, the first encoder installed of `x264enc`, `openh264enc` and VA-API's, `mp4mux`. Candidate frames come off a `tee` through an `appsink`; it holds end-of-stream back until its last frame is taken, so `Recorder::finish` drains it. Compositors send frames only when the screen changes, so the last frame is reused until a new one comes. Without an encoder Scrawl records no movie and keeps sharper candidates instead.
 - **Transcription:** Parakeet through `transcribe.cpp` (`speech.rs`, shared with Windows). As on Windows, Scrawl downloads the model once at launch through `speech_model::ensure` (731 MB with `curl` or `wget`, pinned Hugging Face revision, checked against its SHA-256, into `~/.local/share/scrawl/models`) unless Hex already has one; Settings › Recording shows its progress. A capture made before it lands says so in `summary.md` and is marked `.transcript-pending`, and is transcribed again in place when the download finishes.
 - **Tray:** a StatusNotifierItem (`ksni`); left click starts a recording, the menu is the macOS menu bar menu. GNOME shows it with the AppIndicator extension (on by default on Ubuntu). Without a tray, Scrawl says so in a notification, and launching it again opens Settings (`linux::ipc`, a socket at `$XDG_RUNTIME_DIR/scrawl.sock`).
-- **Clipboard:** text and PNG through the X clipboard (`linux::clipboard`), which XWayland shares with Wayland apps.
+- **Clipboard:** text and PNG through the X clipboard (`linux::clipboard`) on X11 and GNOME; KDE Wayland uses `wl-copy` (bundled in the AppImage) because KWin does not reliably bridge background XWayland selections to native apps.
 - **Launch at login:** `~/.config/autostart/scrawl.desktop`. **Trash:** the freedesktop trash. **Captures:** `~/.local/share/scrawl/captures`; **log:** `~/.local/share/scrawl/Logs/scrawl.log`.
 - **Command-line tool:** Settings › Agents links `~/.local/bin/scrawl` to the AppImage (`$APPIMAGE`).
 
@@ -49,20 +59,18 @@ The cabled iPhone, video export, `agentContext` lookups (`ax_other.rs`), Sparkle
 
 ## Packaging
 
-`scripts/linux/appimage.sh [binary]` builds `target/appimage/Scrawl-<arch>.AppImage` with linuxdeploy and its GStreamer plugin, so GStreamer, `pipewiresrc`, `ximagesrc` and the H.264 encoders come with it. CI builds one on every pull request (the `scrawl-linux-x86_64` artifact). Ubuntu 22.04+ needs `libfuse2` to run AppImages (`--appimage-extract-and-run` works without it). Flatpak is not done yet.
+`scripts/linux/appimage.sh [binary]` builds `target/appimage/Scrawl-<arch>.AppImage` with linuxdeploy and its GStreamer plugin, so GStreamer, `pipewiresrc`, `ximagesrc` and the H.264 encoders come with it. The binary baseline is **Ubuntu 24.04+**. Install `libfuse2t64` to run the AppImage, or run `./Scrawl-<arch>.AppImage --appimage-extract-and-run app` without FUSE.
+
+`.github/workflows/release-linux.yml` builds x86_64 and aarch64 on Ubuntu 24.04 runners. Pull requests and manual dispatches produce artifacts and run packaged `--help` checks; `v*` tags upload versioned AppImages to the matching GitHub release. The site links directly to those versioned assets. Build/deploy the site only after the appcast version is updated and both release assets exist. Flatpak is out of scope.
 
 ## Building and testing
 
 Build dependencies (Ubuntu/Debian; CI installs the same):
 
 ```sh
-sudo apt install build-essential pkg-config cmake ninja-build clang \
-  libxkbcommon-dev libxkbcommon-x11-dev libvulkan-dev libx11-dev libx11-xcb-dev \
-  libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev libxcb-shape0-dev libxcb-randr0-dev \
-  libxcb-composite0-dev libxcb-xinput-dev libasound2-dev libfontconfig-dev libfreetype-dev \
-  libssl-dev libdbus-1-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-pipewire
-cargo build && ./target/debug/scrawl app
+./scripts/linux/dependencies.sh
+cargo build -j 2 --offline
+./target/debug/scrawl app
 ```
 
 GPUI needs Vulkan (`mesa-vulkan-drivers`; llvmpipe works in a VM). Tests: `cargo test`. A desktop test runs in a Tart Ubuntu VM on the Mac mini (`macvm`, see `~/code/home/tools/macvm`): GNOME on Wayland by default, X11 with `WaylandEnable=false` in `/etc/gdm3/custom.conf`. Never test on Kit's desktop session.

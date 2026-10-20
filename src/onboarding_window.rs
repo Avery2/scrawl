@@ -325,7 +325,14 @@ fn set_visible(window: Option<&mut Window>, visible: bool) {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+fn set_visible(window: Option<&mut Window>, visible: bool) {
+    if let Some(id) = window.and_then(|w| crate::linux::x11::window_id(w)) {
+        crate::linux::x11::set_visible(id, visible);
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn set_visible(_window: Option<&mut Window>, _visible: bool) {}
 
 fn ease_out_cubic(t: f32) -> f32 {

@@ -124,9 +124,8 @@ fn has_key(bits: &[u8], code: u16) -> bool {
 
 /// Keyboards and mice: devices with Shift or a left button.
 fn interesting(fd: &OwnedFd) -> bool {
-    key_bits(fd).is_some_and(|bits| {
-        has_key(&bits, code::KEY_LEFTSHIFT) || has_key(&bits, code::BTN_LEFT)
-    })
+    key_bits(fd)
+        .is_some_and(|bits| has_key(&bits, code::KEY_LEFTSHIFT) || has_key(&bits, code::BTN_LEFT))
 }
 
 /// `EVIOCGABS(axis)`: an absolute axis's range, `None` when the device has none.
