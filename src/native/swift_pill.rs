@@ -4,7 +4,7 @@
 //! the springs from `Tune`) goes over stdin as one JSON line, and SwiftUI animates to it in its
 //! own process, so no work on this process's main thread can hold a frame back. The helper
 //! reports clicks, hover and the end of an exit; clicks become the same `PillAction`s as the
-//! Metal capsule's (`click_action`).
+//! Metal capsule's (`PillAction::for_click`).
 
 use std::cell::{Cell, RefCell};
 use std::io::{BufRead, Write};
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::pill::model::{self, ElemId, Metrics, PillOpts, Pres, SpringCfg, layout_of};
-use super::pill::{PillAction, PillSnapshot, atlas};
+use super::pill::{PillAction, PillSnapshot, atlas, panel_origin_at};
 use crate::capture::scrawl_log;
 use crate::ui::motion;
 
@@ -22,46 +22,6 @@ use crate::ui::motion;
 const READY_TIMEOUT: Duration = Duration::from_millis(1500);
 /// A hidden capsule whose exit the helper never confirmed counts as hidden after this.
 const HIDDEN_FALLBACK: Duration = Duration::from_millis(1200);
-
-/// What a click on `elem` asks for while `pres` shows (as the Metal capsule's `dispatch_click`).
-pub fn click_action(pres: &Pres, elem: ElemId) -> Option<PillAction> {
-    let selecting = matches!(pres, Pres::Selecting { .. });
-    if let Some(mode) = elem.mode() {
-        return Some(if selecting {
-            PillAction::SelectMode(mode)
-        } else {
-            PillAction::SwitchRecording(mode)
-        });
-    }
-    Some(match elem {
-        ElemId::Record => PillAction::RecordSelected,
-        ElemId::Undo => PillAction::Undo,
-        ElemId::Cancel => PillAction::Cancel,
-        ElemId::Finish => PillAction::Finish,
-        ElemId::Close if matches!(pres, Pres::Completed { .. }) => PillAction::DismissCompleted,
-        ElemId::Close => PillAction::Cancel,
-        ElemId::Paste => PillAction::Paste(None),
-        ElemId::Inspect => PillAction::Inspect,
-        _ => return None,
-    })
-}
-
-fn elem_from_key(key: &str) -> Option<ElemId> {
-    ElemId::ALL.into_iter().find(|id| id.trace_key() == key)
-}
-
-/// The panel's top-left (global points) on the display holding `point`, else the primary one:
-/// where the Metal capsule's panel goes (`screens::pill_origin`).
-fn panel_origin(point: [f64; 2]) -> Option<[f32; 2]> {
-    let screens = crate::screens::current();
-    let index = crate::screens::index_at(&screens, point).or((!screens.is_empty()).then_some(0))?;
-    let [x, y] = crate::screens::pill_origin(
-        &screens[index],
-        f64::from(model::PANEL_W),
-        f64::from(model::PANEL_Y),
-    );
-    Some([x as f32, y as f32])
-}
 
 /// What the helper reports.
 #[derive(Clone, Debug, PartialEq)]
@@ -82,7 +42,7 @@ pub fn parse_event(line: &str) -> Option<Event> {
             window: v.get("window").and_then(Value::as_u64).unwrap_or(0) as u32,
         },
         "hover" => Event::Hover(v.get("on").and_then(Value::as_bool).unwrap_or(false)),
-        "click" => Event::Click(elem_from_key(v.get("id")?.as_str()?)?),
+        "click" => Event::Click(ElemId::from_trace_key(v.get("id")?.as_str()?)?),
         "paste" => {
             let at = v.get("at")?.as_array()?;
             Event::Paste([at.first()?.as_f64()? as f32, at.get(1)?.as_f64()? as f32])
@@ -95,7 +55,7 @@ pub fn parse_event(line: &str) -> Option<Event> {
 /// The `PillAction` an event asks for while `pres` shows.
 pub fn action_for(event: &Event, pres: &Pres) -> Option<PillAction> {
     match event {
-        Event::Click(elem) => click_action(pres, *elem),
+        Event::Click(elem) => PillAction::for_click(pres, *elem),
         Event::Paste(at) => Some(PillAction::Paste(Some(*at))),
         _ => None,
     }
@@ -117,14 +77,6 @@ fn phase(pres: &Pres) -> &'static str {
         Pres::Processing => "processing",
         Pres::Completed { .. } => "completed",
     }
-}
-
-/// The hold switcher steps modes with a key: the user's own hand, so the highlight doesn't slide.
-pub fn keyed(prev: &Pres, next: &Pres) -> bool {
-    matches!(
-        (prev, next),
-        (Pres::Selecting { hold: true, .. }, Pres::Selecting { hold: true, .. })
-    )
 }
 
 /// One state line for the helper, without its `seq`: the resting capsule and items (panel
@@ -156,8 +108,8 @@ pub fn state_message(
         })
         .collect();
     let label = match &snapshot.pres {
-        Pres::Completed { label } => label.clone(),
-        _ => String::new(),
+        Pres::Completed { label } => label.as_str(),
+        _ => "",
     };
     json!({
         "type": "state",
@@ -182,7 +134,6 @@ pub fn state_message(
             "exit": spring(opts.exit),
             "morphOpen": spring(opts.morph_open),
             "morphClose": spring(opts.morph_close),
-            "hlLead": spring(opts.highlight_lead),
             "hlTrail": spring(opts.highlight_trail),
             "punch": round3(opts.punch),
             "follow": round3(opts.follow),
@@ -191,7 +142,8 @@ pub fn state_message(
 }
 
 struct Sent {
-    /// The last state line without its `seq`, to send only changes.
+    /// The last state inputs and serialized line without its `seq`, to send only changes.
+    last: Option<(PillSnapshot, PillOpts, f32)>,
     body: String,
     pres: Pres,
     seq: u64,
@@ -261,6 +213,7 @@ impl SwiftPill {
             window,
             metrics: atlas::measure_metrics(),
             sent: RefCell::new(Sent {
+                last: None,
                 body: String::new(),
                 pres: Pres::Hidden,
                 seq: 0,
@@ -321,7 +274,7 @@ impl SwiftPill {
     }
 
     pub fn place_on(&self, point: [f64; 2]) {
-        let Some(origin) = panel_origin(point) else {
+        let Some(origin) = panel_origin_at(point) else {
             return;
         };
         let mut sent = self.sent.borrow_mut();
@@ -338,6 +291,17 @@ impl SwiftPill {
 
     pub fn sync(&self, snapshot: PillSnapshot) {
         self.pump();
+        let opts = motion::tune().pill_opts();
+        let time_scale = motion::time_scale();
+        if self
+            .sent
+            .borrow()
+            .last
+            .as_ref()
+            .is_some_and(|(s, o, ts)| s == &snapshot && o == &opts && (ts - time_scale).abs() < 1e-4)
+        {
+            return;
+        }
         let completed_w = match &snapshot.pres {
             Pres::Completed { label } => {
                 let mut sent = self.sent.borrow_mut();
@@ -358,15 +322,16 @@ impl SwiftPill {
             _ => 0.0,
         };
         let mut sent = self.sent.borrow_mut();
-        let keyed = keyed(&sent.pres, &snapshot.pres);
+        let keyed = sent.pres.is_keyed_step(&snapshot.pres);
         let mut message = state_message(
             &snapshot,
-            &motion::tune().pill_opts(),
+            &opts,
             &self.metrics,
             completed_w,
             keyed,
-            motion::time_scale(),
+            time_scale,
         );
+        sent.last = Some((snapshot.clone(), opts, time_scale));
         let body = message.to_string();
         if body == sent.body {
             return;
@@ -568,29 +533,31 @@ mod tests {
         let completed = Pres::Completed {
             label: "Copied".into(),
         };
-        let act = |e: Event, p: &Pres| format!("{:?}", action_for(&e, p));
         assert_eq!(
-            act(Event::Click(ElemId::ChipWindow), &selecting),
-            "Some(SelectMode(Window))"
+            action_for(&Event::Click(ElemId::ChipWindow), &selecting),
+            Some(PillAction::SelectMode(SelectionMode::Window))
         );
         assert_eq!(
-            act(Event::Click(ElemId::ChipWindow), &recording),
-            "Some(SwitchRecording(Window))"
-        );
-        assert_eq!(act(Event::Click(ElemId::Close), &recording), "Some(Cancel)");
-        assert_eq!(
-            act(Event::Click(ElemId::Close), &completed),
-            "Some(DismissCompleted)"
+            action_for(&Event::Click(ElemId::ChipWindow), &recording),
+            Some(PillAction::SwitchRecording(SelectionMode::Window))
         );
         assert_eq!(
-            act(Event::Click(ElemId::Paste), &completed),
-            "Some(Paste(None))"
+            action_for(&Event::Click(ElemId::Close), &recording),
+            Some(PillAction::Cancel)
         );
         assert_eq!(
-            act(Event::Paste([3.0, 4.0]), &completed),
-            "Some(Paste(Some([3.0, 4.0])))"
+            action_for(&Event::Click(ElemId::Close), &completed),
+            Some(PillAction::DismissCompleted)
         );
-        assert_eq!(act(Event::Hover(true), &completed), "None");
+        assert_eq!(
+            action_for(&Event::Click(ElemId::Paste), &completed),
+            Some(PillAction::Paste(None))
+        );
+        assert_eq!(
+            action_for(&Event::Paste([3.0, 4.0]), &completed),
+            Some(PillAction::Paste(Some([3.0, 4.0])))
+        );
+        assert_eq!(action_for(&Event::Hover(true), &completed), None);
     }
 
     #[test]
@@ -600,8 +567,9 @@ mod tests {
             hold: true,
             has_iphone: false,
         };
-        assert!(keyed(&hold(SelectionMode::Screen), &hold(SelectionMode::Window)));
-        assert!(!keyed(&Pres::Hidden, &hold(SelectionMode::Screen)));
+        assert!(hold(SelectionMode::Screen).is_keyed_step(&hold(SelectionMode::Window)));
+        assert!(!hold(SelectionMode::Screen).is_keyed_step(&hold(SelectionMode::Screen)));
+        assert!(!Pres::Hidden.is_keyed_step(&hold(SelectionMode::Screen)));
     }
 }
 

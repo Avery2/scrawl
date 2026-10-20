@@ -746,6 +746,12 @@ fn panel_origin(screen: &crate::screens::Screen) -> [f32; 2] {
     [x as f32, y as f32]
 }
 
+/// The panel's top-left (global points) on the display holding `point`, else the primary one.
+pub fn panel_origin_at(point: [f64; 2]) -> Option<[f32; 2]> {
+    let screens = crate::screens::current();
+    panel_screen(&screens, Some(point)).map(panel_origin)
+}
+
 /// The panel's AppKit frame for a top-left origin in global points.
 fn panel_appkit_rect(mtm: MainThreadMarker, [x, y]: [f32; 2]) -> NSRect {
     let primary_h = NSScreen::screens(mtm)

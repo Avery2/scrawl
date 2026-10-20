@@ -112,7 +112,7 @@ impl Capsule {
     fn exclude_window(&self) {
         let num = self.window_number();
         HELPER_WINDOW.store(
-            if self.is_swift() { num } else { 0 },
+            if self.renderer() == Renderer::SwiftUi { num } else { 0 },
             std::sync::atomic::Ordering::Relaxed,
         );
         if num > 0 {
@@ -142,11 +142,12 @@ impl Capsule {
         self.exclude_window();
     }
 
-    fn is_swift(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        return matches!(&*self.inner.borrow(), Inner::Swift(_));
-        #[cfg(not(target_os = "macos"))]
-        false
+    fn renderer(&self) -> Renderer {
+        match &*self.inner.borrow() {
+            Inner::Metal(_) => Renderer::Metal,
+            #[cfg(target_os = "macos")]
+            Inner::Swift(_) => Renderer::SwiftUi,
+        }
     }
 
     pub fn window_number(&self) -> u32 {
@@ -170,12 +171,7 @@ impl Capsule {
         if read_at.elapsed() >= RENDERER_POLL {
             let now = configured();
             self.wanted.set((now, Instant::now()));
-            let current = if self.is_swift() {
-                Renderer::SwiftUi
-            } else {
-                Renderer::Metal
-            };
-            if now != wanted && now != current {
+            if now != wanted && now != self.renderer() {
                 // Switch only while the current capsule shows nothing (the coordinator stops
                 // syncing while hidden, so this is usually as the next capture opens it, and the
                 // new one enters from hidden); until then keep asking.

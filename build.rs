@@ -88,7 +88,7 @@ fn compile_laser_shader() {
     }
 }
 
-fn compile_metal_shader(src_rel: &str, name: &str) {
+fn compile_metal_shader(src_rel: &str, name: &str) -> PathBuf {
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let output_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     let source = manifest_dir.join(src_rel);
@@ -113,31 +113,14 @@ fn compile_metal_shader(src_rel: &str, name: &str) {
         .status()
         .expect("xcrun metallib is required to build Metal shaders");
     assert!(metallib.success(), "Metal library creation failed for {src_rel}");
+    library
 }
 
 /// Compiles the SwiftUI capsule's `[[stitchable]]` shaders (`helper/PillShaders.metal`) and
 /// embeds the metallib in the helper as base64 (`PillShaderData.swift`), so the one binary
 /// needs no resource file beside it.
-fn embed_pill_shaders(helper_dir: &std::path::Path, out_dir: &std::path::Path) -> PathBuf {
-    let source = helper_dir.join("PillShaders.metal");
-    println!("cargo:rerun-if-changed={}", source.display());
-    let air = out_dir.join("PillShaders.air");
-    let lib = out_dir.join("PillShaders.metallib");
-    let ok = Command::new("xcrun")
-        .args(["--sdk", "macosx", "metal", "-c", "-mmacosx-version-min=26.0"])
-        .arg(&source)
-        .arg("-o")
-        .arg(&air)
-        .status()
-        .is_ok_and(|s| s.success())
-        && Command::new("xcrun")
-            .args(["--sdk", "macosx", "metallib"])
-            .arg(&air)
-            .arg("-o")
-            .arg(&lib)
-            .status()
-            .is_ok_and(|s| s.success());
-    assert!(ok, "PillShaders.metal failed to compile");
+fn embed_pill_shaders(out_dir: &std::path::Path) -> PathBuf {
+    let lib = compile_metal_shader("helper/PillShaders.metal", "PillShaders");
     let bytes = std::fs::read(&lib).expect("read PillShaders.metallib");
     let swift = out_dir.join("PillShaderData.swift");
     std::fs::write(
@@ -188,7 +171,7 @@ fn compile_helper() {
     println!("cargo:rerun-if-changed={}", plist.display());
     // OUT_DIR is target/<profile>/build/scrawl-<hash>/out.
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-    sources.push(embed_pill_shaders(&helper_dir, &out_dir));
+    sources.push(embed_pill_shaders(&out_dir));
     let profile_dir = out_dir
         .ancestors()
         .nth(3)

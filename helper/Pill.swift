@@ -1,7 +1,7 @@
 // The recording capsule drawn by SwiftUI (`scrawl-helper pill`), the `"pillRenderer": "swiftui"`
 // alternative to the Metal capsule in `src/native/pill/mod.rs`.
 //
-// Rust decides what the capsule shows (`src/native/pill/swift.rs`: the state's resting layout from
+// Rust decides what the capsule shows (`src/native/swift_pill.rs`: the state's resting layout from
 // `model::layout_of`, the clock, the springs from `Tune`) and sends it as JSON lines on stdin; this
 // process owns how it moves: one fixed-size transparent panel that never resizes, and every change
 // a SwiftUI animation (springs by duration and bounce, layout animation of the capsule and chips,
@@ -24,7 +24,6 @@ enum PillMetrics {
   /// 84 pt so the shadow and the Esc hint never reach the edge.
   static let width: CGFloat = 640
   static let height: CGFloat = 112
-  static let chip: CGFloat = 32
 }
 
 // MARK: Protocol
@@ -36,7 +35,6 @@ struct PillItem: Decodable, Equatable, Identifiable {
   var enabled: Bool
 
   var frame: CGRect { CGRect(x: rect[0], y: rect[1], width: rect[2], height: rect[3]) }
-  var isMode: Bool { id.hasPrefix("chip:") }
 }
 
 struct PillSpringSpec: Decodable, Equatable {
@@ -63,32 +61,10 @@ struct PillOptions: Decodable, Equatable {
   var exit = PillSpringSpec(0.2, 0)
   var morphOpen = PillSpringSpec(0.42, 0.16)
   var morphClose = PillSpringSpec(0.38, 0.08)
-  var hlLead = PillSpringSpec(0.18, 0)
   var hlTrail = PillSpringSpec(0.25, 0)
   var punch: Double = 2
   /// `pill.follow`: opening, sliding content takes this many times the walls' duration.
   var follow: Double = 1.15
-
-  enum CodingKeys: String, CodingKey {
-    case origin, blur, shellBlur, enter, exit, morphOpen, morphClose, hlLead, hlTrail, punch, follow
-  }
-
-  init() {}
-
-  init(from decoder: Decoder) throws {
-    let c = try decoder.container(keyedBy: CodingKeys.self)
-    origin = try c.decode(Int.self, forKey: .origin)
-    blur = try c.decode(Double.self, forKey: .blur)
-    shellBlur = try c.decode(Double.self, forKey: .shellBlur)
-    enter = try c.decode(PillSpringSpec.self, forKey: .enter)
-    exit = try c.decode(PillSpringSpec.self, forKey: .exit)
-    morphOpen = try c.decode(PillSpringSpec.self, forKey: .morphOpen)
-    morphClose = try c.decode(PillSpringSpec.self, forKey: .morphClose)
-    hlLead = try c.decode(PillSpringSpec.self, forKey: .hlLead)
-    hlTrail = try c.decode(PillSpringSpec.self, forKey: .hlTrail)
-    punch = try c.decode(Double.self, forKey: .punch)
-    follow = try c.decodeIfPresent(Double.self, forKey: .follow) ?? 1.15
-  }
 }
 
 struct PillState: Decodable {
@@ -506,8 +482,8 @@ struct PillItemView: View {
     }
   }
 
-  private func smoke(_ a: Double) -> some View {
-    Capsule().fill(PillColor.smoke.opacity(a))
+  private func chipFill(_ a: Double) -> Color {
+    (model.glass ? PillColor.smoke : Color.white).opacity(a)
   }
 
   private var modeChip: some View {
@@ -525,10 +501,10 @@ struct PillItemView: View {
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .background {
       ZStack {
-        if model.glass { smoke(bg) } else { Capsule().fill(Color.white.opacity(bg)) }
+        Capsule().fill(chipFill(bg))
         if item.active {
           Capsule()
-            .fill(model.glass ? PillColor.smoke.opacity(0.18) : Color.white.opacity(0.16))
+            .fill(chipFill(model.glass ? 0.18 : 0.16))
             .visualEffect { content, proxy in
               content.colorEffect(PillShaders.highlight(size: proxy.size))
             }
@@ -557,7 +533,7 @@ struct PillItemView: View {
       .font(.system(size: 13, weight: .medium))
       .foregroundStyle(Color(white: fg).opacity(item.enabled ? 1 : 0.9))
       .frame(maxWidth: .infinity, maxHeight: .infinity)
-      .background(model.glass ? AnyView(smoke(bg)) : AnyView(Capsule().fill(Color.white.opacity(bg))))
+      .background(Capsule().fill(chipFill(bg)))
       .animation(model.spring(PillSpringSpec(0.2, 0)), value: item.enabled)
   }
 
@@ -569,13 +545,13 @@ struct PillItemView: View {
       .frame(width: 12, height: 12)
       .foregroundStyle(Color(white: fg))
       .frame(width: 28, height: 28)
-      .background(model.glass ? AnyView(smoke(bg)) : AnyView(Circle().fill(Color.white.opacity(bg))))
+      .background(Capsule().fill(chipFill(bg)))
       .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
 
   private var lead: some View {
     ZStack(alignment: .leading) {
-      if model.glass { smoke(0.24) }
+      if model.glass { Capsule().fill(chipFill(0.24)) }
       RecordingDot(reduced: model.reduced).frame(width: 32, height: 32)
       Text(model.clock)
         .font(.system(size: 13, weight: .semibold).monospacedDigit())
@@ -834,6 +810,14 @@ final class PillWindow: NSObject, NSApplicationDelegate {
   /// `--render DIR --states FILE`: each state line (as Rust sends them) drawn at rest at 2x over a
   /// dark, a light and a wallpaper backdrop, to `DIR/NN-phase-style-backdrop.png`.
   @MainActor static func render(states: URL, to dir: URL) {
+    func writePNG<V: View>(_ content: V, scale: CGFloat, to url: URL) {
+      let renderer = ImageRenderer(content: content)
+      renderer.scale = scale
+      if let image = renderer.nsImage, let tiff = image.tiffRepresentation,
+         let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
+        try? png.write(to: url)
+      }
+    }
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     let lines = (try? String(contentsOf: states, encoding: .utf8))?.split(separator: "\n") ?? []
     let backdrops: [(String, AnyView)] = [
@@ -850,12 +834,7 @@ final class PillWindow: NSObject, NSApplicationDelegate {
       }
     }
     .background(PillColor.shell)
-    let dotRenderer = ImageRenderer(content: dots)
-    dotRenderer.scale = 4
-    if let image = dotRenderer.nsImage, let tiff = image.tiffRepresentation,
-       let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
-      try? png.write(to: dir.appending(path: "dot-cycle.png"))
-    }
+    writePNG(dots, scale: 4, to: dir.appending(path: "dot-cycle.png"))
     for (n, line) in lines.enumerated() {
       guard let state = try? JSONDecoder().decode(PillState.self, from: Data(line.utf8)) else { continue }
       let model = PillViewModel()
@@ -874,20 +853,14 @@ final class PillWindow: NSObject, NSApplicationDelegate {
           PillRoot(model: model)
         }
         .frame(width: PillMetrics.width, height: PillMetrics.height)
-        let renderer = ImageRenderer(content: view)
-        renderer.scale = 2
-        guard let image = renderer.nsImage, let tiff = image.tiffRepresentation,
-              let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:])
-        else { continue }
         let file = dir.appending(path: String(format: "%02d-%@-%@-%@.png", n, state.phase, state.style, name))
-        try? png.write(to: file)
+        writePNG(view, scale: 2, to: file)
       }
     }
   }
 
   let model = PillViewModel()
   var panel: PillPanel?
-  var host: PillHostingView?
   var pointer: Timer?
   var hover = false
   /// `SCRAWL_PILL_STALL_MS`: block this process's main thread that long, 80 ms into each state
@@ -919,7 +892,6 @@ final class PillWindow: NSObject, NSApplicationDelegate {
     panel.contentView = host
     panel.orderFrontRegardless()
     self.panel = panel
-    self.host = host
     model.send = { emit($0) }
     model.onVisible = { [weak self] in
       self?.panel?.orderFrontRegardless()
@@ -962,11 +934,6 @@ final class PillWindow: NSObject, NSApplicationDelegate {
       emit(["event": "hover", "on": inside])
     }
     if !model.visible {
-      if hover {
-        hover = false
-        emit(["event": "hover", "on": false])
-      }
-      panel.ignoresMouseEvents = true
       trackPointer(false)
     }
   }
