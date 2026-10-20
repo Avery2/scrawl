@@ -34,7 +34,7 @@ When you answer, refer to moments the same way, as in "#3 (0:10)", so the person
 
 What the drawings mean:
 
-- Red strokes, circles, underlines and arrows are the person's marks, and they point at the problem. Marks drawn on the same screen all show on one keyframe.
+- Red strokes, circles, underlines and arrows are the person's marks, and they point at the problem. Marks drawn on the same screen all show on one keyframe. When there are several, the text numbers them in drawing order (`✎① 0:06 …`, `✎② 0:09 …`); the image shows only the ink, so use `scrawl zoom --mark` to see which ink is which.
 - A ripple around the cursor shows a click or tap, and a finger trail shows a swipe.
 - A glowing red trail that tapers off is the laser pointer, used to point without leaving a mark.
 
@@ -52,15 +52,20 @@ Use `zoom` when the problem is motion (an animation, a jump, a flicker) or happe
 scrawl zoom <bundle> --at 0:21                 # a time, M:SS or seconds
 scrawl zoom <bundle> --at "the width changes"  # or a phrase they said
 scrawl zoom <bundle> --at 0:21 --span 1 --frames 16 --full
+scrawl zoom <bundle> --mark 2                  # the mark shown as ✎② in the text
+scrawl zoom <bundle> --mark 1 --frame 4        # ✎① of keyframe #4, when several have a ✎①
 ```
 
 It prints the path of a PNG sheet of frames around that moment, the time of each cell, and what was said. Open the PNG and look at it before you act on the feedback. `--span` is the seconds covered (default 2, a quarter of it before the moment), `--frames` the number of cells (default 12), and `--full` shows the whole screen instead of the crop. The cells are numbered from #1 within the sheet, so those numbers aren't keyframe numbers.
+
+`--mark` takes a mark's number from the text or its id (`m2`) and centres the sheet on the time it was drawn, with only that mark's ink, drawn whole from the moment it starts. `scrawl inspect <bundle> --marks` lists every mark (`#2 ✎② 0:09 marked (2 strokes) · m2`: keyframe, number, time, shape, what it was drawn on, id), and `--marks --json` gives the same as JSON.
 
 ### Other commands
 
 ```sh
 scrawl inspect <bundle>               # summary.md, the text above
 scrawl inspect <bundle> --json        # scrawl.json
+scrawl inspect <bundle> --marks       # the marks, numbered as in the text [--json]
 scrawl frames <bundle> --from 0:04 --to 0:06 [--fps 4]   # plain PNGs of a range; prints their paths
 scrawl send <bundle> --session ses_…  # queue the capture into an OpenCode session
 scrawl send <bundle> --clipboard      # copy the summary text to the clipboard

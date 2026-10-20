@@ -36,7 +36,8 @@ current copy, so it updates with the app.
 
 With the skill, an agent that gets a Scrawl paste reads the contact sheet and transcript, opens the
 keyframes the narration points at, and uses the command to look closer: `scrawl zoom <bundle> --at
-0:12` (or `--at "a phrase you said"`) makes a dense sheet of frames around a moment, `scrawl
+0:12` (or `--at "a phrase you said"`, or `--mark 2` for the mark the text shows as ✎②; `scrawl
+inspect --marks` lists them) makes a dense sheet of frames around a moment, `scrawl
 frames` pulls a range, `scrawl send` queues a capture into an OpenCode session, and `scrawl export`
 makes a shareable `.mp4`. `scrawl skill` prints the skill without installing anything.
 

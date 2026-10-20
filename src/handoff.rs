@@ -458,8 +458,8 @@ fn log_config_once(message: String) {
     }
 }
 
-/// More of what Scrawl already knows in the summary and on the frames: marks, shortcuts, drags
-/// and windows inline at their time, numbered marks on shared frames, where a screen changed.
+/// More of what Scrawl already knows in the summary: marks, shortcuts, drags and windows inline
+/// at their time, numbered marks on shared frames, where a screen changed.
 pub const AGENT_CONTEXT: &str = "agentContext";
 
 /// Transcribe Mac recordings while they record, so finishing only waits for the last words
