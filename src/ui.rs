@@ -1916,16 +1916,10 @@ impl ScrawlCoordinator {
         if !crate::handoff::native_pill() || self.native_pill.is_some() {
             return;
         }
-        match crate::native::capsule::Capsule::open() {
+        // The capsule adds its window to the ones captures leave out, again whenever it
+        // switches renderer.
+        match crate::native::capsule::Capsule::open(self.telemetry.excluded_window_ids.clone()) {
             Ok(pill) => {
-                let num = pill.window_number();
-                if num > 0 {
-                    self.telemetry
-                        .excluded_window_ids
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(num);
-                }
                 self.native_pill = Some(pill);
             }
             Err(err) => {
