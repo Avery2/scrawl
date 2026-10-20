@@ -672,6 +672,21 @@ pub fn summary_markdown_with(
     out
 }
 
+/// A ⇧-click pin shows live only as a brief ring at the click, gone in this long; the pin itself
+/// stays data (keyframes, summary). Ordinary clicks draw nothing live.
+pub const PIN_PULSE_MS: u64 = 350;
+
+/// The live pulse for a pin dropped `age_ms` ago: a thin ring's radius (points) and opacity. It
+/// grows out fast and slows (ease-out cubic) while it fades to nothing.
+pub fn pin_pulse(age_ms: u64) -> Option<(f32, f32)> {
+    if age_ms >= PIN_PULSE_MS {
+        return None;
+    }
+    let p = age_ms as f32 / PIN_PULSE_MS as f32;
+    let grow = 1.0 - (1.0 - p).powi(3);
+    Some((4.0 + 10.0 * grow, 0.55 * (1.0 - p) * (1.0 - p)))
+}
+
 /// Extracts the active `[now_ms - tail_ms, now_ms]` window of a timed laser stroke,
 /// linearly interpolating the exact tail cutoff point at `t_cutoff` so the tail
 /// glides continuously along the path at 120Hz instead of snapping vertex-by-vertex.
@@ -1167,6 +1182,18 @@ fn smooth_closed_polygon(poly: &[[f32; 2]]) -> Vec<[f32; 2]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pin pulses once and is gone: nothing click-related stays on screen while recording.
+    #[test]
+    fn a_pin_pulse_grows_fades_and_ends() {
+        let (r0, a0) = pin_pulse(0).unwrap();
+        let (r1, a1) = pin_pulse(PIN_PULSE_MS / 2).unwrap();
+        let (r2, a2) = pin_pulse(PIN_PULSE_MS - 1).unwrap();
+        assert!(r0 < r1 && r1 < r2 && r2 <= 14.0);
+        assert!(a0 > a1 && a1 > a2 && a2 < 0.01 && a0 <= 0.55);
+        assert_eq!(pin_pulse(PIN_PULSE_MS), None);
+        assert_eq!(pin_pulse(60_000), None);
+    }
 
     fn stroke(points: &[[f32; 2]], t: u64) -> Stroke {
         Stroke {

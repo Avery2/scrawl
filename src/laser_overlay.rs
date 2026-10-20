@@ -21,14 +21,11 @@ use objc2_foundation::{NSPoint, NSRect};
 use objc2_quartz_core::CALayer;
 
 use crate::capture::SharedCaptureTelemetry;
-use crate::sketch::{slice_laser_window, smooth_ink_points, smooth_laser_points};
+use crate::sketch::{pin_pulse, slice_laser_window, smooth_ink_points, smooth_laser_points};
 
 const TAIL_DURATION_SEC: f32 = 0.42;
 const MAX_SEGMENTS: usize = 16_384;
 const MAX_PINS: usize = 64;
-/// A ⇧-click pin shows live only as a brief ring at the click, gone in this long; the pin itself
-/// stays data (keyframes, summary). Ordinary clicks draw nothing live.
-const PIN_PULSE_MS: u64 = 350;
 /// Side of a culling tile, in points. Each pixel runs only the segments binned into its tile.
 const TILE_PT: f32 = 32.0;
 /// How far a segment can colour a pixel, in points. They must stay at or past the shader's
@@ -75,17 +72,6 @@ struct PinMarker {
     pos: [f32; 2],
     radius: f32,
     alpha: f32,
-}
-
-/// The live pulse for a pin dropped `age_ms` ago: a thin ring's radius (points) and opacity. It
-/// grows out fast and slows (ease-out cubic) while it fades to nothing.
-fn pin_pulse(age_ms: u64) -> Option<(f32, f32)> {
-    if age_ms >= PIN_PULSE_MS {
-        return None;
-    }
-    let p = age_ms as f32 / PIN_PULSE_MS as f32;
-    let grow = 1.0 - (1.0 - p).powi(3);
-    Some((4.0 + 10.0 * grow, 0.55 * (1.0 - p) * (1.0 - p)))
 }
 
 pub struct MetalLaserOverlay {
@@ -754,18 +740,6 @@ mod tests {
     /// `setFragmentBytes` aborts in the driver past 4 KB.
     const SET_BYTES_LIMIT: usize = 4096;
 
-    /// A pin pulses once and is gone: nothing click-related stays on screen while recording.
-    #[test]
-    fn a_pin_pulse_grows_fades_and_ends() {
-        let (r0, a0) = pin_pulse(0).unwrap();
-        let (r1, a1) = pin_pulse(PIN_PULSE_MS / 2).unwrap();
-        let (r2, a2) = pin_pulse(PIN_PULSE_MS - 1).unwrap();
-        assert!(r0 < r1 && r1 < r2 && r2 <= 14.0);
-        assert!(a0 > a1 && a1 > a2 && a2 < 0.01 && a0 <= 0.55);
-        assert_eq!(pin_pulse(PIN_PULSE_MS), None);
-        assert_eq!(pin_pulse(60_000), None);
-    }
-
     /// Uniforms and pins still go through `set_fragment_bytes`; segments don't fit and use a buffer.
     #[test]
     fn inline_fragment_bytes_fit_the_metal_limit() {
@@ -867,7 +841,7 @@ mod tests {
         let (size, scale) = (80_u64, 2.0_f32);
         let points = size as f32 / scale;
         let centre = points / 2.0;
-        for age in [0, 40, 90, 150, 220, 300, PIN_PULSE_MS] {
+        for age in [0, 40, 90, 150, 220, 300, crate::sketch::PIN_PULSE_MS] {
             let pin = pin_pulse(age).map_or(PinMarker::default(), |(radius, alpha)| PinMarker {
                 pos: [centre, centre],
                 radius,
@@ -896,7 +870,7 @@ mod tests {
             };
             let max_alpha = pixels.chunks_exact(4).map(|p| p[3]).max().unwrap_or(0);
             let mid = ((size / 2 * size + size / 2) * 4 + 3) as usize;
-            if age >= PIN_PULSE_MS {
+            if age >= crate::sketch::PIN_PULSE_MS {
                 assert_eq!(max_alpha, 0, "pulse still showing at {age} ms");
             } else {
                 assert!(max_alpha > 0, "no pulse at {age} ms");
