@@ -678,8 +678,7 @@ pub fn set_click_through(id: u32, through: bool) {
     x.flush();
 }
 
-/// Scrawl's own windows that GPUI made, at the top level or one down (in a window manager's
-/// frame).
+/// Scrawl's own windows, including KWin's frame → wrapper → client nesting.
 fn own_gpui_windows(x: &X) -> Vec<Window> {
     let pid = std::process::id();
     let children = |window: Window| -> Vec<Window> {
@@ -690,11 +689,20 @@ fn own_gpui_windows(x: &X) -> Vec<Window> {
             .map(|tree| tree.children)
             .unwrap_or_default()
     };
-    children(x.root)
-        .into_iter()
-        .flat_map(|top| std::iter::once(top).chain(children(top)))
-        .filter(|&id| x.property32(id, "_NET_WM_PID").first() == Some(&pid))
-        .collect()
+    let mut found = Vec::new();
+    let mut level = children(x.root);
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for id in level {
+            if x.property32(id, "_NET_WM_PID").first() == Some(&pid) {
+                found.push(id);
+            } else {
+                next.extend(children(id));
+            }
+        }
+        level = next;
+    }
+    found
 }
 
 /// GPUI windows' X11 ids, by GPUI window id.

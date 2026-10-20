@@ -288,7 +288,15 @@ pub fn global_shortcuts(
                         NewShortcut::new("paste", "Paste the latest capture")
                             .preferred_trigger(paste_trigger.as_str()),
                     ];
-                    proxy.bind_shortcuts(&session, &shortcuts, None).await?.response()?;
+                    let bound = proxy.bind_shortcuts(&session, &shortcuts, None).await?.response()?;
+                    // Plasma 5.27 returns success with an empty list. That is not a binding:
+                    // let the caller use evdev rather than silently losing both shortcuts.
+                    if !["record", "paste"].iter().all(|id| {
+                        bound.shortcuts().iter().any(|s| s.id() == *id && !s.trigger_description().is_empty())
+                    }) {
+                        let _ = session.close().await;
+                        bail!("The desktop did not bind both shortcuts");
+                    }
                     let activated = proxy.receive_activated().await?;
                     anyhow::Ok((proxy, session, activated))
                 };

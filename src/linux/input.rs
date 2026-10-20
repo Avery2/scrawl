@@ -77,7 +77,8 @@ struct Reader {
     pressed: Mutex<HashSet<u16>>,
 }
 
-static READER: OnceLock<Option<Reader>> = OnceLock::new();
+static READER: OnceLock<Reader> = OnceLock::new();
+static STARTED: Mutex<bool> = Mutex::new(false);
 
 fn event_devices() -> Vec<std::path::PathBuf> {
     let mut list: Vec<_> = std::fs::read_dir("/dev/input")
@@ -159,27 +160,30 @@ pub fn devices_readable() -> bool {
 
 /// Starts reading every keyboard and mouse (once). `false` when none can be read.
 pub fn start() -> bool {
-    READER
-        .get_or_init(|| {
-            let fds: Vec<OwnedFd> = event_devices()
-                .iter()
-                .filter_map(|p| open(p))
-                .filter(interesting)
-                .collect();
-            if fds.is_empty() {
-                return None;
-            }
-            crate::capture::scrawl_log(format!("input devices: reading {}", fds.len()));
-            std::thread::Builder::new()
-                .name("scrawl-evdev".into())
-                .spawn(move || read_loop(fds))
-                .ok()?;
-            Some(Reader {
-                held: Mutex::new(Held::default()),
-                pressed: Mutex::new(HashSet::new()),
-            })
-        })
-        .is_some()
+    let mut started = STARTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *started {
+        return true;
+    }
+    let fds: Vec<OwnedFd> = event_devices()
+        .iter()
+        .filter_map(|p| open(p))
+        .filter(interesting)
+        .collect();
+    if fds.is_empty() {
+        return false;
+    }
+    crate::capture::scrawl_log(format!("input devices: reading {}", fds.len()));
+    READER.get_or_init(|| Reader {
+        held: Mutex::new(Held::default()),
+        pressed: Mutex::new(HashSet::new()),
+    });
+    *started = std::thread::Builder::new()
+        .name("scrawl-evdev".into())
+        .spawn(move || read_loop(fds))
+        .is_ok();
+    *started
 }
 
 /// Where an absolute pointing device put the pointer, 0–1 across the desktop, unless a mouse
@@ -190,7 +194,7 @@ pub fn absolute_pointer() -> Option<[f64; 2]> {
 
 /// What is held, counting what was pressed and let go since the last call, for the one poller.
 pub fn take_held() -> Option<Held> {
-    let reader = READER.get()?.as_ref()?;
+    let reader = READER.get()?;
     let mut held = reader
         .held
         .lock()
@@ -208,7 +212,7 @@ pub fn take_held() -> Option<Held> {
 
 /// What is held, when the devices are being read.
 pub fn held() -> Option<Held> {
-    READER.get()?.as_ref().map(|r| {
+    READER.get().map(|r| {
         r.held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -249,7 +253,7 @@ fn read_loop(fds: Vec<OwnedFd>) {
                 let kind = u16::from_ne_bytes([event[16], event[17]]);
                 let code = u16::from_ne_bytes([event[18], event[19]]);
                 let value = i32::from_ne_bytes([event[20], event[21], event[22], event[23]]);
-                let Some(reader) = READER.get().and_then(Option::as_ref) else {
+                let Some(reader) = READER.get() else {
                     continue;
                 };
                 let mut held = reader

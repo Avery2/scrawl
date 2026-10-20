@@ -644,7 +644,7 @@ impl ScreenCaptureSession {
             CandidateBuffer::new(0),
         );
         let mut collected = buffer.into_frames();
-        if collected.is_empty() {
+        if !cfg!(target_os = "linux") && collected.is_empty() {
             collected.push(crate::render::render_synthetic_demo_frame(1280, 800, 0, 0));
         }
         let valid_video =

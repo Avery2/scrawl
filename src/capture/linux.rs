@@ -913,6 +913,9 @@ pub fn update_global_shortcut(telemetry: &SharedCaptureTelemetry, config: Shortc
 
 /// Notes where keys come from: the X server on X11, the input devices on Wayland.
 fn check_tap(telemetry: &SharedCaptureTelemetry) {
+    if linux::wayland_session() {
+        input::start();
+    }
     let keys = !linux::wayland_session() || from_devices();
     if telemetry.tap_live.swap(keys, Ordering::AcqRel) != keys {
         scrawl_log(format!(

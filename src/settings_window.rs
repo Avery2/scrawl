@@ -1310,7 +1310,7 @@ impl SettingsWindow {
             ),
             Permission::Accessibility if LINUX => (
                 "Input devices",
-                "To see ⇧ ink, clicks and Esc (the input group)".to_owned(),
+                "For Shift ink and clicks. Run the copied command in a terminal, then log out and back in.".to_owned(),
                 crate::icons::CLICK,
                 BLUE,
             ),
@@ -1348,17 +1348,27 @@ impl SettingsWindow {
                 .child("Allowed")
                 .into_any_element()
         } else {
-            let title = if row.requested || row.status == Status::Denied {
+            let title = if LINUX && permission == Permission::Accessibility {
+                "Copy command"
+            } else if row.requested || row.status == Status::Denied {
                 "Open Settings"
             } else {
                 "Allow"
             };
             button(theme, id, title, true)
-                .on_click(cx.listener(move |view, _, _, _| view.act(Action::Grant { permission })))
+                .on_click(cx.listener(move |view, _, _, _| {
+                    #[cfg(target_os = "linux")]
+                    if permission == Permission::Accessibility {
+                        crate::linux::privacy::copy_input_command();
+                        return;
+                    }
+                    view.act(Action::Grant { permission });
+                }))
                 .into_any_element()
         };
         div()
-            .h(px(52.0))
+            .min_h(px(52.0))
+            .py(px(8.0))
             .px(px(12.0))
             .flex()
             .items_center()
@@ -1367,6 +1377,7 @@ impl SettingsWindow {
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
                     .flex()
                     .flex_col()
                     .gap(px(1.0))

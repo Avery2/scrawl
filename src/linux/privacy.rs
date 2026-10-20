@@ -8,6 +8,14 @@ use std::collections::BTreeMap;
 
 use crate::onboarding::{Permission, Status};
 
+pub const INPUT_COMMAND: &str = "sudo usermod -aG input \"$USER\"";
+
+pub fn copy_input_command() {
+    if let Err(error) = super::clipboard::set_text(INPUT_COMMAND) {
+        crate::capture::scrawl_log(format!("Copy input command: {error:#}"));
+    }
+}
+
 pub fn permissions() -> BTreeMap<Permission, Status> {
     let input = if super::wayland_session() && !super::input::devices_readable() {
         Status::Denied

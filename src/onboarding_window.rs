@@ -752,7 +752,9 @@ impl OnboardingWindow {
             );
             // Windows and Linux have no prompt for desktop apps: the button always opens
             // Settings (on Linux, the guide to the input group).
-            let title = if row.requested || denied || cfg!(not(target_os = "macos")) {
+            let title = if cfg!(target_os = "linux") && row.permission == Permission::Accessibility {
+                "Copy command"
+            } else if row.requested || denied || cfg!(not(target_os = "macos")) {
                 "Open Settings"
             } else {
                 "Allow"
@@ -764,7 +766,14 @@ impl OnboardingWindow {
                 .when(row.requested && !denied, |d| d.child(spinner(phase)))
                 .child(
                     row_button(SharedString::from(action.clone()), title).on_click(
-                        cx.listener(move |_, _, _, _| events(Event::Action(action.clone()))),
+                        cx.listener(move |_, _, _, _| {
+                            #[cfg(target_os = "linux")]
+                            if title == "Copy command" {
+                                crate::linux::privacy::copy_input_command();
+                                return;
+                            }
+                            events(Event::Action(action.clone()));
+                        }),
                     ),
                 )
                 .into_any_element()
@@ -856,7 +865,7 @@ impl OnboardingWindow {
         } else if state.fix && only(Permission::Accessibility) && cfg!(target_os = "linux") {
             (
                 "The input devices, for ⇧ ink".to_owned(),
-                "On Wayland, Scrawl sees ⇧, clicks and Esc over other apps through the input devices, which only the input group can read. Run sudo usermod -aG input $USER, then log out and in again.".to_owned(),
+                "On Wayland, clicks and Shift ink need access to input devices.".to_owned(),
             )
         } else if state.fix && only(Permission::Accessibility) {
             (
@@ -878,6 +887,8 @@ impl OnboardingWindow {
                     .trim_end()
                     .to_owned(),
             )
+        } else if cfg!(target_os = "linux") {
+            ("Ready to record".to_owned(), "On Wayland, clicks and Shift ink need access to input devices.".to_owned())
         } else {
             let count = rows.iter().filter(|r| r.required).count();
             (
@@ -904,6 +915,14 @@ impl OnboardingWindow {
                 card = card.child(div().ml(px(14.0)).h(px(1.0)).bg(rgba(LINE)));
             }
             card = card.child(self.permission_row(row, phase, cx));
+        }
+        #[cfg(target_os = "linux")]
+        if rows.iter().any(|r| r.permission == Permission::Accessibility && r.status != Status::Granted) {
+            card = card.child(
+                div().px(px(14.0)).pb(px(14.0)).text_size(px(12.0)).text_color(rgb(SOFT))
+                    .child(div().child(crate::linux::privacy::INPUT_COMMAND))
+                    .child(div().mt(px(6.0)).child("Run this in a terminal, then log out and back in. Reopen Scrawl to continue; access is checked automatically."))
+            );
         }
         div()
             .flex()

@@ -393,7 +393,6 @@ pub fn run_sampler(sampler: Sampler) -> Option<PathBuf> {
     let mut last_sample = Instant::now()
         .checked_sub(crate::capture::FRAME_SAMPLE_INTERVAL)
         .unwrap_or_else(Instant::now);
-    let mut phase = 0_u32;
     let mut offset_set = false;
     let records_others = !matches!(
         recorder.as_ref().map(|(_, source)| source),
@@ -436,15 +435,10 @@ pub fn run_sampler(sampler: Sampler) -> Option<PathBuf> {
         if is_urgent || last_sample.elapsed() >= interval {
             last_sample = Instant::now();
             let t_ms = started_at.elapsed().as_millis() as u64;
-            if is_urgent {
-                phase = phase.saturating_add(1);
-            }
             let frame = match recorder.as_mut() {
                 // No frame from the compositor yet: look again on the next turn.
                 Some((r, _)) => r.candidate(t_ms, &masks.1),
-                None => Some(crate::render::render_synthetic_demo_frame(
-                    1280, 800, t_ms, phase,
-                )),
+                None => None,
             };
             match frame {
                 Some(frame) => frames

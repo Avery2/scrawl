@@ -853,6 +853,10 @@ pub fn finalize_capture_bundle(
         duration_ms,
         video_offset_ms,
     } = recording;
+    anyhow::ensure!(
+        !frames.is_empty(),
+        "No screen frames were captured. Choose a screen in the sharing dialog and try again."
+    );
     if let Some(ref audio) = recorded_audio {
         let wav_path = bundle_dir.join("audio.wav");
         let _ = std::fs::create_dir_all(bundle_dir);
