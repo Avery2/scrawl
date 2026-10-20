@@ -93,6 +93,7 @@ pub(crate) struct Tune {
     pub pill_highlight_trail: [f32; 2],
     /// Reveal anticipation / overshoot (pt).
     pub pill_punch: f32,
+    pub pill_follow: f32,
 }
 
 const fn pair(c: crate::native::pill::model::SpringCfg) -> [f32; 2] {
@@ -123,6 +124,7 @@ impl Tune {
         pill_highlight_lead: pair(crate::native::pill::model::HIGHLIGHT_LEAD),
         pill_highlight_trail: pair(crate::native::pill::model::HIGHLIGHT_TRAIL),
         pill_punch: crate::native::pill::model::PUNCH_PT,
+        pill_follow: crate::native::pill::model::FOLLOW,
     };
 }
 
@@ -234,6 +236,9 @@ pub(super) const KEYS: &[(&str, &str, Field)] = &[
         &mut t.pill_highlight_trail[1]
     }),
     ("pill.punch", "Reveal shoots this far past rest (pt, 0 = none)", |t| &mut t.pill_punch),
+    ("pill.follow", "Sliding content takes this many times the walls' duration (1 = with them)", |t| {
+        &mut t.pill_follow
+    }),
 ];
 
 /// Numbered presets; 1 is what ships and names nothing.
@@ -355,6 +360,7 @@ impl Tune {
             highlight_lead: cfg(self.pill_highlight_lead),
             highlight_trail: cfg(self.pill_highlight_trail),
             punch: self.pill_punch.max(0.0),
+            follow: self.pill_follow.clamp(0.5, 3.0),
         }
     }
 

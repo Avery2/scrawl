@@ -156,6 +156,14 @@ pub const UNROLL_STRETCH: f32 = 1.28;
 /// back into place. Driven by `punch_curve` over the entry spring's progress, never by spring
 /// overshoot. `0` is the plain zero-bounce reveal.
 pub const PUNCH_PT: f32 = 2.0;
+
+/// Content that slides with a visible morph (shared chips, the close button) takes this many
+/// times as long as the walls, so the shape leads and the content follows it in, the way the
+/// Dynamic Island moves. Faster than the walls (`SHARED_SPRING` alone), sliding content
+/// overtook them, ran into the wall and was stopped dead by containment.
+pub const FOLLOW: f32 = 1.15;
+/// A wall stopping content slower than this (pt/s) is a nudge at rest, not a visible stop.
+const WALL_STOP_SPEED: f32 = 20.0;
 /// Top / Lead exit: content leaves for this long before the wall folds (knobs `GLASS_DELAY`,
 /// `src/panel/morph.ts`).
 pub const FOLD_WAIT_S: f32 = 0.035;
@@ -192,6 +200,8 @@ pub struct PillOpts {
     pub highlight_trail: SpringCfg,
     /// How far (pt) the reveal shoots past its rest; see `PUNCH_PT`.
     pub punch: f32,
+    /// Sliding content's duration as a multiple of the walls'; see `FOLLOW`.
+    pub follow: f32,
 }
 
 impl Default for PillOpts {
@@ -208,6 +218,7 @@ impl Default for PillOpts {
             highlight_lead: HIGHLIGHT_LEAD,
             highlight_trail: HIGHLIGHT_TRAIL,
             punch: PUNCH_PT,
+            follow: FOLLOW,
         }
     }
 }
@@ -975,6 +986,9 @@ pub struct FrameState {
 
 pub struct PillModel {
     pub t: f32,
+    /// Frames on which containment stopped sliding content dead at a wall (it had overtaken
+    /// the shape). Kept at 0 by `FOLLOW`; counted for tests.
+    pub wall_stops: u32,
     pub pres: Pres,
     pub geo_pres: Pres,
     pub geo_at: f32,
@@ -1019,6 +1033,7 @@ impl PillModel {
         let idle = Layout::centered(ISLAND_OPEN_FROM_W, ISLAND_H);
         Self {
             t: 0.0,
+            wall_stops: 0,
             pres: Pres::Hidden,
             geo_pres: Pres::Hidden,
             geo_at: 0.0,
@@ -1157,6 +1172,8 @@ impl PillModel {
         let before_l = self.l.x;
         let before_r = self.r.x;
         let before_b = self.b.x;
+        // Sliding content's springs toward the left and toward the right wall.
+        let mut slide = (SHARED_SPRING, SHARED_SPRING);
         self.morph_start_w = (before_r - before_l).max(1.0);
         self.morph_start_h = (before_b - TOP).max(1.0);
 
@@ -1246,7 +1263,15 @@ impl PillModel {
             } else {
                 // Visible state-to-state width-led morph (`≤ 350 ms` settled, velocity preserved).
                 // Each wall has its own spring, so a wall whose target doesn't move stays put.
-                let (w_cfg, h_cfg) = self.morph_springs(&lay, before_l, before_r, before_b);
+                let (w_cfg, h_cfg, _) = self.morph_springs(&lay, before_l, before_r, before_b);
+                // Opening, the walls lead and sliding content follows them out; closing, the walls
+                // sweep in and content rides with them on the same spring, so it's never pushed.
+                let follow = SpringCfg::new(
+                    (w_cfg.duration * self.opts.follow).max(SHARED_SPRING.duration),
+                    0.0,
+                );
+                let opening = lay.width() > before_r - before_l + 0.5;
+                slide = if opening { (follow, follow) } else { (w_cfg, w_cfg) };
                 self.l.to(lay.l, w_cfg);
                 self.r.to(lay.r, w_cfg);
                 self.b.to(lay.b, h_cfg);
@@ -1277,8 +1302,9 @@ impl PillModel {
                 if (st.x.x - ix).hypot(st.y.x - iy) > 0.5 {
                     st.travelling = true;
                 }
-                st.x.to(ix, SHARED_SPRING);
-                st.y.to(iy, SHARED_SPRING);
+                let toward = if ix < st.x.x { slide.0 } else { slide.1 };
+                st.x.to(ix, toward);
+                st.y.to(iy, toward);
                 st.active.to(item.active, SpringCfg::new(0.18, 0.0));
             }
         }
@@ -1286,7 +1312,7 @@ impl PillModel {
 
     /// Width and height springs for a visible morph to `lay` from walls at `l`, `r`, `b`: the
     /// palette morph (open or close by area), a touch quicker for short moves; only width bounces.
-    fn morph_springs(&self, lay: &Layout, l: f32, r: f32, b: f32) -> (SpringCfg, SpringCfg) {
+    fn morph_springs(&self, lay: &Layout, l: f32, r: f32, b: f32) -> (SpringCfg, SpringCfg, bool) {
         let dw = (lay.l - l).abs().max((lay.r - r).abs());
         let dh = (lay.b - b).abs();
         let opening = lay.width() * lay.height() >= (r - l) * (b - TOP) - 1.0;
@@ -1297,7 +1323,7 @@ impl PillModel {
         };
         let f = (dw.hypot(dh) / REF_DIST).clamp(0.0, 1.0);
         let dur = (base.duration * mix(DISTANCE_FLOOR, 1.0, f)).max(0.14);
-        (SpringCfg::new(dur, base.bounce), SpringCfg::new(dur, 0.0))
+        (SpringCfg::new(dur, base.bounce), SpringCfg::new(dur, 0.0), opening)
     }
 
     /// Updates the recording clock string (`M:SS`); if the digit count changed (e.g. `9:59 -> 10:00`),
@@ -1524,7 +1550,7 @@ impl PillModel {
             if let Some((at, lay)) = pending
                 && t >= at
             {
-                let (w_cfg, h_cfg) = self.morph_springs(&lay, l.x, r.x, b.x);
+                let (w_cfg, h_cfg, _) = self.morph_springs(&lay, l.x, r.x, b.x);
                 l.to(lay.l, w_cfg);
                 r.to(lay.r, w_cfg);
                 b.to(lay.b, h_cfg);
@@ -1631,6 +1657,7 @@ impl PillModel {
             CONTENT_OUT_SPRING
         };
 
+        let mut wall_stops = 0;
         for id in ElemId::ALL {
             let idx = id as usize;
             let in_active = active_items.iter().any(|item| item.id == id);
@@ -1665,11 +1692,13 @@ impl PillModel {
                 if st.x.x < min_x {
                     st.x.x = min_x;
                     if st.x.v < 0.0 {
+                        wall_stops += u32::from(st.x.v < -WALL_STOP_SPEED);
                         st.x.v = 0.0;
                     }
                 } else if st.x.x > max_x {
                     st.x.x = max_x;
                     if st.x.v > 0.0 {
+                        wall_stops += u32::from(st.x.v > WALL_STOP_SPEED);
                         st.x.v = 0.0;
                     }
                 }
@@ -1773,6 +1802,7 @@ impl PillModel {
             }
         }
 
+        self.wall_stops += wall_stops;
         self.step_highlight(dt, &active_items);
     }
 
@@ -2566,6 +2596,28 @@ mod tests {
             m.advance(FRAME_DT);
         }
         assert!(m.frame().ghost.is_none());
+    }
+
+    /// The shape leads and sliding content follows it in: no visible morph has content
+    /// overtake a wall and get stopped dead against it.
+    #[test]
+    fn sliding_content_follows_the_shape_and_never_hits_a_wall() {
+        let states = visible_states();
+        for opts in all_opts() {
+            for from in &states {
+                for to in &states {
+                    let mut m = PillModel::new(Metrics::default());
+                    m.opts = opts;
+                    settle(&mut m, from.clone());
+                    m.wall_stops = 0;
+                    m.set_pres(to.clone());
+                    for _ in 0..120 {
+                        m.advance(FRAME_DT);
+                    }
+                    assert_eq!(m.wall_stops, 0, "{from:?} -> {to:?} ({opts:?})");
+                }
+            }
+        }
     }
 
     #[test]
