@@ -320,6 +320,18 @@ pub fn annotate_keyframe_in_place(
     stamp_keyframe_badge_in_place(frame, keyframe);
 }
 
+/// Sizes for a frame of `w × h` pixels: `(k, stroke_size, pin_scale)`.
+/// Tuned for ~1280×800 screen frames; phone frames are taller and denser.
+pub(crate) fn annotation_sizes(w: f32, h: f32) -> (f32, f32, f32) {
+    let k = (w.min(h) / 800.0).max(w.max(h) / 1280.0).clamp(1.0, 2.0);
+    let size = (w.min(h) * 0.0065).clamp(4.2, 6.0) * k;
+    (k, size, (w.max(h) / 1280.0).clamp(0.75, 2.5))
+}
+
+pub(crate) fn is_long_press(label: Option<&str>) -> bool {
+    label.is_some_and(|l| l == "long press" || l.starts_with("long press:"))
+}
+
 pub fn annotate_keyframe_marks_in_place(
     frame: &mut RgbaFrame,
     keyframe: &Keyframe,
@@ -333,9 +345,7 @@ pub fn annotate_keyframe_marks_in_place(
     if w == 0.0 || h == 0.0 {
         return;
     }
-    // Sizes are tuned for ~1280×800 screen frames; phone frames are taller and denser.
-    let k = (w.min(h) / 800.0).max(w.max(h) / 1280.0).clamp(1.0, 2.0);
-    let size = (w.min(h) * 0.0065).clamp(4.2, 6.0) * k;
+    let (k, size, pin_scale) = annotation_sizes(w, h);
     // A mark keyframe shows every mark drawn on its screen. Flags carry no ink, so a flagged
     // keyframe still shows the strokes of its moment.
     let shown = crate::sketch::marks_on(keyframe, marks);
@@ -359,13 +369,7 @@ pub fn annotate_keyframe_marks_in_place(
             .collect();
         if let Some(number) = stroke.pin {
             if let Some(&point) = points.first() {
-                draw_pin(
-                    frame,
-                    point,
-                    number,
-                    (w.max(h) / 1280.0).clamp(0.75, 2.5),
-                    1.0,
-                );
+                draw_pin(frame, point, number, pin_scale);
             }
         } else if !points.is_empty() {
             let outline = freehand_outline(
@@ -395,9 +399,7 @@ pub fn annotate_keyframe_marks_in_place(
             label,
         } = event
             && button.as_deref() == Some("touch")
-            && !label
-                .as_deref()
-                .is_some_and(|l| l == "long press" || l.starts_with("long press:"))
+            && !is_long_press(label.as_deref())
             && *t <= keyframe.t
             && keyframe.t.saturating_sub(*t1) <= 900
         {
@@ -422,9 +424,7 @@ pub fn annotate_keyframe_marks_in_place(
                 y0,
                 label,
                 ..
-            } if label
-                .as_deref()
-                .is_some_and(|l| l == "long press" || l.starts_with("long press:"))
+            } if is_long_press(label.as_deref())
                 && ((*t <= keyframe.t && keyframe.t.saturating_sub(*t1) <= 600)
                     || t.abs_diff(keyframe.t) <= 600) =>
             {
@@ -583,11 +583,11 @@ fn draw_keyframe_badge(
     }
 }
 
-fn draw_pin(frame: &mut RgbaFrame, point: [f32; 2], number: u32, scale: f32, alpha: f32) {
+fn draw_pin(frame: &mut RgbaFrame, point: [f32; 2], number: u32, scale: f32) {
     let label = number.to_string();
     let radius = 13.0 * scale;
-    circle(frame, point, radius + 2.5 * scale, opacity(WHITE, alpha));
-    circle(frame, point, radius, opacity(RED, alpha));
+    circle(frame, point, radius + 2.5 * scale, WHITE);
+    circle(frame, point, radius, RED);
     let mut size = 16.0 * scale;
     let width = text_width(&label, size, true);
     if width > radius * 1.65 {
@@ -600,7 +600,7 @@ fn draw_pin(frame: &mut RgbaFrame, point: [f32; 2], number: u32, scale: f32, alp
         point[0] - width * 0.5,
         point[1] - size * 0.58,
         size,
-        opacity(WHITE, alpha),
+        WHITE,
         true,
     );
 }
@@ -683,32 +683,22 @@ fn draw_touch_trail(frame: &mut RgbaFrame, points: &[[f32; 2]], k: f32) {
 /// A round-capped polyline of half-width `radius`, blended once per pixel so a translucent line
 /// doesn't darken where its segments meet.
 fn polyline(frame: &mut RgbaFrame, points: &[[f32; 2]], radius: f32, color: Color) {
-    if points.is_empty() || points.iter().flatten().any(|v| !v.is_finite()) {
+    if points.len() < 2 || points.iter().flatten().any(|v| !v.is_finite()) {
         return;
     }
     let reach = radius + 1.0;
-    let (mut lo, mut hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
-    for p in points {
-        for i in 0..2 {
-            lo[i] = lo[i].min(p[i] - reach);
-            hi[i] = hi[i].max(p[i] + reach);
-        }
-    }
-    let x0 = (lo[0].floor() as i32).max(0);
-    let x1 = (hi[0].ceil() as i32).min(frame.width as i32);
-    let y0 = (lo[1].floor() as i32).max(0);
-    let y1 = (hi[1].ceil() as i32).min(frame.height as i32);
-    let segments: Vec<([f32; 2], [f32; 2])> = if points.len() == 1 {
-        vec![(points[0], points[0])]
-    } else {
-        points.windows(2).map(|w| (w[0], w[1])).collect()
-    };
+    let [bx0, by0, bx1, by1] = crate::sketch::bounds(points);
+    let x0 = ((bx0 - reach).floor() as i32).max(0);
+    let x1 = ((bx1 + reach).ceil() as i32).min(frame.width as i32);
+    let y0 = ((by0 - reach).floor() as i32).max(0);
+    let y1 = ((by1 + reach).ceil() as i32).min(frame.height as i32);
     for py in y0..y1 {
         let y = py as f32 + 0.5;
         for px in x0..x1 {
             let x = px as f32 + 0.5;
             let mut d = f32::INFINITY;
-            for &(a, b) in &segments {
+            for seg in points.windows(2) {
+                let (a, b) = (seg[0], seg[1]);
                 if x < a[0].min(b[0]) - reach
                     || x > a[0].max(b[0]) + reach
                     || y < a[1].min(b[1]) - reach

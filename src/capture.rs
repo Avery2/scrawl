@@ -1267,46 +1267,29 @@ fn is_pin_click(down: (u64, f64, f64), up: (u64, f64, f64)) -> bool {
         && ((up.1 - down.1).hypot(up.2 - down.2) as f32) < CLICK_SLOP_PT
 }
 
-/// How far (points) the ink reaches from where it started.
-fn ink_span_pt(stroke: &Stroke) -> f32 {
+/// Whether `stroke`'s points before `before_ms` reach at least `MIN_INK_SPAN_PT` from its start.
+fn drew_before(stroke: &Stroke, before_ms: u64) -> bool {
     let Some(first) = stroke.pts.get(0..2) else {
-        return 0.0;
+        return false;
     };
-    stroke
+    let mut points = 0_usize;
+    let mut span = 0.0_f32;
+    for p in stroke
         .pts
         .chunks_exact(3)
-        .map(|p| {
-            let dx = (p[0] - first[0]) as f32 / SCALE as f32 * stroke.fw as f32;
-            let dy = (p[1] - first[1]) as f32 / SCALE as f32 * stroke.fh as f32;
-            dx.hypot(dy)
-        })
-        .fold(0.0_f32, f32::max)
+        .take_while(|p| stroke.t0.saturating_add(p[2].max(0) as u64) < before_ms)
+    {
+        points += 1;
+        let dx = (p[0] - first[0]) as f32 / SCALE as f32 * stroke.fw as f32;
+        let dy = (p[1] - first[1]) as f32 / SCALE as f32 * stroke.fh as f32;
+        span = span.max(dx.hypot(dy));
+    }
+    points >= 2 && span >= MIN_INK_SPAN_PT
 }
 
 /// Whether finished ink is worth keeping as a stroke.
 fn is_real_ink(stroke: &Stroke) -> bool {
-    stroke.pts.len() >= 6 && ink_span_pt(stroke) >= MIN_INK_SPAN_PT
-}
-
-/// Whether live ink holds a real stroke drawn before `t_ms` (a ⇧-press at `t_ms` then isn't a pin).
-fn drew_before(ink: &Stroke, t_ms: u64) -> bool {
-    is_real_ink(&ink_before(ink.clone(), t_ms))
-}
-
-/// The part of live ink drawn before `t_ms`.
-fn ink_before(mut stroke: Stroke, t_ms: u64) -> Stroke {
-    let t0 = stroke.t0;
-    let at = |p: &[i32]| t0.saturating_add(p[2].max(0) as u64);
-    let keep = stroke
-        .pts
-        .chunks_exact(3)
-        .take_while(|p| at(p) < t_ms)
-        .count();
-    stroke.pts.truncate(keep * 3);
-    if let Some(last) = stroke.pts.chunks_exact(3).last() {
-        stroke.t1 = at(last);
-    }
-    stroke
+    drew_before(stroke, u64::MAX)
 }
 
 fn same_target_frame(a: TargetFrame, b: TargetFrame) -> bool {
