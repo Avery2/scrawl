@@ -26,15 +26,19 @@ use windows::core::PCWSTR;
 
 use super::wide;
 
-/// Opens a file, folder or URL with its default handler.
-pub fn open(target: &Path) -> Result<()> {
-    // The shell, unlike the file system, rejects `/` in a path (`…\scrawl/captures\…`).
-    let target: std::path::PathBuf = if target.is_absolute() {
+/// The shell, unlike the file system, rejects `/` in a path (`…\scrawl/captures\…`), so an
+/// absolute path is rebuilt from its components with `\` between them. URLs pass through.
+fn shell_path(target: &Path) -> std::path::PathBuf {
+    if target.is_absolute() {
         target.components().collect()
     } else {
         target.to_owned()
-    };
-    let target = wide(&target.to_string_lossy());
+    }
+}
+
+/// Opens a file, folder or URL with its default handler.
+pub fn open(target: &Path) -> Result<()> {
+    let target = wide(&shell_path(target).to_string_lossy());
     let verb = wide("open");
     // ShellExecute pumps messages while it starts the handler. On GPUI's thread that runs queued
     // tasks while the calling event still holds the app, and their panic aborts Scrawl.
@@ -264,5 +268,16 @@ mod tests {
         let _ = child.wait();
         // Already gone (or never there).
         assert!(wait_for_exit(u32::MAX - 3, Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn absolute_paths_lose_their_forward_slashes_and_urls_stay() {
+        let mixed = Path::new(r"C:\Users\a\AppData\Local\scrawl/captures\one.scrawl");
+        assert_eq!(
+            shell_path(mixed).to_string_lossy(),
+            r"C:\Users\a\AppData\Local\scrawl\captures\one.scrawl"
+        );
+        let url = Path::new("https://github.com/kitlangton/scrawl/releases");
+        assert_eq!(shell_path(url), url);
     }
 }
