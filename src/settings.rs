@@ -2450,7 +2450,11 @@ mod tests {
         assert_eq!((row.button, row.enabled), (Some("install"), false));
         assert_eq!(
             row.caption,
-            "The command-line tool works in the installed Scrawl.app."
+            if cfg!(target_os = "linux") {
+                "The command-line tool links to Scrawl's AppImage; run Scrawl from one."
+            } else {
+                "The command-line tool works in the installed Scrawl.app."
+            }
         );
         assert_eq!(
             panel.view(&host).skill_command,
