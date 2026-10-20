@@ -97,6 +97,8 @@ struct SettingsTranscriber: Decodable, Equatable {
     let note = unknown ? nil : "\(name(saved)) isn't available on this Mac. Using \(name(effective))."
     return (title, saved, options, note)
   }
+  /// The program's file name while transcribeCommand is usable.
+  var command: String? = nil
 }
 
 struct SettingsOption: Decodable, Equatable {
@@ -891,6 +893,8 @@ struct SettingsView: View {
     let language = SettingsTranscriber.languageMenu(saved: t.appleLocale, speech: t.speech)
     var engines: [(id: String, title: String, enabled: Bool)] = [("apple", "Apple Speech", true)]
     engines.append(("hex", t.hexTitle, t.hexEnabled))
+    if let command = t.command { engines.append(("command", "Command (\(command))", true)) }
+    let engineTitle = ["hex": "Hex", "command": "Command"][t.engine] ?? "Apple Speech"
     let chosenModel = t.models.first(where: \.chosen)
     let mic = state.microphone
     return VStack(spacing: 0) {
@@ -912,7 +916,7 @@ struct SettingsView: View {
       Color.clear.frame(height: 20)
       SettingsGroup {
         SettingsRow(title: "Transcription") {
-          SettingsPopup(value: t.engine == "hex" ? "Hex" : "Apple Speech", options: engines, selected: t.engine) {
+          SettingsPopup(value: engineTitle, options: engines, selected: t.engine) {
             model.set("transcriber", $0)
           }
         }
@@ -939,7 +943,9 @@ struct SettingsView: View {
           HexLanguageField(model: model, language: t.language)
         }
       }
-      SettingsCaption(text: t.hexEnabled || t.engine == "hex"
+      SettingsCaption(text: t.engine == "command"
+        ? "Command runs transcribeCommand from config.json. If it fails, that recording uses Apple Speech."
+        : t.hexEnabled || t.engine == "hex"
         ? "Apple Speech times each word. Hex uses a model you have in Hex, and its word times are estimates."
         : "Apple Speech runs on this Mac and times each word. Hex shows up here while Hex is running.")
       if t.engine == "apple", let note = language.note {
@@ -1528,6 +1534,8 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
     languageLoading.transcriber.speech = nil
     var languageUnsupported = ready
     languageUnsupported.transcriber.appleLocale = "xx-XX"
+    var command = base
+    command.transcriber = SettingsTranscriber(engine: "command", command: "whisper-scrawl")
     var missing = base
     missing.permissions[0].status = "granted"
     missing.permissions[0].relaunch = true
@@ -1582,6 +1590,7 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
       ("recording-language", .recording, language),
       ("recording-language-loading", .recording, languageLoading),
       ("recording-language-unsupported", .recording, languageUnsupported),
+      ("recording-command", .recording, command),
       ("storage", .storage, base),
       ("permissions", .permissions, base),
       ("permissions-missing", .permissions, missing),
