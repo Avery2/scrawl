@@ -243,9 +243,6 @@ extension EnvironmentValues {
 
 enum SettingsMotion {
   static let reduce = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-  /// Panes cross-fade in place: no travel, so reduced motion keeps the same fade.
-  static let paneIn: Animation = .easeOut(duration: 0.16)
-  static let paneOut: Animation = .easeIn(duration: 0.12)
   /// Switch knobs, keycaps and captions answering Scrawl (bounce 0).
   static let state: Animation = reduce ? .easeOut(duration: 0.15) : .spring(duration: 0.25, bounce: 0)
 }
@@ -675,20 +672,15 @@ struct SettingsView: View {
         .frame(width: SettingsMetrics.sidebar)
         .background(theme.sidebar)
       Rectangle().fill(theme.separator).frame(width: 1)
-      ZStack(alignment: .topLeading) {
-        content(model.pane)
-          .id(model.pane)
-          .transition(.asymmetric(
-            insertion: .opacity.animation(SettingsMotion.paneIn),
-            removal: .opacity.animation(SettingsMotion.paneOut)
-          ))
-      }
-      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-      .background(theme.window)
-      .contentShape(Rectangle())
-      .onTapGesture {
-        if model.state.recording != nil { model.act("cancel-shortcut") }
-      }
+      // Like System Settings, a pane replaces the last on the next frame: no fade between them.
+      content(model.pane)
+        .id(model.pane)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(theme.window)
+        .contentShape(Rectangle())
+        .onTapGesture {
+          if model.state.recording != nil { model.act("cancel-shortcut") }
+        }
     }
     .frame(width: SettingsMetrics.width, height: SettingsMetrics.height)
     .environment(\.settingsTheme, theme)
@@ -737,23 +729,29 @@ struct SettingsView: View {
   private func item(_ pane: SettingsPane) -> some View {
     let theme = SettingsTheme(scheme)
     let selected = model.pane == pane
-    return Button {
-      if model.state.recording != nil { model.act("cancel-shortcut") }
-      model.pane = pane
-    } label: {
-      HStack(spacing: 10) {
-        IconTile(symbol: pane.symbol, tint: pane.tint)
-        Text(pane.title)
-          .font(.system(size: 14))
-          .foregroundStyle(theme.text)
-        Spacer(minLength: 0)
-      }
-      .padding(.horizontal, 8)
-      .frame(height: 36)
-      .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(selected ? theme.selection : .clear))
-      .contentShape(Rectangle())
+    return HStack(spacing: 10) {
+      IconTile(symbol: pane.symbol, tint: pane.tint)
+      Text(pane.title)
+        .font(.system(size: 14))
+        .foregroundStyle(theme.text)
+      Spacer(minLength: 0)
     }
-    .buttonStyle(.plain)
+    .padding(.horizontal, 8)
+    .frame(height: 36)
+    .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(selected ? theme.selection : .clear))
+    .contentShape(Rectangle())
+    // Selects on mouse-down, as a sidebar does, rather than a button's mouse-up.
+    .onLongPressGesture(minimumDuration: 0, perform: {}, onPressingChanged: { down in
+      if down { select(pane) }
+    })
+    .accessibilityElement(children: .combine)
+    .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+    .accessibilityAction { select(pane) }
+  }
+
+  private func select(_ pane: SettingsPane) {
+    if model.state.recording != nil { model.act("cancel-shortcut") }
+    model.pane = pane
   }
 
   // Content
@@ -1190,7 +1188,9 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
   private func updateMeter(pane: SettingsPane? = nil) {
     let onScreen = window?.occlusionState.contains(.visible) == true && window?.isMiniaturized == false
     let showing = (pane ?? model.pane) == .recording && onScreen
-    model.meter.meter(showing ? model.state.microphone.meter : nil)
+    let device = showing ? model.state.microphone.meter : nil
+    // After the pane has drawn: making the capture session shouldn't hold up its frame.
+    DispatchQueue.main.async { [model] in model.meter.meter(device) }
   }
 
   func windowWillClose(_: Notification) {
