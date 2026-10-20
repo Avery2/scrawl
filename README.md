@@ -821,6 +821,31 @@ cargo build --release
 .\target\release\scrawl.exe app
 ```
 
+## Linux
+
+Scrawl runs on Linux desktops (GNOME and KDE Plasma, on Wayland or X11) as the same app, from
+the same GPUI code. It ships as an AppImage (`scripts/linux/appimage.sh`; every pull request's CI
+run has one) with GStreamer inside, so movies record without extra packages. On Wayland its
+windows run through XWayland.
+
+| | X11 | Wayland |
+|---|---|---|
+| Shortcut | `Alt+Shift+S`, `Alt+Shift+V` (`XGrabKey`) | The same, as GNOME keybindings or through the GlobalShortcuts portal |
+| Menu | Tray icon (StatusNotifierItem) | The same (GNOME needs the AppIndicator extension, on by default on Ubuntu) |
+| Screen capture | `ximagesrc` | GNOME's screencast API (no dialog), else the ScreenCast portal (asks once) |
+| Clicks, keys, Shift ink | The X server | The input devices (join the `input` group) |
+| Paste | `Ctrl+V` (`Ctrl+Shift+V` in terminals) through XTEST | The same, through the RemoteDesktop portal (asks once) |
+| Transcription | Parakeet on device (`transcribe.cpp`): **Download** in Settings › Recording (731 MB) | The same |
+| Captures | `~/.local/share/scrawl/captures` | The same |
+
+- **Wayland:** reading clicks, keys and Shift ink needs `sudo usermod -aG input $USER` and a new
+  login (Settings › Permissions shows it). Click positions are exact over X11 apps and with
+  tablets, touchscreens and VMs; with a mouse over a Wayland app they can be stale. Scrawl's pill
+  and ink show in the recording (no Linux desktop lets an app leave its windows out).
+- **Not on Linux:** the cabled iPhone, video export, `agentContext` and Sparkle updates.
+
+See [docs/linux.md](docs/linux.md) for how it works and how to build it.
+
 ## Testing
 
 ```sh
@@ -828,7 +853,8 @@ taskpolicy -c utility cargo test -j 3 --offline -- --test-threads=2
 ./scripts/install-app.sh
 ```
 
-On Windows, `cargo test`; then run `scrawl.exe app` and record with `Alt+Shift+S`.
+On Windows, `cargo test`; then run `scrawl.exe app` and record with `Alt+Shift+S`. On Linux,
+`cargo test`; then run `scrawl app` in a desktop session and record with `Alt+Shift+S`.
 `SCRAWL_SHOW_OWN_WINDOWS=1` keeps Scrawl's own windows (capsule, overlay, picker) in screenshots,
 which normally leave them out.
 

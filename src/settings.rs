@@ -730,8 +730,12 @@ impl CommandLineView {
             }
             State::Unavailable => {
                 view.enabled = false;
-                view.caption =
-                    "The command-line tool works in the installed Scrawl.app.".to_owned();
+                view.caption = if cfg!(target_os = "linux") {
+                    "The command-line tool links to Scrawl's AppImage; run Scrawl from one."
+                } else {
+                    "The command-line tool works in the installed Scrawl.app."
+                }
+                .to_owned();
             }
         }
         if let Some(error) = error {
