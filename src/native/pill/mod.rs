@@ -43,7 +43,7 @@ use self::model::{
     CHIP_H, DONE_TEXT_X, ElemId, FrameState, HUD_CAP, LEAD_TEXT_X, PANEL_H, PANEL_W,
     PROCESSING_TEXT_X, PillModel, Pres, SEG_ICON, SEG_ICON_GAP, SEG_PX,
 };
-use crate::ui::{SelectionMode, motion};
+use crate::ui::motion;
 
 const OFFSCREEN_W_PT: f32 = 960.0;
 const OFFSCREEN_H_PT: f32 = 256.0;
@@ -503,10 +503,6 @@ impl NativePill {
             run: RunStats::default(),
         };
         let main_draws = render.use_glass();
-        render
-            .pipelines
-            .layer
-            .set_presents_with_transaction(main_draws || present_mode() == PresentMode::Transaction);
         let shared = Arc::new(SharedNativePill {
             render: Mutex::new(render),
             main: Mutex::new(MainState {
@@ -632,9 +628,6 @@ impl NativePill {
                 st.style = snapshot.style;
                 st.dirty = true;
                 let main_draws = st.use_glass();
-                st.pipelines
-                    .layer
-                    .set_presents_with_transaction(main_draws || present_mode() == PresentMode::Transaction);
                 self.shared.main_draws.store(main_draws, Ordering::Release);
                 if !main_draws && let Some(ref gv) = main.glass_view {
                     gv.setHidden(true);
@@ -651,7 +644,7 @@ impl NativePill {
             }
             if let Pres::Completed { ref label } = snapshot.pres {
                 let sp = st.pipelines.atlas.update_completed(label);
-                st.model.set_completed_label(label.clone(), sp.size_pt[0]);
+                st.model.set_completed_label(label, sp.size_pt[0]);
             }
             if st.model.pres != snapshot.pres {
                 if pacing::enabled() {
@@ -804,7 +797,6 @@ fn create_glass_views(root_view: &NSView, bounds: NSRect) -> Option<Retained<NSV
     }
 }
 
-/// Logs when the drawable reaches the screen (`SCRAWL_PILL_PACING`).
 /// Notes when the drawable reaches the screen (0 if a newer one replaced it first) for the
 /// run summary, and logs it for `SCRAWL_PILL_PACING` (`n > 0`).
 fn watch_presented(drawable: &metal::MetalDrawableRef, n: u64, presented: &Arc<Presented>) {
@@ -819,54 +811,6 @@ fn watch_presented(drawable: &metal::MetalDrawableRef, n: u64, presented: &Arc<P
     let obj = metal::foreign_types::ForeignTypeRef::as_ptr(drawable).cast::<AnyObject>();
     unsafe {
         let _: () = msg_send![obj, addPresentedHandler: &*block];
-    }
-}
-
-/// How a frame drawn off the main thread reaches the screen (`SCRAWL_PILL_PRESENT`, for
-/// measuring): `transaction` (the default) presents inside an explicit `CATransaction`, as the
-/// main thread does, `at` schedules it for its refresh, `asap` as soon as the GPU is done.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PresentMode {
-    Transaction,
-    At,
-    Asap,
-}
-
-fn present_mode() -> PresentMode {
-    static MODE: std::sync::OnceLock<PresentMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("SCRAWL_PILL_PRESENT").as_deref() {
-        Ok("at") => PresentMode::At,
-        Ok("asap") => PresentMode::Asap,
-        _ => PresentMode::Transaction,
-    })
-}
-
-/// Presents `drawable` from the display link's thread for the refresh at `at` (host seconds).
-fn present_off_main(cmd: &metal::CommandBufferRef, drawable: &metal::MetalDrawableRef, at: f64) {
-    use metal::foreign_types::ForeignTypeRef;
-    let cmd_obj = cmd.as_ptr().cast::<AnyObject>();
-    let drawable_obj = drawable.as_ptr().cast::<AnyObject>();
-    match present_mode() {
-        PresentMode::Transaction => {
-            cmd.commit();
-            cmd.wait_until_scheduled();
-            CATransaction::begin();
-            CATransaction::setDisableActions(true);
-            drawable.present();
-            CATransaction::commit();
-        }
-        PresentMode::At => {
-            unsafe {
-                let _: () = msg_send![cmd_obj, presentDrawable: drawable_obj, atTime: at];
-            }
-            cmd.commit();
-        }
-        PresentMode::Asap => {
-            unsafe {
-                let _: () = msg_send![cmd_obj, presentDrawable: drawable_obj];
-            }
-            cmd.commit();
-        }
     }
 }
 
@@ -1023,7 +967,7 @@ impl SharedNativePill {
         }
         let n = if pacing::enabled() { pacing::next_frame() } else { 0 };
         let glass = main.and_then(|m| m.glass_view.as_deref()).filter(|_| st.use_glass());
-        st.render_frame(&frame, glass, out, n);
+        st.render_frame(&frame, glass, n);
         let drawn = pacing::host_now() - start;
         if st.run.frames > 0 {
             st.run.worst_step = st.run.worst_step.max(step);
@@ -1176,62 +1120,15 @@ impl MainState {
                             let _ = self.action_tx.try_send(PillAction::Paste(Some(screen_pt)));
                         }
                     }
-                } else if up_elem == Some(down_elem) {
-                    self.dispatch_click(&st.model, down_elem);
+                } else if up_elem == Some(down_elem)
+                    && let Some(action) = PillAction::for_click(&st.model.pres, down_elem)
+                {
+                    let _ = self.action_tx.try_send(action);
                 }
             }
             self.paste_drag_start_screen = None;
         }
         self.was_mouse_down = mouse_down;
-    }
-
-    fn dispatch_click(&self, model: &PillModel, elem: ElemId) {
-        let is_selecting = matches!(model.pres, Pres::Selecting { .. });
-        let action = match elem {
-            ElemId::ChipArea => {
-                if is_selecting {
-                    PillAction::SelectMode(SelectionMode::Area)
-                } else {
-                    PillAction::SwitchRecording(SelectionMode::Area)
-                }
-            }
-            ElemId::ChipWindow => {
-                if is_selecting {
-                    PillAction::SelectMode(SelectionMode::Window)
-                } else {
-                    PillAction::SwitchRecording(SelectionMode::Window)
-                }
-            }
-            ElemId::ChipScreen => {
-                if is_selecting {
-                    PillAction::SelectMode(SelectionMode::Screen)
-                } else {
-                    PillAction::SwitchRecording(SelectionMode::Screen)
-                }
-            }
-            ElemId::ChipIphone => {
-                if is_selecting {
-                    PillAction::SelectMode(SelectionMode::Iphone)
-                } else {
-                    PillAction::SwitchRecording(SelectionMode::Iphone)
-                }
-            }
-            ElemId::Record => PillAction::RecordSelected,
-            ElemId::Undo => PillAction::Undo,
-            ElemId::Cancel => PillAction::Cancel,
-            ElemId::Finish => PillAction::Finish,
-            ElemId::Close => {
-                if matches!(model.pres, Pres::Completed { .. }) {
-                    PillAction::DismissCompleted
-                } else {
-                    PillAction::Cancel
-                }
-            }
-            ElemId::Paste => PillAction::Paste(None),
-            ElemId::Inspect => PillAction::Inspect,
-            _ => return,
-        };
-        let _ = self.action_tx.try_send(action);
     }
 }
 
@@ -1281,7 +1178,6 @@ impl RenderState {
         &mut self,
         frame: &FrameState,
         glass: Option<&NSView>,
-        out: f64,
         n: u64,
     ) {
         let use_glass = self.use_glass();
@@ -1336,10 +1232,11 @@ impl RenderState {
         let mut hint_rect = [0.0_f32; 4];
         let mut hint_uv = [0.0_f32; 4];
         if !matches!(self.model.pres, Pres::Completed { .. })
-            && let Some(hov_id @ (ElemId::Cancel | ElemId::Close)) = self.model.hovered
+            && let Some(hov_id) = self.model.hovered
+            && let Some(hint) = hov_id.shortcut_hint()
             && let Some(hov_elem) = frame.elems.iter().find(|e| e.id == hov_id && e.alpha > 0.6)
         {
-            let esc_sp = self.pipelines.atlas.label("Esc");
+            let esc_sp = self.pipelines.atlas.label(hint);
             let hw = 30.0_f32;
             let hh = 18.0_f32;
             let hx = hov_elem.rect[0] + (hov_elem.rect[2] - hw) * 0.5;
@@ -1505,40 +1402,35 @@ impl RenderState {
             enc.end_encoding();
         }
 
-        let Some(gv) = glass else {
-            // Off the main thread: no transaction, presented on the refresh it was sampled for.
-            watch_presented(drawable, n, &self.presented);
-            present_off_main(cmd, drawable, out);
-            return;
-        };
-        // Synchronize `NSGlassEffectView` geometry and Metal drawable presentation in one CATransaction.
         CATransaction::begin();
         CATransaction::setDisableActions(true);
-        if frame.shape.alpha > 0.005 {
-            gv.setHidden(false);
-            let gx = f64::from(frame.shape.l);
-            let gy = f64::from(PANEL_H - frame.shape.b);
-            let gw = f64::from(frame.shape.width());
-            let gh = f64::from(frame.shape.height());
-            gv.setFrame(NSRect::new(NSPoint::new(gx, gy), NSSize::new(gw, gh)));
-            gv.setAlphaValue(f64::from(frame.shape.alpha));
-            unsafe {
-                if msg_send![gv, respondsToSelector: sel!(setCornerRadius:)] {
-                    let _: () = msg_send![gv, setCornerRadius: f64::from(frame.shape.radius)];
+        if let Some(gv) = glass {
+            if frame.shape.alpha > 0.005 {
+                gv.setHidden(false);
+                let gx = f64::from(frame.shape.l);
+                let gy = f64::from(PANEL_H - frame.shape.b);
+                let gw = f64::from(frame.shape.width());
+                let gh = f64::from(frame.shape.height());
+                gv.setFrame(NSRect::new(NSPoint::new(gx, gy), NSSize::new(gw, gh)));
+                gv.setAlphaValue(f64::from(frame.shape.alpha));
+                unsafe {
+                    if msg_send![gv, respondsToSelector: sel!(setCornerRadius:)] {
+                        let _: () = msg_send![gv, setCornerRadius: f64::from(frame.shape.radius)];
+                    }
+                    if msg_send![gv, respondsToSelector: sel!(setTintColor:)] {
+                        let tint = if frame.is_completed {
+                            NSColor::colorWithSRGBRed_green_blue_alpha(0.04, 0.14, 0.09, 0.28)
+                        } else {
+                            NSColor::colorWithSRGBRed_green_blue_alpha(0.06, 0.07, 0.10, 0.22)
+                        };
+                        let _: () = msg_send![gv, setTintColor: Some(&*tint)];
+                    }
                 }
-                if msg_send![gv, respondsToSelector: sel!(setTintColor:)] {
-                    let tint = if frame.is_completed {
-                        NSColor::colorWithSRGBRed_green_blue_alpha(0.04, 0.14, 0.09, 0.28)
-                    } else {
-                        NSColor::colorWithSRGBRed_green_blue_alpha(0.06, 0.07, 0.10, 0.22)
-                    };
-                    let _: () = msg_send![gv, setTintColor: Some(&*tint)];
-                }
+                gv.setNeedsLayout(true);
+                gv.layoutSubtreeIfNeeded();
+            } else {
+                gv.setHidden(true);
             }
-            gv.setNeedsLayout(true);
-            gv.layoutSubtreeIfNeeded();
-        } else {
-            gv.setHidden(true);
         }
         watch_presented(drawable, n, &self.presented);
         cmd.commit();
@@ -1599,12 +1491,8 @@ impl RenderState {
 
         match elem.id {
             ElemId::ChipArea | ElemId::ChipWindow | ElemId::ChipScreen | ElemId::ChipIphone => {
-                let mode = match elem.id {
-                    ElemId::ChipArea => SelectionMode::Area,
-                    ElemId::ChipWindow => SelectionMode::Window,
-                    ElemId::ChipScreen => SelectionMode::Screen,
-                    ElemId::ChipIphone => SelectionMode::Iphone,
-                    _ => unreachable!(),
+                let Some(mode) = elem.id.mode() else {
+                    unreachable!()
                 };
                 // The selected chip's fill is the sliding highlight drawn in the composite pass,
                 // which also sets these white glyphs' level (`CompositeElem::levels`).
@@ -1618,7 +1506,7 @@ impl RenderState {
                     }
                 }
                 let ic = atlas.icon(IconKind::from_mode(mode));
-                let tx = atlas.label(mode.label());
+                let tx = atlas.label(elem.id.label());
                 push_sprite(
                     out,
                     [ox + SEG_PX, oy + (CHIP_H - SEG_ICON) * 0.5, SEG_ICON, SEG_ICON],
@@ -1633,13 +1521,7 @@ impl RenderState {
                 );
             }
             ElemId::Record | ElemId::Finish | ElemId::Paste => {
-                let label = match elem.id {
-                    ElemId::Record => "Record",
-                    ElemId::Finish => "Finish",
-                    ElemId::Paste => "Paste",
-                    _ => unreachable!(),
-                };
-                let tx = atlas.label(label);
+                let tx = atlas.label(elem.id.label());
                 // `ACCENT_COLOR = 0x3b5cf6`, `ACCENT_HOVER = 0x4b6bff`
                 let r = (0.231 + 0.063 * elem.hover - 0.03 * elem.press).clamp(0.0, 1.0);
                 let g = (0.361 + 0.059 * elem.hover - 0.04 * elem.press).clamp(0.0, 1.0);
@@ -1682,12 +1564,6 @@ impl RenderState {
                 );
             }
             ElemId::Undo | ElemId::Cancel | ElemId::Inspect => {
-                let label = match elem.id {
-                    ElemId::Undo => "Undo",
-                    ElemId::Cancel => "Cancel",
-                    ElemId::Inspect => "Inspect",
-                    _ => unreachable!(),
-                };
                 if is_glass {
                     let smoke_a = if elem.enabled {
                         0.20 + 0.12 * elem.hover + 0.06 * elem.press
@@ -1699,7 +1575,7 @@ impl RenderState {
                     let bg_a = 0.08 * elem.hover + 0.06 * elem.press;
                     push_shape(out, [ox, oy, bw, bh], bh * 0.5, [1.0, 1.0, 1.0, bg_a]);
                 }
-                let tx = atlas.label(label);
+                let tx = atlas.label(elem.id.label());
                 let fg = if !elem.enabled {
                     if is_glass { 0.78 } else { 0.56 }
                 } else if is_glass {
@@ -1757,7 +1633,7 @@ impl RenderState {
                         [0.961, 0.961, 0.969, da],
                     );
                 }
-                let tx = atlas.label("Processing…");
+                let tx = atlas.label(elem.id.label());
                 push_sprite(
                     out,
                     text_at(tx, ox + PROCESSING_TEXT_X),
