@@ -15,6 +15,12 @@ brew install --cask kitlangton/tap/scrawl
 
 The app updates itself (Sparkle), so Homebrew leaves updates to it.
 
+On Windows 10 (2004) or later (x64), download the zip from the same page or the
+[latest GitHub release](https://github.com/kitlangton/scrawl/releases/latest), unzip it and run
+`scrawl.exe`. The Windows build is a preview and isn't signed yet, so Windows may say "Windows
+protected your PC": click **More info**, then **Run anyway**. It doesn't update itself yet; see
+[Windows](#windows).
+
 ## Agents
 
 Install the agent skill for Claude Code, OpenCode, Codex and other agents:
@@ -761,12 +767,71 @@ then `granted` or `cancelled` with a `reason` (`back`, `settings-closed`, `no-se
 X,Y,W,H --visible X,Y,W,H` prints where the card would dock (`below`, `inside`, `right`, `left` or
 `clamped`); `scripts/check-permission-panel-dock.sh` checks the cases.
 
+## Windows
+
+Scrawl runs on Windows 10 (2004) and later as the same app: the same capsule, picker, overlay,
+review window, welcome tour and Settings, from the same GPUI code. Only the parts the operating
+system owns differ:
+
+| | macOS | Windows |
+|---|---|---|
+| Shortcut | `⌥⇧S`, `⌥⇧V` | `Alt+Shift+S`, `Alt+Shift+V` |
+| Menu | Menu bar item | Notification area icon (left or right click) |
+| Screen and window capture | ScreenCaptureKit | Windows.Graphics.Capture, H.264 through Media Foundation |
+| Clicks, keys, Shift ink | Mouse monitor, Accessibility key tap, modifier state | Low-level hooks and key state |
+| Ink overlay | Metal panel | Click-through GPUI window, left out of recordings |
+| Transcription | SpeechAnalyzer, or Hex | Parakeet on device (`transcribe.cpp`), Hex's model or Scrawl's own copy |
+| Movie decoding | `scrawl-helper` (AVFoundation) | Media Foundation, in process |
+| Paste | `⌘V` | `Ctrl+V` |
+| Settings and welcome tour | SwiftUI (`scrawl-helper`) | GPUI windows in process, same panes and protocol |
+| Recording capsule | Native AppKit + Metal pill (or GPUI) | GPUI capsule |
+| Launch at login | `SMAppService` | The user's `Run` key (Settings › Apps › Startup) |
+| Captures | `~/Library/Application Support/scrawl/captures` | `%LOCALAPPDATA%\scrawl\captures` |
+| Log | `~/Library/Logs/Scrawl/scrawl.log` | `%LOCALAPPDATA%\Scrawl\Logs\scrawl.log` |
+
+- **Permissions:** none, apart from the microphone switch in Settings › Privacy & security, which
+  the welcome tour and Scrawl's Settings › Permissions check. Screen capture, input hooks and
+  pasting need no grant on Windows.
+- **Shortcuts:** both are recorded in Settings › General like on macOS, as `Ctrl`, `Alt`, `Win` and
+  `Shift` combinations. Scrawl turns down `Ctrl` with one key (apps use those), `Win` with a key
+  (Windows uses those), and `Alt+Tab`, `Alt+F4` and `Alt+Space`.
+- **Transcription:** Parakeet runs on device with measured word timings, so spoken cues ("look
+  here") cut keyframes as on macOS. If [Hex](https://github.com/anomalyco/hex) has installed a
+  model (`%APPDATA%\voice-control\models`), Scrawl uses it. Otherwise the first launch downloads
+  Hex's Parakeet Unified English (730 MB, checked against its SHA-256) into
+  `%LOCALAPPDATA%\Scrawl\models` in the background; Settings › Recording shows the progress, and
+  captures made before it finishes get their transcript once it lands.
+- **Command-line tool:** **Install** in Settings › Agents writes a `scrawl.cmd` shim into
+  `%LOCALAPPDATA%\Microsoft\WindowsApps`, which is on every user's PATH, so agents and terminals
+  can run `scrawl`.
+- **agentContext:** what clicks and marks land on comes from UI Automation, as it does from the
+  Accessibility tree on macOS.
+- **Not on Windows:** the cabled iPhone (it needs AVFoundation's screen capture devices), video
+  export, Sparkle updates (**Check for Updates…** opens the releases page) and the dev-site tab URL
+  (`/sdk.js` registrations still route).
+- **Releases:** a `v*` tag builds `Scrawl-<version>-windows-x64.zip` on GitHub Actions
+  (`.github/workflows/release-windows.yml`) and attaches it to the release. It isn't code-signed
+  yet; signing and automatic updates are planned.
+
+Build with the MSVC toolchain, CMake and the Windows SDK (Visual Studio Build Tools with the C++
+workload). Release builds also need GPUI's shader compiler: set `GPUI_FXC_PATH` to the SDK's
+`fxc.exe` (for example `C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe`).
+
+```powershell
+cargo build --release
+.\target\release\scrawl.exe app
+```
+
 ## Testing
 
 ```sh
 taskpolicy -c utility cargo test -j 3 --offline -- --test-threads=2
 ./scripts/install-app.sh
 ```
+
+On Windows, `cargo test`; then run `scrawl.exe app` and record with `Alt+Shift+S`.
+`SCRAWL_SHOW_OWN_WINDOWS=1` keeps Scrawl's own windows (capsule, overlay, picker) in screenshots,
+which normally leave them out.
 
 - **iPhone:** connect a phone, hold `⌥⇧` and press `S` three times, release, talk, draw over the mirror, press M,
   Finish. Inspect the bundle's `summary.md`, `scrawl.json` (`source`, `device`), contact sheet, and

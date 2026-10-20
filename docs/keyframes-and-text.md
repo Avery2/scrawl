@@ -18,6 +18,8 @@ to Hex. The selection is read once per recording and reused for all speech islan
 It does not inherit Hex's dictation settings. An unsupported code follows the existing
 Hex-failure fallback. Models may ignore language hints (e.g. Parakeet v3).
 
+Apple's model (`src/speech_model.rs`, `scrawl-helper speech-model [--install]`) is SpeechTranscriber where the Mac supports it, else DictationTranscriber (VMs and Macs where `SpeechTranscriber.isAvailable` is false), for the user's locale, the nearest supported one, or en-US. Each app reserves it for itself through `AssetInventory` (attributed to `dev.kitlangton.scrawl.helper`) and a fresh Mac doesn't have it, so the app checks and installs it in the background at launch (not when the transcriber is Hex) and retries a failed install; onboarding's Microphone row, Try it and Settings › Recording show the download. `transcribe` never downloads for long: without a model it returns `missing` (`downloading`, `unsupported`, `failed`), the summary gets a `No transcript: …` line (`TranscriptData::missing`), and a retryable bundle gets `.transcript-pending` and is transcribed again in place, `scrawl.json` and `summary.md` rewritten, when the model arrives (`scrawl retranscribe <bundle>` by hand).
+
 ## Keyframe selection (`src/keyframes.rs`)
 
 - Only cut keyframes on real visual or input events (`Mark` strokes drawn while holding `⇧`, flags, `Click`/`Drag` inside the capture target or phone taps/swipes, `Laser` points, or settled `SceneChange` transitions)—never cut extra keyframes on speech pauses alone over a static screen.

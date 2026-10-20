@@ -250,7 +250,7 @@ pub fn serve(dir: &Path, bundle: &ScrawlBundle, port: u16, open: bool) -> Result
     );
     println!("{url}");
     if open {
-        let _ = std::process::Command::new("open").arg(&url).status();
+        let _ = crate::handoff::open_path(std::path::Path::new(&url));
     }
     let input = input_for_bundle(dir, bundle);
     let page = playground_page(dir, bundle, true)?;
@@ -413,6 +413,7 @@ pub fn build_fixture(
         segments: scenario.segments,
         words: scenario.words,
         estimated: false,
+        missing: None,
     };
     if out.exists() {
         std::fs::remove_dir_all(out)?;
@@ -625,6 +626,7 @@ pub fn simulate_capture(
         segments: Vec::new(),
         words,
         estimated: false,
+        missing: None,
     };
     let started = std::time::Instant::now();
     let (_, bundle, _) = crate::build_bundle_from_parts(

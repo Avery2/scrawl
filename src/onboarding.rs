@@ -212,6 +212,10 @@ pub enum Effect {
     Close,
     /// Close the tour and open the Settings window.
     Settings,
+    /// Screen Recording works: list the screen's content once now, so macOS's "bypass the
+    /// system private window picker" question comes up here, explained, rather than over the
+    /// first recording.
+    ConfirmScreen,
 }
 
 /// One row on the permissions screen.
@@ -244,6 +248,8 @@ pub struct View {
     pub fix: bool,
     /// The demo's outcome so far; until it's `Watched` the button under it reads Skip.
     pub tutorial: Option<Tutorial>,
+    /// macOS may be asking about its private window picker: say to choose Allow.
+    pub picker_note: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -263,6 +269,8 @@ pub struct Flow {
     /// A relaunch was asked for; never twice from one window.
     relaunching: bool,
     tutorial: Option<Tutorial>,
+    /// The step `Effect::ConfirmScreen` was given on (once per window).
+    screen_confirmed: Option<Step>,
 }
 
 impl Flow {
@@ -302,6 +310,7 @@ impl Flow {
             stale_since: None,
             relaunching: false,
             tutorial: None,
+            screen_confirmed: None,
         }
     }
 
@@ -423,6 +432,7 @@ impl Flow {
             ready: self.done(),
             fix: self.mode == Mode::Fix,
             tutorial: self.tutorial,
+            picker_note: self.screen_confirmed == Some(self.step),
         }
     }
 
@@ -561,6 +571,14 @@ impl Flow {
             };
         }
         self.stale_since = None;
+        if matches!(self.step, Step::Permissions | Step::TryIt)
+            && self.screen_confirmed.is_none()
+            && self.asks.contains(&Permission::ScreenRecording)
+            && self.usable(Permission::ScreenRecording)
+        {
+            self.screen_confirmed = Some(self.step);
+            return Effect::ConfirmScreen;
+        }
         if self.mode != Mode::Fix || !self.done() {
             self.ready_at = None;
             return Effect::None;
@@ -761,12 +779,22 @@ pub fn read_grants() -> Option<Grants> {
     })
 }
 
-/// The open welcome window: the `Flow`, the helper drawing it, and a poller re-reading the
+/// What draws the welcome window: the SwiftUI `scrawl-helper onboarding` process on macOS, an
+/// in-process GPUI window (`crate::onboarding_window`) on Windows. Both take the same JSON
+/// messages and report the same button actions.
+enum Transport {
+    Helper {
+        child: std::process::Child,
+        stdin: Option<std::process::ChildStdin>,
+    },
+    InProcess(Option<flume::Sender<serde_json::Value>>),
+}
+
+/// The open welcome window: the `Flow`, the window drawing it, and a poller re-reading the
 /// grants every 0.5 s so each row's check appears by itself.
 pub struct Session {
     flow: Flow,
-    child: std::process::Child,
-    stdin: Option<std::process::ChildStdin>,
+    transport: Transport,
     polling: std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_view: String,
     saved_resume: Option<Step>,
@@ -780,47 +808,20 @@ impl Session {
         shortcut: &str,
         events: impl Fn(Event) + Send + Sync + Clone + 'static,
     ) -> anyhow::Result<Self> {
-        use std::io::BufRead;
-        use std::process::{Command, Stdio};
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let mut command = Command::new(crate::helper::path()?);
-        command
-            .args(["onboarding", "--shortcut", shortcut, "--paste"])
-            .arg(crate::settings::paste_label())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let dev_icon = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/app-icon.png");
-        if Path::new(dev_icon).is_file() {
-            command.args(["--icon", dev_icon]);
-        }
-        let mut child = command.spawn()?;
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-
-        let reader_events = events.clone();
-        std::thread::spawn(move || {
-            if let Some(stdout) = stdout {
-                for line in std::io::BufReader::new(stdout)
-                    .lines()
-                    .map_while(Result::ok)
-                {
-                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-                        continue;
-                    };
-                    let Some(action) = value.get("action").and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    let action = match value.get("permission").and_then(|v| v.as_str()) {
-                        Some(permission) => format!("{action}:{permission}"),
-                        None => action.to_owned(),
-                    };
-                    reader_events(Event::Action(action));
-                }
-            }
-            reader_events(Event::Exited);
-        });
+        let transport = if cfg!(target_os = "windows") {
+            let (sender, receiver) = flume::unbounded();
+            let window_events = events.clone();
+            crate::onboarding_window::request_open(
+                receiver,
+                shortcut.to_owned(),
+                std::sync::Arc::new(move |event| window_events(event)),
+            );
+            Transport::InProcess(Some(sender))
+        } else {
+            Self::spawn_helper(shortcut, events.clone())?
+        };
 
         let polling = std::sync::Arc::new(AtomicBool::new(true));
         let alive = std::sync::Arc::clone(&polling);
@@ -841,8 +842,7 @@ impl Session {
             flow: flow
                 .with_auto_relaunch(allowed)
                 .with_tutorial(progress.tutorial),
-            child,
-            stdin,
+            transport,
             polling,
             last_view: String::new(),
             saved_resume: None,
@@ -851,6 +851,52 @@ impl Session {
         };
         session.sync();
         Ok(session)
+    }
+
+    fn spawn_helper(
+        shortcut: &str,
+        events: impl Fn(Event) + Send + Sync + Clone + 'static,
+    ) -> anyhow::Result<Transport> {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+
+        let mut command = Command::new(crate::helper::path()?);
+        command
+            .args(["onboarding", "--shortcut", shortcut, "--paste"])
+            .arg(crate::settings::paste_label())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let dev_icon = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/app-icon.png");
+        if Path::new(dev_icon).is_file() {
+            command.args(["--icon", dev_icon]);
+        }
+        let mut child = command.spawn()?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+
+        std::thread::spawn(move || {
+            if let Some(stdout) = stdout {
+                for line in std::io::BufReader::new(stdout)
+                    .lines()
+                    .map_while(Result::ok)
+                {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                        continue;
+                    };
+                    let Some(action) = value.get("action").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let action = match value.get("permission").and_then(|v| v.as_str()) {
+                        Some(permission) => format!("{action}:{permission}"),
+                        None => action.to_owned(),
+                    };
+                    events(Event::Action(action));
+                }
+            }
+            events(Event::Exited);
+        });
+        Ok(Transport::Helper { child, stdin })
     }
 
     pub fn mode(&self) -> Mode {
@@ -882,6 +928,29 @@ impl Session {
             }
             Effect::Show => {
                 self.show();
+                Effect::None
+            }
+            Effect::ConfirmScreen => {
+                std::thread::spawn(|| {
+                    // After macOS's own questions (System Settings' "Quit & Reopen") are
+                    // answered and this window is back in front with its note, so the one
+                    // question comes up by itself, over the explanation.
+                    #[cfg(target_os = "macos")]
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+                    #[cfg(target_os = "macos")]
+                    while std::time::Instant::now() < deadline
+                        && crate::windows::macos_is_asking(&objc2::rc::autoreleasepool(|_| {
+                            crate::windows::raw_windows()
+                        }))
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1_200));
+                    let result = crate::capture::screen_capture_probe();
+                    crate::capture::scrawl_log(format!(
+                        "onboarding: listed the screen once for macOS's window picker question: {result:?}"
+                    ));
+                });
                 Effect::None
             }
             other => other,
@@ -924,6 +993,7 @@ impl Session {
     fn sync(&mut self) {
         let mut view = serde_json::to_value(self.flow.view()).unwrap_or_default();
         view["type"] = "state".into();
+        view["speech"] = serde_json::to_value(crate::speech_model::current()).unwrap_or_default();
         let text = view.to_string();
         if text != self.last_view {
             self.send(&view);
@@ -947,12 +1017,24 @@ impl Session {
 
     fn send(&mut self, message: &serde_json::Value) {
         use std::io::Write;
-        if let Some(stdin) = self.stdin.as_mut()
-            && writeln!(stdin, "{message}")
-                .and_then(|()| stdin.flush())
-                .is_err()
-        {
-            self.stdin = None;
+        match &mut self.transport {
+            Transport::Helper { stdin, .. } => {
+                if let Some(pipe) = stdin.as_mut()
+                    && writeln!(pipe, "{message}")
+                        .and_then(|()| pipe.flush())
+                        .is_err()
+                {
+                    *stdin = None;
+                }
+            }
+            Transport::InProcess(sender) => {
+                if sender
+                    .as_ref()
+                    .is_some_and(|s| s.send(message.clone()).is_err())
+                {
+                    *sender = None;
+                }
+            }
         }
     }
 }
@@ -962,11 +1044,37 @@ impl Drop for Session {
         self.polling
             .store(false, std::sync::atomic::Ordering::Release);
         self.send(&serde_json::json!({"type": "close"}));
-        self.stdin = None;
-        let _ = self.child.wait();
+        match &mut self.transport {
+            Transport::Helper { child, stdin } => {
+                *stdin = None;
+                let _ = child.wait();
+            }
+            Transport::InProcess(sender) => *sender = None,
+        }
     }
 }
 
+/// Starts Scrawl again once this copy has quit: the new copy waits for this one
+/// (`win::shell::wait_for_relauncher`) before it starts the app.
+#[cfg(windows)]
+pub fn relaunch() {
+    use std::os::windows::process::CommandExt;
+    /// No console window flashes up for the new copy (`scrawl.exe` is a console program).
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(crate::win::shell::RELAUNCHED_BY, std::process::id().to_string())
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+#[cfg(not(windows))]
 /// Waits (at most 10 s) for process `$1` to exit, then runs the rest.
 const AFTER_EXIT: &str = "pid=$1; shift; i=0; \
     while kill -0 \"$pid\" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done; ";
@@ -974,6 +1082,7 @@ const AFTER_EXIT: &str = "pid=$1; shift; i=0; \
 /// Starts Scrawl again once this copy has quit (after a Screen Recording grant). The app is
 /// opened without `-n`: if macOS's own "Quit & Reopen" already started a new copy, `open` only
 /// brings that one forward, so there are never two.
+#[cfg(not(windows))]
 pub fn relaunch() {
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -1139,6 +1248,8 @@ mod tests {
         // Nothing in Scrawl or its helper asks macOS for it.
         let sources = [
             include_str!("capture.rs"),
+            include_str!("capture/macos.rs"),
+            include_str!("ui/macos.rs"),
             include_str!("onboarding.rs"),
             include_str!("settings.rs"),
             include_str!("ui.rs"),
@@ -1259,10 +1370,55 @@ mod tests {
         // A grant this copy can use (ScreenCaptureKit works without a relaunch, or macOS's
         // Quit & Reopen already restarted it) relaunches nothing.
         let mut flow = Flow::tour(Step::Permissions, Some(grants(&[])));
-        for t in [0, 5_000, 60_000] {
+        assert_eq!(
+            tick(&mut flow, &grants(&[ScreenRecording]), 0),
+            Effect::ConfirmScreen
+        );
+        for t in [5_000, 60_000] {
             assert_eq!(tick(&mut flow, &grants(&[ScreenRecording]), t), Effect::None);
         }
         assert!(!flow.view().rows[0].reopening);
+    }
+
+    #[test]
+    fn once_screen_recording_works_the_window_picker_question_comes_up_explained() {
+        let mut flow = Flow::tour(Step::Permissions, Some(grants(&[])));
+        assert_eq!(tick(&mut flow, &grants(&[Microphone]), 0), Effect::None);
+        assert!(!flow.view().picker_note);
+        // Not while the grant needs a relaunch to work: listing the screen would fail.
+        assert_eq!(
+            tick(&mut flow, &stale(&[ScreenRecording]), 100),
+            Effect::None
+        );
+        assert_eq!(
+            tick(&mut flow, &grants(&[ScreenRecording]), 200),
+            Effect::ConfirmScreen
+        );
+        assert!(flow.view().picker_note);
+        assert_eq!(
+            tick(&mut flow, &grants(&[ScreenRecording]), 300),
+            Effect::None
+        );
+        // Answered by the time Try it shows: no note there.
+        flow.on(Input::Grants {
+            grants: grants(&Permission::REQUIRED),
+            now_ms: 400,
+        });
+        flow.on(Input::Continue);
+        assert_eq!(flow.step(), Step::TryIt);
+        assert!(!flow.view().picker_note);
+        // Everything already on: it comes up on Try it instead, before the first capture.
+        let mut flow = Flow::tour(Step::TryIt, Some(grants(&Permission::REQUIRED)));
+        assert_eq!(flow.step(), Step::TryIt);
+        assert_eq!(
+            tick(&mut flow, &grants(&Permission::REQUIRED), 0),
+            Effect::ConfirmScreen
+        );
+        assert!(flow.view().picker_note);
+        // Gone from the last screen.
+        flow.on(Input::CaptureEnded { completed: true });
+        assert_eq!(flow.step(), Step::Done);
+        assert!(!flow.view().picker_note);
     }
 
     #[test]

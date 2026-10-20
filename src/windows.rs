@@ -198,6 +198,59 @@ pub fn filter_windows(
     out
 }
 
+/// Apps whose windows are macOS asking the user something, never what a capture is about:
+/// UserNotificationCenter shows the privacy alerts (ScreenCaptureKit's "bypass the system
+/// private window picker" among them), SecurityAgent the password sheets.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const SYSTEM_PROMPT_OWNERS: [&str; 2] = ["UserNotificationCenter", "SecurityAgent"];
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_system_prompt(w: &RawWindow) -> bool {
+    w.alpha > 0.01 && SYSTEM_PROMPT_OWNERS.contains(&w.owner.as_str())
+}
+
+/// System prompts (see `SYSTEM_PROMPT_OWNERS`) overlapping `frame`, by window id, sorted.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn system_prompts_over(raw: &[RawWindow], frame: TargetFrame) -> Vec<u32> {
+    let mut ids: Vec<u32> = raw
+        .iter()
+        .filter(|w| {
+            let [x, y, width, height] = w.bounds;
+            is_system_prompt(w)
+                && x < frame.x + frame.width
+                && x + width > frame.x
+                && y < frame.y + frame.height
+                && y + height > frame.y
+        })
+        .map(|w| w.id)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// A macOS question is in view: a system prompt, or an alert in System Settings (a second
+/// window of its own, like the "Quit & Reopen" that follows a Screen Recording grant) while
+/// System Settings is in front. One left behind another window isn't asking anyone.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn macos_is_asking(raw: &[RawWindow]) -> bool {
+    let normal = || raw.iter().filter(|w| w.layer == 0 && w.alpha > 0.01);
+    raw.iter().any(is_system_prompt)
+        || (normal()
+            .next()
+            .is_some_and(|w| w.owner == "System Settings")
+            && normal().filter(|w| w.owner == "System Settings").count() > 1)
+}
+
+/// Whether a global point is on a system prompt (they float above app windows), so a click
+/// there is the user answering macOS rather than part of what they're showing.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn system_prompt_at(raw: &[RawWindow], x: f64, y: f64) -> bool {
+    raw.iter().any(|w| {
+        let [wx, wy, ww, wh] = w.bounds;
+        is_system_prompt(w) && x >= wx && x <= wx + ww && y >= wy && y <= wy + wh
+    })
+}
+
 /// Whether the topmost window under a global point (in `raw`, front to back) belongs to `own_pid`,
 /// looking through `passthrough` windows, which let clicks fall to whatever is below them.
 pub fn owned_window_at(
@@ -288,6 +341,113 @@ pub fn raw_windows() -> Vec<RawWindow> {
     out
 }
 
+/// Reads the visible top-level windows (front to back). Like CGWindowList: the taskbar is the
+/// `Dock` (layer 20), always-on-top and tool windows sit above layer 0, and cloaked (on another
+/// virtual desktop) or minimized windows have no alpha.
+#[cfg(target_os = "windows")]
+pub fn raw_windows() -> Vec<RawWindow> {
+    let mut names: HashMap<u32, String> = HashMap::new();
+    crate::win::top_level_windows()
+        .into_iter()
+        .map(|w| {
+            let taskbar = matches!(w.class.as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd");
+            let owner = if taskbar {
+                "Dock".to_owned()
+            } else {
+                names
+                    .entry(w.pid)
+                    .or_insert_with(|| {
+                        crate::win::app_identity(w.pid)
+                            .map(|(name, _)| name)
+                            .unwrap_or_default()
+                    })
+                    .clone()
+            };
+            let layer = if taskbar {
+                20
+            } else if w.is_app_window() && !w.topmost() {
+                0
+            } else {
+                3
+            };
+            RawWindow {
+                id: w.hwnd as u32,
+                pid: w.pid as i32,
+                owner,
+                title: w.title.clone(),
+                bounds: w.rect,
+                layer,
+                alpha: if w.on_screen() { 1.0 } else { 0.0 },
+            }
+        })
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn app_meta_of(pid: i32) -> AppMeta {
+    let id = crate::win::app_identity(pid as u32).map(|(_, id)| id);
+    let regular = crate::win::top_level_windows()
+        .iter()
+        .any(|w| w.pid == pid as u32 && w.is_app_window());
+    AppMeta {
+        bundle_id: id,
+        regular,
+    }
+}
+
+/// The taskbar's strip on the display at `frame` (global pixels): the difference between the
+/// display and its work area.
+#[cfg(target_os = "windows")]
+pub fn dock_rect(frame: TargetFrame) -> Option<[f64; 4]> {
+    let monitor = crate::win::monitors().into_iter().find(|m| {
+        let [x, y, w, h] = m.rect;
+        (x - frame.x).abs() < 1.0
+            && (y - frame.y).abs() < 1.0
+            && (w - frame.width).abs() < 1.0
+            && (h - frame.height).abs() < 1.0
+    })?;
+    let [fx, fy, fw, fh] = monitor.rect;
+    let [vx, vy, vw, vh] = monitor.work;
+    let (left, right, top, bottom) = (
+        vx - fx,
+        (fx + fw) - (vx + vw),
+        vy - fy,
+        (fy + fh) - (vy + vh),
+    );
+    let min = 8.0;
+    if bottom >= min {
+        Some([fx, vy + vh, fw, bottom])
+    } else if top >= min {
+        Some([fx, fy, fw, top])
+    } else if left >= min {
+        Some([fx, vy, left, vh])
+    } else if right >= min {
+        Some([vx + vw, vy, right, vh])
+    } else {
+        None
+    }
+}
+
+/// One timed snapshot of the windows overlapping `frame`.
+#[cfg(target_os = "windows")]
+pub fn snapshot(
+    frame: TargetFrame,
+    dock: Option<[f64; 4]>,
+    cache: &mut HashMap<i32, AppMeta>,
+) -> Vec<WindowEntry> {
+    let raw = raw_windows();
+    let front = crate::capture::frontmost_external_pid();
+    filter_windows(
+        &raw,
+        frame,
+        std::process::id() as i32,
+        front,
+        dock,
+        &mut |pid| cache.entry(pid).or_insert_with(|| app_meta_of(pid)).clone(),
+    )
+}
+
+#[cfg(target_os = "macos")]
 fn app_meta_of(pid: i32) -> AppMeta {
     use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication};
     match NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
@@ -305,6 +465,7 @@ fn app_meta_of(pid: i32) -> AppMeta {
 /// The strip the Dock reserves on the display at `frame` (global top-left points), from the
 /// difference between the screen's frame and visible frame. `None` when the Dock hides or off
 /// the main thread (`NSScreen` is main-thread only).
+#[cfg(target_os = "macos")]
 pub fn dock_rect(frame: TargetFrame) -> Option<[f64; 4]> {
     use objc2::MainThreadMarker;
     use objc2_app_kit::NSScreen;
@@ -344,6 +505,7 @@ pub fn dock_rect(frame: TargetFrame) -> Option<[f64; 4]> {
 }
 
 /// One timed snapshot of the windows overlapping `frame`.
+#[cfg(target_os = "macos")]
 pub fn snapshot(
     frame: TargetFrame,
     dock: Option<[f64; 4]>,
@@ -648,5 +810,45 @@ mod tests {
             regular: true,
         });
         assert!(hidden.iter().all(|w| w.id != 3));
+    }
+
+    #[test]
+    fn system_prompts_are_found_over_the_capture_and_clicks_on_them_are_answers() {
+        let window = |id, owner: &str, bounds, layer| RawWindow {
+            id,
+            pid: 7,
+            owner: owner.into(),
+            title: String::new(),
+            bounds,
+            layer,
+            alpha: 1.0,
+        };
+        let raw = [
+            window(5, "UserNotificationCenter", [830.0, 188.0, 260.0, 348.0], 8),
+            window(6, "SecurityAgent", [2000.0, 100.0, 300.0, 200.0], 1000),
+            window(7, "Safari", [0.0, 0.0, 1000.0, 500.0], 0),
+        ];
+        // `frame()` is 1000 × 500 at the origin: the password sheet is on another display.
+        assert_eq!(system_prompts_over(&raw, frame()), vec![5]);
+        assert!(system_prompt_at(&raw, 900.0, 300.0));
+        assert!(!system_prompt_at(&raw, 100.0, 100.0));
+        assert!(macos_is_asking(&raw));
+        let settings = [
+            window(8, "System Settings", [597.0, 132.0, 723.0, 625.0], 0),
+            window(9, "Safari", [0.0, 0.0, 1000.0, 500.0], 0),
+        ];
+        assert!(!macos_is_asking(&settings));
+        let quit_and_reopen = [
+            window(10, "System Settings", [829.0, 342.0, 260.0, 204.0], 0),
+            settings[0].clone(),
+        ];
+        assert!(macos_is_asking(&quit_and_reopen));
+        // The same alert behind Scrawl's window.
+        let behind = [
+            window(11, "Scrawl Helper", [650.0, 145.0, 620.0, 532.0], 0),
+            quit_and_reopen[0].clone(),
+            settings[0].clone(),
+        ];
+        assert!(!macos_is_asking(&behind));
     }
 }
