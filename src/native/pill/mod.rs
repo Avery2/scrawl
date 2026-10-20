@@ -9,13 +9,14 @@
 
 pub mod atlas;
 pub mod model;
+mod pacing;
 mod types;
 
 pub use self::types::{PillAction, PillSnapshot, PillStyle};
 
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use core_graphics_types::geometry::CGSize;
@@ -305,6 +306,11 @@ struct SharedNativePill {
     state: Mutex<PillRuntimeState>,
     tick_queued: AtomicBool,
     alive: AtomicBool,
+    /// Display link callbacks so far, and the latest one's now / output time / period (f64 bits).
+    ticks: AtomicU64,
+    link_now: AtomicU64,
+    link_out: AtomicU64,
+    link_period: AtomicU64,
 }
 
 pub struct NativePill {
@@ -414,6 +420,10 @@ impl NativePill {
             }),
             tick_queued: AtomicBool::new(false),
             alive: AtomicBool::new(true),
+            ticks: AtomicU64::new(0),
+            link_now: AtomicU64::new(0),
+            link_out: AtomicU64::new(0),
+            link_period: AtomicU64::new(0),
         });
 
         // Draw initial transparent frame synchronously.
@@ -505,6 +515,9 @@ impl NativePill {
                 st.model.set_completed_label(label.clone(), sp.size_pt[0]);
             }
             if st.model.pres != snapshot.pres {
+                if pacing::enabled() {
+                    pacing::event(&format!("{:?}", snapshot.pres));
+                }
                 let was_hidden = st.model.is_fully_hidden();
                 st.model.set_pres(snapshot.pres);
                 st.dirty = true;
@@ -621,16 +634,39 @@ fn create_glass_views(root_view: &NSView, bounds: NSRect) -> Option<Retained<NSV
     }
 }
 
+/// Logs when the drawable reaches the screen (`SCRAWL_PILL_PACING`).
+fn watch_presented(drawable: &metal::MetalDrawableRef, n: u64) {
+    let block = block2::RcBlock::new(move |d: *mut AnyObject| {
+        let at: f64 = unsafe { msg_send![d, presentedTime] };
+        pacing::presented(n, at);
+    });
+    let obj = metal::foreign_types::ForeignTypeRef::as_ptr(drawable).cast::<AnyObject>();
+    unsafe {
+        let _: () = msg_send![obj, addPresentedHandler: &*block];
+    }
+}
+
 extern "C" fn pill_display_link_cb(
     _display_link: CVDisplayLinkRef,
-    _now: *const CVTimeStamp,
-    _output_time: *const CVTimeStamp,
+    now: *const CVTimeStamp,
+    output_time: *const CVTimeStamp,
     _flags_in: CVOptionFlags,
     _flags_out: *mut CVOptionFlags,
     context: *mut c_void,
 ) -> CVReturn {
     if !context.is_null() {
         let shared = unsafe { &*context.cast::<SharedNativePill>() };
+        shared.ticks.fetch_add(1, Ordering::Relaxed);
+        if let (Some(now), Some(out)) = unsafe { (now.as_ref(), output_time.as_ref()) } {
+            shared.link_now.store(pacing::host_seconds(now.hostTime).to_bits(), Ordering::Relaxed);
+            shared.link_out.store(pacing::host_seconds(out.hostTime).to_bits(), Ordering::Relaxed);
+            let period = if out.videoTimeScale > 0 {
+                out.videoRefreshPeriod as f64 / f64::from(out.videoTimeScale)
+            } else {
+                0.0
+            };
+            shared.link_period.store(period.to_bits(), Ordering::Relaxed);
+        }
         if shared.alive.load(Ordering::Relaxed)
             && !shared.tick_queued.swap(true, Ordering::AcqRel)
         {
@@ -696,6 +732,7 @@ impl SharedNativePill {
             return;
         }
 
+        let start = pacing::host_now();
         st.model.set_opts(motion::tune().pill_opts());
         if dt > 0.0 {
             st.model.advance(dt);
@@ -706,7 +743,25 @@ impl SharedNativePill {
         if motion::tracing() && (!st.model.is_fully_hidden() || animating) {
             st.emit_trace(&frame);
         }
-        st.render_frame(&frame);
+        let n = if pacing::enabled() { pacing::next_frame() } else { 0 };
+        st.render_frame(&frame, n);
+        if n > 0 {
+            let bits = |a: &AtomicU64| f64::from_bits(a.load(Ordering::Relaxed));
+            pacing::frame(&pacing::Frame {
+                n,
+                tick: self.ticks.load(Ordering::Relaxed),
+                link_now: bits(&self.link_now),
+                link_out: bits(&self.link_out),
+                period: bits(&self.link_period),
+                start,
+                end: pacing::host_now(),
+                model_t: st.model.t,
+                dt,
+                l: st.model.l.x,
+                r: st.model.r.x,
+                main: true,
+            });
+        }
     }
 }
 
@@ -869,7 +924,7 @@ impl PillRuntimeState {
         }
     }
 
-    fn render_frame(&mut self, frame: &FrameState) {
+    fn render_frame(&mut self, frame: &FrameState, n: u64) {
         let use_glass = self.style == PillStyle::Glass && self.glass_view.is_some();
 
         let mut prims: Vec<TilePrim> = Vec::with_capacity(frame.elems.len() * 3);
@@ -1122,6 +1177,9 @@ impl PillRuntimeState {
             } else {
                 gv.setHidden(true);
             }
+        }
+        if n > 0 {
+            watch_presented(drawable, n);
         }
         cmd.commit();
         cmd.wait_until_scheduled();
