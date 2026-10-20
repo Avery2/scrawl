@@ -1055,8 +1055,10 @@ impl SharedCaptureTelemetry {
     }
 
     /// The button of a ⇧-press came up (with or without ⇧ still held). A ⇧-click drops the next
-    /// numbered pin where it went down; a ⇧-drag is left to the ink the poller is drawing.
-    /// Returns whether a ⇧-press was waiting, so the release isn't also taken as a click's.
+    /// numbered pin where it went down, unless ink was already drawn in this ⇧ hold: a click in
+    /// the middle of a drawing belongs to the drawing, so it neither pins nor counts as a click.
+    /// A ⇧-drag is left to the ink the poller is drawing. Returns whether a ⇧-press was waiting,
+    /// so the release isn't also taken as a click's.
     fn shift_up(&self, t_ms: u64, screen_x: f64, screen_y: f64) -> bool {
         let Some((t0, x0, y0, start_frame)) = self
             .shift_press
@@ -1075,21 +1077,23 @@ impl SharedCaptureTelemetry {
         {
             return true;
         }
+        {
+            let mut live = self
+                .live_ink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if live.as_ref().is_some_and(|ink| drew_before(ink, t0)) {
+                return true;
+            }
+            // ⇧ draws as it's held, so the live ink is only the click's jitter; further ink
+            // starts a new stroke.
+            *live = None;
+        }
         let (nx, ny, fw, fh) = self.normalize_point(x0, y0);
-        // ⇧ draws as it's held, so the live ink ends in the click's jitter; what was drawn
-        // before the press is kept, and further ink starts a new stroke.
-        let earlier = self
-            .live_ink
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-            .map(|ink| ink_before(ink, t0))
-            .filter(is_real_ink);
         let mut strokes = self
             .strokes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        strokes.extend(earlier);
         let number = strokes.iter().filter(|s| s.pin.is_some()).count() as u32 + 1;
         strokes.push(Stroke {
             t0,
@@ -1263,41 +1267,29 @@ fn is_pin_click(down: (u64, f64, f64), up: (u64, f64, f64)) -> bool {
         && ((up.1 - down.1).hypot(up.2 - down.2) as f32) < CLICK_SLOP_PT
 }
 
-/// How far (points) the ink reaches from where it started.
-fn ink_span_pt(stroke: &Stroke) -> f32 {
+/// Whether `stroke`'s points before `before_ms` reach at least `MIN_INK_SPAN_PT` from its start.
+fn drew_before(stroke: &Stroke, before_ms: u64) -> bool {
     let Some(first) = stroke.pts.get(0..2) else {
-        return 0.0;
+        return false;
     };
-    stroke
+    let mut points = 0_usize;
+    let mut span = 0.0_f32;
+    for p in stroke
         .pts
         .chunks_exact(3)
-        .map(|p| {
-            let dx = (p[0] - first[0]) as f32 / SCALE as f32 * stroke.fw as f32;
-            let dy = (p[1] - first[1]) as f32 / SCALE as f32 * stroke.fh as f32;
-            dx.hypot(dy)
-        })
-        .fold(0.0_f32, f32::max)
+        .take_while(|p| stroke.t0.saturating_add(p[2].max(0) as u64) < before_ms)
+    {
+        points += 1;
+        let dx = (p[0] - first[0]) as f32 / SCALE as f32 * stroke.fw as f32;
+        let dy = (p[1] - first[1]) as f32 / SCALE as f32 * stroke.fh as f32;
+        span = span.max(dx.hypot(dy));
+    }
+    points >= 2 && span >= MIN_INK_SPAN_PT
 }
 
 /// Whether finished ink is worth keeping as a stroke.
 fn is_real_ink(stroke: &Stroke) -> bool {
-    stroke.pts.len() >= 6 && ink_span_pt(stroke) >= MIN_INK_SPAN_PT
-}
-
-/// The part of live ink drawn before `t_ms`.
-fn ink_before(mut stroke: Stroke, t_ms: u64) -> Stroke {
-    let t0 = stroke.t0;
-    let at = |p: &[i32]| t0.saturating_add(p[2].max(0) as u64);
-    let keep = stroke
-        .pts
-        .chunks_exact(3)
-        .take_while(|p| at(p) < t_ms)
-        .count();
-    stroke.pts.truncate(keep * 3);
-    if let Some(last) = stroke.pts.chunks_exact(3).last() {
-        stroke.t1 = at(last);
-    }
-    stroke
+    drew_before(stroke, u64::MAX)
 }
 
 fn same_target_frame(a: TargetFrame, b: TargetFrame) -> bool {
@@ -1795,10 +1787,11 @@ mod tests {
         assert!(!is_pin_click(down, (1_100, 10.0, 10.0 + slop)));
     }
 
-    /// The poller draws ink while ⇧ is held, so the ⇧ goes down (and the cursor may wander)
-    /// before the click: ink from before the press stays a stroke, the click's jitter doesn't.
+    /// The poller draws ink while ⇧ is held. A ⇧-click after ink was drawn in the same hold is
+    /// part of the drawing: no pin, and the stroke carries on whole. A ⇧-click with nothing drawn
+    /// first (only its own jitter) drops a pin and leaves no stroke.
     #[test]
-    fn a_shift_click_keeps_earlier_ink_and_drops_its_own_jitter() {
+    fn a_shift_click_mid_drawing_drops_no_pin() {
         let telemetry = session(1000.0, 1000.0);
         let ink = |pts: &[(i32, i32, i32)]| Stroke {
             t0: 0,
@@ -1813,27 +1806,39 @@ mod tests {
         let press = telemetry.elapsed_ms() + 50;
         let p = press as i32;
         let s = SCALE;
-        // A line drawn while ⇧ was held, then the click's jitter at its end.
-        *telemetry.live_ink.lock().unwrap() = Some(ink(&[
+        // A line drawn while ⇧ was held, then a click at its end.
+        let line = ink(&[
             (s / 10, s / 2, 0),
             (s / 5, s / 2, p - 20),
             (s / 5 + s / 500, s / 2, p + 5),
-        ]));
+        ]);
+        *telemetry.live_ink.lock().unwrap() = Some(line.clone());
         telemetry.shift_down(press, 200.0, 500.0);
         assert!(telemetry.shift_up(press + 80, 201.0, 500.0));
-        assert!(telemetry.live_ink.lock().unwrap().is_none());
+        assert_eq!(telemetry.live_ink.lock().unwrap().as_ref(), Some(&line));
+        // Letting go of ⇧ commits it as one stroke.
+        let at = (200.0, 500.0);
+        track_shift_ink(&telemetry, at, false, true);
 
-        // A ⇧-click with only its own few points of jitter leaves no stroke.
+        // Drawn long before the press still counts: the hold is a drawing.
+        *telemetry.live_ink.lock().unwrap() = Some(ink(&[(s / 10, s / 10, 0), (s / 5, s / 10, 1)]));
+        let t = telemetry.elapsed_ms() + 5_000;
+        telemetry.shift_down(t, 200.0, 100.0);
+        assert!(telemetry.shift_up(t + 60, 200.0, 100.0));
+        *telemetry.live_ink.lock().unwrap() = None;
+
+        // A ⇧-click with only its own few points of jitter is a pin.
         let jitter = ink(&[(s / 2, s / 2, 0), (s / 2 + 2, s / 2, 30)]);
         *telemetry.live_ink.lock().unwrap() = Some(jitter);
         let t = telemetry.elapsed_ms();
         telemetry.shift_down(t, 500.0, 500.0);
         assert!(telemetry.shift_up(t + 60, 500.0, 500.0));
+        assert!(telemetry.live_ink.lock().unwrap().is_none());
 
-        let (_, strokes) = telemetry.finish_session();
+        let (events, strokes) = telemetry.finish_session();
+        assert!(events.is_empty(), "{events:?}");
         let kinds: Vec<_> = strokes.iter().map(|s| (s.pin, s.pts.len() / 3)).collect();
-        assert_eq!(kinds, vec![(None, 2), (Some(1), 1), (Some(2), 1)]);
-        assert_eq!(strokes[0].t1, press - 20);
+        assert_eq!(kinds, vec![(None, 3), (Some(1), 1)]);
     }
 
     #[test]

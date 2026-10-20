@@ -320,6 +320,18 @@ pub fn annotate_keyframe_in_place(
     stamp_keyframe_badge_in_place(frame, keyframe);
 }
 
+/// Sizes for a frame of `w × h` pixels: `(k, stroke_size, pin_scale)`.
+/// Tuned for ~1280×800 screen frames; phone frames are taller and denser.
+pub(crate) fn annotation_sizes(w: f32, h: f32) -> (f32, f32, f32) {
+    let k = (w.min(h) / 800.0).max(w.max(h) / 1280.0).clamp(1.0, 2.0);
+    let size = (w.min(h) * 0.0065).clamp(4.2, 6.0) * k;
+    (k, size, (w.max(h) / 1280.0).clamp(0.75, 2.5))
+}
+
+pub(crate) fn is_long_press(label: Option<&str>) -> bool {
+    label.is_some_and(|l| l == "long press" || l.starts_with("long press:"))
+}
+
 pub fn annotate_keyframe_marks_in_place(
     frame: &mut RgbaFrame,
     keyframe: &Keyframe,
@@ -333,9 +345,7 @@ pub fn annotate_keyframe_marks_in_place(
     if w == 0.0 || h == 0.0 {
         return;
     }
-    // Sizes are tuned for ~1280×800 screen frames; phone frames are taller and denser.
-    let k = (w.min(h) / 800.0).max(w.max(h) / 1280.0).clamp(1.0, 2.0);
-    let size = (w.min(h) * 0.0065).clamp(4.2, 6.0) * k;
+    let (k, size, pin_scale) = annotation_sizes(w, h);
     // A mark keyframe shows every mark drawn on its screen. Flags carry no ink, so a flagged
     // keyframe still shows the strokes of its moment.
     let shown = crate::sketch::marks_on(keyframe, marks);
@@ -359,13 +369,7 @@ pub fn annotate_keyframe_marks_in_place(
             .collect();
         if let Some(number) = stroke.pin {
             if let Some(&point) = points.first() {
-                draw_pin(
-                    frame,
-                    point,
-                    number,
-                    (w.max(h) / 1280.0).clamp(0.75, 2.5),
-                    1.0,
-                );
+                draw_pin(frame, point, number, pin_scale);
             }
         } else if !points.is_empty() {
             let outline = freehand_outline(
@@ -377,9 +381,6 @@ pub fn annotate_keyframe_marks_in_place(
             );
             polygon(frame, &outline, RED);
         }
-    }
-    if shown.len() >= 2 && crate::handoff::experiment(crate::handoff::AGENT_CONTEXT) {
-        draw_mark_numbers(frame, &shown, strokes, k);
     }
     for stroke in strokes.iter().filter(|s| s.laser) {
         draw_laser(frame, stroke, keyframe.t);
@@ -398,9 +399,7 @@ pub fn annotate_keyframe_marks_in_place(
             label,
         } = event
             && button.as_deref() == Some("touch")
-            && !label
-                .as_deref()
-                .is_some_and(|l| l == "long press" || l.starts_with("long press:"))
+            && !is_long_press(label.as_deref())
             && *t <= keyframe.t
             && keyframe.t.saturating_sub(*t1) <= 900
         {
@@ -425,9 +424,7 @@ pub fn annotate_keyframe_marks_in_place(
                 y0,
                 label,
                 ..
-            } if label
-                .as_deref()
-                .is_some_and(|l| l == "long press" || l.starts_with("long press:"))
+            } if is_long_press(label.as_deref())
                 && ((*t <= keyframe.t && keyframe.t.saturating_sub(*t1) <= 600)
                     || t.abs_diff(keyframe.t) <= 600) =>
             {
@@ -586,63 +583,11 @@ fn draw_keyframe_badge(
     }
 }
 
-/// Small numbered discs where each mark of a shared keyframe began, in drawing order, so the
-/// summary's ①②③ point at their ink. Dark with a white ring, unlike red pins.
-fn draw_mark_numbers(frame: &mut RgbaFrame, marks: &[&Mark], strokes: &[Stroke], k: f32) {
-    let (w, h) = (frame.width as f32, frame.height as f32);
-    let radius = 11.0 * k;
-    let mut placed: Vec<[f32; 2]> = Vec::new();
-    for (n, mark) in marks.iter().enumerate() {
-        let start = mark
-            .strokes
-            .iter()
-            .filter_map(|&i| strokes.get(i))
-            .min_by_key(|s| s.t0)
-            .and_then(|s| s.normalized_points().first().copied());
-        let Some([x, y]) = start else {
-            continue;
-        };
-        let lift = radius * 1.1;
-        let clamp_x = |v: f32| v.clamp(radius + 2.0, (w - radius - 2.0).max(radius + 2.0));
-        let clamp_y = |v: f32| v.clamp(radius + 2.0, (h - radius - 2.0).max(radius + 2.0));
-        let mut center = [clamp_x(x * w - lift), clamp_y(y * h - lift)];
-        // Marks that start in one place would hide each other's numbers; step along instead.
-        for _ in 0..marks.len() {
-            let crowded = placed
-                .iter()
-                .any(|p: &[f32; 2]| (p[0] - center[0]).hypot(p[1] - center[1]) < radius * 2.3);
-            if !crowded {
-                break;
-            }
-            center = [clamp_x(center[0] + radius * 2.5), center[1]];
-        }
-        placed.push(center);
-        circle(frame, center, radius + 1.6 * k, WHITE);
-        circle(frame, center, radius, [14, 15, 18, 255]);
-        let label = (n + 1).to_string();
-        let mut size = 14.0 * k;
-        let width = text_width(&label, size, true);
-        if width > radius * 1.6 {
-            size *= radius * 1.6 / width;
-        }
-        let width = text_width(&label, size, true);
-        draw_text(
-            frame,
-            &label,
-            center[0] - width * 0.5,
-            center[1] - size * 0.58,
-            size,
-            WHITE,
-            true,
-        );
-    }
-}
-
-fn draw_pin(frame: &mut RgbaFrame, point: [f32; 2], number: u32, scale: f32, alpha: f32) {
+fn draw_pin(frame: &mut RgbaFrame, point: [f32; 2], number: u32, scale: f32) {
     let label = number.to_string();
     let radius = 13.0 * scale;
-    circle(frame, point, radius + 2.5 * scale, opacity(WHITE, alpha));
-    circle(frame, point, radius, opacity(RED, alpha));
+    circle(frame, point, radius + 2.5 * scale, WHITE);
+    circle(frame, point, radius, RED);
     let mut size = 16.0 * scale;
     let width = text_width(&label, size, true);
     if width > radius * 1.65 {
@@ -655,7 +600,7 @@ fn draw_pin(frame: &mut RgbaFrame, point: [f32; 2], number: u32, scale: f32, alp
         point[0] - width * 0.5,
         point[1] - size * 0.58,
         size,
-        opacity(WHITE, alpha),
+        WHITE,
         true,
     );
 }
@@ -709,42 +654,69 @@ fn draw_laser(frame: &mut RgbaFrame, stroke: &Stroke, time: u64) {
     }
 }
 
+const CLICK_BLUE: Color = [0, 136, 255, 255];
+
+/// Where a click landed, without hiding what's under it: a thin translucent ring with a hairline
+/// white edge (so it reads on dark and on blue) and a small centre dot. No fill.
 fn draw_click_ripple(frame: &mut RgbaFrame, p: [f32; 2], k: f32) {
-    circle(frame, p, 14.0 * k, [0, 136, 255, 68]);
-    ring(frame, p, 15.0 * k, 1.75 * k, WHITE);
-    ring(frame, p, 17.5 * k, 1.75 * k, [0, 136, 255, 235]);
+    let r = 9.0 * k;
+    ring(frame, p, r + 1.1 * k, 0.9 * k, opacity(WHITE, 0.4));
+    ring(frame, p, r, 1.3 * k, opacity(CLICK_BLUE, 0.8));
+    circle(frame, p, 2.0 * k, opacity(WHITE, 0.5));
+    circle(frame, p, 1.3 * k, opacity(CLICK_BLUE, 0.9));
 }
 
-/// A finger's path: a haloed blue line from a small start dot to a ring where it lifted.
+/// A finger's path: a thin translucent blue line from a small dot to a slightly larger one where
+/// it lifted (a tap's ring there, when the keyframe has one, stays the only ring).
 fn draw_touch_trail(frame: &mut RgbaFrame, points: &[[f32; 2]], k: f32) {
     let (Some(&start), Some(&end)) = (points.first(), points.last()) else {
         return;
     };
-    for pair in points.windows(2) {
-        line(
-            frame,
-            pair[0],
-            pair[1],
-            4.5 * k,
-            4.5 * k,
-            [255, 255, 255, 150],
-        );
+    polyline(frame, points, 1.5 * k, opacity(WHITE, 0.22));
+    polyline(frame, points, 0.8 * k, opacity(CLICK_BLUE, 0.7));
+    for (point, r) in [(start, 1.3 * k), (end, 2.2 * k)] {
+        circle(frame, point, r + 0.7 * k, opacity(WHITE, 0.5));
+        circle(frame, point, r, opacity(CLICK_BLUE, 0.9));
     }
-    for pair in points.windows(2) {
-        line(
-            frame,
-            pair[0],
-            pair[1],
-            2.6 * k,
-            2.6 * k,
-            [0, 136, 255, 230],
-        );
+}
+
+/// A round-capped polyline of half-width `radius`, blended once per pixel so a translucent line
+/// doesn't darken where its segments meet.
+fn polyline(frame: &mut RgbaFrame, points: &[[f32; 2]], radius: f32, color: Color) {
+    if points.len() < 2 || points.iter().flatten().any(|v| !v.is_finite()) {
+        return;
     }
-    circle(frame, start, 5.0 * k, WHITE);
-    circle(frame, start, 3.5 * k, [0, 136, 255, 255]);
-    circle(frame, end, 12.0 * k, [0, 136, 255, 60]);
-    ring(frame, end, 13.0 * k, 1.75 * k, WHITE);
-    ring(frame, end, 15.5 * k, 1.75 * k, [0, 136, 255, 235]);
+    let reach = radius + 1.0;
+    let [bx0, by0, bx1, by1] = crate::sketch::bounds(points);
+    let x0 = ((bx0 - reach).floor() as i32).max(0);
+    let x1 = ((bx1 + reach).ceil() as i32).min(frame.width as i32);
+    let y0 = ((by0 - reach).floor() as i32).max(0);
+    let y1 = ((by1 + reach).ceil() as i32).min(frame.height as i32);
+    for py in y0..y1 {
+        let y = py as f32 + 0.5;
+        for px in x0..x1 {
+            let x = px as f32 + 0.5;
+            let mut d = f32::INFINITY;
+            for seg in points.windows(2) {
+                let (a, b) = (seg[0], seg[1]);
+                if x < a[0].min(b[0]) - reach
+                    || x > a[0].max(b[0]) + reach
+                    || y < a[1].min(b[1]) - reach
+                    || y > a[1].max(b[1]) + reach
+                {
+                    continue;
+                }
+                let ab = [b[0] - a[0], b[1] - a[1]];
+                let len2 = (ab[0] * ab[0] + ab[1] * ab[1]).max(1e-6);
+                let t = (((x - a[0]) * ab[0] + (y - a[1]) * ab[1]) / len2).clamp(0.0, 1.0);
+                d = d.min((x - a[0] - ab[0] * t).hypot(y - a[1] - ab[1] * t));
+            }
+            let coverage = (radius + 0.5 - d).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                blend(frame, px, py, color, coverage);
+            }
+        }
+    }
 }
 
 pub fn render_contact_sheet(
@@ -1997,6 +1969,41 @@ mod tests {
         assert_eq!(blue(&stale), 0, "an old swipe should not be drawn");
     }
 
+    /// A click is marked by a thin ring and a small dot: what was clicked stays visible.
+    #[test]
+    fn click_marks_leave_what_they_mark_visible() {
+        let base = solid(1280, 800, [240, 240, 240, 255]);
+        let mut keyframe = key(1);
+        keyframe.reason = KeyframeReason::Click;
+        keyframe.cursor = Some([0.5, 0.5]);
+        let after = render_annotated_keyframe(&base, &keyframe, &[], &[], &[]);
+        let changed: Vec<(usize, usize)> = (0..800)
+            .flat_map(|y| (0..1280).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let i = (y * 1280 + x) * 4;
+                after.rgba[i..i + 4] != base.rgba[i..i + 4]
+            })
+            .filter(|&(x, y)| x > 600 && x < 680 && y > 360 && y < 440)
+            .collect();
+        assert!(!changed.is_empty(), "click mark missing");
+        // A quarter of the filled 18 px disc it replaces, and the band between dot and ring is
+        // left alone.
+        assert!(changed.len() < 260, "{} px painted", changed.len());
+        for (x, y) in [(645, 400), (640, 395), (636, 400)] {
+            let i = (y * 1280 + x) * 4;
+            assert_eq!(
+                after.rgba[i..i + 4],
+                base.rgba[i..i + 4],
+                "({x}, {y}) covered"
+            );
+        }
+        // Nothing is opaque: the screen shows through every pixel of the mark.
+        for (x, y) in changed {
+            let i = (y * 1280 + x) * 4;
+            assert!(after.rgba[i] > 20, "({x}, {y}) hides the screen");
+        }
+    }
+
     #[test]
     fn png_round_trip_preserves_rgba_including_alpha() {
         let frame = RgbaFrame::new(
@@ -2094,22 +2101,15 @@ mod tests {
         assert!(red_rows(115..125) > 0 && red_rows(145..155) > 0);
         assert_eq!(red_rows(175..185), 0, "another keyframe's mark");
 
-        // agentContext numbers the shared marks with dark, white-ringed discs up and left of
-        // where each began.
-        let mut numbered = result.clone();
-        let shown: Vec<&Mark> = marks[..2].iter().collect();
-        draw_mark_numbers(&mut numbered, &shown, &strokes, 1.0);
-        let changed = |x0: usize, y0: usize| {
-            (y0..y0 + 14).any(|y| {
-                (x0..x0 + 14).any(|x| {
-                    let i = (y * 320 + x) * 4;
-                    numbered.rgba[i..i + 4] != result.rgba[i..i + 4]
-                })
-            })
-        };
-        // Starts at (48, 120) and (48, 150); discs sit about 12 px up and left.
-        assert!(changed(30, 102) && changed(30, 132));
-        assert!(!changed(200, 20), "nothing else is touched");
+        // No numbered badges beside the marks (the text numbers them): below the corner badge,
+        // every pixel is the backdrop or red ink.
+        let foreign = result.rgba[60 * 320 * 4..]
+            .chunks_exact(4)
+            .filter(|p| p[..3] != [20, 20, 20] && !(p[0] > p[1] && p[0] > p[2]))
+            .count();
+        assert_eq!(foreign, 0, "pixels that are neither backdrop nor ink");
+        // Tests run with experiments off, so also check the images never depend on agentContext.
+        assert!(!include_str!("render.rs").contains(concat!("handoff::", "AGENT_CONTEXT")));
     }
 
     #[test]

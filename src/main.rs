@@ -322,9 +322,13 @@ enum Command {
         /// Path to `.scrawl` bundle directory, `scrawl.json`, or `latest`.
         #[arg(default_value = "latest")]
         bundle: PathBuf,
-        /// Emit raw `scrawl.json` instead of `summary.md`.
+        /// Emit raw `scrawl.json` instead of `summary.md` (with `--marks`, the marks as JSON).
         #[arg(long)]
         json: bool,
+        /// List the marks: keyframe, number as the summary shows it (✎②), time, shape, what it
+        /// was drawn on, and id, for `scrawl zoom --mark`.
+        #[arg(long)]
+        marks: bool,
         /// Turn an experiment on for this summary (e.g. `agentContext`). Repeatable.
         #[arg(long = "experiment", value_name = "NAME")]
         experiments: Vec<String>,
@@ -343,16 +347,24 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         fps: u32,
     },
-    /// Zoom into one moment: a dense contact sheet of frames around a time or a spoken phrase,
-    /// with the bundle's ink and touches drawn in and each frame's time, plus what was said.
+    /// Zoom into one moment: a dense contact sheet of frames around a time, a spoken phrase or a
+    /// mark, with the bundle's ink and touches drawn in and each frame's time, plus what was said.
     Zoom {
         /// Path to `.scrawl` bundle directory or `latest`.
         #[arg(default_value = "latest")]
         bundle: PathBuf,
         /// The moment: a time (`0:12`, `12.5`) or a phrase from the narration ("width changes").
+        #[arg(long, required_unless_present = "mark", conflicts_with = "mark")]
+        at: Option<String>,
+        /// A mark, centred with its ink drawn: its number in the summary (`2` for ✎②) or its id
+        /// (`m2`). `scrawl inspect --marks` lists them.
         #[arg(long)]
-        at: String,
-        /// Seconds of video to cover (a quarter before the moment, the rest after).
+        mark: Option<String>,
+        /// The keyframe whose ✎① ✎② `--mark` counts (`--frame 2` for #2), when several have one.
+        #[arg(long, requires = "mark")]
+        frame: Option<usize>,
+        /// Seconds of video to cover (a quarter before the moment, the rest after; for a mark, at
+        /// least the whole mark, centred).
         #[arg(long, default_value_t = 2.0)]
         span: f64,
         /// Frames in the sheet.
@@ -1958,13 +1970,26 @@ fn main() -> Result<()> {
         Command::Inspect {
             bundle,
             json,
+            marks,
             experiments,
         } => {
             for name in &experiments {
                 handoff::enable_experiment(name);
             }
             let (dir, loaded) = handoff::load_bundle(&bundle)?;
-            if json {
+            if marks {
+                let entries = agent_context::mark_entries(&loaded);
+                if json {
+                    let list: Vec<_> = entries.iter().map(|e| e.json()).collect();
+                    println!("{}", serde_json::to_string_pretty(&list)?);
+                } else if entries.is_empty() {
+                    println!("No marks");
+                } else {
+                    for entry in &entries {
+                        println!("{}", entry.line());
+                    }
+                }
+            } else if json {
                 println!("{}", serde_json::to_string_pretty(&loaded)?);
             } else {
                 print!("{}", summary_markdown(&loaded, &dir));
@@ -2071,13 +2096,23 @@ fn main() -> Result<()> {
         Command::Zoom {
             bundle,
             at,
+            mark,
+            frame,
             span,
             frames,
             full,
         } => {
             let (dir, loaded) = handoff::load_bundle(&bundle)?;
             ensure!(span.is_finite() && span > 0.0, "--span must be positive");
-            let sheet = zoom::zoom(&dir, &loaded, &at, (span * 1_000.0) as u64, frames, !full)?;
+            let focus = if let Some(query) = &mark {
+                let entry =
+                    agent_context::find_mark(&loaded, query, frame).map_err(anyhow::Error::msg)?;
+                println!("{}", entry.line());
+                zoom::Focus::Mark(entry)
+            } else {
+                zoom::Focus::At(at.as_deref().context("Pass --at or --mark")?)
+            };
+            let sheet = zoom::zoom(&dir, &loaded, focus, (span * 1_000.0) as u64, frames, !full)?;
             println!("{}", sheet.path.display());
             println!(
                 "{} → {}, {} frames: {}",

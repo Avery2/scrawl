@@ -224,15 +224,17 @@ pub(crate) fn quote_label(label: &str) -> String {
     }
 }
 
+/// Whether `mark` belongs to `keyframe` (by `mark_id` or shared `frame` file).
+pub fn mark_on_keyframe(mark: &Mark, keyframe: &Keyframe) -> bool {
+    keyframe.mark_id.as_ref() == Some(&mark.id)
+        || (!keyframe.file.is_empty() && mark.frame.as_ref() == Some(&keyframe.file))
+}
+
 /// The inked marks a keyframe draws (every mark of its screen's group), in drawing order.
 pub fn marks_on<'a>(keyframe: &Keyframe, marks: &'a [Mark]) -> Vec<&'a Mark> {
     let mut shown: Vec<&Mark> = marks
         .iter()
-        .filter(|m| {
-            !m.strokes.is_empty()
-                && (keyframe.mark_id.as_ref() == Some(&m.id)
-                    || (!keyframe.file.is_empty() && m.frame.as_ref() == Some(&keyframe.file)))
-        })
+        .filter(|m| !m.strokes.is_empty() && mark_on_keyframe(m, keyframe))
         .collect();
     shown.sort_by_key(|m| m.t0);
     shown
@@ -418,10 +420,7 @@ pub fn timeline(bundle: &ScrawlBundle) -> Vec<String> {
         .map(|s| (s.t0, format!("{} “{}”", format_clock(s.t0), s.text)))
         .collect();
     for mark in &bundle.marks {
-        let frame = bundle.keyframes.iter().find(|k| {
-            k.mark_id.as_deref() == Some(mark.id.as_str())
-                || mark.frame.as_deref() == Some(k.file.as_str())
-        });
+        let frame = bundle.keyframes.iter().find(|k| mark_on_keyframe(mark, k));
         let suffix = frame
             .map(|k| format!(" — frame #{}", k.index))
             .unwrap_or_default();
@@ -671,6 +670,21 @@ pub fn summary_markdown_with(
         out.push_str(&format!("“{}”\n", bundle.transcript.text.trim()));
     }
     out
+}
+
+/// A ⇧-click pin shows live only as a brief ring at the click, gone in this long; the pin itself
+/// stays data (keyframes, summary). Ordinary clicks draw nothing live.
+pub const PIN_PULSE_MS: u64 = 350;
+
+/// The live pulse for a pin dropped `age_ms` ago: a thin ring's radius (points) and opacity. It
+/// grows out fast and slows (ease-out cubic) while it fades to nothing.
+pub fn pin_pulse(age_ms: u64) -> Option<(f32, f32)> {
+    if age_ms >= PIN_PULSE_MS {
+        return None;
+    }
+    let p = age_ms as f32 / PIN_PULSE_MS as f32;
+    let grow = 1.0 - (1.0 - p).powi(3);
+    Some((4.0 + 10.0 * grow, 0.55 * (1.0 - p) * (1.0 - p)))
 }
 
 /// Extracts the active `[now_ms - tail_ms, now_ms]` window of a timed laser stroke,
@@ -1168,6 +1182,18 @@ fn smooth_closed_polygon(poly: &[[f32; 2]]) -> Vec<[f32; 2]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pin pulses once and is gone: nothing click-related stays on screen while recording.
+    #[test]
+    fn a_pin_pulse_grows_fades_and_ends() {
+        let (r0, a0) = pin_pulse(0).unwrap();
+        let (r1, a1) = pin_pulse(PIN_PULSE_MS / 2).unwrap();
+        let (r2, a2) = pin_pulse(PIN_PULSE_MS - 1).unwrap();
+        assert!(r0 < r1 && r1 < r2 && r2 <= 14.0);
+        assert!(a0 > a1 && a1 > a2 && a2 < 0.01 && a0 <= 0.55);
+        assert_eq!(pin_pulse(PIN_PULSE_MS), None);
+        assert_eq!(pin_pulse(60_000), None);
+    }
 
     fn stroke(points: &[[f32; 2]], t: u64) -> Stroke {
         Stroke {

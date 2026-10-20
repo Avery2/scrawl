@@ -36,7 +36,8 @@ current copy, so it updates with the app.
 
 With the skill, an agent that gets a Scrawl paste reads the contact sheet and transcript, opens the
 keyframes the narration points at, and uses the command to look closer: `scrawl zoom <bundle> --at
-0:12` (or `--at "a phrase you said"`) makes a dense sheet of frames around a moment, `scrawl
+0:12` (or `--at "a phrase you said"`, or `--mark 2` for the mark the text shows as ✎②; `scrawl
+inspect --marks` lists them) makes a dense sheet of frames around a moment, `scrawl
 frames` pulls a range, `scrawl send` queues a capture into an OpenCode session, and `scrawl export`
 makes a shareable `.mp4`. `scrawl skill` prints the skill without installing anything.
 
@@ -209,7 +210,7 @@ Preview every pane, dark and light, with the recorder listening and a combinatio
 - `⌥⇧V`: Paste both `contact-sheet.png` and `summary.md` into the active app or terminal (`⌃⌥⇧V` also works while it's the default)
 - **Normal pointer**: Clicks and scrolls pass straight through to the app underneath
 - **Hold `⇧` (Shift) + move**: Draw a persistent red marker stroke (`#ff3b30`) on screen that fades out after release
-- **`⇧`-click**: Drop a numbered pin where you click (a press that moves under 12 pt and lets go within 1 s; longer is ink)
+- **`⇧`-click**: Drop a numbered pin where you click (a press that moves under 12 pt and lets go within 1 s; longer is ink). It shows as a brief red pulse, not a lasting dot, and lands on the keyframes. A click after you've drawn in the same `⇧` hold is part of the drawing and drops no pin
 - **`⌘Z`**: Undo the last stroke
 - **`Esc`**: Cancel the active selection or capture
 
