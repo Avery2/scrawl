@@ -17,7 +17,7 @@ pub mod smart;
 pub const SMART_ROUTING: &str = "smartRouting";
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -181,25 +181,13 @@ pub fn browser_tab_url(bundle_id: &str) -> Option<String> {
 }
 
 fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<std::process::Output> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+    crate::handoff::output_within(command, timeout)
+        .inspect_err(|err| {
+            if err.downcast_ref::<crate::handoff::TimedOut>().is_some() {
                 scrawl_log("routing: gave up waiting on a subprocess");
-                return None;
             }
-        }
-    }
+        })
+        .ok()
 }
 
 /// The URL a capture was of: the browser in front when it finished, else the captured window's
@@ -323,8 +311,8 @@ pub fn session_for_directory(
 pub struct Hooks {
     pub sdk: fn(&str) -> Option<Registration>,
     pub listener_dir: fn(u16) -> Option<PathBuf>,
-    /// One `GET` against OpenCode's API.
-    pub api: fn(&str) -> Result<Vec<u8>>,
+    /// One `GET` against OpenCode's API, given up after the time given.
+    pub api: fn(&str, Duration) -> Result<Vec<u8>>,
 }
 
 impl Default for Hooks {
@@ -332,8 +320,30 @@ impl Default for Hooks {
         Self {
             sdk: crate::web::lookup,
             listener_dir: listener_directory,
-            api: crate::handoff::api_get,
+            api: crate::handoff::api_get_within,
         }
+    }
+}
+
+/// How long one capture's routing may spend reading sessions, all requests together.
+pub const SESSIONS_BUDGET: Duration = Duration::from_secs(3);
+
+/// `api` limited to `budget` in all, counted from its first request: each request gets what's
+/// left, and none starts after.
+pub fn within(
+    api: fn(&str, Duration) -> Result<Vec<u8>>,
+    budget: Duration,
+) -> impl FnMut(&str) -> Result<Vec<u8>> {
+    let mut deadline = None;
+    move |path| {
+        let deadline = *deadline.get_or_insert_with(|| Instant::now() + budget);
+        let left = deadline.saturating_duration_since(Instant::now());
+        anyhow::ensure!(
+            !left.is_zero(),
+            "OpenCode took over {} ms to list sessions",
+            budget.as_millis()
+        );
+        api(path, left)
     }
 }
 
@@ -347,11 +357,10 @@ pub fn route(url: &str, hooks: &Hooks) -> std::result::Result<Destination, Strin
         url: Some(url.to_owned()),
         directory: dir.map(|d| d.display().to_string()),
     };
-    let mut api = hooks.api;
-    let by_directory = |dir: &Path, via: &str| {
+    let mut api = within(hooks.api, SESSIONS_BUDGET);
+    let by_directory = |api: &mut ApiGet, dir: &Path, via: &str| {
         let (root, git) = project_root(dir);
-        let mut api = hooks.api;
-        session_for_directory(&mut api, &root, git)
+        session_for_directory(api, &root, git)
             .map_err(|err| format!("couldn't list sessions: {err:#}"))?
             .map(|s| destination(&s, via, Some(&root)))
             .ok_or_else(|| format!("no open OpenCode session in {}", root.display()))
@@ -370,7 +379,7 @@ pub fn route(url: &str, hooks: &Hooks) -> std::result::Result<Destination, Strin
             });
         }
         if let Some(dir) = reg.directory.as_deref() {
-            return by_directory(Path::new(dir), "sdk");
+            return by_directory(&mut api, Path::new(dir), "sdk");
         }
     }
     if !parsed.is_loopback() {
@@ -378,7 +387,7 @@ pub fn route(url: &str, hooks: &Hooks) -> std::result::Result<Destination, Strin
     }
     let dir = (hooks.listener_dir)(parsed.port)
         .ok_or_else(|| format!("no process found listening on port {}", parsed.port))?;
-    by_directory(&dir, "localhost")
+    by_directory(&mut api, &dir, "localhost")
 }
 
 /// Decides where a capture that just finished goes; `None` (logged) keeps it on the clipboard.
@@ -724,7 +733,7 @@ mod tests {
     fn listener(port: u16) -> Option<PathBuf> {
         (port == 4321).then(|| PathBuf::from("/p/app"))
     }
-    fn api(path: &str) -> Result<Vec<u8>> {
+    fn api(path: &str, _: Duration) -> Result<Vec<u8>> {
         crate::handoff::fake_api::serve(
             &[
                 session("ses_sdk", "/elsewhere", 5),
@@ -732,6 +741,61 @@ mod tests {
             ],
             path,
         )
+    }
+
+    fn down(_: &str, _: Duration) -> Result<Vec<u8>> {
+        anyhow::bail!("OpenCode API failed: Error: Could not reach server at http://127.0.0.1:4096")
+    }
+    /// Answers each request after 200 ms, or fails once the time it's given runs out.
+    fn slow(path: &str, left: Duration) -> Result<Vec<u8>> {
+        let delay = Duration::from_millis(200);
+        std::thread::sleep(delay.min(left));
+        anyhow::ensure!(left >= delay, "no answer");
+        let sessions: Vec<_> = (0..250)
+            .map(|i| session(&format!("ses_{i}"), "/q", 1_000 + i))
+            .chain([session("ses_app", "/p/app", 10)])
+            .collect();
+        crate::handoff::fake_api::serve(&sessions, path)
+    }
+
+    #[test]
+    fn a_down_or_slow_server_costs_routing_a_bounded_time() {
+        let hooks = Hooks {
+            sdk: no_sdk,
+            listener_dir: listener,
+            api: down,
+        };
+        let started = Instant::now();
+        let err = route("http://127.0.0.1:4321/", &hooks).unwrap_err();
+        assert!(err.contains("Could not reach server"), "{err}");
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        // Every request shares one budget, counted from the first: reading pages stops when
+        // it's spent instead of waiting out each request in turn.
+        let budget = Duration::from_millis(500);
+        let mut requests = 0;
+        let mut api = within(slow, budget);
+        let started = Instant::now();
+        let result = crate::routing::look::read_candidates(
+            &mut |path: &str| {
+                requests += 1;
+                api(path)
+            },
+            &[PathBuf::from("/p/app"), PathBuf::from("/p/other")],
+            &[],
+            look::SESSION_PAGES,
+        );
+        assert!(result.is_err());
+        // Two pages answer, the first folder's read gets the last 100 ms and fails, and the
+        // second is never asked: 500 ms, not the 800 ms four requests take.
+        let took = started.elapsed();
+        assert!((2..4).contains(&requests), "{requests}");
+        assert!(took < Duration::from_millis(700), "{took:?}");
+
+        // A server that answers in time routes as usual.
+        let hooks = Hooks { api: slow, ..hooks };
+        let local = route("http://127.0.0.1:4321/", &hooks).unwrap();
+        assert_eq!(local.session, "ses_app");
     }
 
     #[test]
