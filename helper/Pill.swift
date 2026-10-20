@@ -21,7 +21,7 @@ import SwiftUI
 
 enum PillMetrics {
   /// The Metal panel's width and its capsule's top (`model::PANEL_W`, `TOP`); taller than its
-  /// 84 pt so the shadow and the Esc hint never reach the edge.
+  /// 84 pt so the shadow never reaches the edge.
   static let width: CGFloat = 640
   static let height: CGFloat = 112
 }
@@ -338,7 +338,6 @@ struct PillRoot: View {
             .frame(width: model.shell.width, height: model.shell.height)
             .offset(x: model.shell.minX, y: model.shell.minY)
         }
-      escHint
       if PillTrace.shared != nil { probe }
     }
     .frame(width: PillMetrics.width, height: PillMetrics.height, alignment: .topLeading)
@@ -416,25 +415,6 @@ struct PillRoot: View {
       }
     }
     .frame(width: PillMetrics.width, height: PillMetrics.height, alignment: .topLeading)
-  }
-
-  @ViewBuilder private var escHint: some View {
-    let item = model.items.first { $0.id == model.hovered && ($0.id == "close" || $0.id == "cancel") }
-    ZStack(alignment: .topLeading) {
-      if let item, model.phase != "completed" {
-        Text("Esc")
-          .font(.system(size: 11, weight: .medium))
-          .foregroundStyle(Color(red: 0.78, green: 0.78, blue: 0.80))
-          .frame(width: 30, height: 18)
-          .background(Capsule().fill(Color(red: 0.11, green: 0.11, blue: 0.12).opacity(0.92)))
-          .overlay(Capsule().strokeBorder(Color.white.opacity(0.16), lineWidth: 0.5))
-          .offset(x: item.frame.midX - 15, y: model.restShell.maxY + 4)
-          .transition(presence)
-      }
-    }
-    .frame(width: PillMetrics.width, height: PillMetrics.height, alignment: .topLeading)
-    .animation(model.spring(PillSpringSpec(0.2, 0)), value: item?.id)
-    .allowsHitTesting(false)
   }
 }
 
