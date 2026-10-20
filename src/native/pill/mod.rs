@@ -341,7 +341,8 @@ pub struct NativePill {
     shared: Arc<SharedNativePill>,
     display_link: Option<CVDisplayLink>,
     display_link_ctx: Option<*const SharedNativePill>,
-    /// The link runs only while the capsule is on screen.
+    /// The link runs while anything on screen moves (`PillModel::is_static`), not while the
+    /// capsule is hidden or still.
     link_running: std::cell::Cell<bool>,
     action_rx: flume::Receiver<PillAction>,
     window_num: u32,
@@ -553,7 +554,7 @@ impl NativePill {
             return;
         };
         let mut became_visible = false;
-        let hidden;
+        let idle;
         {
             let (Ok(mut st), Ok(mut main)) = (self.shared.render.lock(), self.shared.main.lock())
             else {
@@ -598,15 +599,18 @@ impl NativePill {
                 }
             }
             main.poll_pointer_and_input(&mut st);
-            hidden = st.model.is_fully_hidden();
+            // Static: nothing would change on screen until the next `sync` changes something.
+            // (A trace keeps the link going, so it records the frames at rest too.)
+            idle = st.model.is_fully_hidden()
+                || (st.model.is_static() && !st.dirty && !motion::tracing());
         }
         // Start and stop the link without holding the lock its callback takes.
         match &self.display_link {
-            Some(dl) if hidden && self.link_running.get() => {
+            Some(dl) if idle && self.link_running.get() => {
                 let _ = dl.stop();
                 self.link_running.set(false);
             }
-            Some(dl) if !hidden && !self.link_running.get() => {
+            Some(dl) if !idle && !self.link_running.get() => {
                 if let Ok(mut st) = self.shared.render.lock() {
                     st.last_out = None;
                 }
@@ -615,7 +619,7 @@ impl NativePill {
             }
             Some(_) => {}
             None => {
-                if !hidden || became_visible {
+                if !idle || became_visible {
                     self.shared.draw_main(pacing::host_now());
                 }
             }
@@ -909,7 +913,7 @@ impl SharedNativePill {
         st.last_out = Some(out);
         let dt = step as f32 * st.time_scale;
 
-        let animating = !st.model.is_at_rest() || matches!(st.model.pres, Pres::Processing);
+        let animating = !st.model.is_static();
         if !animating && !st.dirty {
             if motion::tracing() && !st.model.is_fully_hidden() {
                 let frame = st.model.frame();

@@ -1961,6 +1961,19 @@ impl PillModel {
         })
     }
 
+    /// Something on screen keeps moving at rest: the recording dot's breathing and ripple, or
+    /// the processing spinner (both drawn from the model's clock `t`).
+    pub fn has_ambient_motion(&self) -> bool {
+        let live = |p: &Pres| matches!(p, Pres::Recording { .. } | Pres::Processing);
+        (live(&self.pres) || live(&self.geo_pres)) && self.shell_alpha.x > 0.005
+    }
+
+    /// Nothing on screen would change if the clock advanced: every spring has settled and
+    /// nothing animates on its own. Frames are drawn (and the display link runs) until then.
+    pub fn is_static(&self) -> bool {
+        self.is_at_rest() && !self.has_ambient_motion()
+    }
+
     /// True when the capsule is in `Pres::Hidden` and its outline and alpha have settled to rest.
     pub fn is_fully_hidden(&self) -> bool {
         matches!(self.pres, Pres::Hidden)
@@ -2533,6 +2546,22 @@ mod tests {
             m.advance(FRAME_DT);
         }
         assert!(m.frame().ghost.is_none());
+    }
+
+    #[test]
+    fn the_recording_dot_keeps_the_capsule_animating_at_rest() {
+        let mut m = PillModel::new(Metrics::default());
+        assert!(m.is_static(), "hidden is static");
+        for pres in visible_states() {
+            settle(&mut m, pres.clone());
+            let live = matches!(pres, Pres::Recording { .. } | Pres::Processing);
+            assert_eq!(!m.is_static(), live, "{pres:?}");
+        }
+        settle(&mut m, Pres::Hidden);
+        for _ in 0..120 {
+            m.advance(FRAME_DT);
+        }
+        assert!(m.is_static() && m.is_fully_hidden());
     }
 
     fn settle(m: &mut PillModel, pres: Pres) {
