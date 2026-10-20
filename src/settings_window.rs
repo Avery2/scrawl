@@ -29,6 +29,12 @@ use crate::settings::{Action, Event, Pane, Pressed};
 const WIDTH: f32 = 620.0;
 const HEIGHT: f32 = 448.0;
 const SIDEBAR: f32 = 210.0;
+/// The content pane's width: what the 620-point window keeps after the sidebar and the
+/// hairline between them. Giving the pane an explicit width (rather than `flex_1`) makes the
+/// space it hands its children definite, which GPUI requires to wrap text: with an indefinite
+/// width a caption measures as one full line, inflates the column and pushes trailing controls
+/// (the permission rows' buttons) past the window's edge.
+const CONTENT: f32 = WIDTH - SIDEBAR - 1.0;
 const TITLEBAR: f32 = 52.0;
 const INSET: f32 = 20.0;
 const ROW: f32 = 42.0;
@@ -842,7 +848,7 @@ impl SettingsWindow {
         };
         div()
             .id("settings-content")
-            .flex_1()
+            .w(px(CONTENT))
             .h_full()
             .bg(theme.window())
             .relative()
@@ -872,7 +878,7 @@ impl SettingsWindow {
                     )
                     .child(drag_strip("settings-drag-title").absolute().top_0().left_0()),
             )
-            .child(div().px(px(INSET)).flex().flex_col().child(body))
+            .child(div().w_full().px(px(INSET)).flex().flex_col().child(body))
     }
 
     fn general(&self, theme: Theme, state: &ViewState, cx: &mut Context<Self>) -> Div {
