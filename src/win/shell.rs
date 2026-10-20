@@ -13,7 +13,7 @@ use windows::Win32::Storage::FileSystem::{
     GetFileInformationByHandleEx, GetFileVersionInfoSizeW, GetFileVersionInfoW, OPEN_EXISTING,
     VerQueryValueW,
 };
-use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx};
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
 };
@@ -28,24 +28,35 @@ use super::wide;
 
 /// Opens a file, folder or URL with its default handler.
 pub fn open(target: &Path) -> Result<()> {
+    // The shell, unlike the file system, rejects `/` in a path (`…\scrawl/captures\…`).
+    let target: std::path::PathBuf = if target.is_absolute() {
+        target.components().collect()
+    } else {
+        target.to_owned()
+    };
     let target = wide(&target.to_string_lossy());
     let verb = wide("open");
-    let result = unsafe {
-        ShellExecuteW(
-            None,
-            PCWSTR(verb.as_ptr()),
-            PCWSTR(target.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        )
-    };
+    // ShellExecute pumps messages while it starts the handler. On GPUI's thread that runs queued
+    // tasks while the calling event still holds the app, and their panic aborts Scrawl.
+    let result = std::thread::spawn(move || {
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+        unsafe {
+            ShellExecuteW(
+                None,
+                PCWSTR(verb.as_ptr()),
+                PCWSTR(target.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        }
+        .0 as isize
+    })
+    .join()
+    .unwrap_or(0);
     // ShellExecute returns a value above 32 on success.
-    if result.0 as isize <= 32 {
-        bail!(
-            "Could not open it (ShellExecute error {})",
-            result.0 as isize
-        );
+    if result <= 32 {
+        bail!("Could not open it (ShellExecute error {result})");
     }
     Ok(())
 }

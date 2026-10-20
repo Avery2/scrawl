@@ -4625,11 +4625,13 @@ impl Render for BundleReviewWindow {
                                     false,
                                 )
                                 .on_click(move |_, _, cx| {
-                                    let _ = crate::handoff::open_path(&send_dir);
+                                    let res = crate::handoff::open_path(&send_dir);
+                                    let manager = platform::FILE_MANAGER;
                                     c_send.update(cx, |coord, cx| {
-                                        coord.review_status = Some(
-                                            format!("Opened in {}", platform::FILE_MANAGER).into(),
-                                        );
+                                        coord.review_status = Some(match res {
+                                            Ok(()) => format!("Opened in {manager}"),
+                                            Err(e) => format!("Show in {manager} failed: {e}"),
+                                        });
                                         cx.notify();
                                     });
                                 }),
@@ -4940,6 +4942,7 @@ fn tab_chip(id: &'static str, label: &'static str, selected: bool) -> gpui::Stat
 fn button_base(id: &'static str, primary: bool) -> gpui::Stateful<Div> {
     div()
         .id(id)
+        .map(platform::drag_region_control)
         .h(px(28.0))
         .px(px(12.0))
         .rounded(px(7.0))
