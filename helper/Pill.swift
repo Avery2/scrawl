@@ -363,8 +363,8 @@ struct PillRoot: View {
               content
                 .colorEffect(PillShaders.rim(size: proxy.size, energy: energy, completed: completed))
                 .layerEffect(
-                  PillShaders.morphBlur(radius: 1.2 * energy),
-                  maxSampleOffset: CGSize(width: 3, height: 0),
+                  PillShaders.morphBlur(radius: 0.5 * energy),
+                  maxSampleOffset: CGSize(width: 1.5, height: 0),
                   isEnabled: energy > 0.01
                 )
             }
