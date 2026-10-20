@@ -36,7 +36,7 @@ Without the `input` group, a capture on Wayland has no clicks, keys or ⇧ ink o
 
 ### Picker and portal limits
 
-Screen and Area work on the tested desktops. The Window picker lists X11/XWayland windows only; use Screen or Area for native Wayland apps. A portal window source exists internally, but the UI does not currently offer it. The held shortcut cycles Screen → Window → Screen, skipping the Mac-only iPhone mode. Screen sharing can ask again if a desktop does not honor the saved restore token. Finishing while the dialog is open cancels the pending session; a failed or empty capture reports an error rather than producing demo imagery, and `latest` skips its unfinished directory.
+Screen and Area work on the tested desktops. The Window picker lists X11/XWayland windows only; use Screen or Area for native Wayland apps. A portal window source exists internally, but the UI does not currently offer it. Holding the record shortcut opens the picker, which stays open after release; choose a target or press Esc. The Mac-only iPhone mode is hidden. Screen sharing can ask again if a desktop does not honor the saved restore token. Finishing while the dialog is open cancels the pending session; a failed or empty capture reports an error rather than producing demo imagery, and `latest` skips its unfinished directory.
 
 Plasma 5 can report successful GlobalShortcuts binding with an empty result. Scrawl validates both returned bindings and uses KGlobalAccel directly on Plasma 5, so the shortcut does not also type into the focused app.
 

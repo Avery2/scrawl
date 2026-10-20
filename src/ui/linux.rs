@@ -102,6 +102,11 @@ pub(super) fn window_drag_region(region: Div) -> Div {
     region
 }
 
+/// Linux's title bar owns dragging; controls in the content receive clicks normally.
+pub(super) fn drag_region_control<E>(control: E) -> E {
+    control
+}
+
 /// The desktop draws the window's buttons.
 pub(super) fn caption_buttons() -> Option<AnyElement> {
     None
