@@ -410,6 +410,19 @@ pub struct Config {
     /// The microphone Mac captures record from (`mic`); absent follows the macOS default.
     #[serde(default)]
     pub microphone: Option<crate::mic::Choice>,
+    /// Smart routing's settings (`routing::look`).
+    #[serde(default)]
+    pub routing: Option<RoutingConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutingConfig {
+    /// The checkout each app is built from, by bundle ID or a prefix of one
+    /// (`{"ai.opencode.desktop": "~/code/opencode"}`), for apps whose checkout isn't named like
+    /// them.
+    #[serde(default)]
+    pub apps: std::collections::BTreeMap<String, String>,
 }
 
 /// `true`/`false`, `"yes"`/`"on"`/`"1"` and their opposites, or a number (non-zero is on). Other
@@ -625,6 +638,27 @@ pub fn ensure_ingest_token_in(path: &Path) -> Result<String> {
 
 pub fn ensure_ingest_token() -> Result<String> {
     ensure_ingest_token_in(&default_config_path())
+}
+
+/// `routing.apps` from config.json, `~` expanded. Tests see none.
+pub fn routing_apps() -> Vec<(String, PathBuf)> {
+    if cfg!(test) {
+        return Vec::new();
+    }
+    let home = dirs::home_dir().unwrap_or_default();
+    config()
+        .routing
+        .map(|routing| routing.apps)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, path)| {
+            let path = match path.strip_prefix("~/") {
+                Some(rest) => home.join(rest),
+                None => PathBuf::from(path),
+            };
+            (id, path)
+        })
+        .collect()
 }
 
 /// Whether Mac captures of a dev site go straight to its session (`autoSend`, default on).

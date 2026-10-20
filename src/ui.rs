@@ -373,6 +373,7 @@ fn island_content_width(
     iphone: bool,
     chips: bool,
     completed_note: Option<&str>,
+    routes: &[String],
 ) -> f32 {
     let divider = 1.0 + 2.0 * DIVIDER_MX;
     let inner = match phase {
@@ -418,6 +419,10 @@ fn island_content_width(
                 + LEAD_TRAIL
                 + divider
                 + chip_width(window, "Paste", FontWeight::SEMIBOLD)
+                + routes
+                    .iter()
+                    .map(|label| chip_width(window, label, FontWeight::MEDIUM) + CHIP_GAP)
+                    .sum::<f32>()
                 + chip_width(window, "Inspect", FontWeight::MEDIUM)
                 + CHIP_H
                 + 3.0 * CHIP_GAP
@@ -738,6 +743,9 @@ pub struct ScrawlCoordinator {
     /// A local capture copied while its route is still being worked out; ✕ or Paste clears it,
     /// keeping the capture on the clipboard whatever the route says.
     routing: Option<PathBuf>,
+    /// Sessions the Completed island offers one click away (smart routing): when it asks, the
+    /// suggestion then a runner-up; during the undo window, the runner-up to switch to.
+    route_chips: Vec<RouteChip>,
     /// When this Mac last finished a capture, so ⌥⇧V prefers it over older inbox items.
     last_local_capture_ms: u64,
     inbox: crate::inbox::Inbox,
@@ -824,6 +832,7 @@ impl ScrawlCoordinator {
             completed_note: None,
             pending_send: None,
             routing: None,
+            route_chips: Vec::new(),
             last_local_capture_ms: 0,
             inbox: crate::inbox::Inbox::load_default(),
             last_mode: SelectionMode::load_last_used(),
@@ -1884,6 +1893,7 @@ impl ScrawlCoordinator {
             IslandPhase::Processing => Pres::Processing,
             IslandPhase::Completed { inbox_count, .. } => Pres::Completed {
                 label: completed_label(inbox_count, self.completed_note.as_deref()),
+                routes: self.route_chip_labels(),
             },
         };
         PillSnapshot {
@@ -1915,6 +1925,7 @@ impl ScrawlCoordinator {
             PillAction::Paste(target) => self.paste_completed_bundle(target, cx),
             PillAction::Inspect => self.inspect_completed_bundle(cx),
             PillAction::DismissCompleted => self.dismiss_completed_bundle(cx),
+            PillAction::Route(index) => self.choose_route(index, cx),
         }
     }
 
@@ -1987,7 +1998,9 @@ impl ScrawlCoordinator {
     }
 
     /// Acts on smart routing's decision for a finished local capture (the clipboard already has
-    /// it): a send waits out the undo window first; an offer is only named in the review window.
+    /// it): a send waits out the undo window first, with the runner-up one click away; an offer
+    /// asks on the Completed island ("Send to DESKTOP" beside Paste) and sends nothing until a
+    /// session is picked.
     fn act_on_route(
         &mut self,
         dir: PathBuf,
@@ -1996,13 +2009,22 @@ impl ScrawlCoordinator {
         cx: &mut Context<Self>,
     ) {
         use crate::routing::smart::Decision;
+        let showing = self.completed_dir.as_deref() == Some(dir.as_path());
         match &judgement.decision {
-            Decision::Send { .. } => {
-                if let Some(dest) = crate::routing::smart::destination(&judgement, url.as_deref()) {
-                    self.send_after_undo(dir, dest, cx);
+            Decision::Send { to, instead } => {
+                if showing {
+                    self.route_chips = RouteChip::switches(instead, url.as_deref());
                 }
+                self.send_after_undo(
+                    dir,
+                    crate::routing::smart::destination_of(to, url.as_deref()),
+                    cx,
+                );
             }
             Decision::Offer { choices } => {
+                if showing {
+                    self.route_chips = RouteChip::asks(choices, url.as_deref());
+                }
                 let names: Vec<String> = choices
                     .iter()
                     .map(|c| island_title(c.candidate.label()))
@@ -2017,6 +2039,37 @@ impl ScrawlCoordinator {
             }
             Decision::Keep { .. } => {}
         }
+    }
+
+    /// The labels of the Completed island's route chips.
+    fn route_chip_labels(&self) -> Vec<String> {
+        self.route_chips
+            .iter()
+            .map(|chip| chip.label.clone())
+            .collect()
+    }
+
+    /// A route chip on the Completed island was clicked: the capture goes to that session now,
+    /// as Kit's choice (it replaces a send waiting out its undo window).
+    pub fn choose_route(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(dir) = self.completed_dir.clone() else {
+            return;
+        };
+        let Some(chip) = self.route_chips.get(index).cloned() else {
+            return;
+        };
+        self.route_chips.clear();
+        self.routing = None;
+        self.pending_send = None;
+        self.mark_handled(&dir);
+        scrawl_log(format!(
+            "routing (smart): chose {} ({}) for {}",
+            chip.dest.title,
+            chip.dest.session,
+            dir.display()
+        ));
+        self.send_completed(dir, chip.dest, cx);
+        cx.notify();
     }
 
     /// Shows "Sending to …" for `SMART_SEND_UNDO`, then records the destination and sends,
@@ -2038,6 +2091,7 @@ impl ScrawlCoordinator {
                     return;
                 }
                 coord.pending_send = None;
+                coord.route_chips.clear();
                 coord.send_completed(dir, dest, cx);
                 cx.notify();
             });
@@ -2047,6 +2101,9 @@ impl ScrawlCoordinator {
 
     /// Cancels an automatic send of `dir` (while its route is worked out or during its undo window).
     fn keep_pending_send(&mut self, dir: &std::path::Path) {
+        if self.completed_dir.as_deref() == Some(dir) {
+            self.route_chips.clear();
+        }
         if self.routing.as_deref() == Some(dir) {
             self.routing = None;
             scrawl_log(format!(
@@ -2733,6 +2790,7 @@ impl ScrawlCoordinator {
         drop(rec._metal_overlay);
         self.set_island_phase(IslandPhase::Processing);
         self.completed_note = None;
+        self.route_chips.clear();
         cx.notify();
         if matches!(source, CaptureSource::Lab) {
             let duration_ms = rec.started.elapsed().as_millis() as u64;
@@ -2931,6 +2989,67 @@ impl ScrawlCoordinator {
     }
 }
 
+/// A session offered one click away on the Completed island.
+#[derive(Clone, Debug)]
+struct RouteChip {
+    label: String,
+    dest: crate::model::Destination,
+}
+
+impl RouteChip {
+    /// How many fit beside Paste.
+    const MAX: usize = 2;
+
+    fn chosen(scored: &crate::routing::smart::Scored, url: Option<&str>, label: String) -> Self {
+        let mut dest = crate::routing::smart::destination_of(scored, url);
+        dest.via = "chosen".into();
+        Self { label, dest }
+    }
+
+    /// An offer's chips: "Send to DESKTOP", then the runner-up by name.
+    fn asks(choices: &[crate::routing::smart::Scored], url: Option<&str>) -> Vec<Self> {
+        choices
+            .iter()
+            .take(Self::MAX)
+            .enumerate()
+            .map(|(i, scored)| {
+                let title = chip_title(scored.candidate.label());
+                let label = if i == 0 {
+                    format!("Send to {title}")
+                } else {
+                    title
+                };
+                Self::chosen(scored, url, label)
+            })
+            .collect()
+    }
+
+    /// The undo window's chip beside "Sending to DESKTOP…": "Send to OPENCODE IOS" instead.
+    fn switches(instead: &[crate::routing::smart::Scored], url: Option<&str>) -> Vec<Self> {
+        instead
+            .iter()
+            .take(1)
+            .map(|scored| {
+                let label = format!("Send to {}", chip_title(scored.candidate.label()));
+                Self::chosen(scored, url, label)
+            })
+            .collect()
+    }
+}
+
+/// A session title short enough for a chip.
+fn chip_title(title: &str) -> String {
+    const MAX: usize = 16;
+    if title.chars().count() > MAX {
+        format!(
+            "{}…",
+            title.chars().take(MAX - 1).collect::<String>().trim_end()
+        )
+    } else {
+        title.to_owned()
+    }
+}
+
 enum RouteOutcome {
     None,
     Send(crate::model::Destination),
@@ -3013,6 +3132,7 @@ impl Render for HudPillWindow {
         let clock = format_clock(elapsed_ms);
         let has_iphone = coord.iphone.is_some();
         let completed_note = coord.completed_note.clone();
+        let routes = coord.route_chip_labels();
         // The Recording capsule's trailing group: switch chips or controls, and the swap between.
         let chips = if matches!(phase, IslandPhase::Recording) {
             coord.reveal.is_open()
@@ -3038,6 +3158,7 @@ impl Render for HudPillWindow {
             has_iphone,
             chips,
             completed_note.as_deref(),
+            &routes,
         );
         let snap_initial_width =
             phase_age < 0.025 && matches!(phase, IslandPhase::Selecting { .. }) && opacity < 0.35;
@@ -3150,6 +3271,7 @@ impl Render for HudPillWindow {
         let c_paste_out = self.coordinator.clone();
         let c_inspect = self.coordinator.clone();
         let c_dismiss = self.coordinator.clone();
+        let c_route = self.coordinator.clone();
         let c_record = self.coordinator.clone();
         let c_sel_cancel = self.coordinator.clone();
 
@@ -3308,7 +3430,13 @@ impl Render for HudPillWindow {
             }
             IslandPhase::Completed { inbox_count, .. } => traced(
                 row,
-                named(&["done.lead", "divider.lead", "paste", "inspect", "close"]),
+                ["done.lead", "divider.lead", "paste"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .chain((0..routes.len()).map(|i| format!("route:{i}")))
+                    .chain(["inspect".to_owned(), "close".to_owned()])
+                    .map(|name| Some((name, 1.0)))
+                    .collect(),
             )
             .child(
                 island_lead()
@@ -3363,6 +3491,12 @@ impl Render for HudPillWindow {
                         });
                     }),
             )
+            .children(routes.iter().enumerate().map(|(i, label)| {
+                let c_route = c_route.clone();
+                pill_chip(("hud-route", i), label.clone(), true).on_click(move |_, _, cx| {
+                    c_route.update(cx, |coord, cx| coord.choose_route(i, cx));
+                })
+            }))
             .child(
                 pill_chip("hud-inspect", "Inspect", true).on_click(move |_, _, cx| {
                     c_inspect.update(cx, |coord, cx| coord.inspect_completed_bundle(cx));
@@ -3739,7 +3873,7 @@ fn island_divider() -> Div {
         .bg(rgba(0xffffff1a))
 }
 
-fn hud_chip(id: &'static str) -> gpui::Stateful<Div> {
+fn hud_chip(id: impl Into<gpui::ElementId>) -> gpui::Stateful<Div> {
     div()
         .id(id)
         .h(px(CHIP_H))
@@ -3752,7 +3886,11 @@ fn hud_chip(id: &'static str) -> gpui::Stateful<Div> {
         .whitespace_nowrap()
 }
 
-fn pill_chip(id: &'static str, label: &'static str, enabled: bool) -> gpui::Stateful<Div> {
+fn pill_chip(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<gpui::SharedString>,
+    enabled: bool,
+) -> gpui::Stateful<Div> {
     hud_chip(id)
         .font_weight(FontWeight::MEDIUM)
         .text_color(if enabled {
@@ -3764,7 +3902,7 @@ fn pill_chip(id: &'static str, label: &'static str, enabled: bool) -> gpui::Stat
             d.cursor_pointer()
                 .hover(|s| s.bg(rgba(0xffffff14)).text_color(rgb(TEXT_COLOR)))
         })
-        .child(label)
+        .child(label.into())
 }
 
 fn primary_chip(id: &'static str, label: &'static str) -> gpui::Stateful<Div> {
@@ -5423,6 +5561,7 @@ pub fn run_app(
                                 let duration_ms = bundle.duration_ms;
                                 let inbox_count = coord.add_to_inbox(&dir, &bundle);
                                 coord.completed_dir = Some(dir.clone());
+                                coord.route_chips.clear();
                                 coord.set_review_bundle((dir, *bundle), status);
                                 coord.set_island_phase(IslandPhase::Completed {
                                     finished_at: Instant::now(),
