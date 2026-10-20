@@ -438,6 +438,11 @@ impl NativePill {
                 let _: () = msg_send![&*window, _setPreventsActivation: true];
             }
             window.setReleasedWhenClosed(false);
+            // No AppKit window animation: ordering a utility panel in plays a system zoom and
+            // fade on the whole window, on the window server's timing, over the capsule's own
+            // entry (seen as the window's bounds shrinking by up to 10 pt for a few frames).
+            // 2 = `NSWindowAnimationBehaviorNone`.
+            let _: () = msg_send![&*window, setAnimationBehavior: 2_isize];
         }
 
         let local_bounds = NSRect::new(
