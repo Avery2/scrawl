@@ -69,8 +69,6 @@ struct PillUniforms {
     shape_meta: [f32; 4],
     ghost_rect: [f32; 4],
     ghost_meta: [f32; 4],
-    hint_rect: [f32; 4],
-    hint_uv: [f32; 4],
 }
 
 #[repr(C)]
@@ -899,22 +897,6 @@ impl PillRuntimeState {
             });
         }
 
-        // Optional "Esc" hint pill when hovering Cancel or Close in Selecting / Recording.
-        let mut hint_rect = [0.0_f32; 4];
-        let mut hint_uv = [0.0_f32; 4];
-        if !matches!(self.model.pres, Pres::Completed { .. })
-            && let Some(hov_id @ (ElemId::Cancel | ElemId::Close)) = self.model.hovered
-            && let Some(hov_elem) = frame.elems.iter().find(|e| e.id == hov_id && e.alpha > 0.6)
-        {
-            let esc_sp = self.pipelines.atlas.label("Esc");
-            let hw = 30.0_f32;
-            let hh = 18.0_f32;
-            let hx = hov_elem.rect[0] + (hov_elem.rect[2] - hw) * 0.5;
-            let hy = (frame.shape.b + 4.0).min(PANEL_H - hh - 1.0);
-            hint_rect = [hx, hy, hw, hh];
-            hint_uv = esc_sp.uv;
-        }
-
         let (has_ghost, ghost_rect, ghost_meta) = if let Some(ref g) = frame.ghost {
             (
                 1_u32,
@@ -954,8 +936,6 @@ impl PillRuntimeState {
             ],
             ghost_rect,
             ghost_meta,
-            hint_rect,
-            hint_uv,
         };
 
         let prim_count = prims.len() as u64;
@@ -1061,7 +1041,6 @@ impl PillRuntimeState {
                 comp_elems.as_ptr().cast::<c_void>(),
             );
             enc.set_fragment_texture(0, Some(&self.pipelines.offscreen_b));
-            enc.set_fragment_texture(1, Some(&self.pipelines.atlas.texture));
             enc.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
             enc.end_encoding();
         }
