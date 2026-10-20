@@ -168,7 +168,8 @@ granted and each on-demand sheet: `target/debug/scrawl-helper onboarding --rende
 - **General**: Launch at login, Send dev-site captures to OpenCode, and the two shortcuts, Record
   (`⌥⇧S`) and Paste last capture (`⌥⇧V`).
 - **Recording**: the microphone, with its input level, the transcriber (Apple Speech with its
-  language, or Hex while it runs, with its model and language) and, under Experimental, Video export.
+  language, Hex while it runs, with its model and language, or Command when it's configured) and,
+  under Experimental, Video export.
 - **Storage**: how long recordings are kept, how much space the captures take, and Show in Finder.
 - **Permissions**: the onboarding checklist, so a permission can be turned on later.
 - **Agents**: Install or Uninstall the `scrawl` command (see [Agents](#agents)), and the skill's
@@ -703,9 +704,9 @@ Or in
 { "transcriber": "hex", "hexModel": "whisper_large_v3_turbo", "hexLanguage": "nl" }
 ```
 
-`"transcriber"` is `"apple"` (default) or `"hex"`; `hexModel` defaults to the first ready one of
-`parakeet_unified_en`, `parakeet_v3`, `parakeet_v2`, `whisper_large_v3_turbo`. Scrawl never
-downloads or prepares a Hex model: install it in Hex first.
+`"transcriber"` is `"apple"` (default), `"hex"` or `"command"` (below); `hexModel` defaults to the
+first ready one of `parakeet_unified_en`, `parakeet_v3`, `parakeet_v2`, `whisper_large_v3_turbo`.
+Scrawl never downloads or prepares a Hex model: install it in Hex first.
 
 **Language** in Settings › Recording picks the language Apple Speech transcribes; **Automatic**
 (the default) follows the Mac's language. In config it's `"appleLocale"`, e.g. `"zh-TW"` for
@@ -729,8 +730,62 @@ and ignore the hint.
   `"estimated": true`; because those times are approximate, spoken cues ("now", "here") don't cut
   keyframes from a Hex transcript. Marks, clicks, laser and scene changes still do.
 - `scrawl hex status` shows whether Hex is connected, its ready models and what the next recording
-  will use. `scrawl reprocess <bundle> --out … --transcriber hex|apple` (also `scrawl import`) picks
-  an engine for one run.
+  will use. `scrawl reprocess <bundle> --out … --transcriber hex|apple|command` (also
+  `scrawl import`) picks an engine for one run.
+
+### Your own model (command)
+
+Any other local model (whisper.cpp, MLX Whisper, faster-whisper, Parakeet, a Core ML model…) can
+transcribe through a small wrapper program. Scrawl runs it on the recording's audio and reads a
+JSON transcript from its stdout; it knows nothing about the model, adds no network requests and
+doesn't sandbox the program. It runs on macOS only for now; on Windows recordings keep the local
+engine. In `~/.config/scrawl/config.json` (Settings shows **Command** once it is set; editing it
+stays in the file):
+
+```json
+{
+  "transcriber": "command",
+  "transcribeCommand": ["/Users/me/bin/whisper-scrawl", "--model", "large-v3-turbo", "{audio}"],
+  "transcribeTimeoutSeconds": 600
+}
+```
+
+- `transcribeCommand` is an argv array run directly: no shell, quoting, `~`, variables or globbing.
+  `argv[0]` must be an absolute path. Every `{audio}` in the other arguments becomes the audio path;
+  without one, the path is the last argument. These keys are read on their own, so a mistake in them
+  never resets the rest of the config.
+- `transcribeTimeoutSeconds` is optional: by default the limit is `max(300, 60 + 10 × audio
+  seconds)`, wall clock from the start, model loading included.
+- The program gets the whole recording as one 16 kHz mono 16-bit WAV, `SCRAWL_TRANSCRIBE_VERSION=1`
+  and `SCRAWL_AUDIO=<path>`, stdin `/dev/null`, and its own process group. Its stderr is discarded.
+  It must not change the audio, daemonize or leave processes behind, and must cope with two runs at
+  once. On timeout or more than 8 MiB of output Scrawl kills the group.
+- It exits 0 and prints exactly one JSON object:
+
+  ```json
+  {
+    "version": 1,
+    "model": "whisper-large-v3-turbo",
+    "text": "Click here.",
+    "segments": [{ "t0": 300, "t1": 980, "text": "Click here." }],
+    "words": [{ "t0": 300, "t1": 610, "text": "Click" }, { "t0": 640, "t1": 980, "text": "here." }],
+    "estimated": false
+  }
+  ```
+
+  `version` (the integer 1) and `text` (empty means no speech) are required; the rest may be
+  omitted or `null`, and unknown fields are ignored. Times are integer milliseconds from the first
+  sample. `segments` and `words`, when given, cover the whole text. `estimated` is `false` only if
+  the word times were measured (by the recognizer or an aligner); it defaults to `true`, and spoken
+  cues only cut keyframes from measured words. Without `words`, Scrawl spreads the text over the
+  segments (or the whole recording) and marks those times estimated, as it does for Hex.
+- Spans may overlap or be zero-length; Scrawl sorts them by `t0`. Ends up to 500 ms past the audio
+  are clamped. A negative, fractional or reversed span, or one further past the end, makes Scrawl
+  drop that array and keep the text, spreading it as above when `words` are dropped.
+- The transcript says `"source": "command:<file name of argv[0]>"`. Anything else going wrong (the
+  program missing, a non-zero exit, a timeout, invalid JSON, another version) means Apple Speech
+  transcribes that recording. Each problem is one line in `~/Library/Logs/Scrawl`, never with the
+  program's output, arguments or what was said.
 
 ### Transcribing while recording (experiment)
 
