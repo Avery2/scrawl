@@ -1,6 +1,8 @@
 //! Transcription: Apple's SpeechAnalyzer through `scrawl-helper` (measured word and segment
-//! timings), or Hex when `"transcriber": "hex"` is set and Hex is connected (`crate::hex`; word
-//! times estimated). Any Hex trouble falls back to Apple for that recording.
+//! timings), Hex when `"transcriber": "hex"` is set and Hex is connected (`crate::hex`; word
+//! times estimated), or a program of the user's when `"transcriber": "command"`
+//! (`crate::command_transcriber`). Any Hex or command trouble falls back to Apple for that
+//! recording.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -15,6 +17,7 @@ pub enum Engine {
     #[default]
     Apple,
     Hex,
+    Command,
 }
 
 impl Engine {
@@ -22,6 +25,7 @@ impl Engine {
         match name.trim().to_ascii_lowercase().as_str() {
             "apple" => Some(Self::Apple),
             "hex" => Some(Self::Hex),
+            "command" => Some(Self::Command),
             _ => None,
         }
     }
@@ -30,24 +34,30 @@ impl Engine {
         match self {
             Self::Apple => "apple",
             Self::Hex => "hex",
+            Self::Command => "command",
         }
     }
 
     /// The configured engine: `"transcriber"` in the config file, Apple when missing or unknown.
     pub fn configured() -> Self {
-        crate::handoff::transcriber()
-            .as_deref()
-            .and_then(Self::parse)
-            .unwrap_or_default()
+        Self::resolve(None, crate::handoff::transcriber().as_deref())
     }
 
     /// What recordings use now: a command-line `--transcriber`, else the configured engine.
     pub fn preferred() -> Self {
-        match OVERRIDE.load(Ordering::Relaxed) {
-            1 => Self::Apple,
-            2 => Self::Hex,
-            _ => Self::configured(),
-        }
+        let pinned = match OVERRIDE.load(Ordering::Relaxed) {
+            1 => Some(Self::Apple),
+            2 => Some(Self::Hex),
+            3 => Some(Self::Command),
+            _ => None,
+        };
+        Self::resolve(pinned, crate::handoff::transcriber().as_deref())
+    }
+
+    fn resolve(pinned: Option<Self>, configured: Option<&str>) -> Self {
+        pinned
+            .or_else(|| configured.and_then(Self::parse))
+            .unwrap_or_default()
     }
 }
 
@@ -119,6 +129,7 @@ pub fn set_override(engine: Engine) {
         match engine {
             Engine::Apple => 1,
             Engine::Hex => 2,
+            Engine::Command => 3,
         },
         Ordering::Relaxed,
     );
@@ -136,6 +147,7 @@ pub fn transcribe(wav: Option<&Path>, audio: Option<&RecordedAudio>) -> Transcri
     run(
         Engine::preferred(),
         || try_hex(audio),
+        || try_command(wav, audio),
         || {
             live.and_then(|live| finish_live(live, audio))
                 .unwrap_or_else(|| apple(wav))
@@ -168,23 +180,44 @@ fn finish_live(
     }
 }
 
-/// Hex first when preferred, with Apple as the answer to anything it can't do. `hex` returns
-/// `Ok(None)` when Hex isn't available at all (not connected, model not ready).
+/// The preferred engine first (only that one), with Apple as the answer to anything it can't
+/// do. `hex` returns `Ok(None)` when Hex isn't available at all (not connected, model not
+/// ready).
 fn run(
     engine: Engine,
     hex: impl FnOnce() -> Result<Option<TranscriptData>>,
+    command: impl FnOnce() -> Result<TranscriptData>,
     apple: impl FnOnce() -> TranscriptData,
 ) -> TranscriptData {
-    if engine == Engine::Hex {
-        match hex() {
+    match engine {
+        Engine::Apple => {}
+        Engine::Hex => match hex() {
             Ok(Some(transcript)) => return transcript,
             Ok(None) => {}
             Err(error) => crate::capture::scrawl_log(format!(
                 "Hex transcription failed, using {LOCAL_ENGINE_TITLE}: {error:#}"
             )),
-        }
+        },
+        // The error is a fixed reason (`command_transcriber::Failure`), never the program's
+        // output or arguments.
+        Engine::Command => match command() {
+            Ok(transcript) => return transcript,
+            Err(error) => crate::capture::scrawl_log(format!(
+                "Command transcription failed, using {LOCAL_ENGINE_TITLE}: {error:#}"
+            )),
+        },
     }
     apple()
+}
+
+fn try_command(wav: &Path, audio: &RecordedAudio) -> Result<TranscriptData> {
+    let program = crate::handoff::transcribe_command()?;
+    Ok(crate::command_transcriber::transcribe(
+        &program,
+        wav,
+        audio.sample_count,
+        &mut |line| crate::capture::scrawl_log(line),
+    )?)
 }
 
 fn try_hex(audio: &RecordedAudio) -> Result<Option<TranscriptData>> {
@@ -232,6 +265,7 @@ fn apple(wav: &Path) -> TranscriptData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     fn named(source: &str) -> TranscriptData {
         TranscriptData {
@@ -240,12 +274,35 @@ mod tests {
         }
     }
 
+    fn no_command() -> Result<TranscriptData> {
+        panic!("the command must not run")
+    }
+
     #[test]
     fn engine_names_parse_and_unknown_is_not_an_engine() {
         assert_eq!(Engine::parse("hex"), Some(Engine::Hex));
         assert_eq!(Engine::parse(" Apple "), Some(Engine::Apple));
+        assert_eq!(Engine::parse("Command"), Some(Engine::Command));
         assert_eq!(Engine::parse("whisper"), None);
         assert_eq!(Engine::default(), Engine::Apple);
+        for engine in [Engine::Apple, Engine::Hex, Engine::Command] {
+            assert_eq!(Engine::parse(engine.name()), Some(engine));
+        }
+    }
+
+    #[test]
+    fn the_command_line_engine_beats_the_config_file() {
+        assert_eq!(
+            Engine::resolve(Some(Engine::Command), Some("apple")),
+            Engine::Command
+        );
+        assert_eq!(
+            Engine::resolve(Some(Engine::Apple), Some("command")),
+            Engine::Apple
+        );
+        assert_eq!(Engine::resolve(None, Some("command")), Engine::Command);
+        assert_eq!(Engine::resolve(None, Some("whisper")), Engine::Apple);
+        assert_eq!(Engine::resolve(None, None), Engine::Apple);
     }
 
     #[test]
@@ -253,6 +310,7 @@ mod tests {
         let result = run(
             Engine::Apple,
             || panic!("Hex must not be asked"),
+            no_command,
             || named("speech-analyzer"),
         );
         assert_eq!(result.source, "speech-analyzer");
@@ -263,6 +321,7 @@ mod tests {
         let result = run(
             Engine::Hex,
             || Ok(Some(named("hex:parakeet_v3"))),
+            no_command,
             || panic!("Apple must not be asked"),
         );
         assert_eq!(result.source, "hex:parakeet_v3");
@@ -272,15 +331,43 @@ mod tests {
     fn unavailable_or_failing_hex_falls_back_to_apple() {
         let apple = || named("speech-analyzer");
         assert_eq!(
-            run(Engine::Hex, || Ok(None), apple).source,
+            run(Engine::Hex, || Ok(None), no_command, apple).source,
             "speech-analyzer"
         );
         let failed = run(
             Engine::Hex,
             || Err(anyhow::anyhow!("Hex took too long")),
+            no_command,
             apple,
         );
         assert_eq!(failed.source, "speech-analyzer");
+    }
+
+    #[test]
+    fn the_command_is_used_when_it_answers_and_hex_is_never_asked() {
+        let result = run(
+            Engine::Command,
+            || panic!("Hex must not be asked"),
+            || Ok(named("command:whisper-scrawl")),
+            || panic!("Apple must not be asked"),
+        );
+        assert_eq!(result.source, "command:whisper-scrawl");
+    }
+
+    #[test]
+    fn a_failing_or_missing_command_falls_back_to_apple_once() {
+        let asked = Cell::new(0);
+        let result = run(
+            Engine::Command,
+            || panic!("Hex must not be asked"),
+            || Err(crate::command_transcriber::Unusable::Missing.into()),
+            || {
+                asked.set(asked.get() + 1);
+                named("speech-analyzer")
+            },
+        );
+        assert_eq!(result.source, "speech-analyzer");
+        assert_eq!(asked.get(), 1);
     }
 
     #[test]
