@@ -102,12 +102,12 @@ Continue unlocks once all three are on, and the screen is skipped when they alre
 |---|---|---|
 | Screen & System Audio Recording | Recording the screen (ScreenCaptureKit) | onboarding, required |
 | Microphone | Your narration | onboarding, required |
-| Accessibility ("Device Control and Data Access" on macOS 27) | The key event tap (⌘Z, Esc, S in the switcher, ⌘-shortcuts in the window log), and `⌥⇧V` and the Paste chip, which post ⌘V into the app in front | onboarding, required |
+| Accessibility ("Device Control and Data Access" on macOS 27) | The key event tap (⌘Z, Esc, ⌘-shortcuts in the window log), and `⌥⇧V` and the Paste chip, which post ⌘V into the app in front | onboarding, required |
 | Camera | The cabled iPhone mirror (macOS treats it as a camera) | the first time you pick iPhone |
 
 Scrawl never asks for Input Monitoring. Clicks, drags and scrolls in other apps come from an AppKit
 global mouse monitor (`NSEvent.addGlobalMonitorForEvents`), which needs no permission; ⇧ for ink
-and the switcher's held ⌥⇧ come from polled modifier flags, which need none either; key presses
+and whether ⌥⇧ is still held after ⌥⇧S come from polled modifier flags, which need none either; key presses
 come from an active event tap, which Accessibility allows. macOS applies an Accessibility grant to
 a running app at once (System Settings shows no "Quit & Reopen" for it), and Scrawl makes the tap
 within half a second of it.
@@ -125,7 +125,7 @@ Camera is asked for in the same window, with just its row, when first needed. Sp
 isn't asked for: SpeechAnalyzer transcribes without it. The ⌥⇧S and ⌥⇧V hotkeys themselves need
 no permission (Carbon `RegisterEventHotKey`).
 
-Until the required permissions are on, ⌥⇧S starts nothing (no switcher, picker or overlay that
+Until the required permissions are on, ⌥⇧S starts nothing (no picker or overlay that
 could sit over a macOS prompt): once the keys are released it brings the permissions window
 forward.
 
@@ -202,11 +202,9 @@ Preview every pane, dark and light, with the recorder listening and a combinatio
   hovering keeps them. Click Window or Area to retarget (the first seconds are dropped and the
   picker takes over: click a window or drag an area), iPhone to record the phone instead, or just
   carry on.
-- **Hold `⌥⇧` after `S`**, like `⌘Tab`: after 0.25 s the switcher appears on **Screen**. Each
-  further `S` steps Screen → Window → iPhone → Screen; Window highlights the window under the
-  pointer. Dragging with the mouse selects an area instead. Release `⌥⇧` to record what's
-  selected; `Esc` cancels. With no iPhone cabled, iPhone says so and releasing records nothing.
-- **Choose What to Record…** in the menu bar: the full picker (Area, Window, Screen, iPhone).
+- **Hold `⌥⇧S`** (0.25 s or more), or **Choose What to Record…** in the menu bar: the picker
+  (Area, Window, Screen, iPhone) opens on the display under the pointer and stays open after you
+  let go. Click a mode, click a window or drag an area; `Esc` cancels.
 - `⌥⇧V`: Paste both `contact-sheet.png` and `summary.md` into the active app or terminal (`⌃⌥⇧V` also works while it's the default)
 - **Normal pointer**: Clicks and scrolls pass straight through to the app underneath
 - **Hold `⇧` (Shift) + move**: Draw a persistent red marker stroke (`#ff3b30`) on screen that fades out after release
@@ -834,7 +832,7 @@ On Windows, `cargo test`; then run `scrawl.exe app` and record with `Alt+Shift+S
 `SCRAWL_SHOW_OWN_WINDOWS=1` keeps Scrawl's own windows (capsule, overlay, picker) in screenshots,
 which normally leave them out.
 
-- **iPhone:** connect a phone, hold `⌥⇧` and press `S` three times, release, talk, draw over the mirror, press M,
+- **iPhone:** connect a phone, hold `⌥⇧S`, click iPhone, click the mirror to record, talk, draw over it, press M,
   Finish. Inspect the bundle's `summary.md`, `scrawl.json` (`source`, `device`), contact sheet, and
   frames.
 - **ScrawlKit:** `scrawl import` on a recording and its timeline (or hand-write a timeline for any

@@ -35,7 +35,7 @@ pub enum Permission {
 impl Permission {
     /// What a capture needs, in the order the checklist shows them. Screen Recording comes first
     /// because it's the one that may relaunch Scrawl. Accessibility drives the key event tap
-    /// (⌘Z, Esc, the switcher's presses) and ⌥⇧V's paste. Camera is asked for when first used.
+    /// (⌘Z, Esc) and ⌥⇧V's paste. Camera is asked for when first used.
     pub const REQUIRED: [Permission; 3] = [
         Permission::ScreenRecording,
         Permission::Microphone,

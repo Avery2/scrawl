@@ -1,12 +1,9 @@
-//! The capture shortcut as a ⌘Tab-style switcher. Tap ⌥⇧S to record the screen at once. Keep
-//! holding ⌥⇧ and the switcher appears on Screen: each further S steps Screen → Window → iPhone,
-//! a mouse drag selects an area, Esc cancels, and releasing ⌥⇧ records the selection. A tap's
-//! recording shows the same modes as chips in its capsule for a few seconds (`Reveal`), so the
-//! target can still change and nobody has to know about holding.
+//! The capture shortcut. Tap ⌥⇧S to record the screen at once; the recording's capsule shows
+//! Area · Window · Screen · iPhone as chips for a few seconds (`Reveal`), so the target can still
+//! change. Hold it and the picker opens instead, the same one as the menu's Choose What to
+//! Record…, and stays open after the keys come up: click a chip or a window, or drag an area.
 
-use crate::ui::SelectionMode;
-
-/// ⌥⇧ released sooner than this after the press is a tap: record the screen, no switcher.
+/// ⌥⇧ released sooner than this after the press is a tap: record the screen, no picker.
 pub const TAP_MS: u64 = 250;
 /// A press this soon after a recording starts is a double press, not "finish".
 pub const DOUBLE_PRESS_MS: u64 = 400;
@@ -16,7 +13,7 @@ pub const DOUBLE_PRESS_MS: u64 = 400;
 pub enum Activity {
     /// Nothing recording (a finished capture's island may be showing).
     Free,
-    /// The picker opened from the menu bar.
+    /// The picker is open.
     Picker,
     Recording {
         elapsed_ms: u64,
@@ -29,119 +26,69 @@ pub enum Action {
     None,
     /// A tap: record the display under the pointer, auto-cropped.
     RecordScreen,
-    /// Show the switcher on this mode.
-    Open(SelectionMode),
-    /// Move the open switcher to this mode.
-    Show(SelectionMode),
-    /// ⌥⇧ released: record what the switcher is on.
-    Commit(SelectionMode),
-    /// Esc: close the switcher, record nothing.
+    /// A hold: open the picker.
+    OpenPicker,
+    /// Esc before a tap or hold was decided: nothing happens.
     Cancel,
-    /// The menu-bar picker is open: record what it is on.
+    /// The picker is open: record what it is on.
     RecordSelected,
     Finish,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum State {
-    #[default]
-    Idle,
-    /// ⌥⇧S went down; nothing is shown until it's held for `TAP_MS`.
-    Pending {
-        since_ms: u64,
-    },
-    Switching(SelectionMode),
-}
-
+/// Tells a tap of the shortcut from a hold.
 #[derive(Debug, Default)]
-pub struct Switcher {
-    state: State,
+pub struct Shortcut {
+    /// When ⌥⇧S went down, until it's a tap or a hold.
+    pending_since_ms: Option<u64>,
 }
 
-impl Switcher {
-    /// Whether ⌥⇧ is being held after the shortcut (the switcher may not be showing yet).
-    pub fn is_held(&self) -> bool {
-        self.state != State::Idle
-    }
-
-    pub fn is_switching(&self) -> bool {
-        matches!(self.state, State::Switching(_))
-    }
-
-    pub fn reset(&mut self) {
-        self.state = State::Idle;
-    }
-
-    /// The open switcher's mode changed some other way (a click on a HUD chip); S steps on
-    /// from there.
-    pub fn follow(&mut self, mode: SelectionMode) {
-        if self.is_switching() {
-            self.state = State::Switching(mode);
-        }
+impl Shortcut {
+    /// Whether ⌥⇧S went down and it isn't yet known whether it's a tap or a hold.
+    pub fn is_pending(&self) -> bool {
+        self.pending_since_ms.is_some()
     }
 
     /// The shortcut went down.
     pub fn press(&mut self, now_ms: u64, activity: Activity) -> Action {
-        match (self.state, activity) {
-            (State::Pending { .. }, _) => self.switch_to(SelectionMode::Window, true),
-            (State::Switching(mode), _) => self.switch_to(next(mode), false),
-            (State::Idle, Activity::Recording { elapsed_ms }) if elapsed_ms < DOUBLE_PRESS_MS => {
-                Action::None
-            }
-            (State::Idle, Activity::Recording { .. }) => Action::Finish,
-            (State::Idle, Activity::Processing) => Action::None,
-            (State::Idle, Activity::Picker) => Action::RecordSelected,
-            (State::Idle, Activity::Free) => {
-                self.state = State::Pending { since_ms: now_ms };
+        if self.is_pending() {
+            // Pressed again before the first was decided: as good as a hold.
+            self.pending_since_ms = None;
+            return Action::OpenPicker;
+        }
+        match activity {
+            Activity::Recording { elapsed_ms } if elapsed_ms < DOUBLE_PRESS_MS => Action::None,
+            Activity::Recording { .. } => Action::Finish,
+            Activity::Processing => Action::None,
+            Activity::Picker => Action::RecordSelected,
+            Activity::Free => {
+                self.pending_since_ms = Some(now_ms);
                 Action::None
             }
         }
     }
 
-    /// Polled every few ms with whether the shortcut's modifiers are all still down.
+    /// Polled every few ms while pending, with whether the shortcut's modifiers are all still
+    /// down.
     pub fn tick(&mut self, now_ms: u64, held: bool) -> Action {
-        match self.state {
-            State::Idle => Action::None,
-            State::Pending { .. } if !held => {
-                self.state = State::Idle;
-                Action::RecordScreen
-            }
-            State::Pending { since_ms } if now_ms.saturating_sub(since_ms) >= TAP_MS => {
-                self.switch_to(SelectionMode::Screen, true)
-            }
-            State::Pending { .. } => Action::None,
-            State::Switching(mode) if !held => {
-                self.state = State::Idle;
-                Action::Commit(mode)
-            }
-            State::Switching(_) => Action::None,
-        }
-    }
-
-    /// The mouse dragged while the switcher is up: it selects an area.
-    pub fn drag(&mut self) -> Action {
-        match self.state {
-            State::Switching(mode) if mode != SelectionMode::Area => {
-                self.switch_to(SelectionMode::Area, false)
-            }
-            _ => Action::None,
+        let Some(since_ms) = self.pending_since_ms else {
+            return Action::None;
+        };
+        if !held {
+            self.pending_since_ms = None;
+            Action::RecordScreen
+        } else if now_ms.saturating_sub(since_ms) >= TAP_MS {
+            self.pending_since_ms = None;
+            Action::OpenPicker
+        } else {
+            Action::None
         }
     }
 
     pub fn escape(&mut self) -> Action {
-        if self.state == State::Idle {
-            return Action::None;
-        }
-        self.state = State::Idle;
-        Action::Cancel
-    }
-
-    fn switch_to(&mut self, mode: SelectionMode, open: bool) -> Action {
-        self.state = State::Switching(mode);
-        if open {
-            Action::Open(mode)
+        if self.pending_since_ms.take().is_some() {
+            Action::Cancel
         } else {
-            Action::Show(mode)
+            Action::None
         }
     }
 }
@@ -211,114 +158,67 @@ impl Reveal {
     }
 }
 
-/// The next mode for another S press. An area goes back to the start of the cycle.
-fn next(mode: SelectionMode) -> SelectionMode {
-    match mode {
-        SelectionMode::Screen => SelectionMode::Window,
-        SelectionMode::Window => SelectionMode::Iphone,
-        SelectionMode::Iphone | SelectionMode::Area => SelectionMode::Screen,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use SelectionMode::{Area, Iphone, Screen, Window};
 
     const FREE: Activity = Activity::Free;
 
     #[test]
-    fn a_tap_records_the_screen_without_showing_the_switcher() {
-        let mut s = Switcher::default();
+    fn a_tap_records_the_screen_without_opening_the_picker() {
+        let mut s = Shortcut::default();
         assert_eq!(s.press(0, FREE), Action::None);
         assert_eq!(s.tick(8, true), Action::None);
         assert_eq!(s.tick(120, true), Action::None);
         assert_eq!(s.tick(128, false), Action::RecordScreen);
-        assert!(!s.is_held());
+        assert!(!s.is_pending());
         assert_eq!(s.tick(200, false), Action::None);
     }
 
     #[test]
-    fn holding_opens_the_switcher_on_screen_and_s_cycles_the_modes() {
-        let mut s = Switcher::default();
+    fn holding_opens_the_picker_and_letting_go_does_nothing_more() {
+        let mut s = Shortcut::default();
         s.press(0, FREE);
         assert_eq!(s.tick(240, true), Action::None);
-        assert_eq!(s.tick(250, true), Action::Open(Screen));
-        assert_eq!(s.press(600, FREE), Action::Show(Window));
-        assert_eq!(s.press(800, FREE), Action::Show(Iphone));
-        assert_eq!(s.press(1_000, FREE), Action::Show(Screen));
-        assert_eq!(s.press(1_200, FREE), Action::Show(Window));
-        assert_eq!(s.tick(1_400, true), Action::None);
-        assert_eq!(s.tick(1_408, false), Action::Commit(Window));
-        assert!(!s.is_held());
+        assert_eq!(s.tick(250, true), Action::OpenPicker);
+        assert!(!s.is_pending());
+        assert_eq!(s.tick(900, true), Action::None);
+        assert_eq!(s.tick(1_400, false), Action::None);
+        // Another S while it's up records what the picker is on, like the menu's picker.
+        assert_eq!(s.press(1_500, Activity::Picker), Action::RecordSelected);
     }
 
     #[test]
-    fn a_quick_second_s_opens_the_switcher_on_window() {
-        let mut s = Switcher::default();
+    fn a_quick_second_press_opens_the_picker() {
+        let mut s = Shortcut::default();
         s.press(0, FREE);
-        assert_eq!(s.press(150, FREE), Action::Open(Window));
-        assert_eq!(s.tick(300, true), Action::None);
-        assert_eq!(s.tick(320, false), Action::Commit(Window));
+        assert_eq!(s.press(150, FREE), Action::OpenPicker);
+        assert_eq!(s.tick(160, false), Action::None);
     }
 
     #[test]
-    fn holding_and_releasing_with_no_input_records_the_screen() {
-        let mut s = Switcher::default();
+    fn esc_before_a_tap_or_hold_is_decided_cancels_it() {
+        let mut s = Shortcut::default();
         s.press(0, FREE);
-        assert_eq!(s.tick(250, true), Action::Open(Screen));
-        assert_eq!(s.tick(900, false), Action::Commit(Screen));
-    }
-
-    #[test]
-    fn dragging_while_holding_selects_an_area() {
-        let mut s = Switcher::default();
-        s.press(0, FREE);
-        s.tick(250, true);
-        assert_eq!(s.drag(), Action::Show(Area));
-        assert_eq!(s.drag(), Action::None);
-        assert_eq!(s.tick(1_500, false), Action::Commit(Area));
-        // No switcher, no area.
-        assert_eq!(s.drag(), Action::None);
-        // S after a drag starts the cycle again.
-        s.press(2_000, FREE);
-        s.tick(2_250, true);
-        s.drag();
-        assert_eq!(s.press(2_600, FREE), Action::Show(Screen));
-        // A HUD chip click moved it to iPhone: the next S goes on from there.
-        s.follow(Iphone);
-        assert_eq!(s.press(2_800, FREE), Action::Show(Screen));
-    }
-
-    #[test]
-    fn esc_while_holding_cancels_and_the_release_does_nothing() {
-        let mut s = Switcher::default();
-        s.press(0, FREE);
-        s.tick(250, true);
-        s.press(400, FREE);
         assert_eq!(s.escape(), Action::Cancel);
-        assert_eq!(s.tick(600, true), Action::None);
-        assert_eq!(s.tick(700, false), Action::None);
-        // Esc before the switcher shows cancels the tap too.
-        s.press(1_000, FREE);
-        assert_eq!(s.escape(), Action::Cancel);
-        assert_eq!(s.tick(1_100, false), Action::None);
+        assert_eq!(s.tick(100, false), Action::None);
+        assert_eq!(s.tick(400, true), Action::None);
         assert_eq!(s.escape(), Action::None);
     }
 
     #[test]
     fn a_tap_while_recording_finishes_but_not_a_double_press() {
-        let mut s = Switcher::default();
+        let mut s = Shortcut::default();
         let at = |elapsed_ms| Activity::Recording { elapsed_ms };
         assert_eq!(s.press(0, at(0)), Action::None);
         assert_eq!(s.press(0, at(399)), Action::None);
         assert_eq!(s.press(0, at(400)), Action::Finish);
         assert_eq!(s.press(0, at(60_000)), Action::Finish);
         // Releasing ⌥⇧ after finishing doesn't start anything.
-        assert!(!s.is_held());
+        assert!(!s.is_pending());
         assert_eq!(s.tick(100, false), Action::None);
         assert_eq!(s.press(0, Activity::Processing), Action::None);
-        assert!(!s.is_held());
+        assert!(!s.is_pending());
     }
 
     #[test]
@@ -364,9 +264,9 @@ mod tests {
     }
 
     #[test]
-    fn in_the_menu_picker_the_shortcut_records_its_selection() {
-        let mut s = Switcher::default();
+    fn in_the_picker_the_shortcut_records_its_selection() {
+        let mut s = Shortcut::default();
         assert_eq!(s.press(0, Activity::Picker), Action::RecordSelected);
-        assert!(!s.is_held());
+        assert!(!s.is_pending());
     }
 }
