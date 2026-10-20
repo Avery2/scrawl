@@ -103,7 +103,7 @@ fn read_for(
         }
     }
     ids.extend(address.map(|a| a.session().to_owned()));
-    let mut api = senses.hooks.api;
+    let mut api = super::within(senses.hooks.api, super::SESSIONS_BUDGET);
     match read_candidates(&mut api, &roots, &ids, SESSION_PAGES) {
         Ok(candidates) => (candidates, None),
         Err(err) => (Vec::new(), Some(format!("couldn't list sessions: {err:#}"))),
@@ -636,7 +636,7 @@ mod tests {
     fn no_terminal(_: &str) -> Option<(PathBuf, String)> {
         None
     }
-    fn api(path: &str) -> Result<Vec<u8>> {
+    fn api(path: &str, _: Duration) -> Result<Vec<u8>> {
         crate::handoff::fake_api::serve(
             &[
                 session("ses_board", "BOARD", "/p/board", 10),
@@ -673,7 +673,7 @@ mod tests {
                 .map(|(_, d)| d.clone())
         })
     }
-    fn world_api(path: &str) -> Result<Vec<u8>> {
+    fn world_api(path: &str, _: Duration) -> Result<Vec<u8>> {
         let sessions = WORLD.with(|w| w.borrow().sessions.clone());
         crate::handoff::fake_api::serve(&sessions, path)
     }
@@ -834,6 +834,27 @@ mod tests {
         }
         assert_eq!(sent, 9);
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_down_server_leaves_no_candidates_at_once() {
+        fn down(_: &str, _: Duration) -> Result<Vec<u8>> {
+            anyhow::bail!("Could not reach server at http://127.0.0.1:4096")
+        }
+        let senses = Senses {
+            hooks: Hooks {
+                sdk: no_sdk,
+                listener_dir: listener,
+                api: down,
+            },
+            own_port: tailnet,
+            terminal: no_terminal,
+        };
+        let started = std::time::Instant::now();
+        let live = look_live(None, None, &senses);
+        assert!(live.candidates.is_empty());
+        assert!(live.error.unwrap().contains("couldn't list sessions"));
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[test]

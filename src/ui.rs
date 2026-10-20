@@ -736,6 +736,9 @@ pub struct ScrawlCoordinator {
     /// A smart-routed capture waiting out its undo window before it's sent; ✕ or Paste on the
     /// Completed island cancels it.
     pending_send: Option<PathBuf>,
+    /// A local capture copied while its route is still being worked out; ✕ or Paste clears it,
+    /// keeping the capture on the clipboard whatever the route says.
+    routing: Option<PathBuf>,
     /// When this Mac last finished a capture, so ⌥⇧V prefers it over older inbox items.
     last_local_capture_ms: u64,
     inbox: crate::inbox::Inbox,
@@ -823,6 +826,7 @@ impl ScrawlCoordinator {
             completed_dir: None,
             completed_note: None,
             pending_send: None,
+            routing: None,
             last_local_capture_ms: 0,
             inbox: crate::inbox::Inbox::load_default(),
             last_mode: SelectionMode::load_last_used(),
@@ -895,6 +899,7 @@ impl ScrawlCoordinator {
             return;
         }
         let dir = self.take_paste_target();
+        self.keep_pending_send(&dir);
         if matches!(self.island_phase, IslandPhase::Completed { .. }) {
             self.dismiss_island(cx);
         }
@@ -2090,7 +2095,13 @@ impl ScrawlCoordinator {
                     .iter()
                     .map(|c| island_title(c.candidate.label()))
                     .collect();
-                self.review_status = Some(format!("Copied · for {}?", names.join(" or ")));
+                if self
+                    .review_bundle
+                    .as_ref()
+                    .is_some_and(|(shown, _)| *shown == dir)
+                {
+                    self.review_status = Some(format!("Copied · for {}?", names.join(" or ")));
+                }
             }
             Decision::Keep { .. } => {}
         }
@@ -2105,7 +2116,9 @@ impl ScrawlCoordinator {
         cx: &mut Context<Self>,
     ) {
         self.pending_send = Some(dir.clone());
-        self.completed_note = Some(format!("Sending to {}…", island_title(&dest.title)));
+        if self.completed_dir.as_deref() == Some(dir.as_path()) {
+            self.completed_note = Some(format!("Sending to {}…", island_title(&dest.title)));
+        }
         cx.spawn(async move |entity, cx| {
             cx.background_executor().timer(SMART_SEND_UNDO).await;
             let _ = entity.update(cx, |coord, cx| {
@@ -2113,11 +2126,6 @@ impl ScrawlCoordinator {
                     return;
                 }
                 coord.pending_send = None;
-                if let Err(err) = crate::handoff::load_bundle(&dir).and_then(|(_, mut bundle)| {
-                    crate::routing::record_destination(&dir, &mut bundle, dest.clone())
-                }) {
-                    scrawl_log(format!("routing: couldn't record the destination: {err:#}"));
-                }
                 coord.send_completed(dir, dest, cx);
                 cx.notify();
             });
@@ -2125,8 +2133,15 @@ impl ScrawlCoordinator {
         .detach();
     }
 
-    /// Cancels a smart send of `dir` that is still in its undo window.
+    /// Cancels an automatic send of `dir` (while its route is worked out or during its undo window).
     fn keep_pending_send(&mut self, dir: &std::path::Path) {
+        if self.routing.as_deref() == Some(dir) {
+            self.routing = None;
+            scrawl_log(format!(
+                "routing: kept {} on the clipboard while its route was worked out",
+                dir.display()
+            ));
+        }
         if self.pending_send.as_deref() == Some(dir) {
             self.pending_send = None;
             self.completed_note = None;
@@ -2146,12 +2161,26 @@ impl ScrawlCoordinator {
         cx: &mut Context<Self>,
     ) {
         let title = island_title(&dest.title);
-        self.completed_note = Some(format!("Sending to {title}…"));
+        if self.completed_dir.as_deref() == Some(dir.as_path()) {
+            self.completed_note = Some(format!("Sending to {title}…"));
+        }
+        if self
+            .review_bundle
+            .as_ref()
+            .is_some_and(|(shown, _)| *shown == dir)
+        {
+            self.review_status = Some(format!("Sending to {title}…"));
+        }
         let (sender, receiver) = flume::bounded(1);
         let send_dir = dir.clone();
         let spawned = std::thread::Builder::new()
             .name("scrawl-send".into())
             .spawn(move || {
+                if let Err(err) = crate::handoff::load_bundle(&send_dir).and_then(|(_, mut bundle)| {
+                    crate::routing::record_destination(&send_dir, &mut bundle, dest.clone())
+                }) {
+                    scrawl_log(format!("routing: couldn't record the destination: {err:#}"));
+                }
                 let _ = sender.send(crate::delivery::deliver(
                     &send_dir,
                     &dest.session,
@@ -2832,6 +2861,7 @@ impl ScrawlCoordinator {
             })
             .flatten();
         let captured = target.bundle_id.clone();
+        let finish_started = Instant::now();
         let route = (screen && !smart).then(|| {
             let (front, captured) = (front.clone(), captured.clone());
             std::thread::spawn(move || {
@@ -2869,14 +2899,10 @@ impl ScrawlCoordinator {
                             }
                             let duration_ms =
                                 finalized.as_ref().map_or(0, |(_, b, _)| b.duration_ms);
-                            return (finalized, duration_ms, None);
+                            return (finalized, duration_ms);
                         }
                         CaptureSource::Lab => {
-                            return (
-                                Err(anyhow::anyhow!("a lab recording has no bundle")),
-                                0,
-                                None,
-                            );
+                            return (Err(anyhow::anyhow!("a lab recording has no bundle")), 0);
                         }
                     };
                     let stop_started = Instant::now();
@@ -2897,7 +2923,7 @@ impl ScrawlCoordinator {
                     activity.stop_started = Some(stop_started);
                     activity.stop_ms = Some(stop_started.elapsed().as_millis() as u64);
                     let duration_ms = recording.duration_ms;
-                    let mut finalized = crate::finalize_capture_bundle(
+                    let finalized = crate::finalize_capture_bundle(
                         &bundle_dir,
                         target,
                         recording,
@@ -2907,50 +2933,102 @@ impl ScrawlCoordinator {
                         None,
                         activity,
                     );
-                    if let Ok((dir, bundle, _)) = &mut finalized
-                        && let Some(Ok(Some(dest))) = route.map(std::thread::JoinHandle::join)
-                        && let Err(err) = crate::routing::record_destination(dir, bundle, dest)
-                    {
-                        scrawl_log(format!("routing: couldn't record the destination: {err:#}"));
-                    }
-                    let judged = match (&finalized, look.map(std::thread::JoinHandle::join)) {
-                        (Ok((dir, bundle, _)), Some(Ok(Some(live)))) => {
-                            Some(crate::routing::judge_capture(dir, bundle, live))
-                        }
-                        _ => None,
-                    };
-                    (finalized, duration_ms, judged)
+                    (finalized, duration_ms)
                 })
                 .await;
 
-            let _ = entity.update(cx, |coord, cx| {
-                let (finalized, duration_ms, judged) = result;
-                let mut frame_count = 1;
-                coord.completed_dir = None;
-                if let Ok((dir, bundle, _)) = finalized {
-                    frame_count = bundle.keyframes.len();
-                    let _ = crate::handoff::copy_bundle_to_clipboard(&dir);
-                    coord.completed_dir = Some(dir.clone());
-                    coord.last_local_capture_ms = crate::now_epoch_ms();
-                    if let Some(dest) = bundle.destination.clone() {
-                        coord.send_completed(dir.clone(), dest, cx);
+            // The capture is copied and shown as done as soon as it's built; routing (the
+            // browser tab, the port's process, OpenCode's sessions) can take seconds, or longer
+            // when the server is down, so its outcome follows when it's ready.
+            let routed = entity
+                .update(cx, |coord, cx| {
+                    let (finalized, duration_ms) = result;
+                    let mut frame_count = 1;
+                    let mut routed = None;
+                    coord.completed_dir = None;
+                    if let Ok((dir, bundle, _)) = finalized {
+                        frame_count = bundle.keyframes.len();
+                        let _ = crate::handoff::copy_bundle_to_clipboard(&dir);
+                        coord.completed_dir = Some(dir.clone());
+                        coord.last_local_capture_ms = crate::now_epoch_ms();
+                        if route.is_some() || look.is_some() {
+                            coord.routing = Some(dir.clone());
+                            routed = Some((dir.clone(), look.is_some().then(|| bundle.clone())));
+                        }
+                        coord.set_review_bundle((dir, bundle), coord.completed_note.clone());
                     }
-                    coord.set_review_bundle((dir.clone(), bundle), coord.completed_note.clone());
-                    if let Some((judgement, url)) = judged {
-                        coord.act_on_route(dir, judgement, url, cx);
+                    coord.set_island_phase(IslandPhase::Completed {
+                        finished_at: Instant::now(),
+                        frame_count,
+                        duration_ms,
+                        inbox_count: 0,
+                    });
+                    cx.notify();
+                    routed
+                })
+                .ok()
+                .flatten();
+            let copied_ms = finish_started.elapsed().as_millis();
+            let Some((dir, bundle)) = routed else {
+                return;
+            };
+            let route_dir = dir.clone();
+            let route = cx
+                .background_executor()
+                .spawn(async move {
+                    if let Some(dest) = route.and_then(|route| route.join().ok().flatten()) {
+                        return RouteOutcome::Send(dest);
                     }
-                }
-                coord.set_island_phase(IslandPhase::Completed {
-                    finished_at: Instant::now(),
-                    frame_count,
-                    duration_ms,
-                    inbox_count: 0,
-                });
-                cx.notify();
-            });
+                    if let (Some(bundle), Some(live)) =
+                        (bundle, look.and_then(|look| look.join().ok().flatten()))
+                    {
+                        let (judgement, url) =
+                            crate::routing::judge_capture(&route_dir, &bundle, live);
+                        return RouteOutcome::Judged(judgement, url);
+                    }
+                    RouteOutcome::None
+                })
+                .await;
+            scrawl_log(format!(
+                "finish: copied at {copied_ms}ms · routed at {}ms",
+                finish_started.elapsed().as_millis()
+            ));
+            let _ = entity.update(cx, |coord, cx| coord.route_arrived(dir, route, cx));
         })
         .detach();
     }
+
+    /// Acts on a local capture's route once it's worked out, unless ✕ or Paste on the Completed
+    /// island kept the capture on the clipboard first.
+    fn route_arrived(
+        &mut self,
+        dir: PathBuf,
+        route: RouteOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        if self.routing.as_deref() != Some(dir.as_path()) {
+            if !matches!(route, RouteOutcome::None) {
+                scrawl_log(format!(
+                    "routing: {} was kept on the clipboard before its route arrived",
+                    dir.display()
+                ));
+            }
+            return;
+        }
+        self.routing = None;
+        match route {
+            RouteOutcome::None => return,
+            RouteOutcome::Send(dest) => self.send_completed(dir, dest, cx),
+            RouteOutcome::Judged(judgement, url) => self.act_on_route(dir, judgement, url, cx),
+        }
+        cx.notify();
+    }
+}
+
+enum RouteOutcome {
+    None,
+    Send(crate::model::Destination),
+    Judged(crate::routing::smart::Judgement, Option<String>),
 }
 
 pub struct HudPillWindow {

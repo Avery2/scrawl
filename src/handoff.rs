@@ -947,11 +947,214 @@ pub(crate) fn query_escape(value: &str) -> String {
 pub type ApiGet<'a> = dyn FnMut(&str) -> Result<Vec<u8>> + 'a;
 
 pub fn api_get(path: &str) -> Result<Vec<u8>> {
+    if agent_host().is_none()
+        && let Ok(body) = api_get_within(path, std::time::Duration::from_secs(5))
+    {
+        return Ok(body);
+    }
     opencode_api("get", path, None)
 }
 
+/// How long a TCP connect to the local OpenCode server may take before giving up.
+pub const SERVER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
+const SERVER_RESPONSE_LIMIT: u64 = 16 * 1024 * 1024;
+const DEFAULT_SERVER_PORT: u16 = 0xc0de;
+
+/// Only the connection fields of OpenCode's `service.json` (never its `env` block).
+#[derive(Default, Deserialize)]
+struct ServiceFile {
+    url: Option<String>,
+    hostname: Option<String>,
+    port: Option<u16>,
+    password: Option<String>,
+}
+
+impl ServiceFile {
+    fn load(path: &Path) -> Option<Self> {
+        serde_json::from_slice(&fs::read(path).ok()?).ok()
+    }
+
+    fn address(&self) -> Option<std::net::SocketAddr> {
+        self.url.as_deref().and_then(server_address).or_else(|| {
+            let host = self.hostname.as_deref().unwrap_or("127.0.0.1");
+            server_address(&format!("http://{host}:{}", self.port?))
+        })
+    }
+
+    fn password(&self) -> Option<String> {
+        non_empty(self.password.as_deref())
+    }
+}
+
+fn non_empty(value: Option<&str>) -> Option<String> {
+    value.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
+}
+
+/// The socket address in `http://127.0.0.1:4096…` when its host is an IP or `localhost` (no
+/// lookups).
+fn server_address(url: &str) -> Option<std::net::SocketAddr> {
+    let rest = url.split_whitespace().next()?;
+    let (scheme, rest) = rest.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        let (host, rest) = v6.split_once(']')?;
+        match rest.strip_prefix(':') {
+            Some(port) => (host, port.parse().ok()?),
+            None => (host, default_port),
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, port.parse().ok()?),
+            None => (authority, default_port),
+        }
+    };
+    let ip = if host.eq_ignore_ascii_case("localhost") {
+        std::net::IpAddr::from([127, 0, 0, 1])
+    } else {
+        host.parse().ok()?
+    };
+    Some(std::net::SocketAddr::new(ip, port))
+}
+
+fn resolve_server(
+    files: &[ServiceFile],
+    env_password: Option<&str>,
+) -> (std::net::SocketAddr, Option<String>) {
+    let (address, matched_password) = files
+        .iter()
+        .find_map(|f| Some((f.address()?, f.password())))
+        .unwrap_or_else(|| {
+            (
+                std::net::SocketAddr::from(([127, 0, 0, 1], DEFAULT_SERVER_PORT)),
+                None,
+            )
+        });
+    let password = matched_password
+        .or_else(|| non_empty(env_password))
+        .or_else(|| files.iter().find_map(ServiceFile::password));
+    (address, password)
+}
+
+/// Finds the local OpenCode V2 server from its state registration (`$XDG_STATE_HOME/opencode/service.json`
+/// or `~/.local/state/opencode/service.json`), service config (`$OPENCODE_CONFIG_DIR/service.json`
+/// or `~/.config/opencode/service.json`), and `OPENCODE_PASSWORD`.
+fn local_server() -> (std::net::SocketAddr, Option<String>) {
+    let env_dir = |name: &str| {
+        std::env::var_os(name)
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+    };
+    let home = dirs::home_dir();
+    let files: Vec<ServiceFile> = [
+        env_dir("XDG_STATE_HOME").map(|d| d.join("opencode/service.json")),
+        home.as_ref().map(|h| h.join(".local/state/opencode/service.json")),
+        env_dir("OPENCODE_CONFIG_DIR").map(|d| d.join("service.json")),
+        env_dir("XDG_CONFIG_HOME").map(|d| d.join("opencode/service.json")),
+        home.as_ref().map(|h| h.join(".config/opencode/service.json")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|p| ServiceFile::load(&p))
+    .collect();
+    let env_password = std::env::var("OPENCODE_PASSWORD")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("OPENCODE_SERVER_PASSWORD").ok());
+    resolve_server(&files, env_password.as_deref())
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = u32::from_be_bytes([0, c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)]);
+        let ch = |shift: u32| char::from(TABLE[((n >> shift) & 63) as usize]);
+        out.extend([
+            ch(18),
+            ch(12),
+            if c.len() > 1 { ch(6) } else { '=' },
+            if c.len() > 2 { ch(0) } else { '=' },
+        ]);
+    }
+    out
+}
+
+fn http_get(
+    address: std::net::SocketAddr,
+    password: Option<&str>,
+    path: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>> {
+    use std::io::{Read, Write};
+    let connect = SERVER_CONNECT_TIMEOUT.min(timeout).max(std::time::Duration::from_millis(1));
+    let timeout = timeout.max(std::time::Duration::from_millis(1));
+    let mut stream = std::net::TcpStream::connect_timeout(&address, connect)
+        .with_context(|| format!("Could not reach server at http://{address}"))?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.set_read_timeout(Some(timeout))?;
+    let auth = match password {
+        Some(password) if !password.contains(['\r', '\n']) => format!(
+            "Authorization: Basic {}\r\n",
+            base64(format!("opencode:{password}").as_bytes())
+        ),
+        _ => String::new(),
+    };
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {address}\r\n{auth}Connection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .with_context(|| format!("Could not write to server at http://{address}"))?;
+    let mut bytes = Vec::new();
+    stream
+        .take(SERVER_RESPONSE_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("OpenCode at http://{address} didn't answer in time"))?;
+    ensure!(
+        bytes.len() as u64 <= SERVER_RESPONSE_LIMIT,
+        "OpenCode response too large"
+    );
+    let split = bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .context("Invalid OpenCode HTTP response")?;
+    let header = std::str::from_utf8(&bytes[..split]).context("Invalid OpenCode HTTP header")?;
+    let status: u16 = header
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("Missing OpenCode HTTP status")?
+        .parse()
+        .context("Invalid OpenCode HTTP status")?;
+    let body = bytes[split + 4..].to_vec();
+    if let Some(length) = header
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+    {
+        ensure!(body.len() == length, "Incomplete OpenCode HTTP response");
+    }
+    ensure!(
+        (200..300).contains(&status),
+        "OpenCode API failed: HTTP {status}"
+    );
+    Ok(body)
+}
+
+/// [`api_get`] for routing: talks HTTP directly to the local OpenCode server with a
+/// [`SERVER_CONNECT_TIMEOUT`] connect cap and `timeout` read deadline, instead of spawning
+/// `opencode2 api` per request.
+pub fn api_get_within(path: &str, timeout: std::time::Duration) -> Result<Vec<u8>> {
+    if agent_host().is_some() {
+        return opencode_api("get", path, None);
+    }
+    let (address, password) = local_server();
+    http_get(address, password.as_deref(), path, timeout)
+}
+
 /// How many pages of root sessions (100 each, newest first) a search reads before giving up.
-/// Each page is an `opencode2 api` process, plus an SSH connection with `agentHost`.
 pub const ROOT_SEARCH_PAGES: usize = 5;
 const ROOT_PAGE: usize = 100;
 
@@ -1681,6 +1884,124 @@ mod tests {
         assert!(!experiment("neverEnabled"));
         enable_experiment("enabledForThisTest");
         assert!(experiment("enabledForThisTest"));
+    }
+
+    #[test]
+    fn server_addresses_parse_without_lookups() {
+        let addr = |s: &str| server_address(s).map(|a| a.to_string());
+        assert_eq!(
+            addr("http://127.0.0.1:4096\nmore").as_deref(),
+            Some("127.0.0.1:4096")
+        );
+        assert_eq!(
+            addr("http://localhost:4096/").as_deref(),
+            Some("127.0.0.1:4096")
+        );
+        assert_eq!(addr("http://[::1]:5000").as_deref(), Some("[::1]:5000"));
+        assert_eq!(addr("https://10.0.0.2").as_deref(), Some("10.0.0.2:443"));
+        assert_eq!(addr("http://studio.example.ts.net:4096"), None);
+        assert_eq!(addr("nonsense"), None);
+    }
+
+    #[test]
+    fn server_endpoint_reads_state_and_config_service_files() {
+        let fixture = Fixture::new();
+        let state_path = fixture.0.join("state-service.json");
+        let config_path = fixture.0.join("config-service.json");
+        fs::write(
+            &state_path,
+            r#"{"id":"s1","url":"http://127.0.0.1:49374","pid":123,"password":"secret-state"}"#,
+        )
+        .unwrap();
+        fs::write(
+            &config_path,
+            r#"{"hostname":"127.0.0.1","port":4096,"password":"secret-config","env":{"API_KEY":"ignored"}}"#,
+        )
+        .unwrap();
+        let state = ServiceFile::load(&state_path).unwrap();
+        let config = ServiceFile::load(&config_path).unwrap();
+
+        // State registration wins over service config when both exist.
+        let (addr, pw) = resolve_server(&[state, config], None);
+        assert_eq!(addr, "127.0.0.1:49374".parse().unwrap());
+        assert_eq!(pw.as_deref(), Some("secret-state"));
+
+        // When state registration is absent, config's hostname/port and password are used.
+        let config = ServiceFile::load(&config_path).unwrap();
+        let (addr, pw) = resolve_server(&[config], None);
+        assert_eq!(addr, "127.0.0.1:4096".parse().unwrap());
+        assert_eq!(pw.as_deref(), Some("secret-config"));
+
+        // With no address in files, the default port and OPENCODE_PASSWORD are used.
+        let (addr, pw) = resolve_server(&[], Some("env-pw"));
+        assert_eq!(addr, "127.0.0.1:49374".parse().unwrap());
+        assert_eq!(pw.as_deref(), Some("env-pw"));
+    }
+
+    #[test]
+    fn http_get_authenticates_and_times_out_when_slow() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for i in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0_u8; 256];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                }
+                let head = String::from_utf8_lossy(&req);
+                match i {
+                    0 => {
+                        assert!(
+                            head.contains("Authorization: Basic b3BlbmNvZGU6c2VjcmV0\r\n"),
+                            "{head}"
+                        );
+                        let body = br#"{"data":[]}"#;
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .unwrap();
+                        stream.write_all(body).unwrap();
+                    }
+                    1 => {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .unwrap();
+                    }
+                    _ => {
+                        std::thread::sleep(Duration::from_millis(400));
+                    }
+                }
+            }
+        });
+
+        let body = http_get(address, Some("secret"), "/api/session", Duration::from_secs(1)).unwrap();
+        assert_eq!(body, br#"{"data":[]}"#);
+
+        let err =
+            http_get(address, Some("secret"), "/api/session/missing", Duration::from_secs(1))
+                .unwrap_err();
+        assert!(format!("{err:#}").contains("HTTP 404"), "{err:#}");
+
+        let started = Instant::now();
+        let err = http_get(address, Some("secret"), "/api/session", Duration::from_millis(100))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("didn't answer"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let _ = server.join();
     }
 }
 
