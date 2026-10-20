@@ -420,14 +420,6 @@ impl ElemId {
             Self::Inspect => "Inspect",
         }
     }
-
-    /// Keyboard shortcut hint (`"Esc"` on the `✕` cancel chip and `"Cancel"` chip).
-    pub const fn shortcut_hint(self) -> Option<&'static str> {
-        match self {
-            Self::Close | Self::Cancel => Some("Esc"),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1958,10 +1950,7 @@ mod tests {
     }
 
     #[test]
-    fn outline_width_bounces_on_open_and_close_chip_has_esc_hint() {
-        assert_eq!(ElemId::Close.shortcut_hint(), Some("Esc"));
-        assert_eq!(ElemId::Cancel.shortcut_hint(), Some("Esc"));
-
+    fn outline_width_bounces_on_open_and_close() {
         // 1. Entry from Hidden (`~0.94` scale + `~4 pt` blur -> sharp `1.0` in ≤ 260 ms, no lozenge).
         let mut m = PillModel::new(Metrics::default());
         m.set_pres(Pres::Recording {
