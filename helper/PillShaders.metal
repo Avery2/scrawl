@@ -6,8 +6,9 @@
 #include <SwiftUI/SwiftUI_Metal.h>
 using namespace metal;
 
-/// The capsule's rim: a hairline lit from above (brightest on the top arc), with a faint sheen
-/// under it, that brightens with `energy` while the shape moves. Green when the capture is done.
+/// The capsule's rim: a hairline lit from above (brightest on the top arc), a faint sheen under
+/// it and a soft inner glow along the edge, all brightening with `energy` while the shape moves.
+/// Green when the capture is done.
 [[ stitchable ]] half4 pillRim(float2 pos, half4 color, float2 size, float energy, float completed) {
     if (color.a < 0.001h) { return color; }
     float r = size.y * 0.5;
@@ -17,9 +18,12 @@ using namespace metal;
     float top = 1.0 - clamp(pos.y / max(size.y, 1.0), 0.0, 1.0);
     float light = (0.07 + 0.20 * top * top) * (1.0 + 1.4 * energy);
     float sheen = 0.035 * smoothstep(0.55, 1.0, top) * smoothstep(0.0, 6.0, inside);
+    // A soft inner glow hugging the whole edge, a breath of light that swells as the shape moves.
+    float g = inside / 7.0;
+    float glow = exp(-g * g) * (0.018 + 0.05 * energy) * (0.6 + 0.4 * top);
     half3 tint = mix(half3(1.0h), half3(0.412h, 0.847h, 0.624h), half(completed));
     float lightA = completed > 0.5 ? max(light, 0.32) : light;
-    half add = half(rim * lightA + sheen) * color.a;
+    half add = half(rim * lightA + sheen + glow) * color.a;
     return half4(min(color.rgb + tint * add, half3(color.a)), color.a);
 }
 
@@ -53,4 +57,30 @@ using namespace metal;
         total += w;
     }
     return acc / half(total);
+}
+
+/// The selection highlight lit like a pressed glass key: a little brighter along its top, a
+/// hairline catch on its upper rim, the rest as filled.
+[[ stitchable ]] half4 pillHighlight(float2 pos, half4 color, float2 size) {
+    if (color.a < 0.001h) { return color; }
+    float r = size.y * 0.5;
+    float2 c = float2(clamp(pos.x, r, max(size.x - r, r)), r);
+    float inside = r - length(pos - c);
+    float top = 1.0 - clamp(pos.y / max(size.y, 1.0), 0.0, 1.0);
+    float rim = smoothstep(1.0, 0.1, inside) * smoothstep(0.35, 0.9, top);
+    float lift = 1.0 + 0.35 * top * top;
+    half a = color.a * half(lift) + half(rim * 0.10);
+    return half4(color.rgb / max(color.a, 0.001h) * a, a);
+}
+
+/// A slow light passing across text while Scrawl processes (`phase` 0 → 1 per pass): a soft band,
+/// a quarter of the width, that lifts the glyphs it crosses by at most 35%.
+[[ stitchable ]] half4 pillShimmer(float2 pos, half4 color, float2 size, float phase) {
+    if (color.a < 0.001h) { return color; }
+    float x = pos.x / max(size.x, 1.0);
+    float centre = -0.3 + 1.6 * phase;
+    float d = (x - centre) / 0.14;
+    float band = exp(-d * d);
+    half k = half(0.62 + 0.38 * band);
+    return half4(color.rgb * k, color.a * k);
 }

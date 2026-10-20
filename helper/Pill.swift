@@ -493,6 +493,9 @@ struct PillItemView: View {
         if item.active {
           Capsule()
             .fill(model.glass ? PillColor.smoke.opacity(0.18) : Color.white.opacity(0.16))
+            .visualEffect { content, proxy in
+              content.colorEffect(PillShaders.highlight(size: proxy.size))
+            }
             .matchedGeometryEffect(id: "highlight", in: highlight)
         }
       }
@@ -551,10 +554,7 @@ struct PillItemView: View {
   private var processing: some View {
     ZStack(alignment: .leading) {
       PillSpinner().frame(width: 32, height: 32)
-      Text("Processing…")
-        .font(.system(size: 13, weight: .semibold))
-        .foregroundStyle(PillColor.text)
-        .fixedSize()
+      ShimmerText(text: "Processing…")
         .padding(.leading, 31.5)
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
@@ -601,6 +601,27 @@ struct RecordingDot: View {
   }
 }
 
+/// "Processing…" with a slow light passing across it, a repeating animation driving a shader.
+struct ShimmerText: View {
+  let text: String
+  @State private var phase = 0.0
+
+  var body: some View {
+    Animated(value: phase) { p in
+      Text(text)
+        .font(.system(size: 13, weight: .semibold))
+        .foregroundStyle(PillColor.text)
+        .fixedSize()
+        .visualEffect { content, proxy in
+          content.colorEffect(PillShaders.shimmer(size: proxy.size, phase: p))
+        }
+    }
+    .onAppear {
+      withAnimation(.easeInOut(duration: 1.8).repeatForever(autoreverses: false)) { phase = 1 }
+    }
+  }
+}
+
 /// The capsule's `[[stitchable]]` shaders (`helper/PillShaders.metal`), embedded by build.rs.
 enum PillShaders {
   static let library: ShaderLibrary =
@@ -612,6 +633,14 @@ enum PillShaders {
 
   static func dot(size: CGSize, breath: Double, ripple: Double) -> Shader {
     library.pillDot(.float2(size), .float(breath), .float(ripple))
+  }
+
+  static func highlight(size: CGSize) -> Shader {
+    library.pillHighlight(.float2(size))
+  }
+
+  static func shimmer(size: CGSize, phase: Double) -> Shader {
+    library.pillShimmer(.float2(size), .float(phase))
   }
 
   static func morphBlur(radius: Double) -> Shader {
