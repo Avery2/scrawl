@@ -600,6 +600,20 @@ pub(crate) fn tune_command(action: TuneAction) -> anyhow::Result<()> {
             println!("reveal_enter_s: {:?},", t.reveal_enter_s);
             println!("reveal_exit_s: {:?},", t.reveal_exit_s);
             println!("reveal_blur_px: {:?},", t.reveal_blur_px);
+            println!("time_scale: {:?},", t.time_scale);
+            println!("pill_glass: {:?},", t.pill_glass);
+            println!("pill_origin: {:?},", t.pill_origin);
+            println!("pill_anchor: {:?},", t.pill_anchor);
+            println!("pill_blur: {:?},", t.pill_blur);
+            println!("pill_shell_blur: {:?},", t.pill_shell_blur);
+            println!("pill_enter: {:?},", t.pill_enter);
+            println!("pill_exit: {:?},", t.pill_exit);
+            println!("pill_morph_open: {:?},", t.pill_morph_open);
+            println!("pill_morph_close: {:?},", t.pill_morph_close);
+            println!("pill_highlight_lead: {:?},", t.pill_highlight_lead);
+            println!("pill_highlight_trail: {:?},", t.pill_highlight_trail);
+            println!("pill_punch: {:?},", t.pill_punch);
+            println!("pill_follow: {:?},", t.pill_follow);
         }
     }
     Ok(())

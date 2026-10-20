@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 //!
 //! Ported from Kit Motion study 03 (`island/model.js` and `island/NATIVE.md`):
 //! - Springs are parameterized by `spring(duration, bounce)` with `ω = 2π / duration` and
@@ -30,19 +30,21 @@ pub const PANEL_Y: f32 = 34.0;
 pub const HIT_SLOP: f32 = 4.0;
 /// How far the shader's drop shadow reaches past the outline, and how far down it's offset
 /// (`pill.metal`), so the fixed panel can hold it.
+#[cfg(test)]
 pub const SHADOW_REACH: f32 = 22.0;
+#[cfg(test)]
 pub const SHADOW_DROP: f32 = 4.0;
 pub const CX: f32 = PANEL_W * 0.5;
 /// Top edge of the resting 40 pt capsule inside the 84 pt panel (vertical centre y = 42, screen y = 76).
 pub const TOP: f32 = 22.0;
 pub const ISLAND_H: f32 = 40.0;
-pub const ISLAND_RADIUS: f32 = ISLAND_H * 0.5;
 pub const ISLAND_INSET: f32 = 4.0;
 pub const ISLAND_OPEN_FROM_W: f32 = 120.0;
 pub const IDLE_W: f32 = 96.0;
 pub const IDLE_H: f32 = 24.0;
 
 pub const CHIP_H: f32 = ISLAND_H - 2.0 * ISLAND_INSET; // 32.0
+#[cfg(test)]
 pub const CHIP_RADIUS: f32 = CHIP_H * 0.5; // 16.0
 pub const CHIP_PX: f32 = 12.0;
 /// Gap between items of one group (the mode chips; Undo · Cancel · Finish; Paste · Inspect).
@@ -345,7 +347,7 @@ impl SpringVal {
     }
 
     /// Critically damped 0-bounce step that never crosses `target` (`status-roll.js`).
-    pub fn step_critical(&mut self, dt: f32, visual_duration: f32, _unit: f32) {
+    pub fn step_critical(&mut self, dt: f32, visual_duration: f32) {
         self.duration = visual_duration.max(0.03);
         self.bounce = 0.0;
         self.step(dt);
@@ -375,11 +377,6 @@ impl Silhouette {
     pub fn height(&self) -> f32 {
         (self.b - self.t).max(0.0)
     }
-
-    #[inline]
-    pub fn rect(&self) -> [f32; 4] {
-        [self.l, self.t, self.width(), self.height()]
-    }
 }
 
 /// A capsule's corner radius: half its short side, so the ends are true semicircles at rest and
@@ -400,17 +397,9 @@ pub fn outline_sdf(sh: &Silhouette, x: f32, y: f32) -> f32 {
     qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r
 }
 
-/// How far a rounded box `[x, y, w, h]` (with corner radius `round`) sits inside `sh`, when
-/// scaled by `k` about `origin` and shifted vertically by `dy`.
+/// How far a rounded box `[x, y, w, h]` (with corner radius `round`) sits inside `sh`.
 #[inline]
-pub fn box_clearance(
-    sh: &Silhouette,
-    [x, y, w, h]: [f32; 4],
-    k: f32,
-    round: f32,
-    [ox, oy]: [f32; 2],
-    dy: f32,
-) -> f32 {
+pub fn box_clearance(sh: &Silhouette, [x, y, w, h]: [f32; 4], round: f32) -> f32 {
     let cap = (w * 0.5).min(h * 0.5).max(0.0);
     let r = round.min(cap).max(0.0);
     let x0 = x + cap;
@@ -420,12 +409,10 @@ pub fn box_clearance(
     let mut worst = f32::NEG_INFINITY;
     for cx in [x0, x1] {
         for cy in [y0, y1] {
-            let px = ox + (cx - ox) * k;
-            let py = oy + (cy - oy) * k + dy;
-            worst = worst.max(outline_sdf(sh, px, py));
+            worst = worst.max(outline_sdf(sh, cx, cy));
         }
     }
-    -worst - r * k
+    -worst - r
 }
 
 #[inline]
@@ -541,21 +528,20 @@ impl ElemId {
         !matches!(self, Self::Processing)
     }
 
-    pub const fn accessibility_label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
-            Self::Lead => "Recording timer",
             Self::ChipArea => "Area",
             Self::ChipWindow => "Window",
             Self::ChipScreen => "Screen",
             Self::ChipIphone => "iPhone",
             Self::Record => "Record",
-            Self::Close | Self::Cancel => "Cancel",
             Self::Undo => "Undo",
+            Self::Cancel => "Cancel",
             Self::Finish => "Finish",
-            Self::Processing => "Processing",
-            Self::DoneLead => "Completed",
+            Self::Processing => "Processing…",
             Self::Paste => "Paste",
             Self::Inspect => "Inspect",
+            Self::Lead | Self::Close | Self::DoneLead => "",
         }
     }
 
@@ -624,6 +610,15 @@ impl Pres {
             (Self::Completed { label: a }, Self::Completed { label: b }) => a == b,
             _ => false,
         }
+    }
+
+    /// The hold switcher steps modes with a key: the user's own hand, so the highlight doesn't slide.
+    pub fn is_keyed_step(&self, next: &Self) -> bool {
+        self != next
+            && matches!(
+                (self, next),
+                (Self::Selecting { hold: true, .. }, Self::Selecting { hold: true, .. })
+            )
     }
 }
 
@@ -696,7 +691,6 @@ impl Metrics {
 pub struct LayoutItem {
     pub id: ElemId,
     pub rect: [f32; 4],
-    pub round: f32,
     pub rank: usize,
     pub last: usize,
     pub active: f32,
@@ -754,8 +748,8 @@ pub fn layout_of(
     hold_chips: bool,
 ) -> (Layout, Vec<LayoutItem>) {
     let y0 = TOP + ISLAND_INSET;
-    let mut raw: Vec<(ElemId, f32, f32, f32, bool)> = Vec::with_capacity(8);
-    // (id, width, round, active_level, enabled)
+    let mut raw: Vec<(ElemId, f32, f32, bool)> = Vec::with_capacity(8);
+    // (id, width, active_level, enabled)
     let mut held_row = false;
     match pres {
         Pres::Hidden => {
@@ -770,21 +764,14 @@ pub fn layout_of(
                 raw.push((
                     ElemId::from_mode(seg),
                     m.segment_width(seg),
-                    CHIP_CORE_ROUND,
                     f32::from(u8::from(seg == *mode)),
                     true,
                 ));
             }
             if mode.shows_record() && !*hold {
-                raw.push((
-                    ElemId::Record,
-                    Metrics::chip_width(m.record),
-                    CHIP_CORE_ROUND,
-                    0.0,
-                    true,
-                ));
+                raw.push((ElemId::Record, Metrics::chip_width(m.record), 0.0, true));
             }
-            raw.push((ElemId::Close, CHIP_H, CHIP_CORE_ROUND, 0.0, true));
+            raw.push((ElemId::Close, CHIP_H, 0.0, true));
         }
         Pres::Recording {
             chips,
@@ -793,65 +780,39 @@ pub fn layout_of(
         } => {
             let clock_w = m.clock_width(clock);
             let lead_w = LEAD_TEXT_X + clock_w + LEAD_TRAIL;
-            raw.push((ElemId::Lead, lead_w, CHIP_CORE_ROUND, 0.0, true));
+            raw.push((ElemId::Lead, lead_w, 0.0, true));
             if *chips {
                 held_row = hold_chips;
                 for &seg in SelectionMode::available(*has_iphone) {
                     raw.push((
                         ElemId::from_mode(seg),
                         m.segment_width(seg),
-                        CHIP_CORE_ROUND,
                         f32::from(u8::from(seg == SelectionMode::Screen)),
                         true,
                     ));
                 }
-                raw.push((ElemId::Close, CHIP_H, CHIP_CORE_ROUND, 0.0, true));
+                raw.push((ElemId::Close, CHIP_H, 0.0, true));
             } else {
                 raw.push((
                     ElemId::Undo,
                     Metrics::chip_width(m.undo),
-                    CHIP_CORE_ROUND,
                     0.0,
                     *stroke_count > 0,
                 ));
-                raw.push((
-                    ElemId::Cancel,
-                    Metrics::chip_width(m.cancel),
-                    CHIP_CORE_ROUND,
-                    0.0,
-                    true,
-                ));
-                raw.push((
-                    ElemId::Finish,
-                    Metrics::chip_width(m.finish),
-                    CHIP_CORE_ROUND,
-                    0.0,
-                    true,
-                ));
+                raw.push((ElemId::Cancel, Metrics::chip_width(m.cancel), 0.0, true));
+                raw.push((ElemId::Finish, Metrics::chip_width(m.finish), 0.0, true));
             }
         }
         Pres::Processing => {
             let w = PROCESSING_TEXT_X + m.processing + PROCESSING_TRAIL;
-            raw.push((ElemId::Processing, w, CHIP_CORE_ROUND, 0.0, false));
+            raw.push((ElemId::Processing, w, 0.0, false));
         }
         Pres::Completed { .. } => {
             let lead_w = DONE_TEXT_X + completed_label_w + LEAD_TRAIL;
-            raw.push((ElemId::DoneLead, lead_w, CHIP_CORE_ROUND, 0.0, true));
-            raw.push((
-                ElemId::Paste,
-                Metrics::chip_width(m.paste),
-                CHIP_CORE_ROUND,
-                0.0,
-                true,
-            ));
-            raw.push((
-                ElemId::Inspect,
-                Metrics::chip_width(m.inspect),
-                CHIP_CORE_ROUND,
-                0.0,
-                true,
-            ));
-            raw.push((ElemId::Close, CHIP_H, CHIP_CORE_ROUND, 0.0, true));
+            raw.push((ElemId::DoneLead, lead_w, 0.0, true));
+            raw.push((ElemId::Paste, Metrics::chip_width(m.paste), 0.0, true));
+            raw.push((ElemId::Inspect, Metrics::chip_width(m.inspect), 0.0, true));
+            raw.push((ElemId::Close, CHIP_H, 0.0, true));
         }
     }
 
@@ -881,11 +842,10 @@ pub fn layout_of(
     let last = raw.len().saturating_sub(1);
     let mut x = lay.l + ISLAND_INSET;
     let mut items = Vec::with_capacity(raw.len());
-    for (rank, &(id, w, round, active, enabled)) in raw.iter().enumerate() {
+    for (rank, &(id, w, active, enabled)) in raw.iter().enumerate() {
         items.push(LayoutItem {
             id,
             rect: [x, y0, w, CHIP_H],
-            round,
             rank,
             last,
             active,
@@ -906,7 +866,6 @@ struct ElemState {
     y: SpringVal,
     w: f32,
     h: f32,
-    round: f32,
     rank: usize,
     last: usize,
     a: SpringVal,
@@ -929,7 +888,6 @@ impl ElemState {
             y: SpringVal::new(TOP + ISLAND_INSET, SHARED_SPRING),
             w: CHIP_H,
             h: CHIP_H,
-            round: CHIP_CORE_ROUND,
             rank: 0,
             last: 0,
             a: SpringVal::new(0.0, CONTENT_IN_SPRING),
@@ -1010,7 +968,6 @@ pub struct PillModel {
     pub shell_blur: SpringVal,
     entering_from_hidden: bool,
     morph_start_w: f32,
-    morph_start_h: f32,
     elems: [ElemState; ElemId::COUNT],
     ghost: Option<Silhouette>,
     dis: f32,
@@ -1051,7 +1008,6 @@ impl PillModel {
             shell_blur: SpringVal::new(1.0, ENTRY_SHELL_SPRING),
             entering_from_hidden: false,
             morph_start_w: ISLAND_OPEN_FROM_W,
-            morph_start_h: ISLAND_H,
             elems: [ElemState::new(); ElemId::COUNT],
             ghost: None,
             dis: 1.0,
@@ -1097,10 +1053,7 @@ impl PillModel {
             return;
         }
         // The hold switcher steps modes with a key: the user's own hand, so no slide to wait for.
-        self.hl_keyed = matches!(
-            (&self.pres, &next),
-            (Pres::Selecting { hold: true, .. }, Pres::Selecting { hold: true, .. })
-        );
+        self.hl_keyed = self.pres.is_keyed_step(&next);
         let layout_changed = !self.pres.same_layout(&next);
         let was_visible = !matches!(self.pres, Pres::Hidden);
         let now_hidden = matches!(next, Pres::Hidden);
@@ -1172,10 +1125,8 @@ impl PillModel {
         let before_l = self.l.x;
         let before_r = self.r.x;
         let before_b = self.b.x;
-        // Sliding content's springs toward the left and toward the right wall.
-        let mut slide = (SHARED_SPRING, SHARED_SPRING);
+        let mut slide = SHARED_SPRING;
         self.morph_start_w = (before_r - before_l).max(1.0);
-        self.morph_start_h = (before_b - TOP).max(1.0);
 
         if self.reduced {
             let current = self.silhouette();
@@ -1263,7 +1214,7 @@ impl PillModel {
             } else {
                 // Visible state-to-state width-led morph (`≤ 350 ms` settled, velocity preserved).
                 // Each wall has its own spring, so a wall whose target doesn't move stays put.
-                let (w_cfg, h_cfg, _) = self.morph_springs(&lay, before_l, before_r, before_b);
+                let (w_cfg, h_cfg) = self.morph_springs(&lay, before_l, before_r, before_b);
                 // Opening, the walls lead and sliding content follows them out; closing, the walls
                 // sweep in and content rides with them on the same spring, so it's never pushed.
                 let follow = SpringCfg::new(
@@ -1271,7 +1222,7 @@ impl PillModel {
                     0.0,
                 );
                 let opening = lay.width() > before_r - before_l + 0.5;
-                slide = if opening { (follow, follow) } else { (w_cfg, w_cfg) };
+                slide = if opening { follow } else { w_cfg };
                 self.l.to(lay.l, w_cfg);
                 self.r.to(lay.r, w_cfg);
                 self.b.to(lay.b, h_cfg);
@@ -1288,7 +1239,6 @@ impl PillModel {
             let [ix, iy, iw, ih] = item.rect;
             st.w = iw;
             st.h = ih;
-            st.round = item.round;
             st.rank = item.rank;
             st.last = item.last;
             st.enabled = item.enabled;
@@ -1302,9 +1252,8 @@ impl PillModel {
                 if (st.x.x - ix).hypot(st.y.x - iy) > 0.5 {
                     st.travelling = true;
                 }
-                let toward = if ix < st.x.x { slide.0 } else { slide.1 };
-                st.x.to(ix, toward);
-                st.y.to(iy, toward);
+                st.x.to(ix, slide);
+                st.y.to(iy, slide);
                 st.active.to(item.active, SpringCfg::new(0.18, 0.0));
             }
         }
@@ -1312,7 +1261,7 @@ impl PillModel {
 
     /// Width and height springs for a visible morph to `lay` from walls at `l`, `r`, `b`: the
     /// palette morph (open or close by area), a touch quicker for short moves; only width bounces.
-    fn morph_springs(&self, lay: &Layout, l: f32, r: f32, b: f32) -> (SpringCfg, SpringCfg, bool) {
+    fn morph_springs(&self, lay: &Layout, l: f32, r: f32, b: f32) -> (SpringCfg, SpringCfg) {
         let dw = (lay.l - l).abs().max((lay.r - r).abs());
         let dh = (lay.b - b).abs();
         let opening = lay.width() * lay.height() >= (r - l) * (b - TOP) - 1.0;
@@ -1323,7 +1272,7 @@ impl PillModel {
         };
         let f = (dw.hypot(dh) / REF_DIST).clamp(0.0, 1.0);
         let dur = (base.duration * mix(DISTANCE_FLOOR, 1.0, f)).max(0.14);
-        (SpringCfg::new(dur, base.bounce), SpringCfg::new(dur, 0.0), opening)
+        (SpringCfg::new(dur, base.bounce), SpringCfg::new(dur, 0.0))
     }
 
     /// Updates the recording clock string (`M:SS`); if the digit count changed (e.g. `9:59 -> 10:00`),
@@ -1341,13 +1290,15 @@ impl PillModel {
         }
     }
 
-    pub fn set_completed_label(&mut self, label: String, label_w: f32) {
+    pub fn set_completed_label(&mut self, label: &str, label_w: f32) {
         let width_changed = (self.completed_label_w - label_w).abs() > 0.5;
         self.completed_label_w = label_w;
         if let Pres::Completed { label: ref cur } = self.pres
-            && (*cur != label || width_changed)
+            && (cur != label || width_changed)
         {
-            self.pres = Pres::Completed { label };
+            self.pres = Pres::Completed {
+                label: label.to_owned(),
+            };
             self.apply_geometry();
         }
     }
@@ -1550,7 +1501,7 @@ impl PillModel {
             if let Some((at, lay)) = pending
                 && t >= at
             {
-                let (w_cfg, h_cfg, _) = self.morph_springs(&lay, l.x, r.x, b.x);
+                let (w_cfg, h_cfg) = self.morph_springs(&lay, l.x, r.x, b.x);
                 l.to(lay.l, w_cfg);
                 r.to(lay.r, w_cfg);
                 b.to(lay.b, h_cfg);
@@ -1609,8 +1560,7 @@ impl PillModel {
             self.press.snap(0.0);
             self.squish.snap(0.0);
             self.grow.snap(1.0);
-            self.shell_alpha
-                .step_critical(dt, REDUCED_FADE_S, 100.0);
+            self.shell_alpha.step_critical(dt, REDUCED_FADE_S);
             self.shell_blur.snap(0.0);
             self.dis = (self.dis + dt / REDUCED_FADE_S).min(1.0);
             if self.dis >= 1.0 {
@@ -1627,24 +1577,29 @@ impl PillModel {
                 self.grow.step(dt);
             }
             self.shell_alpha
-                .step_critical(dt, self.shell_alpha.duration, 100.0);
+                .step_critical(dt, self.shell_alpha.duration);
             self.shell_blur
-                .step_critical(dt, self.shell_blur.duration, 100.0);
+                .step_critical(dt, self.shell_blur.duration);
             if self.grow.x > 0.99 && self.shell_alpha.x > 0.95 {
                 self.entering_from_hidden = false;
             }
         }
 
         let now = self.silhouette();
-        let ahead = if reduced {
+        let settled_geo = self.geo_pres == self.pres;
+        let walls_moving = !settled_geo
+            || !self.l.is_resting()
+            || !self.r.is_resting()
+            || !self.b.is_resting()
+            || !self.grow.is_resting();
+        let ahead = if reduced || !walls_moving {
             Vec::new()
         } else {
             self.predict(EXIT_LEAD_S)
         };
-        let settled_geo = self.geo_pres == self.pres;
         let grown = self.grown_enough();
-        let (_, geo_items) = self.layout(&self.geo_pres);
         let (_, active_items) = self.layout(&self.pres);
+        let geo_items = (!settled_geo).then(|| self.layout(&self.geo_pres).1);
 
         let inn = if reduced {
             SpringCfg::new(REDUCED_FADE_S, 0.0)
@@ -1661,10 +1616,12 @@ impl PillModel {
         for id in ElemId::ALL {
             let idx = id as usize;
             let in_active = active_items.iter().any(|item| item.id == id);
-            let in_geo = geo_items.iter().any(|item| item.id == id);
             // During `COLLAPSE_WAIT_S` (`!settled_geo`), shared elements that exist in both the
             // old and new presentation stay visible while outgoing elements fade out.
-            let in_pres = in_active && (settled_geo || in_geo);
+            let in_pres = in_active
+                && geo_items
+                    .as_ref()
+                    .is_none_or(|items| items.iter().any(|item| item.id == id));
             let is_hovered = self.hovered == Some(id);
             let is_pressed = self.pressed == Some(id);
             let (l_now, r_now) = (self.l.x, self.r.x);
@@ -1678,9 +1635,9 @@ impl PillModel {
                 f32::from(u8::from(is_pressed)),
                 SpringCfg::new(if is_pressed { 0.10 } else { 0.20 }, 0.0),
             );
-            st.hover.step_critical(dt, 0.14, 100.0);
-            st.press.step_critical(dt, 0.14, 100.0);
-            st.active.step_critical(dt, 0.16, 100.0);
+            st.hover.step_critical(dt, 0.14);
+            st.press.step_critical(dt, 0.14);
+            st.active.step_critical(dt, 0.16);
 
             if st.travelling && in_pres && !reduced {
                 st.x.step(dt);
@@ -1717,9 +1674,9 @@ impl PillModel {
             let st = self.elems[idx];
             let rest = [st.x.x, st.y.x, st.w, st.h];
             let (rect, k) = self.place(&st, rest);
-            let d = box_clearance(&now, rect, 1.0, st.round * k, [0.0, 0.0], 0.0);
+            let d = box_clearance(&now, rect, CHIP_CORE_ROUND * k);
             let (rest_rect, k_rest) = self.shell_xf(rest);
-            let d_rest = box_clearance(&now, rest_rect, 1.0, st.round * k_rest, [0.0, 0.0], 0.0);
+            let d_rest = box_clearance(&now, rest_rect, CHIP_CORE_ROUND * k_rest);
             let pres_hidden = matches!(self.pres, Pres::Hidden);
             let entering = self.entering_from_hidden;
 
@@ -1766,7 +1723,7 @@ impl PillModel {
             } else {
                 ((if on { inn.duration } else { out.duration }) * BLUR_LEAD).max(0.03)
             };
-            st.blur.step_critical(dt, blur_dur, 100.0);
+            st.blur.step_critical(dt, blur_dur);
 
             // Look-ahead exit cap (`stepCap` in `island/model.js`) for non-travelling elements, on
             // morphs and on Exit (a folding or rolling-up wall sweeps across the row). Items the
@@ -1777,10 +1734,10 @@ impl PillModel {
                 let contact = if hidden || (!settled_geo && in_pres) {
                     f32::INFINITY
                 } else {
-                    let round = st.round * k;
+                    let round = CHIP_CORE_ROUND * k;
                     ahead
                         .iter()
-                        .find(|(_, sh)| box_clearance(sh, rect, 1.0, round, [0.0, 0.0], 0.0) < CLEAR)
+                        .find(|(_, sh)| box_clearance(sh, rect, round) < CLEAR)
                         .map_or(f32::INFINITY, |(at_t, _)| *at_t)
                 };
                 if d < CLEAR {
@@ -1878,13 +1835,13 @@ impl PillModel {
             let rest = [st.x.x, st.y.x, st.w, st.h];
             let (placed, base_k) = self.place(st, rest);
             let press_k = 1.0 - 0.05 * st.press.x.clamp(0.0, 1.0);
-            let d = box_clearance(&shape, placed, 1.0, st.round * base_k, [0.0, 0.0], 0.0);
+            let d = box_clearance(&shape, placed, CHIP_CORE_ROUND * base_k);
             let edge = if !reduced {
                 st.cap.clamp(0.0, 1.0).min(room(d))
             } else if d >= CLEAR {
                 1.0
             } else if let Some(ref g) = ghost
-                && box_clearance(g, placed, 1.0, st.round * base_k, [0.0, 0.0], 0.0) >= CLEAR
+                && box_clearance(g, placed, CHIP_CORE_ROUND * base_k) >= CLEAR
             {
                 g.alpha
             } else {
@@ -2108,9 +2065,8 @@ mod tests {
                 elem.alpha
             );
             if elem.alpha > 1e-3 && !model.reduced {
-                let st = &model.elems[elem.id as usize];
                 let cap = (elem.rect[2] * 0.5).min(elem.rect[3] * 0.5);
-                let r = (st.round * elem.scale).min(cap);
+                let r = (CHIP_CORE_ROUND * elem.scale).min(cap);
                 let x0 = elem.rect[0] + cap;
                 let y0 = elem.rect[1] + cap;
                 let x1 = (elem.rect[0] + elem.rect[2] - cap).max(x0);

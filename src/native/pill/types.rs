@@ -61,7 +61,7 @@ impl PillStyle {
 
 /// User actions emitted by clicking or pressing keys on the native pill (macOS only, so
 /// elsewhere nothing makes them).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum PillAction {
     SelectMode(SelectionMode),
@@ -73,6 +73,32 @@ pub enum PillAction {
     Paste(Option<[f32; 2]>),
     Inspect,
     DismissCompleted,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl PillAction {
+    /// What clicking `elem` asks for while `pres` shows.
+    pub fn for_click(pres: &Pres, elem: super::model::ElemId) -> Option<Self> {
+        use super::model::ElemId;
+        if let Some(mode) = elem.mode() {
+            return Some(if matches!(pres, Pres::Selecting { .. }) {
+                Self::SelectMode(mode)
+            } else {
+                Self::SwitchRecording(mode)
+            });
+        }
+        Some(match elem {
+            ElemId::Record => Self::RecordSelected,
+            ElemId::Undo => Self::Undo,
+            ElemId::Cancel => Self::Cancel,
+            ElemId::Finish => Self::Finish,
+            ElemId::Close if matches!(pres, Pres::Completed { .. }) => Self::DismissCompleted,
+            ElemId::Close => Self::Cancel,
+            ElemId::Paste => Self::Paste(None),
+            ElemId::Inspect => Self::Inspect,
+            _ => return None,
+        })
+    }
 }
 
 /// Coordinator state snapshot synced to `NativePill`.
