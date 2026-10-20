@@ -25,6 +25,8 @@ use crate::ui::SelectionMode;
 pub const PANEL_W: f32 = 640.0;
 pub const PANEL_H: f32 = 84.0;
 pub const PANEL_Y: f32 = 34.0;
+/// How far outside the drawn outline the capsule still takes the pointer (points).
+pub const HIT_SLOP: f32 = 4.0;
 pub const CX: f32 = PANEL_W * 0.5;
 /// Top edge of the resting 40 pt capsule inside the 84 pt panel (vertical centre y = 42, screen y = 76).
 pub const TOP: f32 = 22.0;
@@ -1341,15 +1343,15 @@ impl PillModel {
         }
     }
 
-    /// Hit-tests against the model's target capsule shape (`hitIsland` in `island/model.js`),
-    /// plus a `6 pt` slop margin so reaching for chips keeps mouse events enabled.
+    /// Hit-tests against the outline as it's drawn right now, plus `HIT_SLOP`: the panel takes
+    /// clicks and hover only there and lets everything else through to what's underneath, also
+    /// mid-morph (the target outline would take clicks where nothing is drawn yet).
     pub fn hit_island(&self, x: f32, y: f32) -> bool {
         if matches!(self.pres, Pres::Hidden) {
             return false;
         }
-        let (lay, _) = self.layout(&self.pres);
-        let slop = 6.0;
-        x >= lay.l - slop && x <= lay.r + slop && y >= lay.t - slop && y <= lay.b + slop
+        let sh = self.silhouette();
+        sh.alpha > 0.05 && sh.width() > 1.0 && outline_sdf(&sh, x, y) <= HIT_SLOP
     }
 
     /// Hit-tests interactive elements at `(x, y)` in panel points.
