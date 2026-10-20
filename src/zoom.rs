@@ -235,7 +235,7 @@ pub fn zoom(
                     .unwrap_or_else(|| "The bundle has no video to zoom into".to_owned())
             }
         })?;
-    let (from_ms, to_ms) = match &focus {
+    let ((from_ms, to_ms), mark) = match &focus {
         Focus::At(at) => {
             let at_ms = resolve_moment(bundle, at)?;
             ensure!(
@@ -244,15 +244,12 @@ pub fn zoom(
                 clock(at_ms),
                 clock(bundle.duration_ms)
             );
-            window(at_ms, span_ms, bundle.duration_ms)
+            (window(at_ms, span_ms, bundle.duration_ms), None)
         }
-        Focus::Mark(entry) => {
-            mark_window(entry.mark.t0, entry.mark.t1, span_ms, bundle.duration_ms)
-        }
-    };
-    let mark = match &focus {
-        Focus::Mark(entry) => Some(entry),
-        Focus::At(_) => None,
+        Focus::Mark(entry) => (
+            mark_window(entry.mark.t0, entry.mark.t1, span_ms, bundle.duration_ms),
+            Some(entry),
+        ),
     };
     let mark_crop = mark
         .and_then(|e| e.keyframe)

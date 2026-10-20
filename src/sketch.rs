@@ -224,15 +224,17 @@ pub(crate) fn quote_label(label: &str) -> String {
     }
 }
 
+/// Whether `mark` belongs to `keyframe` (by `mark_id` or shared `frame` file).
+pub fn mark_on_keyframe(mark: &Mark, keyframe: &Keyframe) -> bool {
+    keyframe.mark_id.as_ref() == Some(&mark.id)
+        || (!keyframe.file.is_empty() && mark.frame.as_ref() == Some(&keyframe.file))
+}
+
 /// The inked marks a keyframe draws (every mark of its screen's group), in drawing order.
 pub fn marks_on<'a>(keyframe: &Keyframe, marks: &'a [Mark]) -> Vec<&'a Mark> {
     let mut shown: Vec<&Mark> = marks
         .iter()
-        .filter(|m| {
-            !m.strokes.is_empty()
-                && (keyframe.mark_id.as_ref() == Some(&m.id)
-                    || (!keyframe.file.is_empty() && m.frame.as_ref() == Some(&keyframe.file)))
-        })
+        .filter(|m| !m.strokes.is_empty() && mark_on_keyframe(m, keyframe))
         .collect();
     shown.sort_by_key(|m| m.t0);
     shown
@@ -418,10 +420,7 @@ pub fn timeline(bundle: &ScrawlBundle) -> Vec<String> {
         .map(|s| (s.t0, format!("{} “{}”", format_clock(s.t0), s.text)))
         .collect();
     for mark in &bundle.marks {
-        let frame = bundle.keyframes.iter().find(|k| {
-            k.mark_id.as_deref() == Some(mark.id.as_str())
-                || mark.frame.as_deref() == Some(k.file.as_str())
-        });
+        let frame = bundle.keyframes.iter().find(|k| mark_on_keyframe(mark, k));
         let suffix = frame
             .map(|k| format!(" — frame #{}", k.index))
             .unwrap_or_default();

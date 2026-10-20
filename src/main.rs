@@ -2104,16 +2104,14 @@ fn main() -> Result<()> {
         } => {
             let (dir, loaded) = handoff::load_bundle(&bundle)?;
             ensure!(span.is_finite() && span > 0.0, "--span must be positive");
-            let focus = match (&at, &mark) {
-                (_, Some(query)) => zoom::Focus::Mark(
-                    agent_context::find_mark(&loaded, query, frame).map_err(anyhow::Error::msg)?,
-                ),
-                (Some(at), None) => zoom::Focus::At(at),
-                (None, None) => anyhow::bail!("Pass --at or --mark"),
-            };
-            if let zoom::Focus::Mark(entry) = &focus {
+            let focus = if let Some(query) = &mark {
+                let entry =
+                    agent_context::find_mark(&loaded, query, frame).map_err(anyhow::Error::msg)?;
                 println!("{}", entry.line());
-            }
+                zoom::Focus::Mark(entry)
+            } else {
+                zoom::Focus::At(at.as_deref().context("Pass --at or --mark")?)
+            };
             let sheet = zoom::zoom(&dir, &loaded, focus, (span * 1_000.0) as u64, frames, !full)?;
             println!("{}", sheet.path.display());
             println!(

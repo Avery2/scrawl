@@ -7,7 +7,9 @@
 //! something names it (an Accessibility label, the dev page's element).
 
 use crate::model::*;
-use crate::sketch::{describe_event, direction, marks_on, quote_label, settled_events};
+use crate::sketch::{
+    describe_event, direction, mark_on_keyframe, marks_on, quote_label, settled_events,
+};
 
 /// One keyframe's text: `head` follows `- #N (M:SS)` on the bullet line, `lines` go under it.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -138,15 +140,10 @@ impl MarkEntry<'_> {
     /// `#2 ✎② 0:09 marked (2 strokes) · m2`
     pub fn line(&self) -> String {
         let frame = self.keyframe.map_or("#-".to_owned(), |k| format!("#{k}"));
-        let n = if self.numbered {
-            circled(self.number)
-        } else {
-            String::new()
-        };
+        let num = self.numbered.then_some(self.number);
         format!(
-            "{frame} ✎{n} {} {} · {}",
-            format_clock(self.mark.t0),
-            mark_text(self.mark),
+            "{frame} {} · {}",
+            mark_label(self.mark, num),
             self.mark.id
         )
     }
@@ -171,39 +168,21 @@ impl MarkEntry<'_> {
 
 /// Every mark, in time order, numbered the way the summary numbers them.
 pub fn mark_entries(bundle: &ScrawlBundle) -> Vec<MarkEntry<'_>> {
-    let mut entries: Vec<MarkEntry> = Vec::new();
-    for frame in &bundle.keyframes {
-        let shown = marks_on(frame, &bundle.marks);
-        let numbered = shown.len() >= 2;
-        for (n, mark) in shown.into_iter().enumerate() {
-            if !entries.iter().any(|e| std::ptr::eq(e.mark, mark)) {
-                entries.push(MarkEntry {
-                    mark,
-                    keyframe: Some(frame.index),
-                    number: n + 1,
-                    numbered,
-                });
-            }
-        }
-    }
-    for mark in &bundle.marks {
-        if !entries.iter().any(|e| std::ptr::eq(e.mark, mark)) {
-            let keyframe = bundle
-                .keyframes
-                .iter()
-                .find(|k| {
-                    k.mark_id.as_ref() == Some(&mark.id)
-                        || (mark.frame.is_some() && mark.frame.as_ref() == Some(&k.file))
-                })
-                .map(|k| k.index);
-            entries.push(MarkEntry {
+    let mut entries: Vec<MarkEntry> = bundle
+        .marks
+        .iter()
+        .map(|mark| {
+            let frame = bundle.keyframes.iter().find(|k| mark_on_keyframe(mark, k));
+            let shown = frame.map(|k| marks_on(k, &bundle.marks)).unwrap_or_default();
+            let pos = shown.iter().position(|m| std::ptr::eq(*m, mark));
+            MarkEntry {
                 mark,
-                keyframe,
-                number: 1,
-                numbered: false,
-            });
-        }
-    }
+                keyframe: frame.map(|k| k.index),
+                number: pos.map_or(1, |n| n + 1),
+                numbered: pos.is_some() && shown.len() >= 2,
+            }
+        })
+        .collect();
     entries.sort_by_key(|e| e.mark.t0);
     entries
 }
@@ -666,14 +645,15 @@ fn quoted(text: &str) -> String {
     }
 }
 
+fn mark_label(mark: &Mark, number: Option<usize>) -> String {
+    let n = number.map(circled).unwrap_or_default();
+    format!("✎{n} {} {}", format_clock(mark.t0), mark_text(mark))
+}
+
 fn label(item: &Timed) -> String {
-    let clock = format_clock(item.t);
     match &item.item {
-        Item::Mark { mark, number } => {
-            let n = number.map(circled).unwrap_or_default();
-            format!("✎{n} {clock} {}", mark_text(mark))
-        }
-        Item::Event { text } => format!("· {clock} {text}"),
+        Item::Mark { mark, number } => mark_label(mark, *number),
+        Item::Event { text } => format!("· {} {text}", format_clock(item.t)),
     }
 }
 
