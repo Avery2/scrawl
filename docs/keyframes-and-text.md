@@ -11,6 +11,13 @@ Read this before changing `src/keyframes.rs`, `src/transcribe.rs`, `src/hex.rs`,
 
 Apple SpeechAnalyzer by default (measured word times). `"transcriber": "hex"` + `"hexModel"` in `~/.config/scrawl/config.json` (Settings › Recording, `scrawl hex status`, `--transcriber` on `reprocess`/`import`) uses Hex's local API v2 (discovery file `local-api.json`, bearer token, never logged) only when Hex answers `/health` and has a ready model (`installed && verified`; Scrawl never downloads). Hex gives text only, so each speech island (`audio::speech_islands`, clips merged to ≤ 24) is transcribed on its own and its words are spread over it by length: `source: "hex:<model>"`, `estimated: true`, which `keyframes.rs` reads to skip spoken cues. Any Hex failure falls back to Apple for that recording; Hex absent falls back silently (logged once). Settings reads `hex::cached_status` (a background poller), never the network.
 
+Hex requests use `"hexLanguage"` (Settings › Recording › Hex language), default `en`.
+The field accepts a language code or `auto`, trims/lowercases it, and saves on Return/Apply;
+blank resets to `en`. Scrawl validates URL-safe code syntax only, leaving supported languages
+to Hex. The selection is read once per recording and reused for all speech islands/retries.
+It does not inherit Hex's dictation settings. An unsupported code follows the existing
+Hex-failure fallback. Models may ignore language hints (e.g. Parakeet v3).
+
 Apple's model (`src/speech_model.rs`, `scrawl-helper speech-model [--install]`) is SpeechTranscriber where the Mac supports it, else DictationTranscriber (VMs and Macs where `SpeechTranscriber.isAvailable` is false), for the user's locale, the nearest supported one, or en-US. Each app reserves it for itself through `AssetInventory` (attributed to `dev.kitlangton.scrawl.helper`) and a fresh Mac doesn't have it, so the app checks and installs it in the background at launch (not when the transcriber is Hex) and retries a failed install; onboarding's Microphone row, Try it and Settings › Recording show the download. `transcribe` never downloads for long: without a model it returns `missing` (`downloading`, `unsupported`, `failed`), the summary gets a `No transcript: …` line (`TranscriptData::missing`), and a retryable bundle gets `.transcript-pending` and is transcribed again in place, `scrawl.json` and `summary.md` rewritten, when the model arrives (`scrawl retranscribe <bundle>` by hand).
 
 ## Keyframe selection (`src/keyframes.rs`)

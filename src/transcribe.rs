@@ -205,7 +205,7 @@ fn try_hex(audio: &RecordedAudio) -> Result<Option<TranscriptData>> {
     let Some(model) = crate::hex::pick_model(&models, configured.as_deref()) else {
         return not_connected("no ready model".into());
     };
-    crate::hex::transcribe_audio(&client, &model, audio).map(Some)
+    crate::hex::transcribe_audio(&client, &model, &crate::handoff::hex_language(), audio).map(Some)
 }
 
 fn apple(wav: &Path) -> TranscriptData {

@@ -75,6 +75,7 @@ struct SettingsTranscriber: Decodable, Equatable {
   var engine = "apple"
   var hexTitle = "Hex (not running)"
   var hexEnabled = false
+  var language = "en"
   var models: [SettingsModelOption] = []
   var speech: SpeechStatus?
 }
@@ -842,6 +843,10 @@ struct SettingsView: View {
             ) { model.set("hexModel", $0) }
           }
         }
+        if t.engine == "hex" {
+          SettingsSeparator()
+          HexLanguageField(model: model, language: t.language)
+        }
       }
       SettingsCaption(text: t.hexEnabled || t.engine == "hex"
         ? "Apple Speech times each word. Hex uses a model you have in Hex, and its word times are estimates."
@@ -1297,7 +1302,7 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
     custom.shortcuts[0] = SettingsShortcut(kind: "record", title: "Record", label: "⌃⌥⌘R", key: "R", shift: false, control: true, option: true, command: true, isDefault: false)
     custom.login.on = true
     var hex = base
-    hex.transcriber = SettingsTranscriber(engine: "hex", hexTitle: "Hex", hexEnabled: true, models: [
+    hex.transcriber = SettingsTranscriber(engine: "hex", hexTitle: "Hex", hexEnabled: true, language: "nl", models: [
       SettingsModelOption(id: "parakeet-tdt-0.6b-v3", title: "Parakeet TDT v3", chosen: true),
       SettingsModelOption(id: "whisper-large-v3-turbo", title: "Whisper Large v3 Turbo", chosen: false),
     ])
@@ -1383,5 +1388,44 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
         try? rep.representation(using: .png, properties: [:])?.write(to: url)
       }
     }
+  }
+}
+
+/// Commit on Return or Apply, so intermediate edits never reach the transcriber.
+private struct HexLanguageField: View {
+  @ObservedObject var model: SettingsModel
+  let language: String
+  @State private var draft: String
+
+  init(model: SettingsModel, language: String) {
+    self.model = model
+    self.language = language
+    _draft = State(initialValue: language)
+  }
+
+  private var normalized: String { draft.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+  private var valid: Bool {
+    normalized.isEmpty || normalized.range(of: "^[a-z][a-z0-9-]{0,34}$", options: .regularExpression) != nil
+  }
+  private func apply() {
+    if valid { model.set("hexLanguage", normalized) }
+  }
+  var body: some View {
+    SettingsRow(title: "Hex language") {
+      // ImageRenderer cannot draw AppKit-backed text fields; keep previews readable.
+      if model.rendering {
+        Text(language).frame(width: 120, alignment: .leading)
+      } else {
+        TextField("en", text: $draft)
+          .textFieldStyle(.roundedBorder)
+          .frame(width: 120)
+          .onSubmit { apply() }
+          .accessibilityLabel("Hex language code")
+      }
+      Button("Apply") { apply() }
+        .disabled(!valid || (normalized.isEmpty ? "en" : normalized) == language)
+    }
+    .help("Language code, e.g. en, nl or auto. Support depends on the Hex model; some ignore it. This does not follow Hex’s dictation language.")
+    .onChange(of: language) { _, value in draft = value }
   }
 }
