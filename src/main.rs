@@ -160,7 +160,7 @@ enum HexCommand {
 
 #[derive(Subcommand)]
 enum LabCommand {
-    /// Play a capsule scene: tap-then-area, tap-then-window, tap-then-screen, hold-switcher, finish.
+    /// Play a capsule scene: tap-then-area, tap-then-window, tap-then-screen, hold-then-pick, finish.
     Pill {
         #[arg(value_enum)]
         scene: ui::LabScene,

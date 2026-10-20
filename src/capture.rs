@@ -121,11 +121,11 @@ pub struct ScreenRecording {
 /// Live UI events emitted by the global input monitor to drive Scrawl's HUD & Review windows.
 #[derive(Clone, Debug)]
 pub enum LiveOverlayEvent {
-    /// ⌥⇧S (or the configured shortcut) went down; `hold::Switcher` decides what it means.
+    /// ⌥⇧S (or the configured shortcut) went down; `hold::Shortcut` decides what it means.
     CaptureShortcut,
     PasteLatestShortcut,
     UndoStroke,
-    /// macOS's Esc hotkey; Windows polls Esc while the switcher is held.
+    /// macOS's Esc hotkey; Windows polls Esc from key state.
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     CancelCapture,
     RequestSnapshot,
@@ -702,7 +702,7 @@ pub struct SharedCaptureTelemetry {
     tap_tried_ms: AtomicU64,
     /// Whether key presses are arriving (macOS's key tap, Windows' keyboard hook).
     tap_live: AtomicBool,
-    /// Esc went down since the switcher last looked (`take_escape`).
+    /// Esc went down since the UI loop last looked (`take_escape`).
     escape_pressed: AtomicBool,
     /// A Screen recording started straight from the shortcut: the overlay flashes an edge glow.
     pub start_glow: AtomicBool,
@@ -927,7 +927,7 @@ impl SharedCaptureTelemetry {
         scrawl_log(format!("session clicks from {clicks}, keys from {keys}"));
     }
 
-    /// Whether Esc went down since the last call (the switcher cancels on it).
+    /// Whether Esc went down since the last call (a pending shortcut or an open picker cancels on it).
     pub fn take_escape(&self) -> bool {
         self.escape_pressed.swap(false, Ordering::AcqRel)
     }

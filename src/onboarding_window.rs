@@ -596,7 +596,6 @@ impl OnboardingWindow {
 
     fn how_it_works(&self) -> Div {
         let (s, paste, shift) = self.labels();
-        let (mods, key) = crate::capture::shortcut_parts(&s);
         let pick = if cfg!(target_os = "windows") {
             "a window or an area"
         } else {
@@ -652,7 +651,7 @@ impl OnboardingWindow {
                     .child(row(
                         keycaps(&s, false, 26.0),
                         format!(
-                            "Tap {s} to record the screen under your pointer. Hold {mods} and press {key} again to pick {pick}."
+                            "Tap {s} to record the screen under your pointer, or hold it to pick {pick}."
                         ),
                     ))
                     .child(divider())

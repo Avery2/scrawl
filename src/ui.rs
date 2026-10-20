@@ -350,7 +350,7 @@ fn edge_alpha(inner_now: f32, x: f32, w: f32) -> f32 {
 }
 
 /// The switch chips' clock: the animation clock, so they stay open as long in slow motion
-/// (`motion::time_scale`). The held switcher keeps the real clock: it times key presses.
+/// (`motion::time_scale`). The shortcut keeps the real clock: it times a tap against a hold.
 fn reveal_clock_ms() -> u64 {
     (motion::now() * 1000.0) as u64
 }
@@ -365,25 +365,24 @@ fn uncover_alpha(outer: f32, x: f32, w: f32) -> f32 {
 }
 
 /// Intrinsic outer width of the capsule for a phase, mirroring the layout in `HudPillWindow`.
-/// `hold`: the held switcher, which always lists iPhone and records on release (no Record chip).
 /// `chips`: a Recording capsule showing its switch chips.
 fn island_content_width(
     window: &Window,
     phase: IslandPhase,
     clock: &str,
     iphone: bool,
-    hold: bool,
     chips: bool,
     completed_note: Option<&str>,
 ) -> f32 {
     let divider = 1.0 + 2.0 * DIVIDER_MX;
     let inner = match phase {
         IslandPhase::Selecting { mode } => {
-            let labels: Vec<f32> = SelectionMode::available(iphone || hold)
+            let labels: Vec<f32> = SelectionMode::available(iphone)
                 .iter()
                 .map(|m| measure_text(window, m.label(), HUD_TEXT, FontWeight::MEDIUM))
                 .collect();
-            let record = (mode.shows_record() && !hold)
+            let record = mode
+                .shows_record()
                 .then(|| chip_width(window, "Record", FontWeight::SEMIBOLD));
             selecting_row_width(&labels, record)
         }
@@ -752,12 +751,10 @@ pub struct ScrawlCoordinator {
     grants: Option<crate::onboarding::Grants>,
     /// Holds the permissions window until the shortcut's modifiers are up.
     gate: crate::onboarding::Gate,
-    /// ⌥⇧S held as a ⌘Tab-style switcher (`crate::hold`).
-    switcher: crate::hold::Switcher,
-    /// The modifiers held when the shortcut went down; releasing any of them commits.
+    /// ⌥⇧S tapped or held (`crate::hold`).
+    shortcut: crate::hold::Shortcut,
+    /// The modifiers held when the shortcut went down; releasing any of them makes it a tap.
     hold_mods: u64,
-    /// The open picker is the held switcher, not the menu bar's picker.
-    hold_picker: bool,
     clock: Instant,
     /// `scrawl lab pill`: recordings are pretend (`CaptureSource::Lab`), the picker takes no
     /// input and opens no overlay, and nothing looks for windows or phones.
@@ -831,9 +828,8 @@ impl ScrawlCoordinator {
             settings: None,
             grants: None,
             gate: crate::onboarding::Gate::default(),
-            switcher: crate::hold::Switcher::default(),
+            shortcut: crate::hold::Shortcut::default(),
             hold_mods: 0,
-            hold_picker: false,
             clock: Instant::now(),
             lab: false,
         }
@@ -1160,7 +1156,7 @@ impl ScrawlCoordinator {
             }
         } else if self.is_processing() {
             Activity::Processing
-        } else if self.is_selecting() && !self.switcher.is_switching() {
+        } else if self.is_selecting() {
             Activity::Picker
         } else {
             Activity::Free
@@ -1177,8 +1173,8 @@ impl ScrawlCoordinator {
         if self.gate.is_pending() {
             return;
         }
-        if !self.switcher.is_held() && activity == crate::hold::Activity::Free {
-            // No switcher, picker or overlay before the permissions are on: they sit above
+        if !self.shortcut.is_pending() && activity == crate::hold::Activity::Free {
+            // No picker or overlay before the permissions are on: they sit above
             // macOS's permission prompts and take the clicks meant for them.
             let missing = self.missing_to_record();
             if !self.gate.press(missing) {
@@ -1186,58 +1182,38 @@ impl ScrawlCoordinator {
                 return;
             }
             self.hold_mods = crate::capture::modifier_flags();
-            // An Esc from before this hold doesn't cancel it.
+            // An Esc from before this press doesn't cancel it.
             self.telemetry.take_escape();
         }
-        if let Some(mode) = self.selection_mode() {
-            self.switcher.follow(mode);
-        }
-        let action = self.switcher.press(self.clock_ms(), activity);
-        self.apply_switcher(action, cx);
+        let action = self.shortcut.press(self.clock_ms(), activity);
+        self.apply_shortcut(action, cx);
     }
 
-    /// Polled from the UI loop while the shortcut is held: watches for ⌥⇧ coming up and Esc,
-    /// whichever app or window has focus.
-    pub fn tick_switcher(&mut self, cx: &mut Context<Self>) {
-        if !self.switcher.is_held() {
-            return;
-        }
-        if self.switcher.is_switching() && !self.is_selecting() {
-            // Closed some other way (✕, a click on a chip).
-            self.switcher.reset();
+    /// Polled from the UI loop while a press is pending: watches for ⌥⇧ coming up (a tap) and
+    /// Esc, whichever app or window has focus.
+    pub fn tick_shortcut(&mut self, cx: &mut Context<Self>) {
+        if !self.shortcut.is_pending() {
             return;
         }
         let action = if self.telemetry.take_escape() {
-            self.switcher.escape()
+            self.shortcut.escape()
         } else {
             let mods = crate::capture::modifier_flags();
             let held = self.hold_mods != 0 && mods & self.hold_mods == self.hold_mods;
-            self.switcher.tick(self.clock_ms(), held)
+            self.shortcut.tick(self.clock_ms(), held)
         };
-        self.apply_switcher(action, cx);
+        self.apply_shortcut(action, cx);
     }
 
-    fn apply_switcher(&mut self, action: crate::hold::Action, cx: &mut Context<Self>) {
+    fn apply_shortcut(&mut self, action: crate::hold::Action, cx: &mut Context<Self>) {
         use crate::hold::Action;
         if action != Action::None {
-            scrawl_log(format!("switcher -> {action:?}"));
+            scrawl_log(format!("shortcut -> {action:?}"));
         }
         match action {
-            Action::None => {}
+            Action::None | Action::Cancel => {}
             Action::RecordScreen => self.record_screen_now(cx),
-            Action::Open(mode) => {
-                self.open_picker(Some(SelectionMode::Screen), true, cx);
-                if mode != SelectionMode::Screen {
-                    self.show_switcher_mode(mode, cx);
-                }
-            }
-            Action::Show(mode) => self.show_switcher_mode(mode, cx),
-            Action::Commit(mode) => self.commit_switcher(mode, cx),
-            Action::Cancel => {
-                if self.is_selecting() {
-                    self.cancel_recording(cx);
-                }
-            }
+            Action::OpenPicker => self.open_picker(None, cx),
             Action::RecordSelected => self.record_selected_mode(cx),
             Action::Finish => self.finish_recording(cx),
         }
@@ -1251,62 +1227,6 @@ impl ScrawlCoordinator {
             self.record_selected_mode(cx);
         } else if !self.is_processing() {
             self.record_screen_now(cx);
-        }
-    }
-
-    fn show_switcher_mode(&mut self, mode: SelectionMode, cx: &mut Context<Self>) {
-        if mode == SelectionMode::Iphone && self.iphone.is_some() {
-            self.preview_iphone(cx);
-        } else {
-            self.set_selection_mode(mode, cx);
-            // No phone yet: the badge says so, and the mirror opens if discovery finds one.
-            self.open_iphone_when_found = mode == SelectionMode::Iphone;
-        }
-    }
-
-    /// ⌥⇧ released: record what the switcher shows. An iPhone that isn't there or a drag too
-    /// small for an area records nothing.
-    fn commit_switcher(&mut self, mode: SelectionMode, cx: &mut Context<Self>) {
-        match self.selection_mode().unwrap_or(mode) {
-            SelectionMode::Screen => self.start_recording_full_screen(cx),
-            SelectionMode::Window => {
-                if self.hovered_window.is_none() {
-                    if self.windows_loading {
-                        self.selectable_windows = list_selectable_windows();
-                        self.windows_loading = false;
-                    }
-                    self.hovered_window = current_mouse_screen()
-                        .and_then(|[x, y]| {
-                            selectable_window_at(
-                                &self.selectable_windows,
-                                f64::from(x),
-                                f64::from(y),
-                            )
-                        })
-                        .cloned();
-                }
-                match self.hovered_window.clone() {
-                    Some(target) => self.start_recording_with_target(target, cx),
-                    None => self.start_recording_full_screen(cx),
-                }
-            }
-            SelectionMode::Iphone => {
-                if self.iphone.is_some() || self.iphone_preview.is_some() {
-                    self.start_recording_iphone(cx);
-                } else {
-                    self.cancel_recording(cx);
-                }
-            }
-            SelectionMode::Area => match self
-                .selection_drag
-                .and_then(|(a, b)| area_rect(a, b, self.display_rect))
-            {
-                Some([x, y, w, h]) => {
-                    let target = region_target(x, y, w, h, &self.selectable_windows);
-                    self.start_recording_with_target(target, cx);
-                }
-                None => self.cancel_recording(cx),
-            },
         }
     }
 
@@ -1411,7 +1331,7 @@ impl ScrawlCoordinator {
         // The recording's overlay becomes the picker's (moved if the picker opens on another
         // display), so the border never swaps windows (as the picker → recording path does).
         self.picker_metal_overlay = overlay;
-        self.open_picker(Some(mode), false, cx);
+        self.open_picker(Some(mode), cx);
         if self.is_selecting() && chips_shown && !self.reduced_motion {
             // The chips showed Screen; the picker shows `mode`.
             self.highlight_prev = Some(SelectionMode::Screen);
@@ -1635,7 +1555,6 @@ impl ScrawlCoordinator {
             "q" => cx.quit(),
             "," => {
                 if self.is_selecting() {
-                    self.switcher.reset();
                     self.cancel_recording(cx);
                 }
                 self.open_settings(None);
@@ -1645,14 +1564,20 @@ impl ScrawlCoordinator {
         true
     }
 
-    pub fn handle_selection_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+    /// `repeat`: the key is held and repeating, which never records: the S of a held ⌥⇧S keeps
+    /// repeating into the picker it opened.
+    pub fn handle_selection_key(
+        &mut self,
+        keystroke: &Keystroke,
+        repeat: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(mode) = self.selection_mode() else {
             return false;
         };
         let mods = keystroke.modifiers;
-        // Esc cancels even with ⌥⇧ still held from the switcher.
+        // Esc cancels even with ⌥⇧ still held from the shortcut.
         if keystroke.key == "escape" {
-            self.switcher.reset();
             self.cancel_recording(cx);
             return true;
         }
@@ -1673,7 +1598,9 @@ impl ScrawlCoordinator {
             mods.alt,
             mods.shift,
         ) {
-            self.telemetry.emit_capture_shortcut();
+            if !repeat {
+                self.telemetry.emit_capture_shortcut();
+            }
             return true;
         }
         if mods.platform || mods.control || mods.alt {
@@ -1683,7 +1610,9 @@ impl ScrawlCoordinator {
         // The record shortcut's key ("S") also records on its own while the picker is up.
         let label = self.shortcut_label();
         let record_key = crate::capture::shortcut_parts(&label).1;
+        let records = |key: &str| key == "enter" || key.eq_ignore_ascii_case(record_key);
         match keystroke.key.as_str() {
+            key if repeat && records(key) => {}
             "space" | " " => self.toggle_selection_mode(cx),
             "escape" => self.cancel_recording(cx),
             "enter" => self.record_selected_mode(cx),
@@ -1888,19 +1817,6 @@ impl ScrawlCoordinator {
     fn picker_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
         let [sx, sy] = current_mouse_screen()
             .unwrap_or([f32::from(event.position.x), f32::from(event.position.y)]);
-        // The held switcher keeps the area until ⌥⇧ is released.
-        if self.hold_picker {
-            if self.selection_mode() == Some(SelectionMode::Area)
-                && let Some((start, _)) = self.selection_drag
-            {
-                self.selection_drag = Some((start, [sx, sy]));
-            } else {
-                self.selection_drag = None;
-            }
-            self.sync_picker_overlay();
-            cx.notify();
-            return;
-        }
         if let Some((start, _)) = self.selection_drag.take() {
             if let Some([x, y, w, h]) = area_rect(start, [sx, sy], self.display_rect) {
                 let target = region_target(x, y, w, h, &self.selectable_windows);
@@ -1954,11 +1870,7 @@ impl ScrawlCoordinator {
 
         let pres = match self.island_phase {
             IslandPhase::Hidden | IslandPhase::Dismissing => Pres::Hidden,
-            IslandPhase::Selecting { mode } => Pres::Selecting {
-                mode,
-                hold: self.hold_picker,
-                has_iphone,
-            },
+            IslandPhase::Selecting { mode } => Pres::Selecting { mode, has_iphone },
             IslandPhase::Recording => Pres::Recording {
                 chips: self.reveal.is_open(),
                 has_iphone,
@@ -2347,20 +2259,16 @@ impl ScrawlCoordinator {
     /// The menu bar's picker, opening on the mode the last recording used.
     pub fn begin_target_selection(&mut self, cx: &mut Context<Self>) {
         if self.ready_to_record() {
-            self.open_picker(None, false, cx);
+            self.open_picker(None, cx);
         }
     }
 
-    /// Opens the picker on `mode`, else on the mode the last recording used. `hold`: it is the
-    /// held switcher (`crate::hold`), which records on release.
-    fn open_picker(&mut self, mode: Option<SelectionMode>, hold: bool, cx: &mut Context<Self>) {
+    /// Opens the picker on `mode`, else on the mode the last recording used.
+    fn open_picker(&mut self, mode: Option<SelectionMode>, cx: &mut Context<Self>) {
         if self.is_recording() || self.is_processing() {
             return;
         }
-        scrawl_log(format!(
-            "open_picker invoked (mode: {mode:?}, hold: {hold})"
-        ));
-        self.hold_picker = hold;
+        scrawl_log(format!("open_picker invoked (mode: {mode:?})"));
         let started = Instant::now();
         self.recording_shortcut_key = false;
         self.selectable_windows.clear();
@@ -2525,9 +2433,7 @@ impl ScrawlCoordinator {
             quick && target.mode == CaptureMode::Display,
             std::sync::atomic::Ordering::Release,
         );
-        if let IslandPhase::Selecting { mode } = self.island_phase
-            && !self.hold_picker
-        {
+        if let IslandPhase::Selecting { mode } = self.island_phase {
             self.remember_mode(mode);
         }
         self.recording_shortcut_key = false;
@@ -3029,7 +2935,6 @@ impl Render for HudPillWindow {
         let clock = format_clock(elapsed_ms);
         let has_iphone = coord.iphone.is_some();
         let completed_note = coord.completed_note.clone();
-        let hold = coord.hold_picker;
         // The Recording capsule's trailing group: switch chips or controls, and the swap between.
         let chips = if matches!(phase, IslandPhase::Recording) {
             coord.reveal.is_open()
@@ -3053,7 +2958,6 @@ impl Render for HudPillWindow {
             target_phase,
             &clock,
             has_iphone,
-            hold,
             chips,
             completed_note.as_deref(),
         );
@@ -3204,9 +3108,9 @@ impl Render for HudPillWindow {
             let Some(layout) = switch_layout else {
                 return Vec::new();
             };
-            let modes = SelectionMode::available(has_iphone || hold);
+            let modes = SelectionMode::available(has_iphone);
             let mut widths: Vec<f32> = modes.iter().map(|&m| segment_width(window, m)).collect();
-            if mode.shows_record() && !hold {
+            if mode.shows_record() {
                 widths.push(chip_width(window, "Record", FontWeight::SEMIBOLD));
             }
             widths.extend([layout.divider_w, CHIP_H]);
@@ -3274,14 +3178,14 @@ impl Render for HudPillWindow {
             IslandPhase::Selecting { mode } => {
                 let alphas = selecting_alphas(mode);
                 let alpha = |i: usize| alphas.get(i).copied().unwrap_or(1.0);
-                let n_modes = SelectionMode::available(has_iphone || hold).len();
-                let record = mode.shows_record() && !hold;
+                let n_modes = SelectionMode::available(has_iphone).len();
+                let record = mode.shows_record();
                 let after = n_modes + usize::from(record);
                 traced(
                     row.when_some(switch_layout, |row, layout| {
                         row.relative().left(px(layout.dx))
                     }),
-                    SelectionMode::available(has_iphone || hold)
+                    SelectionMode::available(has_iphone)
                         .iter()
                         .map(|m| m.label())
                         .map(|label| format!("chip:{label}"))
@@ -3292,7 +3196,7 @@ impl Render for HudPillWindow {
                         .collect(),
                 )
                 .children(
-                    SelectionMode::available(has_iphone || hold)
+                    SelectionMode::available(has_iphone)
                         .iter()
                         .enumerate()
                         .map(|(i, &segment)| {
@@ -3555,7 +3459,7 @@ impl Render for HudPillWindow {
             // Clicking a chip can make the pill the key window; keep the picker's keyboard map.
             .on_key_down(move |event: &KeyDownEvent, _, cx| {
                 if c_keys.update(cx, |coord, cx| {
-                    coord.handle_selection_key(&event.keystroke, cx)
+                    coord.handle_selection_key(&event.keystroke, event.is_held, cx)
                 }) {
                     cx.stop_propagation();
                 }
@@ -3952,10 +3856,6 @@ impl Render for TargetPickerWindow {
             .and_then(PhoneSession::device)
             .or_else(|| coord.iphone.clone())
             .map_or_else(|| "iPhone".to_string(), |d| d.name);
-        let hold = coord.hold_picker;
-        let shortcut = coord.shortcut_label();
-        let (hold_mods, hold_key) = crate::capture::shortcut_parts(&shortcut);
-        let no_phone = hold && iphone_rect.is_none() && coord.iphone.is_none();
 
         // Selection rect in window-local coordinates, clipped to the screen, plus its badge.
         let highlight: Option<([f32; 4], String)> = match mode {
@@ -3988,29 +3888,14 @@ impl Render for TargetPickerWindow {
                 ]);
                 ([(rx - origin[0]) * k, (ry - origin[1]) * k, rw * k, rh * k], title)
             }),
-            SelectionMode::Screen if hold => Some((
-                [0.0, 0.0, screen[0], screen[1]],
-                format!(
-                    "Full screen · {hold_key} to switch · drag for an area · release {hold_mods} to record"
-                ),
-            )),
             SelectionMode::Screen => Some((
                 [0.0, 0.0, screen[0], screen[1]],
                 "Full screen · Click to record".to_string(),
             )),
-            SelectionMode::Iphone if no_phone => Some((
-                [0.0, 0.0, screen[0], screen[1]],
-                "No iPhone connected".to_string(),
-            )),
             SelectionMode::Iphone => iphone_rect.map(|[rx, ry, rw, rh]| {
-                let action = if hold {
-                    format!("release {hold_mods} to record")
-                } else {
-                    "Click to record".to_string()
-                };
                 (
                     [(rx - origin[0]) * k, (ry - origin[1]) * k, rw * k, rh * k],
-                    format!("{iphone_name} · {action}"),
+                    format!("{iphone_name} · Click to record"),
                 )
             }),
         }
@@ -4027,7 +3912,6 @@ impl Render for TargetPickerWindow {
                 measure_text(window, &measured_label, BADGE_TEXT, FontWeight::MEDIUM).min(max_text);
             let size = [text_w + 2.0 * BADGE_PX + 2.0, BADGE_H];
             let anchor = match mode {
-                SelectionMode::Iphone if no_phone => BadgeAnchor::Center,
                 SelectionMode::Area | SelectionMode::Iphone => BadgeAnchor::BelowTrailing,
                 SelectionMode::Window | SelectionMode::Screen => BadgeAnchor::Center,
             };
@@ -4096,7 +3980,7 @@ impl Render for TargetPickerWindow {
             // equivalent, keyDown, or input method command) and this runs up to three times:
             // Space and the arrows then toggle or cycle back to where they started.
             if c_key.update(cx, |coord, cx| {
-                coord.handle_selection_key(&event.keystroke, cx)
+                coord.handle_selection_key(&event.keystroke, event.is_held, cx)
             }) {
                 cx.stop_propagation();
             }
@@ -4111,15 +3995,6 @@ impl Render for TargetPickerWindow {
                         IslandPhase::Selecting { mode } => mode,
                         _ => return,
                     };
-                    // The held switcher: a drag selects an area; releasing ⌥⇧ records.
-                    if coord.hold_picker {
-                        coord.selection_drag = Some(([sx, sy], [sx, sy]));
-                        if cur_mode == SelectionMode::Area {
-                            coord.sync_picker_overlay();
-                            cx.notify();
-                        }
-                        return;
-                    }
                     match cur_mode {
                         SelectionMode::Area => {
                             coord.selection_drag = Some(([sx, sy], [sx, sy]));
@@ -4166,29 +4041,12 @@ impl Render for TargetPickerWindow {
         .on_mouse_move(move |event: &MouseMoveEvent, _window, cx| {
             let [sx, sy] = current_mouse_screen()
                 .unwrap_or([f32::from(event.position.x), f32::from(event.position.y)]);
-            let dragging = event.pressed_button == Some(MouseButton::Left);
             c_move.update(cx, |coord, cx| {
                 coord.selection_pointer = Some([sx, sy]);
                 let cur_mode = match coord.island_phase {
                     IslandPhase::Selecting { mode } => mode,
                     _ => return,
                 };
-                if coord.hold_picker
-                    && dragging
-                    && let Some((start, _)) = coord.selection_drag
-                {
-                    let moved = (sx - start[0]).hypot(sy - start[1]) >= 6.0;
-                    if cur_mode != SelectionMode::Area && moved {
-                        let action = coord.switcher.drag();
-                        coord.apply_switcher(action, cx);
-                    }
-                    if coord.selection_mode() == Some(SelectionMode::Area) {
-                        coord.selection_drag = Some((start, [sx, sy]));
-                        coord.sync_picker_overlay();
-                        cx.notify();
-                    }
-                    return;
-                }
                 match cur_mode {
                     SelectionMode::Area => {
                         if let Some((start, _)) = coord.selection_drag {
@@ -5051,9 +4909,8 @@ fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
         },
     );
     // A menu bar (accessory) app isn't active when its menu or capsule is used, and keys only
-    // reach the picker while it is. The held switcher takes its keys from the key tap instead,
-    // so it leaves the app in front alone.
-    if !lab && !coord_entity.read(cx).switcher.is_held() {
+    // reach the picker while it is.
+    if !lab {
         platform::take_keys(cx);
     }
 
@@ -5501,8 +5358,8 @@ pub fn run_app(
                     }
 
                     motion::poll_tune();
-                    if loop_coord.read(cx).switcher.is_held() {
-                        loop_coord.update(cx, |coord, cx| coord.tick_switcher(cx));
+                    if loop_coord.read(cx).shortcut.is_pending() {
+                        loop_coord.update(cx, |coord, cx| coord.tick_shortcut(cx));
                     } else if loop_coord.read(cx).telemetry.take_escape()
                         && loop_coord.read(cx).is_selecting()
                     {

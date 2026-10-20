@@ -1385,9 +1385,9 @@ fn check_key_tap(telemetry: &Arc<SharedCaptureTelemetry>) -> bool {
 /// Starts watching input across every app, with no Input Monitoring:
 /// - clicks, drags and scrolls from an AppKit global mouse monitor, which needs no permission
 ///   (only key events need Accessibility, per `addGlobalMonitorForEvents`' documentation);
-/// - ⇧ (ink), the laser and the switcher's held modifiers from polled modifier flags, which need
+/// - ⇧ (ink), the laser and the shortcut's held modifiers from polled modifier flags, which need
 ///   no permission either (the HID poller);
-/// - key presses (the switcher's S, Esc, ⌘Z, ⌘-chords for the window log) from an active key
+/// - key presses (Esc, ⌘Z, ⌘-chords for the window log) from an active key
 ///   event tap, which Accessibility allows and which is made, without a relaunch, as soon as
 ///   Accessibility is on (`check_key_tap`).
 ///
@@ -1603,7 +1603,7 @@ unsafe extern "C" fn key_tap_callback(
     let shift = (flags & FLAG_SHIFT) != 0;
     let keycode = unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_KEYCODE) } as u16;
     if telemetry.matches_shortcut(keycode, cmd, ctrl, alt, shift) {
-        // Holding S repeats the key; only a fresh press switches modes.
+        // Holding S repeats the key; only a fresh press counts.
         if unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_AUTOREPEAT) } == 0 {
             telemetry.emit_capture_shortcut();
         }
