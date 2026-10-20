@@ -5375,6 +5375,15 @@ pub fn run_app(
             .detach();
         }
 
+        // The SwiftUI capsule runs in its own process: start it now, so the first capture
+        // doesn't wait for it.
+        #[cfg(target_os = "macos")]
+        if crate::handoff::native_pill()
+            && crate::handoff::pill_renderer() == crate::native::capsule::Renderer::SwiftUi
+        {
+            coordinator.update(cx, |coord, _| coord.ensure_native_pill());
+        }
+
         let loop_coord = coordinator.clone();
         cx.spawn(async move |cx| {
             let mut shown_status: Option<String> = None;
