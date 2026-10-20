@@ -190,6 +190,13 @@ pub fn run(options: Options) {
 
         // The app's frame loop, minus everything that isn't the capsule.
         let loop_coord = coordinator.clone();
+        // `SCRAWL_LAB_STALL_MS=<n>` blocks the main thread for 0..n ms after each tick, standing in
+        // for the real app's work (GPUI windows, capture, ingest), to show frames don't wait on it.
+        let stall_ms = std::env::var("SCRAWL_LAB_STALL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
         cx.spawn(async move |cx| {
             loop {
                 cx.background_executor()
@@ -198,6 +205,12 @@ pub fn run(options: Options) {
                 let alive = cx.update(|cx| {
                     motion::poll_tune();
                     loop_coord.update(cx, |coord, cx| coord.island_tick(cx));
+                    if stall_ms > 0 {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        std::thread::sleep(Duration::from_micros(seed % (stall_ms * 1000)));
+                    }
                 });
                 if alive.is_err() {
                     break;
