@@ -525,6 +525,7 @@ async function main() {
   status.textContent = `WebGPU ${info?.vendor ?? ""} ${info?.architecture ?? ""} · ${format} · dpr ${devicePixelRatio}`
   requestAnimationFrame(frame)
   void lastRealDt
+  Object.assign(window, { __pill: { model, coord, take: () => take, playScene, replay } })
 }
 
 main().catch((err) => {

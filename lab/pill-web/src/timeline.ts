@@ -206,6 +206,7 @@ export class TimelineView {
         c.beginPath()
         let pen = false
         let any = false
+        let lastY = 0
         for (const fr of frames) {
           const v = s.get(fr)
           if (v === null || !Number.isFinite(v)) {
@@ -213,10 +214,15 @@ export class TimelineView {
             continue
           }
           any = true
+          // A step per frame: each value holds until the next drawn frame, so a rest (no
+          // frames) or a jump shows as what was on screen, never an interpolated ramp.
           const px = this.x(fr.t)
           const py = y(v)
-          if (pen) c.lineTo(px, py)
-          else c.moveTo(px, py)
+          if (pen) {
+            c.lineTo(px, lastY)
+            c.lineTo(px, py)
+          } else c.moveTo(px, py)
+          lastY = py
           pen = true
         }
         if (any) c.stroke()

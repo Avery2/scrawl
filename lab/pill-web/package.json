@@ -6,7 +6,8 @@
     "wasm": "sh ./build-wasm.sh",
     "dev": "sh ./build-wasm.sh && vite",
     "build": "sh ./build-wasm.sh && vite build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "parity": "sh ./build-wasm.sh && bun parity/parity.ts"
   },
   "dependencies": {
     "knobs": "npm:@kitlangton/knobs@^0.3.0"
