@@ -265,8 +265,6 @@ struct SettingsTheme {
   var control: Color { ink(dark ? 0.08 : 0.06) }
   var controlLine: Color { ink(dark ? 0.1 : 0.1) }
   var track: Color { ink(dark ? 0.12 : 0.13) }
-  var key: Color { dark ? Color.black.opacity(0.28) : Color.black.opacity(0.035) }
-  var keyLine: Color { ink(dark ? 0.08 : 0.09) }
   var accent: Color { Color.accentColor }
   var positive: Color { Color(red: 0.2, green: 0.74, blue: 0.42) }
   var negative: Color { Color(red: 1, green: 0.27, blue: 0.23) }
@@ -510,31 +508,24 @@ struct SettingsRow<Trailing: View>: View {
   }
 }
 
-/// A group's heading, eight points in from the group's edge, with an optional trailing control.
-struct SettingsHeader<Trailing: View>: View {
+/// A group's heading, eight points in from the group's edge.
+struct SettingsHeader: View {
   @Environment(\.settingsTheme) private var theme
   let title: String
-  @ViewBuilder let trailing: () -> Trailing
 
-  var body: some View {
-    HStack {
-      Text(title)
-        .font(.system(size: 13, weight: .semibold))
-        .foregroundStyle(theme.secondary)
-      Spacer()
-      trailing()
-    }
-    .padding(.horizontal, 8)
-    .frame(height: 20)
-    .padding(.top, 20)
-    .padding(.bottom, 6)
-  }
-}
-
-extension SettingsHeader where Trailing == EmptyView {
   init(_ title: String) {
     self.title = title
-    trailing = { EmptyView() }
+  }
+
+  var body: some View {
+    Text(title)
+      .font(.system(size: 13, weight: .semibold))
+      .foregroundStyle(theme.secondary)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(.horizontal, 8)
+      .frame(height: 20)
+      .padding(.top, 20)
+      .padding(.bottom, 6)
   }
 }
 
@@ -640,9 +631,15 @@ struct LevelMeter: View {
 struct ShortcutRecorder: View {
   @Environment(\.settingsTheme) private var theme
   @ObservedObject var model: SettingsModel
-  @ObservedObject var clock: ChordClock
+  @ObservedObject private var clock: ChordClock
   let shortcut: SettingsShortcut
   @State private var hovering = false
+
+  init(model: SettingsModel, shortcut: SettingsShortcut) {
+    self.model = model
+    self.clock = model.clock
+    self.shortcut = shortcut
+  }
 
   var body: some View {
     VStack(spacing: 0) {
@@ -671,15 +668,13 @@ struct ShortcutRecorder: View {
         .padding(.trailing, 8)
         .frame(height: 50)
         .contentShape(Rectangle())
-        .onTapGesture {
-          model.act(shortcut.recording ? "cancel-shortcut" : "record-shortcut", ["kind": shortcut.kind])
-        }
+        .onTapGesture(perform: toggle)
         .onHover { hovering = $0 }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(shortcut.title) shortcut")
         .accessibilityValue(shortcut.recording ? "Listening" : shortcut.label)
         .accessibilityAddTraits(.isButton)
-        .accessibilityAction { model.act(shortcut.recording ? "cancel-shortcut" : "record-shortcut", ["kind": shortcut.kind]) }
+        .accessibilityAction { toggle() }
       }
       ZStack(alignment: .leading) {
         SettingsCaption(text: caption, error: shortcut.error != nil && !shortcut.recording)
@@ -689,6 +684,10 @@ struct ShortcutRecorder: View {
       .frame(height: 26, alignment: .top)
     }
     .animation(SettingsMotion.state, value: shortcut)
+  }
+
+  private func toggle() {
+    model.act(shortcut.recording ? "cancel-shortcut" : "record-shortcut", ["kind": shortcut.kind])
   }
 
   @ViewBuilder private var chord: some View {
@@ -863,7 +862,7 @@ struct SettingsView: View {
       }
       ForEach(state.shortcuts) { shortcut in
         Color.clear.frame(height: 14)
-        ShortcutRecorder(model: model, clock: model.clock, shortcut: shortcut)
+        ShortcutRecorder(model: model, shortcut: shortcut)
       }
     }
   }
@@ -1412,15 +1411,18 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
       }
       model.advanceChords(to: t)
       model.renderTime = t
-      let view = SettingsView(model: model)
-        .environment(\.colorScheme, light ? .light : .dark)
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-      let renderer = ImageRenderer(content: view)
-      renderer.scale = 2
-      guard let image = renderer.cgImage else { continue }
-      let url = dir.appending(path: String(format: "%04d.png", frame))
-      try? NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])?.write(to: url)
+      writeSnapshot(model: model, scheme: light ? .light : .dark, to: dir.appending(path: String(format: "%04d.png", frame)))
     }
+  }
+
+  @MainActor private static func writeSnapshot(model: SettingsModel, scheme: ColorScheme, to url: URL) {
+    let view = SettingsView(model: model)
+      .environment(\.colorScheme, scheme)
+      .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    let renderer = ImageRenderer(content: view)
+    renderer.scale = 2
+    guard let image = renderer.cgImage else { return }
+    try? NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])?.write(to: url)
   }
 
   /// Every pane, dark and light, plus each state of the shortcut chords, as PNGs.
@@ -1459,15 +1461,15 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
       (1.3, { $0.hold([.control, .option, .command], at: 1.3) }), (1.6, { $0.type("record", "R", at: 1.6) }),
       (1.62, { $0.show(custom, at: 1.62) }), (1.9, { $0.hold([], at: 1.9) }),
     ]
-    let shortcutStages: [String: ([(Double, (SettingsModel) -> Void)], Double)] = [
-      "general": (rest, 5),
-      "general-held": (rest + [(1, { $0.hold([.option, .shift], at: 1) })], 2),
-      "general-listening": (listen, 2.5),
-      "general-partial": (listen + [(1.5, { $0.hold([.control, .option], at: 1.5) })], 2.5),
-      "general-refused": (refuse, 2.02),
-      "general-refused-reason": (refuse, 3.2),
-      "general-accepted": (accept, 2.2),
-      "general-custom": ([(0, { $0.show(custom, at: 0) })], 5),
+    let shortcutStages: [(String, [(Double, (SettingsModel) -> Void)], Double)] = [
+      ("general", rest, 5),
+      ("general-held", rest + [(1, { $0.hold([.option, .shift], at: 1) })], 2),
+      ("general-listening", listen, 2.5),
+      ("general-partial", listen + [(1.5, { $0.hold([.control, .option], at: 1.5) })], 2.5),
+      ("general-refused", refuse, 2.02),
+      ("general-refused-reason", refuse, 3.2),
+      ("general-accepted", accept, 2.2),
+      ("general-custom", [(0, { $0.show(custom, at: 0) })], 5),
     ]
     var hex = base
     hex.transcriber = SettingsTranscriber(engine: "hex", hexTitle: "Hex", hexEnabled: true, models: [
@@ -1513,14 +1515,6 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var micNotAllowed = base
     micNotAllowed.microphone.meter = nil
     let samples: [(String, SettingsPane, SettingsState)] = [
-      ("general", .general, base),
-      ("general-held", .general, base),
-      ("general-listening", .general, listening),
-      ("general-partial", .general, listening),
-      ("general-refused", .general, refused),
-      ("general-refused-reason", .general, refused),
-      ("general-accepted", .general, custom),
-      ("general-custom", .general, custom),
       ("recording", .recording, base),
       ("recording-hex", .recording, hex),
       ("recording-mic-chosen", .recording, micChosen),
@@ -1541,33 +1535,28 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
     ]
     var index = 0
     for scheme in [ColorScheme.dark, .light] {
-      for (name, pane, state) in samples {
-        if scheme == .light && name.contains("-") && !name.hasPrefix("general-") && !name.hasPrefix("recording-mic") { continue }
+      let suffix = scheme == .dark ? "dark" : "light"
+      for (name, steps, t) in shortcutStages {
         index += 1
         model.resetChords()
-        if let (steps, t) = shortcutStages[name] {
-          for (at, step) in steps {
-            model.advanceChords(to: at)
-            step(model)
-          }
-          model.advanceChords(to: t)
-          model.renderTime = t
-        } else {
-          model.show(state, at: 0)
-          model.renderTime = 5
+        for (at, step) in steps {
+          model.advanceChords(to: at)
+          step(model)
         }
+        model.advanceChords(to: t)
+        model.renderTime = t
+        model.pane = .general
+        writeSnapshot(model: model, scheme: scheme, to: dir.appending(path: String(format: "%02d-%@-%@.png", index, name, suffix)))
+      }
+      for (name, pane, state) in samples {
+        if scheme == .light && name.contains("-") && !name.hasPrefix("recording-mic") { continue }
+        index += 1
+        model.resetChords()
+        model.show(state, at: 0)
+        model.renderTime = 5
         model.pane = pane
         model.meter.level = 0.44
-        let view = SettingsView(model: model)
-          .environment(\.colorScheme, scheme)
-          .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        let renderer = ImageRenderer(content: view)
-        renderer.scale = 2
-        guard let image = renderer.cgImage else { continue }
-        let rep = NSBitmapImageRep(cgImage: image)
-        let suffix = scheme == .dark ? "dark" : "light"
-        let url = dir.appending(path: String(format: "%02d-%@-%@.png", index, name, suffix))
-        try? rep.representation(using: .png, properties: [:])?.write(to: url)
+        writeSnapshot(model: model, scheme: scheme, to: dir.appending(path: String(format: "%02d-%@-%@.png", index, name, suffix)))
       }
     }
   }

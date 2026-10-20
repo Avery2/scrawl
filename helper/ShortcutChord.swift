@@ -291,6 +291,8 @@ final class ChordController {
     if on, !wasRecording {
       attempt = []
       refusing = false
+      motion.strike.jump(0, at: t)
+      motion.strikeFade.jump(1, at: t)
       motion.listen.set(1, at: t)
     } else if !on, wasRecording {
       motion.listen.set(0, at: t)
@@ -381,18 +383,6 @@ final class ChordController {
 
 let chordInk = Color(red: 1, green: 0x3B / 255, blue: 0x30 / 255)
 
-private func mix(_ a: Color, _ b: Color, _ t: Double) -> Color {
-  guard let a = NSColor(a).usingColorSpace(.sRGB), let b = NSColor(b).usingColorSpace(.sRGB) else { return Color(a) }
-  let t = max(0, min(1, t))
-  return Color(
-    .sRGB,
-    red: a.redComponent + (b.redComponent - a.redComponent) * t,
-    green: a.greenComponent + (b.greenComponent - a.greenComponent) * t,
-    blue: a.blueComponent + (b.blueComponent - a.blueComponent) * t,
-    opacity: a.alphaComponent + (b.alphaComponent - a.alphaComponent) * t
-  )
-}
-
 /// One shortcut's capsule at time `t`. Always dark, like the pill it echoes.
 struct PillChord: View {
   let motion: ChordMotion
@@ -409,7 +399,7 @@ struct PillChord: View {
     ZStack(alignment: .topLeading) {
       Capsule()
         .fill(LinearGradient(colors: [Color(white: 0.13), Color(white: 0.075)], startPoint: .top, endPoint: .bottom))
-        .overlay(Capsule().strokeBorder(mix(.white.opacity(hovering ? 0.17 : 0.1), chordInk.opacity(0.8), listen), lineWidth: 1))
+        .overlay(Capsule().strokeBorder(Color.white.opacity(hovering ? 0.17 : 0.1).mix(chordInk.opacity(0.8), listen), lineWidth: 1))
         .frame(width: w, height: h)
       Circle()
         .fill(chordInk)
@@ -427,7 +417,7 @@ struct PillChord: View {
           let p = key.presence.value(t)
           if p > 0.003 {
             let kw = ChordMotion.capWidth(label)
-            ChordKey(label: label, width: kw, press: m.reduce ? 0 : key.press.value(t), lit: m.reduce ? key.press.value(t) : 0, ink: key.ink.value(t))
+            ChordKey(label: label, width: kw, press: key.press.value(t), ink: key.ink.value(t), reduce: m.reduce)
               .scaleEffect(m.reduce ? 1 : 0.9 + 0.1 * p)
               .blur(radius: m.reduce ? 0 : (1 - p) * 3)
               .opacity(p)
@@ -467,32 +457,30 @@ struct PillChord: View {
 struct ChordKey: View {
   let label: String
   let width: CGFloat
-  /// 0…1: how far down.
+  /// 0…1: how far down (brightens only when `reduce` is true).
   let press: Double
-  /// 0…1: brighter, for reduced motion's press.
-  var lit = 0.0
   /// 0…1: red.
   let ink: Double
+  var reduce = false
 
   var body: some View {
     let size = ChordMotion.size
     let lip: CGFloat = 1.5
-    let glow = max(press, lit)
     ZStack(alignment: .top) {
       Capsule().fill(Color.black.opacity(0.75)).frame(width: width, height: size - lip).offset(y: lip)
       Capsule()
         .fill(LinearGradient(
-          colors: [Color(white: 0.27 + 0.05 * glow), Color(white: 0.2 + 0.04 * glow)],
+          colors: [Color(white: 0.27 + 0.05 * press), Color(white: 0.2 + 0.04 * press)],
           startPoint: .top, endPoint: .bottom
         ))
-        .overlay(Capsule().strokeBorder(mix(.white.opacity(0.09), chordInk.opacity(0.9), ink), lineWidth: 1))
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.09).mix(chordInk.opacity(0.9), ink), lineWidth: 1))
         .overlay(
           Text(label)
             .font(.system(size: label.count > 1 ? 11 : 14, weight: .medium, design: .rounded))
-            .foregroundStyle(mix(.white.opacity(0.82 + 0.18 * glow), chordInk, ink))
+            .foregroundStyle(Color.white.opacity(0.82 + 0.18 * press).mix(chordInk, ink))
         )
         .frame(width: width, height: size - lip)
-        .offset(y: CGFloat(press) * lip)
+        .offset(y: reduce ? 0 : CGFloat(press) * lip)
     }
     .frame(width: width, height: size, alignment: .top)
   }
