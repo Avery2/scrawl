@@ -8,6 +8,7 @@ import Speech
 struct SpeechChoice {
   let dictation: Bool
   let locale: Locale
+  let supported: [String]
 
   var name: String { dictation ? "DictationTranscriber" : "SpeechTranscriber" }
 
@@ -23,16 +24,25 @@ struct SpeechChoice {
 /// A fresh Mac has none, so Scrawl installs it in the background at launch
 /// (`scrawl-helper speech-model --install`) rather than in the middle of a capture.
 enum SpeechModel {
-  static func choose() async -> SpeechChoice? {
-    if SpeechTranscriber.isAvailable,
-       let locale = pick(await SpeechTranscriber.supportedLocales, equivalent: await SpeechTranscriber.supportedLocale(equivalentTo: Locale.current))
-    {
-      return SpeechChoice(dictation: false, locale: locale)
+  static func choose(preferred: String? = nil) async -> SpeechChoice? {
+    if SpeechTranscriber.isAvailable {
+      let supported = await SpeechTranscriber.supportedLocales
+      if let locale = await locale(preferred: preferred, in: supported, equivalent: { await SpeechTranscriber.supportedLocale(equivalentTo: Locale.current) }) {
+        return SpeechChoice(dictation: false, locale: locale, supported: supported.map { $0.identifier(.bcp47) }.sorted())
+      }
     }
-    if let locale = pick(await DictationTranscriber.supportedLocales, equivalent: await DictationTranscriber.supportedLocale(equivalentTo: Locale.current)) {
-      return SpeechChoice(dictation: true, locale: locale)
+    let supported = await DictationTranscriber.supportedLocales
+    if let locale = await locale(preferred: preferred, in: supported, equivalent: { await DictationTranscriber.supportedLocale(equivalentTo: Locale.current) }) {
+      return SpeechChoice(dictation: true, locale: locale, supported: supported.map { $0.identifier(.bcp47) }.sorted())
     }
     return nil
+  }
+
+  private static func locale(preferred: String?, in supported: [Locale], equivalent: () async -> Locale?) async -> Locale? {
+    if let preferred, let match = supported.first(where: { $0.language.maximalIdentifier == Locale(identifier: preferred).language.maximalIdentifier }) {
+      return match
+    }
+    return pick(supported, equivalent: await equivalent())
   }
 
   /// `equivalent` only counts when it's really in `supported` (macOS 26 names en_US even where
@@ -57,18 +67,20 @@ enum SpeechModel {
     }
   }
 
-  static func describe(_ choice: SpeechChoice?, status: String) -> [String: Any] {
-    guard let choice else { return ["status": "unsupported"] }
-    return ["engine": choice.name, "locale": choice.locale.identifier, "status": status]
+  static func describe(_ choice: SpeechChoice?, status: String, locales: [String] = []) -> [String: Any] {
+    guard let choice else { return ["status": "unsupported", "locales": locales] }
+    return ["engine": choice.name, "locale": choice.locale.identifier, "status": status, "locales": choice.supported]
   }
 
   /// `speech-model [--install]`: one status line; with `--install`, installs the model if it
   /// isn't, with progress lines about once a second and a last line that's `installed` or
   /// `failed` (with `error`).
-  static func run(install: Bool) async {
-    let choice = await choose()
+  static func run(install: Bool, preferred: String? = nil) async {
+    let choice = await choose(preferred: preferred)
     guard let choice else {
-      emit(describe(nil, status: "unsupported"))
+      let supported = SpeechTranscriber.isAvailable
+        ? await SpeechTranscriber.supportedLocales : await DictationTranscriber.supportedLocales
+      emit(describe(nil, status: "unsupported", locales: supported.map { $0.identifier(.bcp47) }.sorted()))
       return
     }
     let status = await status(choice)
@@ -89,6 +101,14 @@ enum SpeechModel {
   }
 
   static func install(_ choice: SpeechChoice, progress: @escaping @Sendable (Double) -> Void) async throws {
+    // Each language reserves a slot; Scrawl uses one language at a time.
+    let reserved = await AssetInventory.reservedLocales
+    if !reserved.contains(where: { $0.language.maximalIdentifier == choice.locale.language.maximalIdentifier }) {
+      var count = reserved.count
+      for locale in reserved where count >= AssetInventory.maximumReservedLocales {
+        if await AssetInventory.release(reservedLocale: locale) { count -= 1 }
+      }
+    }
     guard let request = try await AssetInventory.assetInstallationRequest(supporting: [choice.module()]) else { return }
     let reporter = Task {
       while !Task.isCancelled {
@@ -105,8 +125,8 @@ enum SpeechModel {
 /// audio time range. Without a usable model the output says why in `missing` (`downloading`,
 /// `unsupported` or `failed`, with `error`) and has no text, rather than failing.
 enum Transcriber {
-  static func transcribe(_ url: URL) async throws -> [String: Any] {
-    guard let choice = await SpeechModel.choose() else {
+  static func transcribe(_ url: URL, preferred: String? = nil) async throws -> [String: Any] {
+    guard let choice = await SpeechModel.choose(preferred: preferred) else {
       return missing(nil, "unsupported")
     }
     switch await SpeechModel.status(choice) {

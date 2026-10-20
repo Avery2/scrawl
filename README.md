@@ -167,8 +167,8 @@ granted and each on-demand sheet: `target/debug/scrawl-helper onboarding --rende
 
 - **General**: Launch at login, Send dev-site captures to OpenCode, and the two shortcuts, Record
   (`⌥⇧S`) and Paste last capture (`⌥⇧V`).
-- **Recording**: the microphone, with its input level, the transcriber (Apple Speech, or Hex while
-  it runs, with its model) and, under Experimental, Video export.
+- **Recording**: the microphone, with its input level, the transcriber (Apple Speech with its
+  language, or Hex while it runs, with its model and language) and, under Experimental, Video export.
 - **Storage**: how long recordings are kept, how much space the captures take, and Show in Finder.
 - **Permissions**: the onboarding checklist, so a permission can be turned on later.
 - **Agents**: Install or Uninstall the `scrawl` command (see [Agents](#agents)), and the skill's
@@ -693,7 +693,7 @@ word was spoken. The word timings drive two things:
 
 ### Apple or Hex
 
-Apple's SpeechAnalyzer is the default and needs nothing. If you use Hex
+Apple's SpeechAnalyzer is the default; Scrawl prepares its language model automatically. If you use Hex
 (2.2 or later, running), Scrawl can transcribe with it instead and with whichever model Hex has
 ready: Settings › Recording › **Transcription** → **Hex**, then pick a model under **Hex model**.
 Or in
@@ -705,7 +705,14 @@ Or in
 
 `"transcriber"` is `"apple"` (default) or `"hex"`; `hexModel` defaults to the first ready one of
 `parakeet_unified_en`, `parakeet_v3`, `parakeet_v2`, `whisper_large_v3_turbo`. Scrawl never
-downloads or prepares a model: install it in Hex first.
+downloads or prepares a Hex model: install it in Hex first.
+
+**Language** in Settings › Recording picks the language Apple Speech transcribes. **Automatic**
+follows the Mac's language as before. You can also set `"appleLocale": "zh-TW"` in
+`~/.config/scrawl/config.json`, for example for Traditional Chinese (Taiwan). Missing, blank or
+`"auto"` means Automatic. If this Mac doesn't support a saved language, Scrawl falls back to
+Automatic and Settings says which language it is using. Changing the language checks and, if
+needed, downloads its model in the background while Apple Speech is the configured transcriber.
 
 **Hex language** in Settings › Recording (or `"hexLanguage"` in config) sets the language
 code sent to Hex. It defaults to `en` to preserve existing behavior; use `nl` for Dutch or

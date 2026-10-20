@@ -76,8 +76,27 @@ struct SettingsTranscriber: Decodable, Equatable {
   var hexTitle = "Hex (not running)"
   var hexEnabled = false
   var language = "en"
+  var appleLocale = "auto"
   var models: [SettingsModelOption] = []
   var speech: SpeechStatus?
+
+  static func languageMenu(saved: String, speech: SpeechStatus?) -> (value: String, selected: String, options: [(id: String, title: String, enabled: Bool)], note: String?) {
+    func name(_ id: String) -> String { Locale.current.localizedString(forIdentifier: id) ?? id }
+    let effective = speech?.locale ?? Locale.current.identifier
+    let automatic = "Automatic (\(name(saved == "auto" ? effective : Locale.current.identifier)))"
+    let supported = (speech?.locales ?? []).map { (id: $0, title: name($0), enabled: true) }
+      .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+    var options: [(id: String, title: String, enabled: Bool)] = [("auto", automatic, true), ("-", "", false)] + supported
+    if saved == "auto" { return ("Automatic", "auto", options, nil) }
+    if let match = supported.first(where: { Locale(identifier: $0.id).language.maximalIdentifier == Locale(identifier: saved).language.maximalIdentifier }) {
+      return (match.title, match.id, options, nil)
+    }
+    let unknown = supported.isEmpty
+    let title = unknown ? name(saved) : "\(name(saved)) (not available)"
+    options.append((saved, title, unknown))
+    let note = unknown ? nil : "\(name(saved)) isn't available on this Mac. Using \(name(effective))."
+    return (title, saved, options, note)
+  }
 }
 
 struct SettingsOption: Decodable, Equatable {
@@ -869,6 +888,7 @@ struct SettingsView: View {
 
   private var recording: some View {
     let t = state.transcriber
+    let language = SettingsTranscriber.languageMenu(saved: t.appleLocale, speech: t.speech)
     var engines: [(id: String, title: String, enabled: Bool)] = [("apple", "Apple Speech", true)]
     engines.append(("hex", t.hexTitle, t.hexEnabled))
     let chosenModel = t.models.first(where: \.chosen)
@@ -896,6 +916,14 @@ struct SettingsView: View {
             model.set("transcriber", $0)
           }
         }
+        if t.engine == "apple" {
+          SettingsSeparator()
+          SettingsRow(title: "Language") {
+            SettingsPopup(value: language.value, options: language.options, selected: language.selected) {
+              model.set("appleLocale", $0)
+            }
+          }
+        }
         if t.engine == "hex", !t.models.isEmpty {
           SettingsSeparator()
           SettingsRow(title: "Hex model") {
@@ -914,7 +942,10 @@ struct SettingsView: View {
       SettingsCaption(text: t.hexEnabled || t.engine == "hex"
         ? "Apple Speech times each word. Hex uses a model you have in Hex, and its word times are estimates."
         : "Apple Speech runs on this Mac and times each word. Hex shows up here while Hex is running.")
-      if t.engine == "apple", let line = t.speech?.line {
+      if t.engine == "apple", let note = language.note {
+        SettingsCaption(text: note)
+      }
+      if t.engine == "apple", t.speech?.notReady == true, let line = t.speech?.line {
         SettingsCaption(text: line)
       }
       SettingsHeader("Experimental")
@@ -1487,6 +1518,16 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
     hex.videoExport = true
     var downloading = base
     downloading.transcriber.speech = SpeechStatus(state: "downloading", locale: "en_US", progress: 0.42)
+    let locales = ["de-DE", "en-GB", "en-US", "es-ES", "fr-FR", "ja-JP", "ko-KR", "yue-CN", "zh-CN", "zh-TW"]
+    var ready = base
+    ready.transcriber.speech = SpeechStatus(state: "ready", locale: "en_US", progress: 1, locales: locales)
+    var language = base
+    language.transcriber.appleLocale = "zh-TW"
+    language.transcriber.speech = SpeechStatus(state: "ready", locale: "zh_TW", progress: 1, locales: locales)
+    var languageLoading = language
+    languageLoading.transcriber.speech = nil
+    var languageUnsupported = ready
+    languageUnsupported.transcriber.appleLocale = "xx-XX"
     var missing = base
     missing.permissions[0].status = "granted"
     missing.permissions[0].relaunch = true
@@ -1537,6 +1578,10 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
       ("recording-mic-missing", .recording, micMissing),
       ("recording-mic-not-allowed", .recording, micNotAllowed),
       ("recording-downloading", .recording, downloading),
+      ("recording-ready", .recording, ready),
+      ("recording-language", .recording, language),
+      ("recording-language-loading", .recording, languageLoading),
+      ("recording-language-unsupported", .recording, languageUnsupported),
       ("storage", .storage, base),
       ("permissions", .permissions, base),
       ("permissions-missing", .permissions, missing),

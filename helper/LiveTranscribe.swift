@@ -9,11 +9,11 @@ import Speech
 /// `transcribe` gives them for the WAV. It never downloads a model: one that isn't installed
 /// fails at once, and Scrawl transcribes the finished recording instead.
 enum LiveTranscriber {
-  static func run() async throws {
-    guard SpeechTranscriber.isAvailable else { throw HelperError("SpeechTranscriber isn't available on this Mac") }
-    var found = await SpeechTranscriber.supportedLocale(equivalentTo: Locale.current)
-    if found == nil { found = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: "en-US")) }
-    guard let locale = found else { throw HelperError("SpeechTranscriber has no supported locale") }
+  static func run(preferred: String? = nil) async throws {
+    guard let choice = await SpeechModel.choose(preferred: preferred), !choice.dictation else {
+      throw HelperError("SpeechTranscriber isn't available on this Mac")
+    }
+    let locale = choice.locale
     let transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: [], reportingOptions: [], attributeOptions: [.audioTimeRange])
     guard await AssetInventory.status(forModules: [transcriber]) == .installed else {
       throw HelperError("the speech model for \(locale.identifier) isn't installed")

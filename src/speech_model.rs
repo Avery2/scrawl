@@ -9,14 +9,40 @@
 //! in place: `scrawl.json` and `summary.md` are rewritten with the transcript.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::model::MissingTranscript;
+
+/// Validates a locale id and normalizes its separators; Automatic has no id.
+pub fn locale_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.len() > 35 || value.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    let mut subtags = value.split(['-', '_']);
+    let language = subtags.next()?;
+    if !(2..=3).contains(&language.len()) || !language.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    if !subtags.all(|subtag| {
+        (1..=8).contains(&subtag.len()) && subtag.bytes().all(|b| b.is_ascii_alphanumeric())
+    }) {
+        return None;
+    }
+    Some(value.replace('_', "-"))
+}
+
+/// Helper arguments for a validated locale id.
+pub fn locale_args(locale: Option<&str>) -> Vec<std::ffi::OsString> {
+    match locale {
+        Some(id) => vec!["--locale".into(), id.into()],
+        None => Vec::new(),
+    }
+}
 
 /// Marks a bundle that should be transcribed again once the model is installed.
 pub const PENDING: &str = ".transcript-pending";
@@ -53,106 +79,194 @@ pub struct Status {
     /// `en_US`; the helper window shows its name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub locale: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub locales: Vec<String>,
     /// 0…1 while downloading.
     pub progress: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-static STATUS: Mutex<Status> = Mutex::new(Status {
-    state: State::Unknown,
-    engine: None,
-    locale: None,
-    progress: 0.0,
-    error: None,
-});
-static RUNNING: AtomicBool = AtomicBool::new(false);
-
-pub fn current() -> Status {
-    STATUS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+#[derive(Default)]
+struct Worker {
+    status: Status,
+    running: bool,
+    enabled: bool,
+    generation: u64,
 }
 
-fn update(change: impl FnOnce(&mut Status)) {
-    change(
-        &mut STATUS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    );
+impl Worker {
+    fn request(&mut self, restart: bool, enabled: bool) -> Option<u64> {
+        self.enabled = enabled;
+        if restart {
+            self.generation += 1;
+            self.status = Status {
+                locales: std::mem::take(&mut self.status.locales),
+                ..Default::default()
+            };
+        }
+        if !self.enabled
+            || self.running
+            || matches!(self.status.state, State::Ready | State::Unavailable)
+        {
+            return None;
+        }
+        self.running = true;
+        Some(self.generation)
+    }
+
+    fn apply(&mut self, generation: u64, line: &crate::helper::SpeechModelLine) -> bool {
+        if self.stale(generation) {
+            return false;
+        }
+        let s = &mut self.status;
+        s.engine = line.engine.clone().or(s.engine.take());
+        s.locale = line.locale.clone().or(s.locale.take());
+        if let Some(locales) = &line.locales {
+            s.locales = locales.clone();
+        }
+        s.state = match line.status.as_str() {
+            "installed" => State::Ready,
+            "unsupported" => State::Unavailable,
+            "failed" => State::Failed,
+            _ => State::Downloading,
+        };
+        s.progress = line.progress.unwrap_or(s.progress);
+        s.error = line.error.clone();
+        true
+    }
+
+    fn finish(&mut self, generation: u64) -> Option<u64> {
+        if self.enabled && self.stale(generation) {
+            return Some(self.generation);
+        }
+        self.running = false;
+        None
+    }
+
+    fn stale(&self, generation: u64) -> bool {
+        generation != self.generation
+    }
+}
+
+static WORKER: Mutex<Worker> = Mutex::new(Worker {
+    status: Status {
+        state: State::Unknown,
+        engine: None,
+        locale: None,
+        locales: Vec::new(),
+        progress: 0.0,
+        error: None,
+    },
+    running: false,
+    enabled: false,
+    generation: 0,
+});
+
+fn lock() -> MutexGuard<'static, Worker> {
+    WORKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+pub fn current() -> Status {
+    lock().status.clone()
 }
 
 /// Checks the model in the background and installs it if it's missing, unless the transcriber
 /// is Hex (whose users don't need it) or a check is already running. Cheap to call again.
 pub fn ensure() {
-    if crate::transcribe::Engine::configured() == crate::transcribe::Engine::Hex {
+    start(false);
+}
+
+/// Checks the selected language again, superseding any earlier check or download.
+pub fn restart() {
+    start(true);
+}
+
+fn start(restart: bool) {
+    let enabled = crate::transcribe::Engine::configured() != crate::transcribe::Engine::Hex;
+    if !restart && !enabled {
         return;
     }
-    if matches!(current().state, State::Ready | State::Unavailable)
-        || RUNNING.swap(true, Ordering::AcqRel)
-    {
+    let mut worker = lock();
+    let Some(mut generation) = worker.request(restart, enabled) else {
         return;
-    }
+    };
     let spawned = std::thread::Builder::new()
         .name("scrawl-speech-model".into())
-        .spawn(|| {
-            work();
-            RUNNING.store(false, Ordering::Release);
+        .spawn(move || {
+            loop {
+                work(generation);
+                match lock().finish(generation) {
+                    Some(next) => generation = next,
+                    None => break,
+                }
+            }
         });
     if spawned.is_err() {
-        RUNNING.store(false, Ordering::Release);
+        worker.running = false;
     }
 }
 
-fn work() {
+fn work(generation: u64) {
     for attempt in 0..=RETRY_AFTER.len() {
-        update(|s| {
-            if s.state != State::Downloading {
-                s.state = State::Checking;
+        {
+            let mut worker = lock();
+            if worker.stale(generation) {
+                return;
             }
-        });
-        let result = crate::helper::install_speech_model(|line| {
-            update(|s| {
-                s.engine = line.engine.clone().or(s.engine.take());
-                s.locale = line.locale.clone().or(s.locale.take());
-                s.state = match line.status.as_str() {
-                    "installed" => State::Ready,
-                    "unsupported" => State::Unavailable,
-                    "failed" => State::Failed,
-                    _ => State::Downloading,
-                };
-                s.progress = line.progress.unwrap_or(s.progress);
-                s.error = line.error.clone();
-            });
-        });
-        let status = current();
-        if let Err(error) = result {
-            update(|s| {
-                s.state = State::Failed;
-                s.error = Some(format!("{error:#}"));
-            });
+            if worker.status.state != State::Downloading {
+                worker.status.state = State::Checking;
+            }
         }
+        let result = crate::helper::install_speech_model(
+            crate::handoff::apple_locale().as_deref(),
+            &|| lock().stale(generation),
+            |line| {
+                lock().apply(generation, &line);
+            },
+        );
+        let status = {
+            let mut worker = lock();
+            if worker.stale(generation) {
+                return;
+            }
+            if let Err(error) = result {
+                worker.status.state = State::Failed;
+                worker.status.error = Some(format!("{error:#}"));
+            }
+            worker.status.clone()
+        };
         crate::capture::scrawl_log(format!(
             "speech model: {:?} {} {}{}",
-            current().state,
+            status.state,
             status.engine.as_deref().unwrap_or("?"),
             status.locale.as_deref().unwrap_or("?"),
-            current()
+            status
                 .error
+                .as_ref()
                 .map(|e| format!(" ({e})"))
                 .unwrap_or_default()
         ));
-        match current().state {
+        match status.state {
             State::Ready => {
-                transcribe_pending(&crate::handoff::default_captures_dir());
+                if !lock().stale(generation) {
+                    transcribe_pending(&crate::handoff::default_captures_dir());
+                }
                 return;
             }
             State::Unavailable => return,
             _ => {}
         }
         if let Some(wait) = RETRY_AFTER.get(attempt) {
-            std::thread::sleep(*wait);
+            let deadline = Instant::now() + *wait;
+            while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+                if lock().stale(generation) {
+                    return;
+                }
+                std::thread::sleep(left.min(Duration::from_secs(1)));
+            }
         }
     }
 }
@@ -269,6 +383,137 @@ pub fn transcribe_again(dir: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn line(status: &str) -> crate::helper::SpeechModelLine {
+        crate::helper::SpeechModelLine {
+            status: status.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_restart_can_cancel_without_requesting_more_work() {
+        let mut w = Worker::default();
+        assert_eq!(w.request(true, false), None);
+        assert!(!w.running);
+        let g0 = w.request(false, true).unwrap();
+        assert!(w.apply(g0, &line("downloading")));
+        assert_eq!(w.request(true, false), None);
+        assert!(w.stale(g0));
+        assert_eq!(w.status.state, State::Unknown);
+        assert!(!w.apply(g0, &line("installed")));
+        assert_eq!(w.finish(g0), None);
+        assert!(!w.running);
+        let g1 = w.request(false, true).unwrap();
+        assert_ne!(g0, g1);
+        assert!(w.apply(g1, &line("installed")));
+    }
+
+    #[test]
+    fn a_restart_while_running_is_never_lost() {
+        let mut w = Worker::default();
+        let g0 = w.request(false, true).unwrap();
+        assert_eq!(w.request(true, true), None);
+        assert!(!w.apply(g0, &line("installed")));
+        assert_eq!(w.status.state, State::Unknown);
+        let g1 = w.finish(g0).expect("runs again for the new language");
+        assert!(w.apply(g1, &line("installed")));
+        assert_eq!(w.status.state, State::Ready);
+        assert_eq!(w.finish(g1), None);
+        assert!(!w.running);
+        assert_eq!(w.request(false, true), None);
+        assert!(w.request(true, true).is_some());
+    }
+
+    #[test]
+    fn restarting_between_the_last_attempt_and_going_idle_still_runs() {
+        let mut w = Worker::default();
+        let g0 = w.request(false, true).unwrap();
+        assert!(w.apply(g0, &line("installed")));
+        assert_eq!(w.request(true, true), None);
+        assert!(w.finish(g0).is_some());
+    }
+
+    #[test]
+    fn a_b_c_changes_only_publish_the_latest() {
+        let mut w = Worker::default();
+        let g0 = w.request(false, true).unwrap();
+        assert_eq!(w.request(true, true), None);
+        let g1 = w.generation;
+        assert_eq!(w.request(true, true), None);
+        let g2 = w.generation;
+        assert!(w.stale(g0));
+        assert!(w.stale(g1));
+        assert!(!w.stale(g2));
+        assert!(!w.apply(g0, &line("installed")));
+        assert!(!w.apply(g1, &line("failed")));
+        assert_eq!(w.status.state, State::Unknown);
+        assert_eq!(w.finish(g0), Some(g2));
+        assert!(w.apply(g2, &line("installed")));
+        assert_eq!(w.finish(g2), None);
+        assert!(!w.running);
+        assert_eq!(w.request(false, true), None);
+    }
+
+    #[test]
+    fn locales_survive_a_restart() {
+        let mut w = Worker::default();
+        let g0 = w.request(false, true).unwrap();
+        let mut failed = line("failed");
+        failed.engine = Some("SpeechTranscriber".into());
+        failed.locale = Some("en_US".into());
+        failed.locales = Some(vec!["en-US".into(), "zh-TW".into()]);
+        failed.progress = Some(0.5);
+        failed.error = Some("download failed".into());
+        assert!(w.apply(g0, &failed));
+        let locales = w.status.locales.clone();
+        assert_eq!(w.request(true, true), None);
+        assert_eq!(
+            w.status,
+            Status {
+                locales: locales.clone(),
+                ..Default::default()
+            }
+        );
+        let g1 = w.finish(g0).unwrap();
+        assert!(w.apply(g1, &line("installed")));
+        assert_eq!(w.status.locales, locales);
+    }
+
+    #[test]
+    fn locale_ids_are_bcp47_shaped_and_nothing_else() {
+        assert_eq!(locale_id(" zh-TW ").as_deref(), Some("zh-TW"));
+        assert_eq!(locale_id("zh_Hant_TW").as_deref(), Some("zh-Hant-TW"));
+        assert_eq!(locale_id("yue-CN").as_deref(), Some("yue-CN"));
+        assert_eq!(locale_id("en").as_deref(), Some("en"));
+        for automatic_or_bad in [
+            "",
+            "auto",
+            "AUTO",
+            "zh-TW --install",
+            "../x",
+            "z",
+            "zhxx-TW",
+            "zh--TW",
+            "zh-",
+            "-zh",
+            "zh-TOOLONGSUBTAG",
+            "中文",
+            "zh TW",
+        ] {
+            assert_eq!(locale_id(automatic_or_bad), None, "{automatic_or_bad:?}");
+        }
+        assert_eq!(locale_id(&format!("en{}", "-a".repeat(20))), None); // > 35 bytes
+    }
+
+    #[test]
+    fn a_locale_becomes_one_argument_pair() {
+        assert!(locale_args(None).is_empty());
+        assert_eq!(
+            locale_args(Some("zh-TW")),
+            ["--locale", "zh-TW"].map(std::ffi::OsString::from)
+        );
+    }
 
     #[test]
     fn a_download_in_progress_will_be_retried_but_a_missing_language_will_not() {
