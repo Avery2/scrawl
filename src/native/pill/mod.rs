@@ -1,6 +1,6 @@
 //! Native AppKit `NSPanel` + `CAMetalLayer` + Metal renderer for the Scrawl recording pill.
 //!
-//! Replaces the GPUI `HudPillWindow` with a single fixed-size `NSPanel` (`640 × 84 pt` at `y = 34`
+//! Replaces the GPUI `HudPillWindow` with a single fixed-size `NSPanel` (`640 × 92 pt` at `y = 34`
 //! below the menu bar) that never resizes or moves during morphs. Supports two backdrop looks via
 //! `pillStyle: "black" | "glass"`:
 //! - `"black"`: Analytic SDF rounded-rect silhouette + shadow + specular border in Metal.
@@ -297,6 +297,8 @@ struct RenderState {
     /// The refresh the last step was sampled for (host seconds); `None` after a pause.
     last_out: Option<f64>,
     dirty: bool,
+    presented: Arc<Presented>,
+    run: RunStats,
 }
 
 impl RenderState {
@@ -335,6 +337,56 @@ struct SharedNativePill {
     link_now: AtomicU64,
     link_out: AtomicU64,
     link_period: AtomicU64,
+    /// Whether the panel should let the pointer through (it's off the drawn outline), decided
+    /// on whichever thread saw it last; `apply_ignore` makes the panel match on the main thread.
+    want_ignore: AtomicBool,
+    ignore_queued: AtomicBool,
+    /// A press started on the capsule (keeps it taking events until the button comes up).
+    pressing: AtomicBool,
+}
+
+/// What reached the screen, from `MTLDrawable.presentedTime`: the last time (f64 bits), the
+/// longest gap between shown frames in the current run, and how many were shown or replaced.
+#[derive(Default)]
+struct Presented {
+    last: AtomicU64,
+    max_gap: AtomicU64,
+    shown: AtomicU64,
+    replaced: AtomicU64,
+}
+
+impl Presented {
+    fn note(&self, at: f64) {
+        if at <= 0.0 {
+            self.replaced.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let last = f64::from_bits(self.last.swap(at.to_bits(), Ordering::Relaxed));
+        let gap = at - last;
+        if last > 0.0 && gap < 0.25 && gap > f64::from_bits(self.max_gap.load(Ordering::Relaxed)) {
+            self.max_gap.store(gap.to_bits(), Ordering::Relaxed);
+        }
+        self.shown.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Shown, replaced, worst gap (s) since the last call.
+    fn take(&self) -> (u64, u64, f64) {
+        (
+            self.shown.swap(0, Ordering::Relaxed),
+            self.replaced.swap(0, Ordering::Relaxed),
+            f64::from_bits(self.max_gap.swap(0, Ordering::Relaxed)),
+        )
+    }
+}
+
+/// One run of frames (a morph, or a stretch of breathing), summarised in `scrawl.log` when it
+/// ends so a janky moment in real use leaves numbers behind.
+#[derive(Default)]
+struct RunStats {
+    frames: u32,
+    worst_step: f64,
+    max_draw: f64,
+    max_wait: f64,
 }
 
 pub struct NativePill {
@@ -386,6 +438,11 @@ impl NativePill {
                 let _: () = msg_send![&*window, _setPreventsActivation: true];
             }
             window.setReleasedWhenClosed(false);
+            // No AppKit window animation: ordering a utility panel in plays a system zoom and
+            // fade on the whole window, on the window server's timing, over the capsule's own
+            // entry (seen as the window's bounds shrinking by up to 10 pt for a few frames).
+            // 2 = `NSWindowAnimationBehaviorNone`.
+            let _: () = msg_send![&*window, setAnimationBehavior: 2_isize];
         }
 
         let local_bounds = NSRect::new(
@@ -442,6 +499,8 @@ impl NativePill {
             time_scale: motion::time_scale(),
             last_out: None,
             dirty: true,
+            presented: Arc::new(Presented::default()),
+            run: RunStats::default(),
         };
         let main_draws = render.use_glass();
         render
@@ -467,7 +526,13 @@ impl NativePill {
             link_now: AtomicU64::new(0),
             link_out: AtomicU64::new(0),
             link_period: AtomicU64::new(0),
+            want_ignore: AtomicBool::new(true),
+            ignore_queued: AtomicBool::new(false),
+            pressing: AtomicBool::new(false),
         });
+        if pacing::enabled() {
+            pacing::event("window-frame");
+        }
 
         // Draw initial transparent frame synchronously.
         shared.draw_main(pacing::host_now());
@@ -529,6 +594,9 @@ impl NativePill {
         st.screen_origin_top_left = origin;
         main.window
             .setFrame_display(panel_appkit_rect(mtm, origin), true);
+        if pacing::enabled() {
+            pacing::event("window-frame");
+        }
         // On a 1x screen AppKit resets the layer's contentsScale; keep the scale it's drawn at.
         let scale = st.pipelines.scale;
         st.pipelines.layer.set_contents_scale(f64::from(scale));
@@ -598,7 +666,10 @@ impl NativePill {
                     became_visible = true;
                 }
             }
-            main.poll_pointer_and_input(&mut st);
+            main.poll_pointer_and_input(&mut st, &self.shared);
+            self.shared
+                .pressing
+                .store(main.press_down_elem.is_some(), Ordering::Release);
             // Static: nothing would change on screen until the next `sync` changes something.
             // (A trace keeps the link going, so it records the frames at rest too.)
             idle = st.model.is_fully_hidden()
@@ -734,12 +805,16 @@ fn create_glass_views(root_view: &NSView, bounds: NSRect) -> Option<Retained<NSV
 }
 
 /// Logs when the drawable reaches the screen (`SCRAWL_PILL_PACING`).
-/// Logs when the drawable reaches the screen (`SCRAWL_PILL_PACING`); a frame replaced before
-/// it was shown reports 0.
-fn watch_presented(drawable: &metal::MetalDrawableRef, n: u64) {
+/// Notes when the drawable reaches the screen (0 if a newer one replaced it first) for the
+/// run summary, and logs it for `SCRAWL_PILL_PACING` (`n > 0`).
+fn watch_presented(drawable: &metal::MetalDrawableRef, n: u64, presented: &Arc<Presented>) {
+    let presented = presented.clone();
     let block = block2::RcBlock::new(move |d: *mut AnyObject| {
         let at: f64 = unsafe { msg_send![d, presentedTime] };
-        pacing::presented(n, at);
+        presented.note(at);
+        if n > 0 {
+            pacing::presented(n, at);
+        }
     });
     let obj = metal::foreign_types::ForeignTypeRef::as_ptr(drawable).cast::<AnyObject>();
     unsafe {
@@ -901,9 +976,11 @@ impl SharedNativePill {
     /// refreshes it's drawn for, so the motion moves the same amount each frame, and a refresh
     /// that was missed is caught up rather than slowing the motion down.
     fn draw(&self, out: f64, period: f64, main: Option<&MainState>) {
+        let asked = pacing::host_now();
         let Ok(mut st) = self.render.lock() else {
             return;
         };
+        let wait = pacing::host_now() - asked;
         let step = match st.last_out {
             Some(prev) if out <= prev + 1e-4 => return,
             Some(prev) => out - prev,
@@ -915,6 +992,20 @@ impl SharedNativePill {
 
         let animating = !st.model.is_static();
         if !animating && !st.dirty {
+            if st.run.frames > 0 {
+                let run = std::mem::take(&mut st.run);
+                let (shown, replaced, gap) = st.presented.take();
+                let stride = refresh_stride(period, self.low_power.load(Ordering::Relaxed));
+                crate::capture::scrawl_log(format!(
+                    "pill frames: {} drawn, link {:.0} Hz x{stride}, {shown} shown, {replaced} replaced, worst shown gap {:.1} ms, worst step {:.1} ms, draw max {:.2} ms, lock wait max {:.2} ms",
+                    run.frames,
+                    if period > 0.0 { 1.0 / period } else { 0.0 },
+                    gap * 1000.0,
+                    run.worst_step * 1000.0,
+                    run.max_draw * 1000.0,
+                    run.max_wait * 1000.0,
+                ));
+            }
             if motion::tracing() && !st.model.is_fully_hidden() {
                 let frame = st.model.frame();
                 st.emit_trace(&frame);
@@ -933,6 +1024,19 @@ impl SharedNativePill {
         let n = if pacing::enabled() { pacing::next_frame() } else { 0 };
         let glass = main.and_then(|m| m.glass_view.as_deref()).filter(|_| st.use_glass());
         st.render_frame(&frame, glass, out, n);
+        let drawn = pacing::host_now() - start;
+        if st.run.frames > 0 {
+            st.run.worst_step = st.run.worst_step.max(step);
+        } else {
+            // A new run: what was shown before it is no part of it.
+            st.presented.take();
+        }
+        st.run.frames += 1;
+        st.run.max_draw = st.run.max_draw.max(drawn);
+        st.run.max_wait = st.run.max_wait.max(wait);
+        if main.is_none() {
+            self.track_pointer(&st);
+        }
         if n > 0 {
             let bits = |a: &AtomicU64| f64::from_bits(a.load(Ordering::Relaxed));
             pacing::frame(&pacing::Frame {
@@ -953,13 +1057,74 @@ impl SharedNativePill {
     }
 }
 
-impl MainState {
-    fn poll_pointer_and_input(&mut self, st: &mut RenderState) {
-        if st.model.is_fully_hidden() {
-            if !self.ignores_mouse {
-                self.ignores_mouse = true;
-                self.window.setIgnoresMouseEvents(true);
+impl SharedNativePill {
+    /// Checks the pointer against the outline just drawn, on the drawing thread, so the panel
+    /// stops taking clicks the moment the shape leaves the pointer (and starts when it arrives)
+    /// without waiting for the main thread's next poll to notice. Only a change goes to the main
+    /// thread, which is the only place the panel itself can change.
+    fn track_pointer(&self, st: &RenderState) {
+        let Some([gx, gy]) = pointer_global() else {
+            return;
+        };
+        let [ox, oy] = st.screen_origin_top_left;
+        let inside = st.model.hit_island(gx - ox, gy - oy);
+        let want = !inside && !self.pressing.load(Ordering::Relaxed);
+        if self.want_ignore.swap(want, Ordering::AcqRel) != want
+            && !self.ignore_queued.swap(true, Ordering::AcqRel)
+        {
+            let ctx = std::ptr::from_ref(self);
+            // `self` lives in an `Arc` (the display link holds one); lend the main queue another.
+            unsafe {
+                Arc::increment_strong_count(ctx);
+                dispatch_async_f(&_dispatch_main_q, ctx.cast_mut().cast(), apply_ignore_trampoline);
             }
+        }
+    }
+}
+
+extern "C" fn apply_ignore_trampoline(context: *mut c_void) {
+    let shared = unsafe { Arc::from_raw(context.cast::<SharedNativePill>()) };
+    shared.ignore_queued.store(false, Ordering::Release);
+    if shared.alive.load(Ordering::Relaxed)
+        && let Ok(mut main) = shared.main.lock()
+    {
+        main.apply_ignore(shared.want_ignore.load(Ordering::Acquire));
+    }
+}
+
+/// The pointer in global top-left points (`CGEventGetLocation`), from any thread.
+fn pointer_global() -> Option<[f32; 2]> {
+    unsafe extern "C" {
+        fn CGEventCreate(source: *const c_void) -> *mut c_void;
+        fn CGEventGetLocation(event: *mut c_void) -> core_graphics_types::geometry::CGPoint;
+        fn CFRelease(cf: *const c_void);
+    }
+    unsafe {
+        let event = CGEventCreate(std::ptr::null());
+        if event.is_null() {
+            return None;
+        }
+        let p = CGEventGetLocation(event);
+        CFRelease(event);
+        Some([p.x as f32, p.y as f32])
+    }
+}
+
+impl MainState {
+    fn apply_ignore(&mut self, ignore: bool) {
+        if self.ignores_mouse != ignore {
+            self.ignores_mouse = ignore;
+            self.window.setIgnoresMouseEvents(ignore);
+            if pacing::enabled() {
+                pacing::event(if ignore { "pointer-through" } else { "pointer-taken" });
+            }
+        }
+    }
+
+    fn poll_pointer_and_input(&mut self, st: &mut RenderState, shared: &SharedNativePill) {
+        if st.model.is_fully_hidden() {
+            shared.want_ignore.store(true, Ordering::Release);
+            self.apply_ignore(true);
             return;
         }
 
@@ -980,10 +1145,8 @@ impl MainState {
 
         let inside_island = st.model.hit_island(local_x, local_y);
         let should_ignore = !inside_island && self.press_down_elem.is_none();
-        if self.ignores_mouse != should_ignore {
-            self.ignores_mouse = should_ignore;
-            self.window.setIgnoresMouseEvents(should_ignore);
-        }
+        shared.want_ignore.store(should_ignore, Ordering::Release);
+        self.apply_ignore(should_ignore);
 
         let prev_hover = st.model.hovered;
         let prev_press = st.model.pressed;
@@ -1344,9 +1507,7 @@ impl RenderState {
 
         let Some(gv) = glass else {
             // Off the main thread: no transaction, presented on the refresh it was sampled for.
-            if n > 0 {
-                watch_presented(drawable, n);
-            }
+            watch_presented(drawable, n, &self.presented);
             present_off_main(cmd, drawable, out);
             return;
         };
@@ -1379,9 +1540,7 @@ impl RenderState {
         } else {
             gv.setHidden(true);
         }
-        if n > 0 {
-                watch_presented(drawable, n);
-            }
+        watch_presented(drawable, n, &self.presented);
         cmd.commit();
         cmd.wait_until_scheduled();
         drawable.present();
