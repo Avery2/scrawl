@@ -11,6 +11,7 @@ mod autocrop_lab;
 mod capture;
 #[cfg_attr(target_os = "windows", path = "win/command_line.rs")]
 mod command_line;
+mod command_transcriber;
 mod delivery;
 mod export;
 mod handoff;
