@@ -59,26 +59,6 @@ impl PillStyle {
     }
 }
 
-/// Which capsule draws (`pillRenderer: "metal" | "swiftui"`, `SCRAWL_PILL_RENDERER`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum PillRenderer {
-    #[default]
-    Metal,
-    SwiftUi,
-}
-
-#[allow(dead_code)]
-impl PillRenderer {
-    pub fn from_str_opt(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "swiftui" | "swift" => Some(Self::SwiftUi),
-            "metal" => Some(Self::Metal),
-            _ => None,
-        }
-    }
-}
-
 /// User actions emitted by clicking or pressing keys on the native pill (macOS only, so
 /// elsewhere nothing makes them).
 #[derive(Clone, Copy, Debug)]

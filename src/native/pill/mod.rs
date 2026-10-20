@@ -10,10 +10,9 @@
 pub mod atlas;
 pub mod model;
 mod pacing;
-mod swift;
 mod types;
 
-pub use self::types::{PillAction, PillRenderer, PillSnapshot, PillStyle};
+pub use self::types::{PillAction, PillSnapshot, PillStyle};
 
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -338,101 +337,7 @@ struct SharedNativePill {
     link_period: AtomicU64,
 }
 
-/// The recording capsule: the Metal one in this process, or the SwiftUI one in `scrawl-helper
-/// pill` (`"pillRenderer": "swiftui"`, `swift.rs`), which falls back to Metal when the helper
-/// won't start or goes away.
 pub struct NativePill {
-    inner: std::cell::RefCell<Renderer>,
-}
-
-enum Renderer {
-    Metal(MetalPill),
-    Swift(swift::SwiftPill),
-}
-
-impl NativePill {
-    pub fn open() -> Result<Self, String> {
-        let renderer = if crate::handoff::pill_renderer() == PillRenderer::SwiftUi {
-            match swift::SwiftPill::open() {
-                Ok(pill) => {
-                    crate::capture::scrawl_log(format!(
-                        "SwiftUI pill started (scrawl-helper pill, window {})",
-                        pill.window_number()
-                    ));
-                    Renderer::Swift(pill)
-                }
-                Err(err) => {
-                    crate::capture::scrawl_log(format!(
-                        "SwiftUI pill failed to start ({err}); using the Metal pill"
-                    ));
-                    Renderer::Metal(MetalPill::open()?)
-                }
-            }
-        } else {
-            Renderer::Metal(MetalPill::open()?)
-        };
-        Ok(Self {
-            inner: std::cell::RefCell::new(renderer),
-        })
-    }
-
-    pub fn window_number(&self) -> u32 {
-        match &*self.inner.borrow() {
-            Renderer::Metal(p) => p.window_number(),
-            Renderer::Swift(p) => p.window_number(),
-        }
-    }
-
-    pub fn place_on(&self, point: [f64; 2]) {
-        match &*self.inner.borrow() {
-            Renderer::Metal(p) => p.place_on(point),
-            Renderer::Swift(p) => p.place_on(point),
-        }
-    }
-
-    pub fn sync(&self, snapshot: PillSnapshot) {
-        let dead = matches!(&*self.inner.borrow(), Renderer::Swift(p) if !p.is_alive());
-        if dead {
-            crate::capture::scrawl_log("SwiftUI pill went away; using the Metal pill");
-            match MetalPill::open() {
-                Ok(metal) => {
-                    if let Some(point) = crate::screens::pointer() {
-                        metal.place_on(point);
-                    }
-                    *self.inner.borrow_mut() = Renderer::Metal(metal);
-                }
-                Err(err) => crate::capture::scrawl_log(format!("MetalPill::open error: {err}")),
-            }
-        }
-        match &*self.inner.borrow() {
-            Renderer::Metal(p) => p.sync(snapshot),
-            Renderer::Swift(p) => p.sync(snapshot),
-        }
-    }
-
-    pub fn drain_actions(&self) -> Vec<PillAction> {
-        match &*self.inner.borrow() {
-            Renderer::Metal(p) => p.drain_actions(),
-            Renderer::Swift(p) => p.drain_actions(),
-        }
-    }
-
-    pub fn is_fully_hidden(&self) -> bool {
-        match &*self.inner.borrow() {
-            Renderer::Metal(p) => p.is_fully_hidden(),
-            Renderer::Swift(p) => p.is_fully_hidden(),
-        }
-    }
-
-    pub fn pointer_on_pill(&self) -> bool {
-        match &*self.inner.borrow() {
-            Renderer::Metal(p) => p.pointer_on_pill(),
-            Renderer::Swift(p) => p.pointer_on_pill(),
-        }
-    }
-}
-
-pub struct MetalPill {
     shared: Arc<SharedNativePill>,
     display_link: Option<CVDisplayLink>,
     display_link_ctx: Option<*const SharedNativePill>,
@@ -443,9 +348,9 @@ pub struct MetalPill {
     window_num: u32,
 }
 
-impl MetalPill {
+impl NativePill {
     pub fn open() -> Result<Self, String> {
-        let mtm = MainThreadMarker::new().ok_or("MetalPill::open requires the main thread")?;
+        let mtm = MainThreadMarker::new().ok_or("NativePill::open requires the main thread")?;
         let screens = crate::screens::current();
         // Drawn at the sharpest scale of any display, so moving between them needs no new
         // textures (a 1x display just downsamples).
@@ -740,7 +645,7 @@ impl MetalPill {
     }
 }
 
-impl Drop for MetalPill {
+impl Drop for NativePill {
     fn drop(&mut self) {
         self.shared.alive.store(false, Ordering::SeqCst);
         if let Some(ref dl) = self.display_link {
@@ -757,7 +662,7 @@ impl Drop for MetalPill {
 }
 
 /// The screen holding `point` (global points), else the primary one.
-pub(super) fn panel_screen(
+fn panel_screen(
     screens: &[crate::screens::Screen],
     point: Option<[f64; 2]>,
 ) -> Option<&crate::screens::Screen> {
@@ -768,7 +673,7 @@ pub(super) fn panel_screen(
 }
 
 /// The panel's top-left (global points) on `screen`.
-pub(super) fn panel_origin(screen: &crate::screens::Screen) -> [f32; 2] {
+fn panel_origin(screen: &crate::screens::Screen) -> [f32; 2] {
     let [x, y] = crate::screens::pill_origin(
         screen,
         f64::from(PANEL_W),
@@ -1118,33 +1023,53 @@ impl MainState {
     }
 
     fn dispatch_click(&self, model: &PillModel, elem: ElemId) {
-        if let Some(action) = click_action(&model.pres, elem) {
-            let _ = self.action_tx.try_send(action);
-        }
+        let is_selecting = matches!(model.pres, Pres::Selecting { .. });
+        let action = match elem {
+            ElemId::ChipArea => {
+                if is_selecting {
+                    PillAction::SelectMode(SelectionMode::Area)
+                } else {
+                    PillAction::SwitchRecording(SelectionMode::Area)
+                }
+            }
+            ElemId::ChipWindow => {
+                if is_selecting {
+                    PillAction::SelectMode(SelectionMode::Window)
+                } else {
+                    PillAction::SwitchRecording(SelectionMode::Window)
+                }
+            }
+            ElemId::ChipScreen => {
+                if is_selecting {
+                    PillAction::SelectMode(SelectionMode::Screen)
+                } else {
+                    PillAction::SwitchRecording(SelectionMode::Screen)
+                }
+            }
+            ElemId::ChipIphone => {
+                if is_selecting {
+                    PillAction::SelectMode(SelectionMode::Iphone)
+                } else {
+                    PillAction::SwitchRecording(SelectionMode::Iphone)
+                }
+            }
+            ElemId::Record => PillAction::RecordSelected,
+            ElemId::Undo => PillAction::Undo,
+            ElemId::Cancel => PillAction::Cancel,
+            ElemId::Finish => PillAction::Finish,
+            ElemId::Close => {
+                if matches!(model.pres, Pres::Completed { .. }) {
+                    PillAction::DismissCompleted
+                } else {
+                    PillAction::Cancel
+                }
+            }
+            ElemId::Paste => PillAction::Paste(None),
+            ElemId::Inspect => PillAction::Inspect,
+            _ => return,
+        };
+        let _ = self.action_tx.try_send(action);
     }
-}
-
-/// What a click on `elem` asks for while `pres` shows (both renderers).
-pub(super) fn click_action(pres: &Pres, elem: ElemId) -> Option<PillAction> {
-    let selecting = matches!(pres, Pres::Selecting { .. });
-    if let Some(mode) = elem.mode() {
-        return Some(if selecting {
-            PillAction::SelectMode(mode)
-        } else {
-            PillAction::SwitchRecording(mode)
-        });
-    }
-    Some(match elem {
-        ElemId::Record => PillAction::RecordSelected,
-        ElemId::Undo => PillAction::Undo,
-        ElemId::Cancel => PillAction::Cancel,
-        ElemId::Finish => PillAction::Finish,
-        ElemId::Close if matches!(pres, Pres::Completed { .. }) => PillAction::DismissCompleted,
-        ElemId::Close => PillAction::Cancel,
-        ElemId::Paste => PillAction::Paste(None),
-        ElemId::Inspect => PillAction::Inspect,
-        _ => return None,
-    })
 }
 
 impl RenderState {

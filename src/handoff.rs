@@ -670,8 +670,9 @@ pub fn native_pill() -> bool {
 
 /// Which native capsule draws (`SCRAWL_PILL_RENDERER` or `pillRenderer` in `config.json`,
 /// default Metal).
-pub fn pill_renderer() -> crate::native::pill::PillRenderer {
-    use crate::native::pill::PillRenderer;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn pill_renderer() -> crate::native::capsule::Renderer {
+    use crate::native::capsule::Renderer as PillRenderer;
     if let Ok(val) = std::env::var("SCRAWL_PILL_RENDERER")
         && let Some(renderer) = PillRenderer::from_str_opt(&val)
     {

@@ -89,9 +89,9 @@ final class PillViewModel: ObservableObject {
   @Published var shell = CGRect(x: 260, y: 22, width: 120, height: 40)
   @Published var shellAlpha: Double = 0
   @Published var items: [PillItem] = []
-  @Published var hlL: CGFloat = 0
-  @Published var hlR: CGFloat = 0
-  @Published var hlAlpha: Double = 0
+  /// Counts the shape's morphs: each one kicks the rim light and the wall's motion blur.
+  @Published var morphs = 0
+  var morphDuration: Double = 0.4
   @Published var clock = "0:00"
   @Published var label = ""
   @Published var style = "black"
@@ -142,6 +142,9 @@ final class PillViewModel: ObservableObject {
     return Animation(PunchSpring(spring: base, over: opts.punch / travel)).speed(timeScale)
   }
 
+  /// A state that arrived while the entry's first frame (the origin pose) was still to be drawn.
+  private var pendingEntry: PillState?
+
   func apply(_ s: PillState) {
     let wasVisible = visible
     seq = s.seq
@@ -151,10 +154,10 @@ final class PillViewModel: ObservableObject {
     if reduced != s.reduced { reduced = s.reduced }
     if label != s.label { label = s.label }
     let rest = CGRect(x: s.shell[0], y: s.shell[1], width: s.shell[2], height: s.shell[3])
-    let selected = s.items.first { $0.isMode && $0.active }?.frame
 
     if s.phase == "hidden" {
       restShell = .zero
+      pendingEntry = nil
       guard wasVisible else { return }
       let leaving = seq
       withAnimation(spring(opts.exit), completionCriteria: .logicallyComplete) {
@@ -162,7 +165,6 @@ final class PillViewModel: ObservableObject {
         shell = pose(shell)
         shellAlpha = 0
         items = []
-        hlAlpha = 0
       } completion: { [weak self] in
         guard let self, self.phase == "hidden", self.seq == leaving else { return }
         self.send(["event": "hidden", "seq": leaving])
@@ -173,8 +175,13 @@ final class PillViewModel: ObservableObject {
     }
 
     restShell = rest
+    if pendingEntry != nil {
+      pendingEntry = s
+      return
+    }
     if !wasVisible {
-      // Entry: start from the origin pose with nothing inside, then one animation to rest.
+      // Entry: draw the origin pose with nothing inside, then one animation to rest (to the
+      // latest state, if another came before that first frame).
       onVisible()
       var still = Transaction()
       still.disablesAnimations = true
@@ -184,77 +191,60 @@ final class PillViewModel: ObservableObject {
         shellAlpha = 0
         items = []
         clock = s.clock
-        if let selected {
-          hlL = selected.minX
-          hlR = selected.maxX
-        }
-        hlAlpha = 0
       }
+      pendingEntry = s
       DispatchQueue.main.async { [self] in
-        guard seq == s.seq else { return }
+        guard let s = pendingEntry else { return }
+        pendingEntry = nil
+        let rest = CGRect(x: s.shell[0], y: s.shell[1], width: s.shell[2], height: s.shell[3])
+        var still = Transaction()
+        still.disablesAnimations = true
+        withTransaction(still) { shell = pose(rest) }
         withAnimation(entryAnimation(rest: rest)) {
+          phase = s.phase
           shell = rest
           shellAlpha = 1
           items = s.items
-          hlAlpha = selected == nil ? 0 : 1
+          clock = s.clock
         }
       }
       return
     }
 
-    // A morph between two visible states: one spring for the capsule and everything on it.
+    if clock != s.clock {
+      withAnimation(spring(PillSpringSpec(0.3, 0))) { clock = s.clock }
+    }
+    let sameLayout = items.map(\.id) == s.items.map(\.id) && items.map(\.rect) == s.items.map(\.rect)
+    if sameLayout {
+      // Only the selection or an enabled state changed: the highlight slides (matched geometry);
+      // a key step in the hold switcher is the user's own hand, so it's near-instant.
+      if items != s.items {
+        withAnimation(spring(s.keyed ? PillSpringSpec(0.1, 0) : opts.hlTrail)) { items = s.items }
+      }
+      if phase != s.phase { phase = s.phase }
+      return
+    }
+
+    // A morph between two visible states. The shape leads and the content follows: widening,
+    // the chips ride a slightly longer spring than the wall; narrowing, the leaving chips fade
+    // before the wall reaches them (`model::COLLAPSE_WAIT_S`).
     let narrowing = rest.width < shell.width - 1
-    let morph = spring(narrowing ? opts.morphClose : opts.morphOpen)
+    let spec = narrowing ? opts.morphClose : opts.morphOpen
+    let morph = spring(spec)
+    let follow = spring(PillSpringSpec(spec.duration * (narrowing ? 1 : 1.12), spec.bounce))
     let leavingIDs = Set(items.map(\.id)).subtracting(s.items.map(\.id))
-    // Leaving chips fade before the wall reaches them (`model::COLLAPSE_WAIT_S`).
     let shellMorph = narrowing && !leavingIDs.isEmpty && !reduced ? morph.delay(0.06 / timeScale) : morph
+    if abs(rest.width - shell.width) > 1, !reduced {
+      morphDuration = spec.duration / timeScale
+      morphs &+= 1
+    }
     withAnimation(shellMorph) {
       shell = rest
       shellAlpha = 1
     }
-    withAnimation(morph) {
+    withAnimation(follow) {
       phase = s.phase
       items = s.items
-    }
-    if clock != s.clock {
-      withAnimation(spring(PillSpringSpec(0.3, 0))) { clock = s.clock }
-    }
-    moveHighlight(to: selected, keyed: s.keyed)
-  }
-
-  /// The highlight's two edges have their own springs: the one facing the slide leads, so it
-  /// stretches toward the next chip and settles to its width (knobs `Edges`).
-  private func moveHighlight(to target: CGRect?, keyed: Bool) {
-    guard let target else {
-      withAnimation(spring(opts.exit)) { hlAlpha = 0 }
-      return
-    }
-    if hlAlpha < 0.01 {
-      var still = Transaction()
-      still.disablesAnimations = true
-      withTransaction(still) {
-        hlL = target.minX
-        hlR = target.maxX
-      }
-      withAnimation(spring(opts.enter)) { hlAlpha = 1 }
-      return
-    }
-    if target.minX == hlL && target.maxX == hlR { return }
-    if keyed {
-      withAnimation(spring(PillSpringSpec(0.1, 0))) {
-        hlL = target.minX
-        hlR = target.maxX
-        hlAlpha = 1
-      }
-      return
-    }
-    let right = target.midX > (hlL + hlR) / 2
-    withAnimation(spring(opts.hlLead)) {
-      if right { hlR = target.maxX } else { hlL = target.minX }
-    }
-    withAnimation(spring(opts.hlTrail)) {
-      if right { hlL = target.minX } else { hlR = target.maxX }
-      hlAlpha = 1
     }
   }
 
@@ -325,6 +315,7 @@ struct PresenceModifier: ViewModifier {
 
 struct PillRoot: View {
   @ObservedObject var model: PillViewModel
+  @Namespace private var highlight
 
   var body: some View {
     ZStack(alignment: .topLeading) {
@@ -341,16 +332,11 @@ struct PillRoot: View {
     .frame(width: PillMetrics.width, height: PillMetrics.height, alignment: .topLeading)
   }
 
-  /// `SCRAWL_PILL_TRACE`: logs every frame SwiftUI computes for the capsule's edges and the
-  /// highlight's, with the time it computed it, so gaps (missed frames) show.
+  /// `SCRAWL_PILL_TRACE`: logs every frame SwiftUI computes for the capsule's edges, with the time it computed it, so gaps (missed frames) show.
   private var probe: some View {
     Animated(value: model.shell.minX) { l in
       Animated(value: model.shell.maxX) { r in
-        Animated(value: model.hlL) { hl in
-          Animated(value: model.hlR) { hr in
-            PillTrace.shared?.frame(l: l, r: r, hl: hl, hr: hr)
-          }
-        }
+        PillTrace.shared?.frame(l: l, r: r, hl: 0, hr: 0)
       }
     }
     .allowsHitTesting(false)
@@ -367,18 +353,31 @@ struct PillRoot: View {
           .glassEffect(.regular.tint(PillColor.smoke.opacity(0.22)), in: Capsule())
           .overlay(Capsule().strokeBorder(PillColor.green.opacity(completed ? 0.42 : 0), lineWidth: 1))
       } else {
+        // Each morph kicks `energy` to 1 and lets it settle with the shape: the rim lights up
+        // and the walls get a touch of motion blur, both in Metal on the shape's own pixels.
+        let settle = max(model.morphDuration, 0.2)
         capsule
           .foregroundStyle(PillColor.shell.opacity(0.96))
-          .overlay(
-            Capsule().strokeBorder(completed ? PillColor.green.opacity(0.42) : Color.white.opacity(0.12), lineWidth: 0.5)
-          )
+          .keyframeAnimator(initialValue: 0.0, trigger: model.morphs) { view, energy in
+            view.visualEffect { content, proxy in
+              content
+                .colorEffect(PillShaders.rim(size: proxy.size, energy: energy, completed: completed))
+                .layerEffect(
+                  PillShaders.morphBlur(radius: 1.2 * energy),
+                  maxSampleOffset: CGSize(width: 3, height: 0),
+                  isEnabled: energy > 0.01
+                )
+            }
+          } keyframes: { _ in
+            LinearKeyframe(1.0, duration: 0.05)
+            SpringKeyframe(0.0, duration: settle, spring: Spring(duration: settle, bounce: 0))
+          }
           .shadow(color: .black.opacity(0.28), radius: 9, y: 4)
       }
     }
     .blur(radius: model.opts.shellBlur * (1 - model.shellAlpha))
     .opacity(model.shellAlpha)
     .offset(x: model.shell.minX, y: model.shell.minY)
-    .animation(model.spring(PillSpringSpec(0.25, 0)), value: completed)
   }
 
   private var presence: AnyTransition {
@@ -393,10 +392,9 @@ struct PillRoot: View {
 
   private var content: some View {
     ZStack(alignment: .topLeading) {
-      highlight
       ForEach(model.items) { item in
         PillItemView(
-          item: item, model: model,
+          item: item, model: model, highlight: highlight,
           hovered: model.hovered == item.id, pressed: model.pressed == item.id
         )
         .frame(width: item.frame.width, height: item.frame.height)
@@ -405,18 +403,6 @@ struct PillRoot: View {
       }
     }
     .frame(width: PillMetrics.width, height: PillMetrics.height, alignment: .topLeading)
-  }
-
-  private var highlight: some View {
-    Animated(value: model.hlL) { l in
-      Animated(value: model.hlR) { r in
-        Capsule()
-          .fill(model.glass ? PillColor.smoke.opacity(0.18) : Color.white.opacity(0.16))
-          .frame(width: max(r - l, 0), height: PillMetrics.chip)
-          .offset(x: l, y: model.shell.minY + 4)
-      }
-    }
-    .opacity(model.hlAlpha)
   }
 
   @ViewBuilder private var escHint: some View {
@@ -442,6 +428,8 @@ struct PillRoot: View {
 struct PillItemView: View {
   let item: PillItem
   @ObservedObject var model: PillViewModel
+  /// The selection highlight is one shape that moves between chips (matched geometry).
+  let highlight: Namespace.ID
   let hovered: Bool
   let pressed: Bool
 
@@ -498,8 +486,16 @@ struct PillItemView: View {
     .foregroundStyle(Color(white: level))
     .padding(.horizontal, 10)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(model.glass ? AnyView(smoke(bg)) : AnyView(Capsule().fill(Color.white.opacity(bg))))
-    .animation(model.spring(model.opts.hlTrail), value: item.active)
+    .background {
+      ZStack {
+        if model.glass { smoke(bg) } else { Capsule().fill(Color.white.opacity(bg)) }
+        if item.active {
+          Capsule()
+            .fill(model.glass ? PillColor.smoke.opacity(0.18) : Color.white.opacity(0.16))
+            .matchedGeometryEffect(id: "highlight", in: highlight)
+        }
+      }
+    }
   }
 
   private var accentChip: some View {
@@ -582,23 +578,43 @@ struct PillItemView: View {
   }
 }
 
-/// The red dot breathes and sends out a ripple every 1.6 s, as repeating animations.
+/// The red dot breathes and sends out a ripple every 1.6 s: repeating animations whose values
+/// drive a Metal shader (core, glow, ring).
 struct RecordingDot: View {
-  @State private var ripple = false
-  @State private var breath = false
+  @State private var ripple = 0.0
+  @State private var breath = 0.0
 
   var body: some View {
-    ZStack {
-      Circle().fill(PillColor.red).frame(width: 20, height: 20)
-        .scaleEffect(ripple ? 1 : 0.4)
-        .opacity(ripple ? 0 : 0.34)
-      Circle().fill(PillColor.red).frame(width: 8, height: 8)
-        .opacity(breath ? 0.78 : 1)
+    Animated(value: ripple) { r in
+      Animated(value: breath) { b in
+        Rectangle()
+          .fill(.white)
+          .colorEffect(PillShaders.dot(size: CGSize(width: 32, height: 32), breath: b, ripple: r))
+      }
     }
+    .frame(width: 32, height: 32)
     .onAppear {
-      withAnimation(.easeOut(duration: 1.6).repeatForever(autoreverses: false)) { ripple = true }
-      withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) { breath = true }
+      withAnimation(.linear(duration: 1.6).repeatForever(autoreverses: false)) { ripple = 1 }
+      withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) { breath = 1 }
     }
+  }
+}
+
+/// The capsule's `[[stitchable]]` shaders (`helper/PillShaders.metal`), embedded by build.rs.
+enum PillShaders {
+  static let library: ShaderLibrary =
+    Data(base64Encoded: pillShaderLibraryBase64).map { ShaderLibrary(data: $0) } ?? .default
+
+  static func rim(size: CGSize, energy: Double, completed: Bool) -> Shader {
+    library.pillRim(.float2(size), .float(energy), .float(completed ? 1 : 0))
+  }
+
+  static func dot(size: CGSize, breath: Double, ripple: Double) -> Shader {
+    library.pillDot(.float2(size), .float(breath), .float(ripple))
+  }
+
+  static func morphBlur(radius: Double) -> Shader {
+    library.pillMorphBlur(.float(radius))
   }
 }
 

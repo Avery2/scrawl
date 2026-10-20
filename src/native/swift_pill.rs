@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::model::{ElemId, Metrics, PillOpts, Pres, SpringCfg, layout_of};
-use super::{PillAction, PillSnapshot, PillStyle, click_action};
+use super::pill::model::{self, ElemId, Metrics, PillOpts, Pres, SpringCfg, layout_of};
+use super::pill::{PillAction, PillSnapshot, atlas};
 use crate::capture::scrawl_log;
 use crate::ui::motion;
 
@@ -22,6 +22,46 @@ use crate::ui::motion;
 const READY_TIMEOUT: Duration = Duration::from_millis(1500);
 /// A hidden capsule whose exit the helper never confirmed counts as hidden after this.
 const HIDDEN_FALLBACK: Duration = Duration::from_millis(1200);
+
+/// What a click on `elem` asks for while `pres` shows (as the Metal capsule's `dispatch_click`).
+pub fn click_action(pres: &Pres, elem: ElemId) -> Option<PillAction> {
+    let selecting = matches!(pres, Pres::Selecting { .. });
+    if let Some(mode) = elem.mode() {
+        return Some(if selecting {
+            PillAction::SelectMode(mode)
+        } else {
+            PillAction::SwitchRecording(mode)
+        });
+    }
+    Some(match elem {
+        ElemId::Record => PillAction::RecordSelected,
+        ElemId::Undo => PillAction::Undo,
+        ElemId::Cancel => PillAction::Cancel,
+        ElemId::Finish => PillAction::Finish,
+        ElemId::Close if matches!(pres, Pres::Completed { .. }) => PillAction::DismissCompleted,
+        ElemId::Close => PillAction::Cancel,
+        ElemId::Paste => PillAction::Paste(None),
+        ElemId::Inspect => PillAction::Inspect,
+        _ => return None,
+    })
+}
+
+fn elem_from_key(key: &str) -> Option<ElemId> {
+    ElemId::ALL.into_iter().find(|id| id.trace_key() == key)
+}
+
+/// The panel's top-left (global points) on the display holding `point`, else the primary one:
+/// where the Metal capsule's panel goes (`screens::pill_origin`).
+fn panel_origin(point: [f64; 2]) -> Option<[f32; 2]> {
+    let screens = crate::screens::current();
+    let index = crate::screens::index_at(&screens, point).or((!screens.is_empty()).then_some(0))?;
+    let [x, y] = crate::screens::pill_origin(
+        &screens[index],
+        f64::from(model::PANEL_W),
+        f64::from(model::PANEL_Y),
+    );
+    Some([x as f32, y as f32])
+}
 
 /// What the helper reports.
 #[derive(Clone, Debug, PartialEq)]
@@ -42,7 +82,7 @@ pub fn parse_event(line: &str) -> Option<Event> {
             window: v.get("window").and_then(Value::as_u64).unwrap_or(0) as u32,
         },
         "hover" => Event::Hover(v.get("on").and_then(Value::as_bool).unwrap_or(false)),
-        "click" => Event::Click(ElemId::from_trace_key(v.get("id")?.as_str()?)?),
+        "click" => Event::Click(elem_from_key(v.get("id")?.as_str()?)?),
         "paste" => {
             let at = v.get("at")?.as_array()?;
             Event::Paste([at.first()?.as_f64()? as f32, at.get(1)?.as_f64()? as f32])
@@ -132,9 +172,9 @@ pub fn state_message(
         "timeScale": round3(time_scale),
         "opts": {
             "origin": match opts.origin {
-                super::model::Origin::Centre => 0,
-                super::model::Origin::Top => 1,
-                super::model::Origin::Lead => 2,
+                model::Origin::Centre => 0,
+                model::Origin::Top => 1,
+                model::Origin::Lead => 2,
             },
             "blur": round3(opts.content_blur),
             "shellBlur": round3(opts.shell_blur),
@@ -218,7 +258,7 @@ impl SwiftPill {
             events,
             actions: RefCell::new(Vec::new()),
             window,
-            metrics: super::atlas::measure_metrics(),
+            metrics: atlas::measure_metrics(),
             sent: RefCell::new(Sent {
                 body: String::new(),
                 pres: Pres::Hidden,
@@ -280,11 +320,9 @@ impl SwiftPill {
     }
 
     pub fn place_on(&self, point: [f64; 2]) {
-        let screens = crate::screens::current();
-        let Some(screen) = super::panel_screen(&screens, Some(point)) else {
+        let Some(origin) = panel_origin(point) else {
             return;
         };
-        let origin = super::panel_origin(screen);
         let mut sent = self.sent.borrow_mut();
         if sent
             .origin
@@ -305,10 +343,10 @@ impl SwiftPill {
                 match &sent.completed {
                     Some((text, w)) if text == label => *w,
                     _ => {
-                        let w = super::atlas::measure_text_pt(
+                        let w = atlas::measure_text_pt(
                             label,
-                            super::model::HUD_TEXT,
-                            super::atlas::WEIGHT_SEMIBOLD,
+                            model::HUD_TEXT,
+                            atlas::WEIGHT_SEMIBOLD,
                             false,
                         );
                         sent.completed = Some((label.clone(), w));
@@ -371,11 +409,6 @@ impl SwiftPill {
         self.pump();
         self.hover.get() && self.alive.get()
     }
-
-    #[allow(dead_code)]
-    pub fn style(&self) -> PillStyle {
-        PillStyle::current()
-    }
 }
 
 impl Drop for SwiftPill {
@@ -397,6 +430,7 @@ impl Drop for SwiftPill {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::pill::PillStyle;
     use crate::ui::SelectionMode;
 
     fn snapshot(pres: Pres) -> PillSnapshot {

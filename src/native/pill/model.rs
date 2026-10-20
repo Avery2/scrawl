@@ -500,10 +500,6 @@ impl ElemId {
         }
     }
 
-    pub fn from_trace_key(key: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|id| id.trace_key() == key)
-    }
-
     pub const fn from_mode(mode: SelectionMode) -> Self {
         match mode {
             SelectionMode::Area => Self::ChipArea,

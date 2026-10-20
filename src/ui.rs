@@ -671,7 +671,7 @@ pub struct ScrawlCoordinator {
     telemetry: Arc<SharedCaptureTelemetry>,
     active_recording: Option<ActiveRecording>,
     picker_metal_overlay: Option<LaserOverlay>,
-    native_pill: Option<crate::native::pill::NativePill>,
+    native_pill: Option<crate::native::capsule::Capsule>,
     iphone_preview: Option<PhoneSession>,
     island_phase: IslandPhase,
     island_prev_phase: IslandPhase,
@@ -1916,7 +1916,7 @@ impl ScrawlCoordinator {
         if !crate::handoff::native_pill() || self.native_pill.is_some() {
             return;
         }
-        match crate::native::pill::NativePill::open() {
+        match crate::native::capsule::Capsule::open() {
             Ok(pill) => {
                 let num = pill.window_number();
                 if num > 0 {
