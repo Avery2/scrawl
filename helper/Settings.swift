@@ -719,7 +719,7 @@ struct ShortcutRecorder: View {
     if let error = shortcut.error { return error }
     return shortcut.kind == "paste"
       ? "Pastes the last capture into the app in front."
-      : "Tap to record. Hold to choose what to record."
+      : "Records the screen. Press again to finish."
   }
 }
 

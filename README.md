@@ -44,7 +44,7 @@ makes a shareable `.mp4`. `scrawl skill` prints the skill without installing any
 ## Usage
 
 ```sh
-# Launch the GPUI menu-bar and review app (tap ⌥⇧S to record, hold it to choose what to record)
+# Launch the GPUI menu-bar and review app (press ⌥⇧S to record)
 cargo run -- app
 
 # Generate a realistic multi-frame demo bundle and print its agent summary
@@ -194,17 +194,16 @@ Preview every pane, dark and light, with the recorder listening and a combinatio
 
 ## Capture Controls
 
-- **Tap `⌥⇧S`** (release within 0.25 s): record the display under the pointer straight away,
-  auto-cropped (see below). Tap it again to finish; a tap within 0.4 s of the start is ignored, so a
-  double press doesn't leave an empty capture. `⌃⌥⇧S` also works (only while `⌥⇧S` is the
+- **Press `⌥⇧S`**: record the display under the pointer as soon as you let go, however long you
+  held it, auto-cropped (see below). Press it again to finish; a press within 0.4 s of the start is
+  ignored, so a double press doesn't leave an empty capture. `⌃⌥⇧S` also works (only while `⌥⇧S` is the
   shortcut; see [Settings](#settings) to change it). As it starts, the island opens onto the modes (Area · Window ·
   **Screen** · iPhone when one is cabled) for about 3.5 s, or until you click, scroll or draw;
   hovering keeps them. Click Window or Area to retarget (the first seconds are dropped and the
   picker takes over: click a window or drag an area), iPhone to record the phone instead, or just
   carry on.
-- **Hold `⌥⇧S`** (0.25 s or more), or **Choose What to Record…** in the menu bar: the picker
-  (Area, Window, Screen, iPhone) opens on the display under the pointer and stays open after you
-  let go. Click a mode, click a window or drag an area; `Esc` cancels.
+- **Choose What to Record…** in the menu bar: the picker (Area, Window, Screen, iPhone) opens on
+  the display under the pointer. Click a mode, click a window or drag an area; `Esc` cancels.
 - `⌥⇧V`: Paste both `contact-sheet.png` and `summary.md` into the active app or terminal (`⌃⌥⇧V` also works while it's the default)
 - **Normal pointer**: Clicks and scrolls pass straight through to the app underneath
 - **Hold `⇧` (Shift) + move**: Draw a persistent red marker stroke (`#ff3b30`) on screen that fades out after release
@@ -832,7 +831,7 @@ On Windows, `cargo test`; then run `scrawl.exe app` and record with `Alt+Shift+S
 `SCRAWL_SHOW_OWN_WINDOWS=1` keeps Scrawl's own windows (capsule, overlay, picker) in screenshots,
 which normally leave them out.
 
-- **iPhone:** connect a phone, hold `⌥⇧S`, click iPhone, click the mirror to record, talk, draw over it, press M,
+- **iPhone:** connect a phone, press `⌥⇧S`, click the iPhone chip, talk, draw over the mirror, press M,
   Finish. Inspect the bundle's `summary.md`, `scrawl.json` (`source`, `device`), contact sheet, and
   frames.
 - **ScrawlKit:** `scrawl import` on a recording and its timeline (or hand-write a timeline for any

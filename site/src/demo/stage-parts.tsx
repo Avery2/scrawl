@@ -117,14 +117,13 @@ type IslandProps = {
   phonePressed: boolean
   recordPressed: boolean
   finishPressed: boolean
-  undoDim: boolean
   recText: string
 }
 
 const islandItems = (state: Pill, phoneOn: boolean) =>
   state === "notch" ? PILL.items.select : state === "select" && phoneOn ? PILL.items.selectPhone : PILL.items[state]
 
-function IslandContent({ state, phoneOn, phonePressed, recordPressed, finishPressed, undoDim, recText }: IslandProps) {
+function IslandContent({ state, phoneOn, phonePressed, recordPressed, finishPressed, recText }: IslandProps) {
   const items = islandItems(state, phoneOn)
   const [lead, , c2, c3, c4, c5] = items
   return (
@@ -161,11 +160,8 @@ function IslandContent({ state, phoneOn, phonePressed, recordPressed, finishPres
             <b>{recText}</b>
           </span>
           <Divider />
-          <Chip w={c2} dim={undoDim}>
-            Undo
-          </Chip>
-          <Chip w={c3}>Cancel</Chip>
-          <Chip w={c4} primary pressed={finishPressed}>
+          <Chip w={c2}>Cancel</Chip>
+          <Chip w={c3} primary pressed={finishPressed}>
             Finish
           </Chip>
         </>
@@ -249,7 +245,6 @@ export function Island({ t, mode }: { t: number; mode: Mode }) {
       phonePressed={mode === "iphone" && pressedAt(t, T.phoneClick)}
       recordPressed={mode === "iphone" && pressedAt(t, T.phoneRecord)}
       finishPressed={pressedAt(t, T.finish)}
-      undoDim={t < T.circle[1]}
       recText={state === "recording" ? clock(t - T.record) : "0:00"}
       gone={gone}
       leaving={leaving}

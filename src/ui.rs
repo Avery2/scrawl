@@ -101,8 +101,8 @@ impl Spring {
 // The capsule's springs and durations live in `motion::Tune` (defaults in `Tune::DEFAULT`, live
 // overrides from `~/.config/scrawl/tune.json` in debug builds; `scrawl tune`).
 //
-// Switch chips on a tap-started recording (`crate::hold::Reveal`). One shape: the recording pill
-// grows into the chip row and folds back. The width leads the morph palette (.42/.16 open,
+// Switch chips on a tap-started recording (`crate::shortcut::Reveal`). One shape: the recording
+// pill grows into the chip row and folds back. The width leads the morph palette (.42/.16 open,
 // .38/.08 close) on a slightly faster spring; the lead (dot + clock) stays pinned to the left
 // edge, and each trailing item fades in as the moving edge uncovers it, on the same frame. The
 // chips ↔ controls swap fades in place with a sine blur pulse (sharp at both ends) and no content
@@ -287,7 +287,7 @@ fn segment_width(window: &Window, mode: SelectionMode) -> f32 {
 }
 
 /// Widths of the items after a Recording capsule's divider: the switch chips while the reveal
-/// is open (`crate::hold::Reveal`), else Undo · Cancel · Finish.
+/// is open (`crate::shortcut::Reveal`), else Cancel · Finish.
 fn recording_trail_widths(window: &Window, chips: bool, iphone: bool) -> Vec<f32> {
     if chips {
         SelectionMode::available(iphone)
@@ -296,7 +296,6 @@ fn recording_trail_widths(window: &Window, chips: bool, iphone: bool) -> Vec<f32
             .collect()
     } else {
         vec![
-            chip_width(window, "Undo", FontWeight::MEDIUM),
             chip_width(window, "Cancel", FontWeight::MEDIUM),
             chip_width(window, "Finish", FontWeight::SEMIBOLD),
         ]
@@ -316,7 +315,7 @@ fn trail_keys(
             .map(|m| format!("chip:{}", m.label()))
             .collect()
     } else {
-        ["undo", "cancel", "finish"].map(String::from).to_vec()
+        ["cancel", "finish"].map(String::from).to_vec()
     };
     names
         .into_iter()
@@ -350,7 +349,7 @@ fn edge_alpha(inner_now: f32, x: f32, w: f32) -> f32 {
 }
 
 /// The switch chips' clock: the animation clock, so they stay open as long in slow motion
-/// (`motion::time_scale`). The shortcut keeps the real clock: it times a tap against a hold.
+/// (`motion::time_scale`).
 fn reveal_clock_ms() -> u64 {
     (motion::now() * 1000.0) as u64
 }
@@ -692,8 +691,8 @@ pub struct ScrawlCoordinator {
     island_opacity: f32,
     /// Which width spring the current morph uses.
     island_morph: Morph,
-    /// Switch chips on a tap-started recording (`crate::hold::Reveal`).
-    reveal: crate::hold::Reveal,
+    /// Switch chips on a tap-started recording (`crate::shortcut::Reveal`).
+    reveal: crate::shortcut::Reveal,
     /// When the chips last opened or folded, for the in-place swap of the trailing group.
     reveal_since: f64,
     /// The trailing group fading out after that change: `Some(true)` the chips, `Some(false)` the
@@ -762,11 +761,10 @@ pub struct ScrawlCoordinator {
     grants: Option<crate::onboarding::Grants>,
     /// Holds the permissions window until the shortcut's modifiers are up.
     gate: crate::onboarding::Gate,
-    /// ⌥⇧S tapped or held (`crate::hold`).
-    shortcut: crate::hold::Shortcut,
-    /// The modifiers held when the shortcut went down; releasing any of them makes it a tap.
+    /// ⌥⇧S waiting for its keys to come up (`crate::shortcut`).
+    shortcut: crate::shortcut::Shortcut,
+    /// The modifiers held when the shortcut went down; releasing any of them starts the recording.
     hold_mods: u64,
-    clock: Instant,
     /// `scrawl lab pill`: recordings are pretend (`CaptureSource::Lab`), the picker takes no
     /// input and opens no overlay, and nothing looks for windows or phones.
     lab: bool,
@@ -802,7 +800,7 @@ impl ScrawlCoordinator {
             island_y_velocity: 0.0,
             island_opacity: 0.0,
             island_morph: Morph::Phase,
-            reveal: crate::hold::Reveal::default(),
+            reveal: crate::shortcut::Reveal::default(),
             reveal_since: motion::now(),
             reveal_outgoing: None,
             reveal_prev_chips: false,
@@ -841,9 +839,8 @@ impl ScrawlCoordinator {
             settings: None,
             grants: None,
             gate: crate::onboarding::Gate::default(),
-            shortcut: crate::hold::Shortcut::default(),
+            shortcut: crate::shortcut::Shortcut::default(),
             hold_mods: 0,
-            clock: Instant::now(),
             lab: false,
         }
     }
@@ -1162,8 +1159,8 @@ impl ScrawlCoordinator {
         }
     }
 
-    fn activity(&self) -> crate::hold::Activity {
-        use crate::hold::Activity;
+    fn activity(&self) -> crate::shortcut::Activity {
+        use crate::shortcut::Activity;
         if let Some(rec) = &self.active_recording {
             Activity::Recording {
                 elapsed_ms: rec.started.elapsed().as_millis() as u64,
@@ -1177,17 +1174,13 @@ impl ScrawlCoordinator {
         }
     }
 
-    fn clock_ms(&self) -> u64 {
-        self.clock.elapsed().as_millis() as u64
-    }
-
     /// The capture shortcut went down (from Carbon, the event tap or the HID poller).
     pub fn press_shortcut(&mut self, cx: &mut Context<Self>) {
         let activity = self.activity();
         if self.gate.is_pending() {
             return;
         }
-        if !self.shortcut.is_pending() && activity == crate::hold::Activity::Free {
+        if !self.shortcut.is_pending() && activity == crate::shortcut::Activity::Free {
             // No picker or overlay before the permissions are on: they sit above
             // macOS's permission prompts and take the clicks meant for them.
             let missing = self.missing_to_record();
@@ -1199,12 +1192,12 @@ impl ScrawlCoordinator {
             // An Esc from before this press doesn't cancel it.
             self.telemetry.take_escape();
         }
-        let action = self.shortcut.press(self.clock_ms(), activity);
+        let action = self.shortcut.press(activity);
         self.apply_shortcut(action, cx);
     }
 
-    /// Polled from the UI loop while a press is pending: watches for ⌥⇧ coming up (a tap) and
-    /// Esc, whichever app or window has focus.
+    /// Polled from the UI loop while a press is pending: watches for ⌥⇧ coming up and Esc,
+    /// whichever app or window has focus.
     pub fn tick_shortcut(&mut self, cx: &mut Context<Self>) {
         if !self.shortcut.is_pending() {
             return;
@@ -1214,20 +1207,19 @@ impl ScrawlCoordinator {
         } else {
             let mods = crate::capture::modifier_flags();
             let held = self.hold_mods != 0 && mods & self.hold_mods == self.hold_mods;
-            self.shortcut.tick(self.clock_ms(), held)
+            self.shortcut.tick(held)
         };
         self.apply_shortcut(action, cx);
     }
 
-    fn apply_shortcut(&mut self, action: crate::hold::Action, cx: &mut Context<Self>) {
-        use crate::hold::Action;
+    fn apply_shortcut(&mut self, action: crate::shortcut::Action, cx: &mut Context<Self>) {
+        use crate::shortcut::Action;
         if action != Action::None {
             scrawl_log(format!("shortcut -> {action:?}"));
         }
         match action {
             Action::None | Action::Cancel => {}
             Action::RecordScreen => self.record_screen_now(cx),
-            Action::OpenPicker => self.open_picker(None, cx),
             Action::RecordSelected => self.record_selected_mode(cx),
             Action::Finish => self.finish_recording(cx),
         }
@@ -1578,8 +1570,7 @@ impl ScrawlCoordinator {
         true
     }
 
-    /// `repeat`: the key is held and repeating, which never records: the S of a held ⌥⇧S keeps
-    /// repeating into the picker it opened.
+    /// `repeat`: the key is held and repeating, which never records.
     pub fn handle_selection_key(
         &mut self,
         keystroke: &Keystroke,
@@ -1873,14 +1864,6 @@ impl ScrawlCoordinator {
         let elapsed_ms = recording_ms.unwrap_or(self.last_elapsed_ms);
         let clock = format_clock(elapsed_ms);
         let has_iphone = self.iphone.is_some();
-        let stroke_count = self
-            .telemetry
-            .strokes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|s| !s.laser)
-            .count();
 
         let pres = match self.island_phase {
             IslandPhase::Hidden | IslandPhase::Dismissing => Pres::Hidden,
@@ -1888,7 +1871,6 @@ impl ScrawlCoordinator {
             IslandPhase::Recording => Pres::Recording {
                 chips: self.reveal.is_open(),
                 has_iphone,
-                stroke_count,
             },
             IslandPhase::Processing => Pres::Processing,
             IslandPhase::Completed { inbox_count, .. } => Pres::Completed {
@@ -1919,7 +1901,6 @@ impl ScrawlCoordinator {
             PillAction::SelectMode(mode) => self.click_selection_mode(mode, cx),
             PillAction::SwitchRecording(mode) => self.switch_recording(mode, cx),
             PillAction::RecordSelected => self.record_selected_mode(cx),
-            PillAction::Undo => self.undo_stroke(cx),
             PillAction::Cancel => self.cancel_recording(cx),
             PillAction::Finish => self.finish_recording(cx),
             PillAction::Paste(target) => self.paste_completed_bundle(target, cx),
@@ -3120,15 +3101,6 @@ impl Render for HudPillWindow {
         let island_velocity = coord.island_velocity;
         let highlight_prev = coord.highlight_prev;
         let highlight_p = ease_out_cubic(motion::age(coord.highlight_since) / HIGHLIGHT_FADE_S);
-        let stroke_count = coord
-            .telemetry
-            .strokes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|s| !s.laser)
-            .count();
-
         let clock = format_clock(elapsed_ms);
         let has_iphone = coord.iphone.is_some();
         let completed_note = coord.completed_note.clone();
@@ -3493,12 +3465,12 @@ impl Render for HudPillWindow {
             )
             .children(routes.iter().enumerate().map(|(i, label)| {
                 let c_route = c_route.clone();
-                pill_chip(("hud-route", i), label.clone(), true).on_click(move |_, _, cx| {
+                pill_chip(("hud-route", i), label.clone()).on_click(move |_, _, cx| {
                     c_route.update(cx, |coord, cx| coord.choose_route(i, cx));
                 })
             }))
             .child(
-                pill_chip("hud-inspect", "Inspect", true).on_click(move |_, _, cx| {
+                pill_chip("hud-inspect", "Inspect").on_click(move |_, _, cx| {
                     c_inspect.update(cx, |coord, cx| coord.inspect_completed_bundle(cx));
                 }),
             )
@@ -3589,13 +3561,7 @@ impl Render for HudPillWindow {
                         (fade > 0.002).then(|| {
                             let (out_alphas, _) = alphas(out_chips, fade);
                             traced(
-                                self.recording_trail(
-                                    out_chips,
-                                    has_iphone,
-                                    stroke_count,
-                                    &out_alphas,
-                                    false,
-                                ),
+                                self.recording_trail(out_chips, has_iphone, &out_alphas, false),
                                 trail_keys(out_chips, has_iphone, &out_alphas, "out:"),
                             )
                         })
@@ -3611,7 +3577,7 @@ impl Render for HudPillWindow {
                             slot.child(div().absolute().left(px(0.0)).top(px(0.0)).child(group))
                         })
                         .child(traced(
-                            self.recording_trail(chips, has_iphone, stroke_count, &in_alphas, true),
+                            self.recording_trail(chips, has_iphone, &in_alphas, true),
                             trail_keys(chips, has_iphone, &in_alphas, ""),
                         ))
                 })
@@ -3792,13 +3758,12 @@ impl SwitchLayout {
 
 impl HudPillWindow {
     /// One trailing group of the Recording capsule, each item faded by `alphas`: the switch chips
-    /// (Screen selected, as a tap records the screen) or Undo · Cancel · Finish. An outgoing
+    /// (Screen selected, as a tap records the screen) or Cancel · Finish. An outgoing
     /// group isn't `interactive`.
     fn recording_trail(
         &self,
         chips: bool,
         has_iphone: bool,
-        stroke_count: usize,
         alphas: &[f32],
         interactive: bool,
     ) -> Div {
@@ -3818,22 +3783,12 @@ impl HudPillWindow {
                 },
             ));
         }
-        let c_undo = self.coordinator.clone();
         let c_cancel = self.coordinator.clone();
         let c_finish = self.coordinator.clone();
         group
             .child(
-                pill_chip("hud-undo", "Undo", stroke_count > 0)
+                pill_chip("hud-cancel", "Cancel")
                     .opacity(alpha(0))
-                    .when(interactive && stroke_count > 0, |d| {
-                        d.on_click(move |_, _, cx| {
-                            c_undo.update(cx, |coord, cx| coord.undo_stroke(cx));
-                        })
-                    }),
-            )
-            .child(
-                pill_chip("hud-cancel", "Cancel", true)
-                    .opacity(alpha(1))
                     .when(interactive, |d| {
                         d.on_click(move |_, _, cx| {
                             c_cancel.update(cx, |coord, cx| coord.cancel_recording(cx));
@@ -3842,7 +3797,7 @@ impl HudPillWindow {
             )
             .child(
                 primary_chip("hud-done", "Finish")
-                    .opacity(alpha(2))
+                    .opacity(alpha(1))
                     .when(interactive, |d| {
                         d.on_click(move |_, _, cx| {
                             c_finish.update(cx, |coord, cx| coord.finish_recording(cx));
@@ -3889,19 +3844,12 @@ fn hud_chip(id: impl Into<gpui::ElementId>) -> gpui::Stateful<Div> {
 fn pill_chip(
     id: impl Into<gpui::ElementId>,
     label: impl Into<gpui::SharedString>,
-    enabled: bool,
 ) -> gpui::Stateful<Div> {
     hud_chip(id)
         .font_weight(FontWeight::MEDIUM)
-        .text_color(if enabled {
-            rgb(TEXT_SOFT)
-        } else {
-            rgb(0x56565a)
-        })
-        .when(enabled, |d| {
-            d.cursor_pointer()
-                .hover(|s| s.bg(rgba(0xffffff14)).text_color(rgb(TEXT_COLOR)))
-        })
+        .text_color(rgb(TEXT_SOFT))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgba(0xffffff14)).text_color(rgb(TEXT_COLOR)))
         .child(label.into())
 }
 

@@ -17,7 +17,6 @@ mod handoff;
 #[cfg_attr(target_os = "windows", path = "win/helper.rs")]
 mod helper;
 mod hex;
-mod hold;
 mod icons;
 mod inbox;
 mod keyframes;
@@ -38,6 +37,7 @@ mod routing;
 mod screens;
 mod settings;
 mod settings_window;
+mod shortcut;
 mod sketch;
 #[cfg(target_os = "macos")]
 mod sparkle;
@@ -161,7 +161,7 @@ enum HexCommand {
 
 #[derive(Subcommand)]
 enum LabCommand {
-    /// Play a capsule scene: tap-then-area, tap-then-window, tap-then-screen, hold-then-pick, finish.
+    /// Play a capsule scene: tap-then-area, tap-then-window, tap-then-screen, picker, finish.
     Pill {
         #[arg(value_enum)]
         scene: ui::LabScene,
