@@ -9,7 +9,7 @@
 //! command) and About.
 //!
 //! Shortcuts live under `"shortcuts"` (`{"record": {"keyCode", "modifiers", "label"}}`, Carbon
-//! modifier bits; absent means the default). While the window records one, Scrawl's hotkeys are
+//! modifier bits; absent means the default, and `"paste": null` turns paste off). While the window records one, Scrawl's hotkeys are
 //! paused (`capture::pause_shortcuts`) so the current combo reaches the recorder.
 
 use std::collections::BTreeSet;
@@ -83,8 +83,10 @@ impl Shortcuts {
         let mut shortcuts = Self::default();
         let stored = config.get("shortcuts");
         for kind in ShortcutKind::ALL {
-            if let Some(cfg) = stored
-                .and_then(|s| s.get(kind_key(kind)))
+            let value = stored.and_then(|s| s.get(kind_key(kind)));
+            if kind.can_unset() && value.is_some_and(serde_json::Value::is_null) {
+                shortcuts.set(kind, ShortcutConfig::unset());
+            } else if let Some(cfg) = value
                 .and_then(|v| serde_json::from_value::<Stored>(v.clone()).ok())
                 .and_then(|s| from_stored(kind, s))
             {
@@ -160,7 +162,7 @@ fn read_json(path: &Path) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
-/// Saves one shortcut; a default is removed rather than written.
+/// Saves one shortcut; a default is removed rather than written, and one turned off is `null`.
 pub fn save_shortcut(kind: ShortcutKind, cfg: &ShortcutConfig) {
     if let Err(error) = save_shortcut_in(&crate::handoff::default_config_path(), kind, cfg) {
         crate::capture::scrawl_log(format!("Saving the {kind:?} shortcut failed: {error:#}"));
@@ -180,6 +182,12 @@ pub fn save_shortcut_in(
     let map = shortcuts.as_object_mut().expect("an object");
     if cfg.is_default_for(kind) {
         map.remove(kind_key(kind));
+    } else if cfg.is_unset() {
+        anyhow::ensure!(
+            kind.can_unset(),
+            "the {kind:?} shortcut can't be turned off"
+        );
+        map.insert(kind_key(kind).to_owned(), serde_json::Value::Null);
     } else {
         map.insert(
             kind_key(kind).to_owned(),
@@ -193,13 +201,19 @@ pub fn save_shortcut_in(
     crate::handoff::set_config_value_in(path, "shortcuts", shortcuts)
 }
 
-/// The label of the paste shortcut, for hints (`⌥⇧V`, or `Alt+Shift+V`, unless changed).
+/// The label of the paste shortcut, for hints (`⌥⇧V`, or `Alt+Shift+V`, unless changed; "the
+/// paste shortcut" while it's off).
 pub fn paste_label() -> String {
-    PASTE_LABEL
+    let label = PASTE_LABEL
         .lock()
         .ok()
         .and_then(|label| label.clone())
-        .unwrap_or_else(|| ShortcutConfig::default_paste().label)
+        .unwrap_or_else(|| ShortcutConfig::default_paste().label);
+    if label.is_empty() {
+        "the paste shortcut".to_owned()
+    } else {
+        label
+    }
 }
 
 static PASTE_LABEL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -226,6 +240,22 @@ pub struct Pressed {
     #[serde(default)]
     pub reserved: bool,
 }
+
+impl Pressed {
+    /// Delete or forward delete with no modifier, which turns a shortcut off.
+    pub fn is_delete(&self) -> bool {
+        let modifiers = self.modifiers
+            & (CARBON_CMD_KEY | CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY);
+        modifiers == 0 && DELETE_KEYS.contains(&self.key_code)
+    }
+}
+
+#[cfg(target_os = "windows")]
+const DELETE_KEYS: [u32; 2] = [0x08, 0x2E];
+
+/// `kVK_Delete`, `kVK_ForwardDelete`.
+#[cfg(not(target_os = "windows"))]
+const DELETE_KEYS: [u32; 2] = [51, 117];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Rejection {
@@ -709,6 +739,8 @@ pub struct ShortcutView {
     pub option: bool,
     pub command: bool,
     pub is_default: bool,
+    /// It can be turned off (paste); `label` is empty while it is.
+    pub clearable: bool,
     /// The recorder is waiting for a new combination.
     pub recording: bool,
     /// Why the last combination was turned down.
@@ -883,6 +915,7 @@ fn shortcut_view(
         option: mods & CARBON_OPTION_KEY != 0,
         command: mods & CARBON_CMD_KEY != 0,
         is_default: cfg.is_default_for(kind),
+        clearable: kind.can_unset(),
         recording,
         error: error.cloned(),
     }
@@ -914,6 +947,10 @@ pub enum Action {
     /// Esc, a click elsewhere, or the window losing focus.
     CancelShortcut,
     ResetShortcut {
+        kind: ShortcutKind,
+    },
+    /// The × beside the paste shortcut, or Delete while it records: no shortcut at all.
+    ClearShortcut {
         kind: ShortcutKind,
     },
     /// A permission row's button.
@@ -1016,6 +1053,10 @@ impl Panel {
                 }
                 self.stop_recording(host);
                 let mut shortcuts = host.shortcuts();
+                if kind.can_unset() && pressed.is_delete() {
+                    self.apply(kind, ShortcutConfig::unset(), &mut shortcuts, host);
+                    return Effect::None;
+                }
                 let other = match kind {
                     ShortcutKind::Record => &shortcuts.paste,
                     ShortcutKind::Paste => &shortcuts.record,
@@ -1030,6 +1071,14 @@ impl Panel {
                 self.stop_recording(host);
                 let mut shortcuts = host.shortcuts();
                 self.apply(kind, kind.default_config(), &mut shortcuts, host);
+                Effect::None
+            }
+            Action::ClearShortcut { kind } => {
+                self.stop_recording(host);
+                if kind.can_unset() {
+                    let mut shortcuts = host.shortcuts();
+                    self.apply(kind, ShortcutConfig::unset(), &mut shortcuts, host);
+                }
                 Effect::None
             }
             Action::Grant { permission } => self.grant(permission),
@@ -2059,6 +2108,122 @@ mod tests {
     }
 
     #[test]
+    fn the_paste_shortcut_can_be_turned_off_and_back_on() {
+        let dir = TempDir::new("clear");
+        let mut host = fake(&dir);
+        let mut panel = Panel::default();
+        std::fs::write(&host.path, r#"{"ingestToken":"secret"}"#).unwrap();
+        panel.on(
+            Action::ClearShortcut {
+                kind: ShortcutKind::Paste,
+            },
+            &mut host,
+        );
+        assert!(host.shortcuts.paste.is_unset());
+        assert!(host.shortcuts.record.is_default_for(ShortcutKind::Record));
+        let config = read_json(&host.path);
+        assert!(config["shortcuts"]["paste"].is_null());
+        assert!(config["shortcuts"].get("paste").is_some(), "stored as null");
+        assert_eq!(config["ingestToken"], "secret");
+        let (loaded, _) = Shortcuts::load_from(&host.path, &dir.0.join("legacy.json"));
+        assert!(loaded.paste.is_unset());
+        assert!(loaded.record.is_default_for(ShortcutKind::Record));
+
+        let view = panel.view(&host);
+        let paste = &view.shortcuts[1];
+        assert_eq!((paste.label.as_str(), paste.key.as_str()), ("", ""));
+        assert!(paste.clearable && !paste.is_default);
+        assert!(!(paste.shift || paste.control || paste.option || paste.command));
+        assert!(!view.shortcuts[0].clearable);
+
+        // Nothing is registered for it and no key press matches it.
+        assert!(crate::capture::hotkey_combos(ShortcutKind::Paste, &loaded.paste).is_empty());
+        assert!(!crate::capture::shortcut_matches(
+            ShortcutKind::Paste,
+            &loaded.paste,
+            V as u16,
+            V as u16,
+            false,
+            false,
+            true,
+            true,
+        ));
+
+        // With paste off, any combination is free for Record, and Reset brings ⌥⇧V back.
+        let free = validate(
+            ShortcutKind::Record,
+            &pressed(R, CARBON_CONTROL_KEY | CARBON_OPTION_KEY, "r"),
+            &host.shortcuts.paste,
+        );
+        assert_eq!(free.map(|c| c.label), Ok(label(CTRL_OPT, "R")));
+        panel.on(
+            Action::ResetShortcut {
+                kind: ShortcutKind::Paste,
+            },
+            &mut host,
+        );
+        assert!(host.shortcuts.paste.is_default_for(ShortcutKind::Paste));
+        assert!(read_json(&host.path)["shortcuts"].get("paste").is_none());
+    }
+
+    #[test]
+    fn delete_while_recording_turns_paste_off_but_never_record() {
+        let dir = TempDir::new("clear-delete");
+        let mut host = fake(&dir);
+        let mut panel = Panel::default();
+        let delete = if WIN { 0x08 } else { 51 };
+        let press = |panel: &mut Panel, host: &mut Fake, kind: ShortcutKind, p: Pressed| {
+            panel.on(Action::RecordShortcut { kind }, host);
+            panel.on(Action::Shortcut { kind, pressed: p }, host);
+        };
+        press(
+            &mut panel,
+            &mut host,
+            ShortcutKind::Record,
+            pressed(delete, 0, ""),
+        );
+        assert_eq!(host.shortcuts, Shortcuts::default());
+        assert_eq!(
+            panel.view(&host).shortcuts[0].error,
+            Some(Rejection::NoModifier.message())
+        );
+        panel.on(
+            Action::ClearShortcut {
+                kind: ShortcutKind::Record,
+            },
+            &mut host,
+        );
+        assert_eq!(host.shortcuts, Shortcuts::default());
+        assert!(!host.path.exists(), "nothing saved");
+        assert!(
+            save_shortcut_in(&host.path, ShortcutKind::Record, &ShortcutConfig::unset()).is_err()
+        );
+        // A `null` record shortcut written by hand is read as the default.
+        std::fs::write(&host.path, r#"{"shortcuts":{"record":null}}"#).unwrap();
+        let (loaded, _) = Shortcuts::load_from(&host.path, &dir.0.join("legacy.json"));
+        assert_eq!(loaded, Shortcuts::default());
+        std::fs::remove_file(&host.path).unwrap();
+
+        press(
+            &mut panel,
+            &mut host,
+            ShortcutKind::Paste,
+            pressed(delete, CARBON_OPTION_KEY, ""),
+        );
+        assert!(!host.shortcuts.paste.is_unset(), "⌥⌫ is a combination");
+        press(
+            &mut panel,
+            &mut host,
+            ShortcutKind::Paste,
+            pressed(delete, 0, ""),
+        );
+        assert!(host.shortcuts.paste.is_unset());
+        assert_eq!(panel.recording(), None);
+        assert_eq!(host.paused.last(), Some(&false));
+        assert!(panel.view(&host).shortcuts[1].error.is_none());
+    }
+
+    #[test]
     fn toggles_and_popups_write_their_keys() {
         let dir = TempDir::new("set");
         let mut host = fake(&dir);
@@ -2315,6 +2480,12 @@ mod tests {
             parse(r#"{"action":"record-shortcut","kind":"record"}"#),
             Action::RecordShortcut {
                 kind: ShortcutKind::Record
+            }
+        );
+        assert_eq!(
+            parse(r#"{"action":"clear-shortcut","kind":"paste"}"#),
+            Action::ClearShortcut {
+                kind: ShortcutKind::Paste
             }
         );
         assert_eq!(

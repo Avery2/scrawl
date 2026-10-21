@@ -20,7 +20,8 @@ import SwiftUI
 // Clicks and key presses go back on stdout, e.g. {"action":"set","key":"autoSend","value":false},
 // {"action":"record-shortcut","kind":"record"}, {"action":"shortcut","kind":"record",
 // "keyCode":15,"modifiers":6144,"key":"r","reserved":false}, {"action":"cancel-shortcut"},
-// {"action":"reset-shortcut","kind":"paste"}, {"action":"grant","permission":"camera"},
+// {"action":"reset-shortcut","kind":"paste"}, {"action":"clear-shortcut","kind":"paste"},
+// {"action":"grant","permission":"camera"},
 // {"action":"reopen"}, {"action":"show-captures"}, {"action":"check-for-updates"},
 // {"action":"tour"}, {"action":"install-cli"}, {"action":"uninstall-cli"}, {"action":"close"}.
 
@@ -42,10 +43,13 @@ struct SettingsShortcut: Decodable, Equatable, Identifiable {
   var option = true
   var command = false
   var isDefault = true
+  /// It can be turned off (paste); `label` is empty while it is.
+  var clearable = false
   var recording = false
   var error: String?
 
   var id: String { kind }
+  var off: Bool { label.isEmpty }
 }
 
 struct SettingsModelOption: Decodable, Equatable {
@@ -140,7 +144,7 @@ struct SettingsState: Decodable, Equatable {
   var autoSend = true
   var shortcuts: [SettingsShortcut] = [
     SettingsShortcut(),
-    SettingsShortcut(kind: "paste", title: "Paste last capture", label: "⌥⇧V", key: "V"),
+    SettingsShortcut(kind: "paste", title: "Paste last capture", label: "⌥⇧V", key: "V", clearable: true),
   ]
   var microphone = SettingsMicrophone()
   var transcriber = SettingsTranscriber()
@@ -682,6 +686,20 @@ struct ShortcutRecorder: View {
             .help("Reset to \(shortcut.kind == "paste" ? "⌥⇧V" : "⌥⇧S")")
             .transition(SettingsMotion.replace)
           }
+          if shortcut.clearable && !shortcut.off && !shortcut.recording {
+            Button { model.act("clear-shortcut", ["kind": shortcut.kind]) } label: {
+              Image(systemName: "xmark")
+                .font(.system(size: 8, weight: .bold))
+                .foregroundStyle(theme.secondary)
+                .frame(width: 20, height: 20)
+                .background(Circle().fill(theme.control))
+                .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .help("Turn off")
+            .accessibilityLabel("Turn off \(shortcut.title) shortcut")
+            .transition(SettingsMotion.replace)
+          }
           field
         }
         .padding(.leading, 12)
@@ -694,7 +712,7 @@ struct ShortcutRecorder: View {
         .onHover { hovering = $0 }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(shortcut.title) shortcut")
-        .accessibilityValue(shortcut.recording ? "Listening" : shortcut.label)
+        .accessibilityValue(shortcut.recording ? "Listening" : shortcut.off ? "Off" : shortcut.label)
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { model.act(shortcut.recording ? "cancel-shortcut" : "record-shortcut", ["kind": shortcut.kind]) }
       }
@@ -734,7 +752,7 @@ struct ShortcutRecorder: View {
   }
 
   private var caption: String {
-    if shortcut.recording { return "Esc cancels." }
+    if shortcut.recording { return shortcut.clearable ? "Esc cancels. Delete turns it off." : "Esc cancels." }
     if let error = shortcut.error { return error }
     return shortcut.kind == "paste"
       ? "Pastes the last capture into the app in front."
@@ -1489,6 +1507,10 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var custom = base
     custom.shortcuts[0] = SettingsShortcut(kind: "record", title: "Record", label: "⌃⌥⌘R", key: "R", shift: false, control: true, option: true, command: true, isDefault: false)
     custom.login.on = true
+    var pasteOff = base
+    pasteOff.shortcuts[1] = SettingsShortcut(kind: "paste", title: "Paste last capture", label: "", key: "", shift: false, option: false, isDefault: false, clearable: true)
+    var pasteListening = base
+    pasteListening.shortcuts[1].recording = true
     // The shortcut keys are drawn at a moment after a few steps: (time, step).
     let rest: [(Double, (SettingsModel) -> Void)] = [(0, { $0.show(base, at: 0) })]
     let listen = rest + [(1, { $0.show(listening, at: 1) })]
@@ -1509,6 +1531,9 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
       "general-refused-reason": (refuse, 3.2),
       "general-accepted": (accept, 1.86),
       "general-custom": ([(0, { $0.show(custom, at: 0) })], 5),
+      "general-paste-listening": (rest + [(1, { $0.show(pasteListening, at: 1) })], 2.5),
+      "general-paste-cleared": (rest + [(1, { $0.show(pasteListening, at: 1) }), (1.5, { $0.type("paste", "⌫", at: 1.5) }), (1.52, { $0.show(pasteOff, at: 1.52) })], 1.7),
+      "general-paste-off": ([(0, { $0.show(pasteOff, at: 0) })], 5),
     ]
     var hex = base
     hex.transcriber = SettingsTranscriber(engine: "hex", hexTitle: "Hex", hexEnabled: true, language: "nl", models: [
@@ -1572,6 +1597,9 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
       ("general-refused-reason", .general, refused),
       ("general-accepted", .general, custom),
       ("general-custom", .general, custom),
+      ("general-paste-listening", .general, pasteListening),
+      ("general-paste-cleared", .general, pasteOff),
+      ("general-paste-off", .general, pasteOff),
       ("recording", .recording, base),
       ("recording-hex", .recording, hex),
       ("recording-mic-chosen", .recording, micChosen),
