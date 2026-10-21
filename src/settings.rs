@@ -792,13 +792,16 @@ fn microphone_view(
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriberView {
-    /// What recordings use now: "apple" or "hex".
+    /// What recordings use now: "apple", "hex" or "command".
     pub engine: &'static str,
     pub hex_title: &'static str,
     pub hex_enabled: bool,
     pub language: String,
     pub apple_locale: String,
     pub models: Vec<ModelView>,
+    /// The program's file name while `transcribeCommand` is usable (read, never run); Command
+    /// is offered only then.
+    pub command: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -897,6 +900,8 @@ pub enum Action {
     /// A settings control: `launchAtLogin`, `autoSend`, `videoExport` (bool), `microphone`
     /// ("default" or a device id), `transcriber` ("apple"/"hex"), `hexModel` (an id),
     /// `hexLanguage` (a code), `appleLocale` (a locale id or "auto"), `retention` (a preset id).
+    /// ("default" or a device id), `transcriber` ("apple"/"hex"/"command"), `hexModel` (an id),
+    /// `hexLanguage` (a code), `retention` (a preset id).
     Set {
         key: String,
         value: serde_json::Value,
@@ -1197,6 +1202,9 @@ impl Panel {
             .and_then(crate::transcribe::Engine::parse)
             .unwrap_or_default();
         let menu = crate::transcribe::menu_state(engine, hex.as_ref(), config.hex_model.as_deref());
+        let command = crate::command_transcriber::Program::load_from(&host.config_path())
+            .ok()
+            .map(|program| program.name());
         let policy = crate::retention::Policy::load_from(&host.config_path());
         let login = login_item();
         // Windows asks for no screen or accessibility grant, and has no cabled iPhone.
@@ -1240,7 +1248,11 @@ impl Panel {
                 self.status(Permission::Microphone) == Status::Granted,
             ),
             transcriber: TranscriberView {
-                engine: if menu.hex_checked { "hex" } else { "apple" },
+                engine: match engine {
+                    crate::transcribe::Engine::Command if command.is_some() => "command",
+                    _ if menu.hex_checked => "hex",
+                    _ => "apple",
+                },
                 hex_title: menu.hex_title,
                 hex_enabled: menu.hex_enabled,
                 language: crate::handoff::hex_language_from(&config),
@@ -1251,6 +1263,7 @@ impl Panel {
                     .into_iter()
                     .map(|(id, title, chosen)| ModelView { id, title, chosen })
                     .collect(),
+                command,
             },
             video_export: config.video_export.unwrap_or(false),
             retention: RetentionView {
@@ -2229,6 +2242,36 @@ mod tests {
         pick(&mut panel, &mut host, "default");
         assert_eq!(read_json(&host.path).get("microphone"), None);
         assert_eq!(panel.view(&host).microphone.selected, "default");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn command_shows_only_while_it_is_configured() {
+        let dir = TempDir::new("command");
+        let mut host = fake(&dir);
+        let mut panel = Panel::default();
+        std::fs::write(&host.path, r#"{"transcriber":"command"}"#).unwrap();
+        let view = panel.view(&host).transcriber;
+        assert_eq!((view.engine, view.command), ("apple", None));
+
+        std::fs::write(
+            &host.path,
+            r#"{"transcriber":"apple","transcribeCommand":["/opt/stt/whisper-scrawl","{audio}"]}"#,
+        )
+        .unwrap();
+        let view = panel.view(&host).transcriber;
+        assert_eq!(view.engine, "apple");
+        assert_eq!(view.command.as_deref(), Some("whisper-scrawl"));
+
+        panel.on(
+            Action::Set {
+                key: "transcriber".into(),
+                value: "command".into(),
+            },
+            &mut host,
+        );
+        assert_eq!(read_json(&host.path)["transcriber"], "command");
+        assert_eq!(panel.view(&host).transcriber.engine, "command");
     }
 
     #[test]

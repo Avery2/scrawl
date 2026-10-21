@@ -11,6 +11,7 @@ mod autocrop_lab;
 mod capture;
 #[cfg_attr(target_os = "windows", path = "win/command_line.rs")]
 mod command_line;
+mod command_transcriber;
 mod delivery;
 mod export;
 mod handoff;
@@ -79,13 +80,27 @@ struct Cli {
 }
 
 fn parse_engine(name: &str) -> Result<crate::transcribe::Engine, String> {
-    crate::transcribe::Engine::parse(name).ok_or_else(|| "expected `apple` or `hex`".to_owned())
+    crate::transcribe::Engine::parse(name)
+        .ok_or_else(|| "expected `apple`, `hex` or `command`".to_owned())
 }
 
 /// `scrawl hex status`: connection, models and what the next recording would use.
 fn hex_status() {
     let preferred = transcribe::Engine::configured();
     println!("Preferred transcriber: {}", preferred.name());
+    // Never runs the program; argv is not printed.
+    let command = handoff::transcribe_command();
+    if preferred == transcribe::Engine::Command {
+        match &command {
+            Ok(program) => println!("Command: {}", program.name()),
+            Err(unusable) => println!("Command: not usable ({unusable})"),
+        }
+    }
+    let next = |hex_model: Option<&str>| match (preferred, hex_model, &command) {
+        (transcribe::Engine::Command, _, Ok(program)) => format!("Command ({})", program.name()),
+        (transcribe::Engine::Hex, Some(model), _) => format!("Hex ({model})"),
+        _ => transcribe::LOCAL_ENGINE_TITLE.to_owned(),
+    };
     let configured = handoff::hex_model();
     println!(
         "Hex model setting: {}",
@@ -96,7 +111,7 @@ fn hex_status() {
         Ok(status) => status,
         Err(error) => {
             println!("Hex: not connected ({error:#})");
-            println!("Next recording uses: {}", transcribe::LOCAL_ENGINE_TITLE);
+            println!("Next recording uses: {}", next(None));
             return;
         }
     };
@@ -114,13 +129,7 @@ fn hex_status() {
         "Hex model in use: {}",
         chosen.as_deref().unwrap_or("none ready")
     );
-    println!(
-        "Next recording uses: {}",
-        match (preferred, chosen) {
-            (transcribe::Engine::Hex, Some(model)) => format!("Hex ({model})"),
-            _ => transcribe::LOCAL_ENGINE_TITLE.to_owned(),
-        }
-    );
+    println!("Next recording uses: {}", next(chosen.as_deref()));
 }
 
 #[derive(Subcommand)]
@@ -248,7 +257,7 @@ enum Command {
         /// Copy the summary to the clipboard.
         #[arg(long)]
         clipboard: bool,
-        /// Transcribe with `apple` or `hex` instead of the configured transcriber.
+        /// Transcribe with `apple`, `hex` or `command` instead of the configured transcriber.
         #[arg(long, value_parser = parse_engine)]
         transcriber: Option<crate::transcribe::Engine>,
     },
@@ -286,7 +295,7 @@ enum Command {
         /// many times real time first, as if recording, so the finish only transcribes the tail.
         #[arg(long, hide = true, requires = "bench")]
         live_speed: Option<f64>,
-        /// Transcribe with `apple` or `hex` instead of the configured transcriber.
+        /// Transcribe with `apple`, `hex` or `command` instead of the configured transcriber.
         #[arg(long, value_parser = parse_engine)]
         transcriber: Option<crate::transcribe::Engine>,
         /// Turn an experiment on for this run, as `"experiments"` in `config.json` would

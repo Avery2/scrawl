@@ -387,7 +387,9 @@ pub struct Config {
     /// Feature flag: shows **Export Last Capture as Video…** in the menu (default off).
     #[serde(default)]
     pub video_export: Option<bool>,
-    /// `"apple"` (default) or `"hex"`: which engine transcribes recordings (`transcribe`).
+    /// `"apple"` (default), `"hex"` or `"command"`: which engine transcribes recordings
+    /// (`transcribe`). The command's own keys are read by `transcribe_command`, not here, so a
+    /// malformed one can't reset this struct.
     #[serde(default)]
     pub transcriber: Option<String>,
     /// The Hex model to use when `transcriber` is `"hex"` (default: the first ready one of
@@ -726,6 +728,13 @@ pub fn apple_locale_from(config: &Config) -> Option<String> {
         .apple_locale
         .as_deref()
         .and_then(crate::speech_model::locale_id)
+}
+
+/// The command transcriber's program (`transcribeCommand`, `transcribeTimeoutSeconds`), read
+/// on its own from the config file.
+pub fn transcribe_command()
+-> Result<crate::command_transcriber::Program, crate::command_transcriber::Unusable> {
+    crate::command_transcriber::Program::load_from(&default_config_path())
 }
 
 /// Whether the native AppKit + Metal recording pill is enabled (`SCRAWL_NATIVE_PILL` or
@@ -1856,6 +1865,20 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn malformed_command_keys_never_reset_the_rest_of_the_config() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("config.json");
+        fs::write(
+            &path,
+            br#"{"transcriber":"command","autoSend":false,"transcribeCommand":"whisper {audio}","transcribeTimeoutSeconds":"soon"}"#,
+        )
+        .unwrap();
+        let config = load_config_from(&path);
+        assert_eq!(config.transcriber.as_deref(), Some("command"));
+        assert_eq!(config.auto_send, Some(false));
     }
 
     #[test]
