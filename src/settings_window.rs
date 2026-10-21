@@ -948,7 +948,7 @@ impl SettingsWindow {
         } else if kind == ShortcutKind::Paste {
             "Pastes the last capture into the app in front.".to_owned()
         } else {
-            "Tap to record. Hold to choose what to record.".to_owned()
+            "Records the screen. Press again to finish.".to_owned()
         };
         let key = if recording {
             "…".to_owned()

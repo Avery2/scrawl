@@ -178,7 +178,7 @@ export const PILL = {
   items: {
     select: [56, 94, 66, 13, 32],
     selectPhone: [56, 94, 66, 72, 13, 32],
-    recording: [70, 13, 58, 68, 68],
+    recording: [70, 13, 68, 68],
     processing: [132],
     copied: [98, 13, 62, 74, 32],
   },
@@ -305,7 +305,7 @@ export function buildScript(mode: Mode, a: Anchors): Script {
     { n: 2, t: T.pin2, at: pin2 },
   ]
 
-  const finish = chipCenter(PILL.items.recording, 4)
+  const finish = chipCenter(PILL.items.recording, 3)
   const prompt: Point = PROMPT_AT
   const clicks: Click[] = [...pins.map((p) => ({ t: p.t, at: p.at })), { t: T.finish, at: finish }, { t: T.promptClick, at: prompt }]
 

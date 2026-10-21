@@ -50,7 +50,6 @@ pub enum PillAction {
     SelectMode(SelectionMode),
     SwitchRecording(SelectionMode),
     RecordSelected,
-    Undo,
     Cancel,
     Finish,
     Paste(Option<[f32; 2]>),
