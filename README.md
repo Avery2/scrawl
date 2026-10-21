@@ -598,6 +598,7 @@ The bundle keeps them as `context`, `contextChanges`, and `screens` spans (`{t0,
 
 ```
 [scrawl 0:25 · iPhone · OpenCode 1.4 (354) · /…/20261014-101500.scrawl]
+Open contact-sheet.png and frames/ in that folder before changing anything: the marks and words only make sense on the images, which can show more than the text does.
 Screen: Sessions · server: studio · session: ses_3f…
 - #1 (0:01) “So here.”
 - #3 (0:08) ⟨Settings › Experimental⟩ [tapped “Back”] “Go back.”
