@@ -1200,6 +1200,7 @@ struct PermissionLine: View {
     case "microphone": "To hear you"
     case "accessibility": "For ⌘Z and \(paste)"
     case "camera": "To show a cabled iPhone"
+    case "speech-recognition": "To write down what you say"
     default: ""
     }
   }
@@ -1210,6 +1211,7 @@ struct PermissionLine: View {
     case "microphone": (Color(red: 1, green: 0.62, blue: 0.3), Color(red: 0.95, green: 0.44, blue: 0.12))
     case "accessibility": (Color(red: 0.36, green: 0.66, blue: 1), Color(red: 0.16, green: 0.45, blue: 0.95))
     case "camera": (Color(red: 0.36, green: 0.82, blue: 0.56), Color(red: 0.16, green: 0.66, blue: 0.4))
+    case "speech-recognition": (Color(red: 1, green: 0.42, blue: 0.56), Color(red: 0.9, green: 0.24, blue: 0.4))
     default: (Color(white: 0.62), Color(white: 0.45))
     }
   }

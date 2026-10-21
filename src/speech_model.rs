@@ -1,7 +1,9 @@
 //! Apple's on-device speech model. A fresh Mac doesn't have it, and each app has to reserve it
 //! for itself (`AssetInventory`, attributed to `scrawl-helper`), so Scrawl checks and installs
 //! it in the background at launch (`scrawl-helper speech-model --install`) instead of during the
-//! first capture. Onboarding and Settings show how that's going (`view`).
+//! first capture. Onboarding and Settings show how that's going (`view`). On macOS 15 there's
+//! nothing to download: the check is for the Speech Recognition permission (`NeedsPermission`,
+//! asked for in onboarding) and Dictation's on-device model.
 //!
 //! A capture that finishes without a model says so in its summary (`TranscriptData::missing`,
 //! from `missing`). When the reason can pass (still downloading, a failed download), the bundle
@@ -57,6 +59,9 @@ pub enum State {
     Ready,
     /// No Apple speech model for this Mac and language.
     Unavailable,
+    /// macOS 15: Speech Recognition isn't allowed yet (onboarding asks for it). Checked again
+    /// once it is (`note_grants`).
+    NeedsPermission,
     Failed,
 }
 
@@ -65,7 +70,8 @@ pub enum State {
 #[serde(rename_all = "camelCase")]
 pub struct Status {
     pub state: State,
-    /// `SpeechTranscriber`, or `DictationTranscriber` on Macs without SpeechTranscriber.
+    /// `SpeechTranscriber`, `DictationTranscriber` on Macs without SpeechTranscriber, or
+    /// `SFSpeechRecognizer` on macOS 15.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
     /// `en_US`; the helper window shows its name.
@@ -120,6 +126,7 @@ impl Worker {
         s.state = match line.status.as_str() {
             "installed" => State::Ready,
             "unsupported" => State::Unavailable,
+            "permission" => State::NeedsPermission,
             "failed" => State::Failed,
             _ => State::Downloading,
         };
@@ -244,7 +251,7 @@ fn work(generation: u64) {
                 }
                 return;
             }
-            State::Unavailable => return,
+            State::Unavailable | State::NeedsPermission => return,
             _ => {}
         }
         if let Some(wait) = RETRY_AFTER.get(attempt) {
@@ -256,6 +263,15 @@ fn work(generation: u64) {
                 std::thread::sleep(left.min(Duration::from_secs(1)));
             }
         }
+    }
+}
+
+/// Speech Recognition was just allowed (macOS 15): check the model again now.
+pub fn note_grants(grants: &crate::onboarding::Grants) {
+    if current().state == State::NeedsPermission
+        && grants.granted(crate::onboarding::Permission::SpeechRecognition)
+    {
+        ensure();
     }
 }
 
@@ -273,6 +289,19 @@ pub fn missing(why: &str, locale: &str, error: Option<&str>) -> MissingTranscrip
                 "{model} was still downloading. The audio is saved, and Scrawl adds the \
                  transcript to this bundle when the download finishes."
             ),
+            retry: true,
+        },
+        "permission" => MissingTranscript {
+            reason: "Speech Recognition is off for Scrawl. The audio is saved, and Scrawl adds \
+                     the transcript to this bundle once it's on (Scrawl Settings › Permissions)."
+                .to_owned(),
+            retry: true,
+        },
+        "dictation" => MissingTranscript {
+            reason: "Dictation's on-device model isn't on this Mac. Turn on Dictation in System \
+                     Settings › Keyboard, and Scrawl adds the transcript to this bundle once it's \
+                     there."
+                .to_owned(),
             retry: true,
         },
         "unsupported" => MissingTranscript {
@@ -492,5 +521,15 @@ mod tests {
         );
         let failed = missing("failed", "en_US", Some("asset unavailable"));
         assert!(failed.retry && failed.reason.contains("(asset unavailable)"));
+        let dictation = missing("dictation", "en_US", None);
+        assert!(dictation.retry && dictation.reason.contains("Turn on Dictation"));
+        // macOS 15 without Speech Recognition: transcribed again once it's allowed.
+        let off = missing("permission", "en_US", Some("Speech Recognition is off"));
+        assert!(
+            off.retry
+                && off
+                    .reason
+                    .starts_with("Speech Recognition is off for Scrawl.")
+        );
     }
 }

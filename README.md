@@ -6,8 +6,9 @@ Press a shortcut (`⌥⇧S`) and Scrawl starts recording the screen. Talk, click
 
 ## Install
 
-Scrawl needs an Apple silicon Mac on macOS 26 or later. Download the DMG from
-[scrawl.kitlangton.com](https://scrawl.kitlangton.com), or use Homebrew:
+Scrawl needs an Apple silicon Mac on macOS 15 or later (live transcription and Liquid Glass need
+macOS 26). Download the DMG from [scrawl.kitlangton.com](https://scrawl.kitlangton.com), or use
+Homebrew:
 
 ```sh
 brew install --cask kitlangton/tap/scrawl
@@ -679,8 +680,11 @@ daily, at low priority, and logs what it did:
 
 ## Transcription
 
-Narration is transcribed on device by Apple's SpeechAnalyzer (macOS 26), which reports when every
-word was spoken. The word timings drive two things:
+Narration is transcribed on device by Apple's SpeechAnalyzer (macOS 26), or on macOS 15 by the
+older on-device `SFSpeechRecognizer`. On macOS 15 onboarding asks for Speech Recognition, and
+Dictation's on-device model has to be on the Mac (System Settings › Keyboard › Dictation); Scrawl
+never falls back to Apple's servers. Both report when every word was spoken. The word timings
+drive two things:
 
 - **Text per keyframe.** Each keyframe's text runs from the start of the clause in progress when
   its moment began (the action, the transition, or the spoken cue) until the next keyframe, so the

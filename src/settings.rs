@@ -1274,6 +1274,7 @@ impl Panel {
                 Permission::Microphone,
                 Permission::Accessibility,
                 Permission::Camera,
+                Permission::SpeechRecognition,
             ]
         };
         View {
@@ -1340,6 +1341,7 @@ impl Panel {
             captures_size: self.captures_size.map(crate::retention::format_bytes),
             permissions: order
                 .iter()
+                .filter(|p| p.asked(self.grants.as_ref()))
                 .map(|&permission| PermissionView {
                     permission,
                     status: self.status(permission),
