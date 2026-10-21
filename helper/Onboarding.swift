@@ -91,6 +91,7 @@ struct SpeechStatus: Decodable, Equatable {
   var state = "unknown"
   var locale: String?
   var progress = 0.0
+  var locales: [String]?
 
   private var language: String {
     locale.flatMap { Locale.current.localizedString(forIdentifier: $0) } ?? "your language"

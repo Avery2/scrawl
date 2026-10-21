@@ -797,6 +797,7 @@ pub struct TranscriberView {
     pub hex_title: &'static str,
     pub hex_enabled: bool,
     pub language: String,
+    pub apple_locale: String,
     pub models: Vec<ModelView>,
 }
 
@@ -895,7 +896,7 @@ fn shortcut_view(
 pub enum Action {
     /// A settings control: `launchAtLogin`, `autoSend`, `videoExport` (bool), `microphone`
     /// ("default" or a device id), `transcriber` ("apple"/"hex"), `hexModel` (an id),
-    /// `hexLanguage` (a code), `retention` (a preset id).
+    /// `hexLanguage` (a code), `appleLocale` (a locale id or "auto"), `retention` (a preset id).
     Set {
         key: String,
         value: serde_json::Value,
@@ -944,6 +945,8 @@ pub enum Effect {
     CheckForUpdates,
     /// The captures folder may have changed size.
     Measure,
+    /// The Apple Speech language changed.
+    SpeechModel,
     Relaunch,
     Tour,
     Close,
@@ -1131,6 +1134,17 @@ impl Panel {
                     write("hexLanguage", language.into());
                 }
             }
+            ("appleLocale", serde_json::Value::String(locale)) => {
+                let locale = locale.trim();
+                if locale.is_empty() || locale.eq_ignore_ascii_case("auto") {
+                    write("appleLocale", serde_json::Value::Null);
+                    return Effect::SpeechModel;
+                }
+                if let Some(locale) = crate::speech_model::locale_id(locale) {
+                    write("appleLocale", locale.into());
+                    return Effect::SpeechModel;
+                }
+            }
             ("retention", serde_json::Value::String(id)) => {
                 if let Some(preset) = crate::retention::Preset::ALL
                     .into_iter()
@@ -1230,6 +1244,8 @@ impl Panel {
                 hex_title: menu.hex_title,
                 hex_enabled: menu.hex_enabled,
                 language: crate::handoff::hex_language_from(&config),
+                apple_locale: crate::handoff::apple_locale_from(&config)
+                    .unwrap_or_else(|| "auto".into()),
                 models: menu
                     .models
                     .into_iter()
@@ -1527,6 +1543,10 @@ impl Session {
                         crate::retention::captures_size(&crate::handoff::default_captures_dir());
                     events(Event::CapturesSize(size));
                 });
+                Effect::None
+            }
+            Effect::SpeechModel => {
+                crate::speech_model::restart();
                 Effect::None
             }
             other => other,
@@ -2091,6 +2111,24 @@ mod tests {
         assert_eq!(panel.view(&host).transcriber.language, "auto");
         set(&mut panel, &mut host, "hexLanguage", "".into());
         assert_eq!(panel.view(&host).transcriber.language, "en");
+        assert_eq!(panel.view(&host).transcriber.apple_locale, "auto");
+        assert_eq!(
+            set(&mut panel, &mut host, "appleLocale", "zh-TW".into()),
+            Effect::SpeechModel
+        );
+        assert_eq!(read_json(&host.path)["appleLocale"], "zh-TW");
+        assert_eq!(panel.view(&host).transcriber.apple_locale, "zh-TW");
+        assert_eq!(
+            set(&mut panel, &mut host, "appleLocale", "zh-TW --install".into()),
+            Effect::None
+        );
+        assert_eq!(read_json(&host.path)["appleLocale"], "zh-TW");
+        assert_eq!(
+            set(&mut panel, &mut host, "appleLocale", "auto".into()),
+            Effect::SpeechModel
+        );
+        assert!(read_json(&host.path).get("appleLocale").is_none());
+        assert_eq!(panel.view(&host).transcriber.apple_locale, "auto");
         set(&mut panel, &mut host, "retention", "forever".into());
         // "Forever" says it all; no caption.
         assert_eq!(panel.view(&host).retention.note, "");

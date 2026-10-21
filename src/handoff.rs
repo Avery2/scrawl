@@ -397,6 +397,9 @@ pub struct Config {
     /// Hex language code (`"en"` by default, `"auto"` for model language detection).
     #[serde(default)]
     pub hex_language: Option<String>,
+    /// Apple Speech locale (BCP-47, e.g. "zh-TW"); missing means the Mac's own language.
+    #[serde(default)]
+    pub apple_locale: Option<String>,
     /// Whether to use the native Metal recording pill instead of GPUI's `HudPillWindow` (default `true`).
     #[serde(default)]
     pub native_pill: Option<bool>,
@@ -711,6 +714,18 @@ pub fn hex_language_from(config: &Config) -> String {
         .as_deref()
         .and_then(crate::hex::language_code)
         .unwrap_or_else(|| crate::hex::DEFAULT_LANGUAGE.into())
+}
+
+/// The configured Apple Speech locale, or the Mac's own language when unset.
+pub fn apple_locale() -> Option<String> {
+    apple_locale_from(&config())
+}
+
+pub fn apple_locale_from(config: &Config) -> Option<String> {
+    config
+        .apple_locale
+        .as_deref()
+        .and_then(crate::speech_model::locale_id)
 }
 
 /// Whether the native AppKit + Metal recording pill is enabled (`SCRAWL_NATIVE_PILL` or
@@ -1791,6 +1806,31 @@ mod tests {
             let mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn apple_locale_round_trips_and_keeps_other_keys() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("config.json");
+        fs::write(&path, br#"{"ingestToken":"abc","autoSend":false}"#).unwrap();
+        let config = load_config_from(&path);
+        assert_eq!(apple_locale_from(&config), None);
+        assert_eq!(config.auto_send, Some(false));
+
+        for (value, expected) in [
+            ("zh-TW".into(), Some("zh-TW")),
+            ("bad value".into(), None),
+            (5.into(), None),
+            (serde_json::Value::Null, None),
+        ] {
+            set_config_value_in(&path, "appleLocale", value).unwrap();
+            let config = load_config_from(&path);
+            assert_eq!(apple_locale_from(&config).as_deref(), expected);
+            assert_eq!(config.ingest_token.as_deref(), Some("abc"));
+            assert_eq!(config.auto_send, Some(false));
+        }
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(raw.get("appleLocale").is_none());
     }
 
     #[test]
