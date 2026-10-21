@@ -33,5 +33,6 @@ it's unset.
 
 Check after deploying: the live DMG, zips and newest delta match the release's sha256s, the live
 appcast's signature verifies, `spctl` accepts the downloaded DMG and the app in it, the site shows the
-new version for both the Mac and Windows download buttons, and the Windows zip has `scrawl.exe`, the
-three Visual C++ DLLs, README and LICENSE.
+new version for both the Mac and Windows download buttons, and the Windows zip has `scrawl.exe`,
+`transcribe.dll`, `ggml.dll`, `ggml-base.dll`, a `ggml-cpu-<tier>.dll` for every x86 tier (see
+[windows.md](windows.md)), the Visual C++ runtime DLLs they import, README and LICENSE.
