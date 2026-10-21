@@ -14,7 +14,7 @@ $dumpbin = (Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Se
 # address-size prefix) is AVX-512, whatever register width it uses.
 function Avx512Lines([string]$file) {
   @(& $dumpbin /nologo /disasm $file |
-    Select-String -Pattern '^\s+[0-9A-F]+: (6[4-7] )?62 [0-9A-F]{2} [0-9A-F]{2} [0-9A-F]{2} ' -CaseSensitive)
+    Select-String -Pattern '^\s+[0-9A-F]+: (6[4-7] )?62 [0-9A-F]{2} [0-9A-F]{2} [0-9A-F]{2} ' -CaseSensitive -Context 40, 2)
 }
 
 $imports = & $dumpbin /nologo /dependents (Join-Path $Dir "scrawl.exe")
@@ -33,7 +33,7 @@ foreach ($name in $baseline) {
   $hits = Avx512Lines $file
   if ($hits.Count -gt 0) {
     "$name has $($hits.Count) AVX-512 instructions, e.g.:"
-    $hits | Select-Object -First 5 | ForEach-Object { "  $($_.Line.Trim())" }
+    $hits | Select-Object -First 2 | ForEach-Object { $_.Context.PreContext; ">> $($_.Line)"; $_.Context.PostContext; "" }
     $failed = $true
   } else {
     "$name`: no AVX-512"
