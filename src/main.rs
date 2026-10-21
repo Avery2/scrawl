@@ -1,7 +1,5 @@
 mod agent_context;
 mod audio;
-#[cfg_attr(not(target_os = "macos"), path = "win/playback.rs")]
-mod playback;
 mod autocrop;
 // Windows looks elements up through UI Automation (`win/uia.rs`); other systems have no lookup.
 #[cfg_attr(
@@ -33,6 +31,9 @@ mod onboarding;
 mod onboarding_window;
 mod page;
 mod phone;
+// Lowers the output volume while recording on macOS; elsewhere a no-op.
+#[cfg_attr(not(target_os = "macos"), path = "win/playback.rs")]
+mod playback;
 mod recover;
 mod render;
 mod retention;

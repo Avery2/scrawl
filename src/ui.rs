@@ -1925,7 +1925,9 @@ impl ScrawlCoordinator {
     }
 
     pub fn dismiss_island(&mut self, cx: &mut Context<Self>) {
-        if !self.is_recording() { self.playback.take(); }
+        if !self.is_recording() {
+            self.playback.take();
+        }
         if matches!(
             self.island_phase,
             IslandPhase::Hidden | IslandPhase::Dismissing

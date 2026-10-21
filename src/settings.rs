@@ -624,7 +624,7 @@ pub struct View {
     pub shortcuts: Vec<ShortcutView>,
     pub microphone: MicrophoneView,
     pub transcriber: TranscriberView,
-    pub playback_mode: String,
+    pub lower_playback: bool,
     pub playback_level: u8,
     pub video_export: bool,
     pub retention: RetentionView,
@@ -1168,11 +1168,8 @@ impl Panel {
                     return Effect::OpenLoginItems;
                 }
             }
-            ("autoSend" | "videoExport", serde_json::Value::Bool(on)) => write(key, (*on).into()),
-            ("playbackMode", serde_json::Value::String(mode))
-                if matches!(mode.as_str(), "unchanged" | "mute" | "lower") =>
-            {
-                write(key, value.clone());
+            ("autoSend" | "videoExport" | "lowerPlayback", serde_json::Value::Bool(on)) => {
+                write(key, (*on).into())
             }
             ("playbackLevel", serde_json::Value::Number(level))
                 if level.as_u64().is_some_and(|n| n <= 100) =>
@@ -1308,11 +1305,8 @@ impl Panel {
                 self.inputs.as_ref(),
                 self.status(Permission::Microphone) == Status::Granted,
             ),
-            playback_mode: config
-                .playback_mode
-                .clone()
-                .unwrap_or_else(|| "unchanged".into()),
-            playback_level: config.playback_level.unwrap_or(20).min(100),
+            lower_playback: config.lower_playback.unwrap_or(false),
+            playback_level: config.recording_volume(),
             transcriber: TranscriberView {
                 engine: match engine {
                     crate::transcribe::Engine::Command if command.is_some() => "command",
@@ -2269,15 +2263,14 @@ mod tests {
             )
         };
         assert!(panel.view(&host).auto_send);
-        assert_eq!(panel.view(&host).playback_mode, "unchanged");
+        assert!(!panel.view(&host).lower_playback);
         assert_eq!(panel.view(&host).playback_level, 20);
-        set(&mut panel, &mut host, "playbackMode", "lower".into());
+        set(&mut panel, &mut host, "lowerPlayback", true.into());
         set(&mut panel, &mut host, "playbackLevel", 35.into());
-        set(&mut panel, &mut host, "playbackMode", "invalid".into());
         set(&mut panel, &mut host, "playbackLevel", 101.into());
         set(&mut panel, &mut host, "playbackLevel", (-1).into());
         set(&mut panel, &mut host, "playbackLevel", 0.5.into());
-        assert_eq!(Panel::default().view(&host).playback_mode, "lower");
+        assert!(Panel::default().view(&host).lower_playback);
         assert_eq!(Panel::default().view(&host).playback_level, 35);
         set(&mut panel, &mut host, "autoSend", false.into());
         set(&mut panel, &mut host, "videoExport", true.into());

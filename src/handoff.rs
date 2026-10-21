@@ -392,8 +392,9 @@ pub struct Config {
     /// malformed one can't reset this struct.
     #[serde(default)]
     pub transcriber: Option<String>,
+    /// Lower the output volume while recording (`playback`) to `playbackLevel` percent of it.
     #[serde(default)]
-    pub playback_mode: Option<String>,
+    pub lower_playback: Option<bool>,
     #[serde(default)]
     pub playback_level: Option<u8>,
     /// The Hex model to use when `transcriber` is `"hex"` (default: the first ready one of
@@ -422,6 +423,13 @@ pub struct Config {
     /// Smart routing's settings (`routing::look`).
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
+}
+
+impl Config {
+    /// The output volume while recording when `lowerPlayback` is on, in percent of what it was.
+    pub fn recording_volume(&self) -> u8 {
+        self.playback_level.unwrap_or(20).min(100)
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
