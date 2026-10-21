@@ -229,12 +229,12 @@ enum Recognizer {
   }
 
   /// Chunks run one after another; the recognizer is not built for concurrent tasks. Without
-  /// permission (`missing: permission`) or the Dictation model (`failed`) the output says so
+  /// permission (`missing: permission`) or the Dictation model (`dictation`) the output says so
   /// rather than asking now.
   static func transcribe(_ url: URL, choice: SpeechChoice) async throws -> [String: Any] {
     let (status, error) = await SpeechModel.status(choice)
     if status != "installed" {
-      var result = Transcriber.missing(choice, status)
+      var result = Transcriber.missing(choice, status == "failed" ? "dictation" : status)
       result["error"] = error
       return result
     }

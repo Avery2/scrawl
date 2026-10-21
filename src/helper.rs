@@ -117,7 +117,8 @@ struct Transcript {
     text: String,
     segments: Vec<TranscriptSegment>,
     words: Vec<WordTiming>,
-    /// No usable speech model: `downloading`, `unsupported` or `failed` (with `error`).
+    /// No usable speech model: `downloading`, `unsupported` or `failed` (with `error`); on macOS
+    /// 15 also `permission` (Speech Recognition is off) or `dictation` (no Dictation model).
     #[serde(default)]
     missing: Option<String>,
     #[serde(default)]

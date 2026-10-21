@@ -297,6 +297,13 @@ pub fn missing(why: &str, locale: &str, error: Option<&str>) -> MissingTranscrip
                 .to_owned(),
             retry: true,
         },
+        "dictation" => MissingTranscript {
+            reason: "Dictation's on-device model isn't on this Mac. Turn on Dictation in System \
+                     Settings › Keyboard, and Scrawl adds the transcript to this bundle once it's \
+                     there."
+                .to_owned(),
+            retry: true,
+        },
         "unsupported" => MissingTranscript {
             reason: format!(
                 "this Mac has no Apple speech model for {locale}. Hex can transcribe instead \
@@ -514,6 +521,8 @@ mod tests {
         );
         let failed = missing("failed", "en_US", Some("asset unavailable"));
         assert!(failed.retry && failed.reason.contains("(asset unavailable)"));
+        let dictation = missing("dictation", "en_US", None);
+        assert!(dictation.retry && dictation.reason.contains("Turn on Dictation"));
         // macOS 15 without Speech Recognition: transcribed again once it's allowed.
         let off = missing("permission", "en_US", Some("Speech Recognition is off"));
         assert!(
