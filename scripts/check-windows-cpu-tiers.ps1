@@ -21,8 +21,13 @@ function Avx512Lines([string]$file) {
 
 function Guarded($hit) {
   $before = @($hit.Context.PreContext)
-  for ($i = 0; $i -lt $before.Count - 1; $i++) {
-    if ($before[$i] -match '\scmp\s+\S.*,6\s*$' -and $before[$i + 1] -match '\sj(l|b)\s') { return $true }
+  for ($i = 0; $i -lt $before.Count; $i++) {
+    if ($before[$i] -notmatch '\scmp\s+\S.*,6\s*$') { continue }
+    # The compiler may schedule a few unrelated instructions between the compare and the branch.
+    for ($j = $i + 1; $j -lt [Math]::Min($i + 8, $before.Count); $j++) {
+      if ($before[$j] -match '\sj(l|b)\s') { return $true }
+      if ($before[$j] -match '\s(cmp|test)\s') { break }
+    }
   }
   $false
 }
