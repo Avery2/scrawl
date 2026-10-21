@@ -384,6 +384,10 @@ mod tests {
         if fresh {
             assert_eq!(last, 1.0);
         }
+        if std::env::var_os("SCRAWL_TEST_NO_AVX512").is_some() {
+            // Under SDE: proves the emulated CPU is the one without AVX-512.
+            assert!(!std::arch::is_x86_feature_detected!("avx512f"));
+        }
         init_backends().unwrap();
         for device in transcribe_cpp::devices() {
             eprintln!("device: {} ({})", device.name, device.description);

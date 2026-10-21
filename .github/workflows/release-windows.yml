@@ -114,6 +114,7 @@ jobs:
         shell: pwsh
         env:
           SCRAWL_TEST_MODEL_DIR: ${{ runner.temp }}\speech-model
+          SCRAWL_TEST_NO_AVX512: "1"
         run: |
           $test = cargo test ${{ env.BUILD }} --bin scrawl --no-run --message-format=json |
             ForEach-Object { $_ | ConvertFrom-Json } |
