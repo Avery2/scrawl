@@ -28,7 +28,7 @@ When you answer, refer to moments the same way, as in "#3 (0:10)", so the person
 
 ## Reading a bundle
 
-1. Look at `contact-sheet.png` in the bundle first (it's often attached already). It shows every keyframe in time order, left to right and top to bottom, each with a `#N M:SS` badge.
+1. Look at `contact-sheet.png` in the bundle first (it's often attached already). It shows every keyframe in time order, left to right and top to bottom, each with its number `N` in a small white chip in a top corner (the `#N` in `summary.md`).
 2. Read the transcript lines next to it. Speech recognition mishears names and code terms, so trust the screen when the two disagree.
 3. Open `frames/frame-NN.png` for any keyframe you need at full size (`frame-03.png` is #3). When the summary says `Cropped to:`, the uncropped screens are in `frames-full/`.
 
