@@ -35,8 +35,16 @@ struct SpeechChoice {
 /// bundle id (`dev.kitlangton.scrawl.helper`) and downloads the model if the Mac doesn't have it.
 /// A fresh Mac has none, so Scrawl installs it in the background at launch
 /// (`scrawl-helper speech-model --install`) rather than in the middle of a capture. On macOS 15
-/// the same command asks for Speech Recognition and checks for the Dictation model instead.
+/// the same command checks for the Speech Recognition permission and the Dictation model instead.
 enum SpeechModel {
+  /// SpeechAnalyzer (macOS 26, built with its SDK); otherwise `Recognizer`.
+  static var analyzer: Bool {
+    #if compiler(>=6.2)
+    if #available(macOS 26, *) { return true }
+    #endif
+    return false
+  }
+
   static func choose(preferred: String? = nil) async -> SpeechChoice? {
     #if compiler(>=6.2)
     if #available(macOS 26, *) { return await analyzerChoice(preferred: preferred) }
@@ -80,19 +88,24 @@ enum SpeechModel {
     return supported.first { $0.identifier(.bcp47) == "en-US" }
   }
 
-  static func status(_ choice: SpeechChoice) async -> String {
+  /// `installed`, `downloading`, `supported` (can be downloaded) or `unsupported`. On macOS 15
+  /// there's nothing to download: `installed`, `permission` (Speech Recognition is off) or
+  /// `failed` (no Dictation model), with `error` saying what to turn on.
+  static func status(_ choice: SpeechChoice) async -> (status: String, error: String?) {
     #if compiler(>=6.2)
     if #available(macOS 26, *) {
       switch await AssetInventory.status(forModules: [choice.module()]) {
-      case .installed: return "installed"
-      case .downloading: return "downloading"
-      case .supported: return "supported"
-      case .unsupported: return "unsupported"
-      @unknown default: return "unsupported"
+      case .installed: return ("installed", nil)
+      case .downloading: return ("downloading", nil)
+      case .supported: return ("supported", nil)
+      case .unsupported: return ("unsupported", nil)
+      @unknown default: return ("unsupported", nil)
       }
     }
     #endif
-    return await Recognizer.problem(choice) == nil ? "installed" : "supported"
+    if let off = Recognizer.permissionProblem() { return ("permission", off) }
+    if let missing = await Recognizer.dictationProblem(choice) { return ("failed", missing) }
+    return ("installed", nil)
   }
 
   /// Every locale the engine knows, for Settings' language menu.
@@ -107,23 +120,25 @@ enum SpeechModel {
     return SFSpeechRecognizer.supportedLocales().map { $0.identifier(.bcp47) }.sorted()
   }
 
-  static func describe(_ choice: SpeechChoice?, status: String, locales: [String] = []) -> [String: Any] {
+  static func describe(_ choice: SpeechChoice?, status: String, error: String? = nil, locales: [String] = []) -> [String: Any] {
     guard let choice else { return ["status": "unsupported", "locales": locales] }
-    return ["engine": choice.name, "locale": choice.locale.identifier, "status": status, "locales": choice.supported]
+    var line: [String: Any] = ["engine": choice.name, "locale": choice.locale.identifier, "status": status, "locales": choice.supported]
+    if let error { line["error"] = error }
+    return line
   }
 
   /// `speech-model [--install]`: one status line; with `--install`, installs the model if it
-  /// isn't, with progress lines about once a second and a last line that's `installed` or
-  /// `failed` (with `error`).
+  /// can be downloaded, with progress lines about once a second and a last line that's
+  /// `installed` or `failed` (with `error`). Never asks for a permission.
   static func run(install: Bool, preferred: String? = nil) async {
     let choice = await choose(preferred: preferred)
     guard let choice else {
       emit(describe(nil, status: "unsupported", locales: await supportedLocales()))
       return
     }
-    let status = await status(choice)
-    emit(describe(choice, status: status))
-    guard install, status != "installed", status != "unsupported" else { return }
+    let (status, error) = await status(choice)
+    emit(describe(choice, status: status, error: error))
+    guard install, status == "supported" || status == "downloading" else { return }
     do {
       try await self.install(choice) { fraction in
         var line = describe(choice, status: "downloading")
@@ -158,19 +173,17 @@ enum SpeechModel {
       }
       defer { reporter.cancel() }
       try await request.downloadAndInstall()
-      return
     }
     #endif
-    try await Recognizer.install(choice)
   }
 }
 
 /// macOS 15: SFSpeechRecognizer, on device only so narration never leaves the Mac. There's no
-/// AssetInventory before macOS 26. Instead `speech-model --install` asks for Speech Recognition
-/// (SFSpeechRecognizer has a permission prompt of its own, unlike SpeechAnalyzer) and checks that
-/// Dictation's on-device model is on this Mac, so neither waits for the first capture.
-/// `supportsOnDeviceRecognition` can be true before that model is downloaded, so the check
-/// recognizes half a second of silence.
+/// AssetInventory before macOS 26, so nothing to download: SFSpeechRecognizer needs the Speech
+/// Recognition permission (asked for in onboarding, `Permissions.request`) and Dictation's
+/// on-device model, which `speech-model` checks for at launch so neither waits for the first
+/// capture. `supportsOnDeviceRecognition` can be true before that model is downloaded, so the
+/// check recognizes half a second of silence.
 enum Recognizer {
   /// The language chosen in Settings when there's a recognizer for it, else the user's locale
   /// or en-US, preferring one that recognizes on device.
@@ -188,14 +201,18 @@ enum Recognizer {
     return SpeechChoice(engine: .recognizer, locale: recognizer.locale, supported: ids)
   }
 
-  /// Why the recognizer can't transcribe yet, or nil when it can. Never prompts.
-  static func problem(_ choice: SpeechChoice) async -> String? {
+  /// What to turn on when Speech Recognition isn't allowed, or nil when it is. Never prompts.
+  static func permissionProblem() -> String? {
     switch SFSpeechRecognizer.authorizationStatus() {
-    case .authorized: break
-    case .notDetermined: return "Scrawl hasn't been allowed to use Speech Recognition yet."
-    default: return "Speech Recognition is off for Scrawl. Turn it on in System Settings › Privacy & Security › Speech Recognition."
+    case .authorized: return nil
+    case .notDetermined: return "Speech Recognition isn't allowed yet, so captures have no transcript."
+    default: return "Speech Recognition is off. Turn it on in System Settings › Privacy & Security."
     }
-    let dictationOff = "Apple's on-device Dictation model isn't on this Mac. Turn on Dictation in System Settings › Keyboard to download it."
+  }
+
+  /// Dictation's on-device model is missing (or broken), or nil when it recognizes.
+  static func dictationProblem(_ choice: SpeechChoice) async -> String? {
+    let dictationOff = "Turn on Dictation in System Settings › Keyboard for transcripts."
     guard let recognizer = SFSpeechRecognizer(locale: choice.locale), recognizer.supportsOnDeviceRecognition else { return dictationOff }
     let format = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)!
     guard let silence = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 8000) else { return dictationOff }
@@ -207,25 +224,18 @@ enum Recognizer {
       _ = try await recognize(request, with: recognizer, timeout: 10)
       return nil
     } catch {
-      return "\(dictationOff) (\(error.localizedDescription))"
+      return dictationOff
     }
-  }
-
-  static func install(_ choice: SpeechChoice) async throws {
-    if SFSpeechRecognizer.authorizationStatus() == .notDetermined {
-      _ = await withCheckedContinuation { cont in
-        SFSpeechRecognizer.requestAuthorization { cont.resume(returning: $0) }
-      }
-    }
-    if let problem = await problem(choice) { throw HelperError(problem) }
   }
 
   /// Chunks run one after another; the recognizer is not built for concurrent tasks. Without
-  /// permission or the Dictation model the output says so in `missing` rather than asking now.
+  /// permission (`missing: permission`) or the Dictation model (`failed`) the output says so
+  /// rather than asking now.
   static func transcribe(_ url: URL, choice: SpeechChoice) async throws -> [String: Any] {
-    if let problem = await problem(choice) {
-      var result = Transcriber.missing(choice, "failed")
-      result["error"] = problem
+    let (status, error) = await SpeechModel.status(choice)
+    if status != "installed" {
+      var result = Transcriber.missing(choice, status)
+      result["error"] = error
       return result
     }
     guard let recognizer = SFSpeechRecognizer(locale: choice.locale) else { return Transcriber.missing(choice, "unsupported") }
@@ -325,7 +335,7 @@ enum Transcriber {
   #if compiler(>=6.2)
   @available(macOS 26, *)
   private static func analyzerTranscribe(_ url: URL, choice: SpeechChoice) async throws -> [String: Any] {
-    switch await SpeechModel.status(choice) {
+    switch await SpeechModel.status(choice).status {
     case "installed": break
     case "downloading": return missing(choice, "downloading")
     case "unsupported": return missing(choice, "unsupported")

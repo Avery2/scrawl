@@ -681,7 +681,9 @@ daily, at low priority, and logs what it did:
 ## Transcription
 
 Narration is transcribed on device by Apple's SpeechAnalyzer (macOS 26), or on macOS 15 by the
-older on-device `SFSpeechRecognizer`. Both report when every word was spoken. The word timings
+older on-device `SFSpeechRecognizer`. On macOS 15 onboarding asks for Speech Recognition, and
+Dictation's on-device model has to be on the Mac (System Settings › Keyboard › Dictation); Scrawl
+never falls back to Apple's servers. Both report when every word was spoken. The word timings
 drive two things:
 
 - **Text per keyframe.** Each keyframe's text runs from the start of the clause in progress when

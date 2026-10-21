@@ -1350,6 +1350,12 @@ impl SettingsWindow {
                 crate::icons::IPHONE,
                 GREEN,
             ),
+            Permission::SpeechRecognition => (
+                "Speech Recognition",
+                "To write down what you say".to_owned(),
+                crate::icons::MIC,
+                ORANGE,
+            ),
         };
         let granted = row.status == Status::Granted;
         let id = SharedString::from(format!("settings-grant-{permission:?}"));
