@@ -215,7 +215,7 @@ final class PillViewModel: ObservableObject {
     }
     let sameLayout = items.map(\.id) == s.items.map(\.id) && items.map(\.rect) == s.items.map(\.rect)
     if sameLayout {
-      // Only the selection or an enabled state changed: the highlight slides (matched geometry);
+      // Only the selection changed: the highlight slides (matched geometry);
       // a key step in the hold switcher is the user's own hand, so it's near-instant.
       if items != s.items {
         withAnimation(spring(s.keyed ? PillSpringSpec(0.1, 0) : opts.hlTrail)) { items = s.items }
@@ -434,7 +434,7 @@ struct PillItemView: View {
       switch item.id {
       case "chip:Area", "chip:Window", "chip:Screen", "chip:iPhone": modeChip
       case "record", "finish", "paste": accentChip
-      case "undo", "cancel", "inspect": plainChip
+      case "cancel", "inspect": plainChip
       case "close": closeChip
       case "lead": lead
       case "processing": processing
@@ -455,7 +455,6 @@ struct PillItemView: View {
     case "record": "Record"
     case "finish": "Finish"
     case "paste": "Paste"
-    case "undo": "Undo"
     case "cancel": "Cancel"
     case "inspect": "Inspect"
     default: ""
@@ -504,17 +503,13 @@ struct PillItemView: View {
   }
 
   private var plainChip: some View {
-    let fg: Double = !item.enabled ? (model.glass ? 0.78 : 0.56)
-      : model.glass ? 0.92 + 0.08 * hover : 0.74 + 0.22 * hover
-    let bg: Double = model.glass
-      ? (item.enabled ? 0.20 + 0.12 * hover + 0.06 * press : 0.12)
-      : (item.enabled ? 0.08 * hover + 0.06 * press : 0)
+    let fg: Double = model.glass ? 0.92 + 0.08 * hover : 0.74 + 0.22 * hover
+    let bg: Double = model.glass ? 0.20 + 0.12 * hover + 0.06 * press : 0.08 * hover + 0.06 * press
     return Text(name)
       .font(.system(size: 13, weight: .medium))
-      .foregroundStyle(Color(white: fg).opacity(item.enabled ? 1 : 0.9))
+      .foregroundStyle(Color(white: fg))
       .frame(maxWidth: .infinity, maxHeight: .infinity)
       .background(Capsule().fill(chipFill(bg)))
-      .animation(model.spring(PillSpringSpec(0.2, 0)), value: item.enabled)
   }
 
   private var closeChip: some View {

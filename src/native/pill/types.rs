@@ -67,7 +67,6 @@ pub enum PillAction {
     SelectMode(SelectionMode),
     SwitchRecording(SelectionMode),
     RecordSelected,
-    Undo,
     Cancel,
     Finish,
     Paste(Option<[f32; 2]>),
@@ -89,7 +88,6 @@ impl PillAction {
         }
         Some(match elem {
             ElemId::Record => Self::RecordSelected,
-            ElemId::Undo => Self::Undo,
             ElemId::Cancel => Self::Cancel,
             ElemId::Finish => Self::Finish,
             ElemId::Close if matches!(pres, Pres::Completed { .. }) => Self::DismissCompleted,

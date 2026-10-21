@@ -287,7 +287,7 @@ fn segment_width(window: &Window, mode: SelectionMode) -> f32 {
 }
 
 /// Widths of the items after a Recording capsule's divider: the switch chips while the reveal
-/// is open (`crate::hold::Reveal`), else Undo · Cancel · Finish.
+/// is open (`crate::hold::Reveal`), else Cancel · Finish.
 fn recording_trail_widths(window: &Window, chips: bool, iphone: bool) -> Vec<f32> {
     if chips {
         SelectionMode::available(iphone)
@@ -296,7 +296,6 @@ fn recording_trail_widths(window: &Window, chips: bool, iphone: bool) -> Vec<f32
             .collect()
     } else {
         vec![
-            chip_width(window, "Undo", FontWeight::MEDIUM),
             chip_width(window, "Cancel", FontWeight::MEDIUM),
             chip_width(window, "Finish", FontWeight::SEMIBOLD),
         ]
@@ -316,7 +315,7 @@ fn trail_keys(
             .map(|m| format!("chip:{}", m.label()))
             .collect()
     } else {
-        ["undo", "cancel", "finish"].map(String::from).to_vec()
+        ["cancel", "finish"].map(String::from).to_vec()
     };
     names
         .into_iter()
@@ -1937,14 +1936,6 @@ impl ScrawlCoordinator {
         let elapsed_ms = recording_ms.unwrap_or(self.last_elapsed_ms);
         let clock = format_clock(elapsed_ms);
         let has_iphone = self.iphone.is_some();
-        let stroke_count = self
-            .telemetry
-            .strokes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|s| !s.laser)
-            .count();
 
         let pres = match self.island_phase {
             IslandPhase::Hidden | IslandPhase::Dismissing => Pres::Hidden,
@@ -1956,7 +1947,6 @@ impl ScrawlCoordinator {
             IslandPhase::Recording => Pres::Recording {
                 chips: self.reveal.is_open(),
                 has_iphone,
-                stroke_count,
             },
             IslandPhase::Processing => Pres::Processing,
             IslandPhase::Completed { inbox_count, .. } => Pres::Completed {
@@ -1986,7 +1976,6 @@ impl ScrawlCoordinator {
             PillAction::SelectMode(mode) => self.click_selection_mode(mode, cx),
             PillAction::SwitchRecording(mode) => self.switch_recording(mode, cx),
             PillAction::RecordSelected => self.record_selected_mode(cx),
-            PillAction::Undo => self.undo_stroke(cx),
             PillAction::Cancel => self.cancel_recording(cx),
             PillAction::Finish => self.finish_recording(cx),
             PillAction::Paste(target) => self.paste_completed_bundle(target, cx),
@@ -3011,15 +3000,6 @@ impl Render for HudPillWindow {
         let island_velocity = coord.island_velocity;
         let highlight_prev = coord.highlight_prev;
         let highlight_p = ease_out_cubic(motion::age(coord.highlight_since) / HIGHLIGHT_FADE_S);
-        let stroke_count = coord
-            .telemetry
-            .strokes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|s| !s.laser)
-            .count();
-
         let clock = format_clock(elapsed_ms);
         let has_iphone = coord.iphone.is_some();
         let completed_note = coord.completed_note.clone();
@@ -3376,7 +3356,7 @@ impl Render for HudPillWindow {
                     }),
             )
             .child(
-                pill_chip("hud-inspect", "Inspect", true).on_click(move |_, _, cx| {
+                pill_chip("hud-inspect", "Inspect").on_click(move |_, _, cx| {
                     c_inspect.update(cx, |coord, cx| coord.inspect_completed_bundle(cx));
                 }),
             )
@@ -3467,13 +3447,7 @@ impl Render for HudPillWindow {
                         (fade > 0.002).then(|| {
                             let (out_alphas, _) = alphas(out_chips, fade);
                             traced(
-                                self.recording_trail(
-                                    out_chips,
-                                    has_iphone,
-                                    stroke_count,
-                                    &out_alphas,
-                                    false,
-                                ),
+                                self.recording_trail(out_chips, has_iphone, &out_alphas, false),
                                 trail_keys(out_chips, has_iphone, &out_alphas, "out:"),
                             )
                         })
@@ -3489,7 +3463,7 @@ impl Render for HudPillWindow {
                             slot.child(div().absolute().left(px(0.0)).top(px(0.0)).child(group))
                         })
                         .child(traced(
-                            self.recording_trail(chips, has_iphone, stroke_count, &in_alphas, true),
+                            self.recording_trail(chips, has_iphone, &in_alphas, true),
                             trail_keys(chips, has_iphone, &in_alphas, ""),
                         ))
                 })
@@ -3670,13 +3644,12 @@ impl SwitchLayout {
 
 impl HudPillWindow {
     /// One trailing group of the Recording capsule, each item faded by `alphas`: the switch chips
-    /// (Screen selected, as a tap records the screen) or Undo · Cancel · Finish. An outgoing
+    /// (Screen selected, as a tap records the screen) or Cancel · Finish. An outgoing
     /// group isn't `interactive`.
     fn recording_trail(
         &self,
         chips: bool,
         has_iphone: bool,
-        stroke_count: usize,
         alphas: &[f32],
         interactive: bool,
     ) -> Div {
@@ -3696,22 +3669,12 @@ impl HudPillWindow {
                 },
             ));
         }
-        let c_undo = self.coordinator.clone();
         let c_cancel = self.coordinator.clone();
         let c_finish = self.coordinator.clone();
         group
             .child(
-                pill_chip("hud-undo", "Undo", stroke_count > 0)
+                pill_chip("hud-cancel", "Cancel")
                     .opacity(alpha(0))
-                    .when(interactive && stroke_count > 0, |d| {
-                        d.on_click(move |_, _, cx| {
-                            c_undo.update(cx, |coord, cx| coord.undo_stroke(cx));
-                        })
-                    }),
-            )
-            .child(
-                pill_chip("hud-cancel", "Cancel", true)
-                    .opacity(alpha(1))
                     .when(interactive, |d| {
                         d.on_click(move |_, _, cx| {
                             c_cancel.update(cx, |coord, cx| coord.cancel_recording(cx));
@@ -3720,7 +3683,7 @@ impl HudPillWindow {
             )
             .child(
                 primary_chip("hud-done", "Finish")
-                    .opacity(alpha(2))
+                    .opacity(alpha(1))
                     .when(interactive, |d| {
                         d.on_click(move |_, _, cx| {
                             c_finish.update(cx, |coord, cx| coord.finish_recording(cx));
@@ -3764,18 +3727,12 @@ fn hud_chip(id: &'static str) -> gpui::Stateful<Div> {
         .whitespace_nowrap()
 }
 
-fn pill_chip(id: &'static str, label: &'static str, enabled: bool) -> gpui::Stateful<Div> {
+fn pill_chip(id: &'static str, label: &'static str) -> gpui::Stateful<Div> {
     hud_chip(id)
         .font_weight(FontWeight::MEDIUM)
-        .text_color(if enabled {
-            rgb(TEXT_SOFT)
-        } else {
-            rgb(0x56565a)
-        })
-        .when(enabled, |d| {
-            d.cursor_pointer()
-                .hover(|s| s.bg(rgba(0xffffff14)).text_color(rgb(TEXT_COLOR)))
-        })
+        .text_color(rgb(TEXT_SOFT))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgba(0xffffff14)).text_color(rgb(TEXT_COLOR)))
         .child(label)
 }
 

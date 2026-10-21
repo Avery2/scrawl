@@ -1547,28 +1547,21 @@ impl RenderState {
                     [0.961, 0.961, 0.969, 1.0],
                 );
             }
-            ElemId::Undo | ElemId::Cancel | ElemId::Inspect => {
+            ElemId::Cancel | ElemId::Inspect => {
                 if is_glass {
-                    let smoke_a = if elem.enabled {
-                        0.20 + 0.12 * elem.hover + 0.06 * elem.press
-                    } else {
-                        0.12
-                    };
+                    let smoke_a = 0.20 + 0.12 * elem.hover + 0.06 * elem.press;
                     push_shape(out, [ox, oy, bw, bh], bh * 0.5, [0.06, 0.07, 0.10, smoke_a]);
-                } else if elem.enabled && (elem.hover > 0.01 || elem.press > 0.01) {
+                } else if elem.hover > 0.01 || elem.press > 0.01 {
                     let bg_a = 0.08 * elem.hover + 0.06 * elem.press;
                     push_shape(out, [ox, oy, bw, bh], bh * 0.5, [1.0, 1.0, 1.0, bg_a]);
                 }
                 let tx = atlas.label(elem.id.label());
-                let fg = if !elem.enabled {
-                    if is_glass { 0.78 } else { 0.56 }
-                } else if is_glass {
+                let fg = if is_glass {
                     0.92 + 0.08 * elem.hover
                 } else {
                     0.74 + 0.22 * elem.hover
                 };
-                let fg_a = if !elem.enabled { 0.90 } else { 1.0 };
-                push_sprite(out, center_text(tx), tx.uv, [fg, fg, fg, fg_a]);
+                push_sprite(out, center_text(tx), tx.uv, [fg, fg, fg, 1.0]);
             }
             ElemId::Close => {
                 if is_glass {

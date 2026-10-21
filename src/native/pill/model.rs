@@ -47,7 +47,7 @@ pub const CHIP_H: f32 = ISLAND_H - 2.0 * ISLAND_INSET; // 32.0
 #[cfg(test)]
 pub const CHIP_RADIUS: f32 = CHIP_H * 0.5; // 16.0
 pub const CHIP_PX: f32 = 12.0;
-/// Gap between items of one group (the mode chips; Undo · Cancel · Finish; Paste · Inspect).
+/// Gap between items of one group (the mode chips; Cancel · Finish; Paste · Inspect).
 pub const CHIP_GAP: f32 = 2.0;
 /// Gap between groups (lead | chips | ✕), which replaces the old 1 pt dividers.
 pub const GROUP_GAP: f32 = 6.0;
@@ -458,17 +458,16 @@ pub enum ElemId {
     ChipIphone = 4,
     Record = 5,
     Close = 6,
-    Undo = 7,
-    Cancel = 8,
-    Finish = 9,
-    Processing = 10,
-    DoneLead = 11,
-    Paste = 12,
-    Inspect = 13,
+    Cancel = 7,
+    Finish = 8,
+    Processing = 9,
+    DoneLead = 10,
+    Paste = 11,
+    Inspect = 12,
 }
 
 impl ElemId {
-    pub const COUNT: usize = 14;
+    pub const COUNT: usize = 13;
     pub const ALL: [ElemId; Self::COUNT] = [
         Self::Lead,
         Self::ChipArea,
@@ -477,7 +476,6 @@ impl ElemId {
         Self::ChipIphone,
         Self::Record,
         Self::Close,
-        Self::Undo,
         Self::Cancel,
         Self::Finish,
         Self::Processing,
@@ -495,7 +493,6 @@ impl ElemId {
             Self::ChipIphone => "chip:iPhone",
             Self::Record => "record",
             Self::Close => "close",
-            Self::Undo => "undo",
             Self::Cancel => "cancel",
             Self::Finish => "finish",
             Self::Processing => "processing",
@@ -539,7 +536,6 @@ impl ElemId {
             Self::ChipScreen => "Screen",
             Self::ChipIphone => "iPhone",
             Self::Record => "Record",
-            Self::Undo => "Undo",
             Self::Cancel => "Cancel",
             Self::Finish => "Finish",
             Self::Processing => "Processing…",
@@ -557,7 +553,6 @@ pub enum Pres {
     Recording {
         chips: bool,
         has_iphone: bool,
-        stroke_count: usize,
     },
     Selecting {
         mode: SelectionMode,
@@ -572,7 +567,7 @@ pub enum Pres {
 
 impl Pres {
     /// Whether two presentations share the same geometry/layout structure (ignoring minor state
-    /// like `stroke_count` or active mode highlight when `shows_record` doesn't change).
+    /// like the active mode highlight when `shows_record` doesn't change).
     pub fn same_layout(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Hidden, Self::Hidden) | (Self::Processing, Self::Processing) => true,
@@ -580,12 +575,10 @@ impl Pres {
                 Self::Recording {
                     chips: a,
                     has_iphone: ia,
-                    ..
                 },
                 Self::Recording {
                     chips: b,
                     has_iphone: ib,
-                    ..
                 },
             ) => a == b && (ia == ib || !*a),
             (
@@ -627,7 +620,6 @@ pub struct Metrics {
     pub screen: f32,
     pub iphone: f32,
     pub record: f32,
-    pub undo: f32,
     pub cancel: f32,
     pub finish: f32,
     pub processing: f32,
@@ -645,7 +637,6 @@ impl Default for Metrics {
             screen: 44.0,
             iphone: 43.0,
             record: 46.0,
-            undo: 34.0,
             cancel: 44.0,
             finish: 38.0,
             processing: 78.0,
@@ -770,11 +761,7 @@ pub fn layout_of(
             }
             raw.push((ElemId::Close, CHIP_H, 0.0, true));
         }
-        Pres::Recording {
-            chips,
-            has_iphone,
-            stroke_count,
-        } => {
+        Pres::Recording { chips, has_iphone } => {
             let clock_w = m.clock_width(clock);
             let lead_w = LEAD_TEXT_X + clock_w + LEAD_TRAIL;
             raw.push((ElemId::Lead, lead_w, 0.0, true));
@@ -790,12 +777,6 @@ pub fn layout_of(
                 }
                 raw.push((ElemId::Close, CHIP_H, 0.0, true));
             } else {
-                raw.push((
-                    ElemId::Undo,
-                    Metrics::chip_width(m.undo),
-                    0.0,
-                    *stroke_count > 0,
-                ));
                 raw.push((ElemId::Cancel, Metrics::chip_width(m.cancel), 0.0, true));
                 raw.push((ElemId::Finish, Metrics::chip_width(m.finish), 0.0, true));
             }
@@ -915,7 +896,6 @@ pub struct FrameElem {
     pub active: f32,
     pub hover: f32,
     pub press: f32,
-    pub enabled: bool,
 }
 
 /// The sliding selection highlight behind the mode chips.
@@ -1881,7 +1861,6 @@ impl PillModel {
                 active: st.active.x.clamp(0.0, 1.0),
                 hover: st.hover.x.clamp(0.0, 1.0),
                 press: st.press.x.clamp(0.0, 1.0),
-                enabled: st.enabled,
             });
         }
 
@@ -2096,7 +2075,6 @@ mod tests {
                     Pres::Recording {
                         chips: true,
                         has_iphone: false,
-                        stroke_count: 0,
                     },
                 ),
                 (
@@ -2116,7 +2094,6 @@ mod tests {
                     Pres::Recording {
                         chips: true,
                         has_iphone: false,
-                        stroke_count: 0,
                     },
                 ),
                 (
@@ -2136,7 +2113,6 @@ mod tests {
                     Pres::Recording {
                         chips: true,
                         has_iphone: false,
-                        stroke_count: 0,
                     },
                 ),
                 (
@@ -2144,7 +2120,6 @@ mod tests {
                     Pres::Recording {
                         chips: false,
                         has_iphone: false,
-                        stroke_count: 1,
                     },
                 ),
                 (2.4, Pres::Hidden),
@@ -2188,7 +2163,6 @@ mod tests {
                     Pres::Recording {
                         chips: false,
                         has_iphone: true,
-                        stroke_count: 0,
                     },
                 ),
                 (3.6, Pres::Hidden),
@@ -2200,7 +2174,6 @@ mod tests {
                     Pres::Recording {
                         chips: true,
                         has_iphone: false,
-                        stroke_count: 0,
                     },
                 ),
                 (
@@ -2208,7 +2181,6 @@ mod tests {
                     Pres::Recording {
                         chips: false,
                         has_iphone: false,
-                        stroke_count: 0,
                     },
                 ),
                 (2.0, Pres::Processing),
@@ -2255,7 +2227,6 @@ mod tests {
         m.set_pres(Pres::Recording {
             chips: true,
             has_iphone: false,
-            stroke_count: 0,
         });
         for _ in 0..8 {
             m.advance(FRAME_DT);
@@ -2284,12 +2255,10 @@ mod tests {
             Pres::Recording {
                 chips: true,
                 has_iphone: false,
-                stroke_count: 0,
             },
             Pres::Recording {
                 chips: false,
                 has_iphone: false,
-                stroke_count: 2,
             },
             Pres::Selecting {
                 mode: SelectionMode::Area,
@@ -2364,7 +2333,6 @@ mod tests {
         m.set_pres(Pres::Recording {
             chips: true,
             has_iphone: false,
-            stroke_count: 0,
         });
         let mut saw_sharp_before_opaque = false;
         for _ in 0..120 {
@@ -2383,7 +2351,6 @@ mod tests {
         m.set_pres(Pres::Recording {
             chips: false,
             has_iphone: false,
-            stroke_count: 0,
         });
         let start_x = m.frame().elems.iter().find(|e| e.id == ElemId::Lead).unwrap().rect[0];
         let mut moved = 0.0_f32;
@@ -2410,7 +2377,6 @@ mod tests {
         m.set_pres(Pres::Recording {
             chips: true,
             has_iphone: false,
-            stroke_count: 0,
         });
         let target_w = m.r.target - m.l.target;
         m.advance(FRAME_DT);
@@ -2486,7 +2452,6 @@ mod tests {
         m.set_pres(Pres::Recording {
             chips: true,
             has_iphone: false,
-            stroke_count: 0,
         });
         let target_w = m.r.target - m.l.target;
         let mut first: Vec<(ElemId, f32)> = Vec::new();
@@ -2516,13 +2481,25 @@ mod tests {
     }
 
     #[test]
+    fn recording_controls_are_cancel_and_finish() {
+        let pres = Pres::Recording {
+            chips: false,
+            has_iphone: false,
+        };
+        let (layout, items) = layout_of(&pres, "0:00", 0.0, &Metrics::default(), true);
+        let ids: Vec<ElemId> = items.iter().map(|i| i.id).collect();
+        assert_eq!(ids, [ElemId::Lead, ElemId::Cancel, ElemId::Finish]);
+        let last = items.last().unwrap().rect;
+        assert!((layout.r - (last[0] + last[2]) - ISLAND_INSET).abs() < 0.5);
+    }
+
+    #[test]
     fn reduce_motion_dissolves_without_travel() {
         let mut m = PillModel::new(Metrics::default());
         m.reduced = true;
         m.set_pres(Pres::Recording {
             chips: true,
             has_iphone: false,
-            stroke_count: 0,
         });
         for _ in 0..60 {
             m.advance(FRAME_DT);
@@ -2599,17 +2576,14 @@ mod tests {
             Pres::Recording {
                 chips: true,
                 has_iphone: false,
-                stroke_count: 0,
             },
             Pres::Recording {
                 chips: true,
                 has_iphone: true,
-                stroke_count: 0,
             },
             Pres::Recording {
                 chips: false,
                 has_iphone: false,
-                stroke_count: 1,
             },
             Pres::Selecting {
                 mode: SelectionMode::Area,
@@ -2689,7 +2663,6 @@ mod tests {
             Pres::Recording {
                 chips: true,
                 has_iphone: false,
-                stroke_count: 0,
             },
         );
         let rest = m.frame();
@@ -2754,7 +2727,6 @@ mod tests {
             Pres::Recording {
                 chips: true,
                 has_iphone: false,
-                stroke_count: 0,
             },
         );
         m.set_pres(Pres::Selecting {
@@ -2815,7 +2787,6 @@ mod tests {
             m.set_pres(Pres::Recording {
                 chips: true,
                 has_iphone: false,
-                stroke_count: 0,
             });
             for _ in 0..60 {
                 m.advance(FRAME_DT);
@@ -2831,7 +2802,6 @@ mod tests {
         let pres = Pres::Recording {
             chips: false,
             has_iphone: false,
-            stroke_count: 0,
         };
         let rest = layout_of(&pres, "0:00", 46.0, &Metrics::default(), true).0;
         let first = |origin| {
@@ -2858,7 +2828,6 @@ mod tests {
             Pres::Recording {
                 chips: true,
                 has_iphone: true,
-                stroke_count: 0,
             },
             Pres::Selecting {
                 mode: SelectionMode::Area,
@@ -2896,7 +2865,6 @@ mod tests {
             m.set_pres(Pres::Recording {
                 chips: true,
                 has_iphone: true,
-                stroke_count: 0,
             });
             (1..120)
                 .find(|_| {
@@ -2914,7 +2882,6 @@ mod tests {
         let pres = Pres::Recording {
             chips: true,
             has_iphone: true,
-            stroke_count: 0,
         };
         let heights = |punch: f32| {
             let mut m = PillModel::new(Metrics::default());
@@ -2970,7 +2937,6 @@ mod tests {
         let rec = |chips| Pres::Recording {
             chips,
             has_iphone: true,
-            stroke_count: 0,
         };
         let hold = |mode| Pres::Selecting {
             mode,

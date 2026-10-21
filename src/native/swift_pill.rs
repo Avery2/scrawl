@@ -476,20 +476,23 @@ mod tests {
     }
 
     #[test]
-    fn undo_is_disabled_until_a_stroke() {
+    fn recording_shows_cancel_and_finish_without_undo() {
         let v = message(Pres::Recording {
             chips: false,
             has_iphone: false,
-            stroke_count: 0,
         });
-        let undo = v["items"]
+        let ids: Vec<&str> = v["items"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|i| i["id"] == "undo")
-            .unwrap()
-            .clone();
-        assert_eq!(undo["enabled"], false);
+            .map(|i| i["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["lead", "cancel", "finish"]);
+        let finish = &v["items"][2]["rect"];
+        let right = finish[0].as_f64().unwrap() + finish[2].as_f64().unwrap();
+        let shell = &v["shell"];
+        let shell_r = shell[0].as_f64().unwrap() + shell[2].as_f64().unwrap();
+        assert!((shell_r - right - f64::from(model::ISLAND_INSET)).abs() < 0.5);
     }
 
     #[test]
@@ -528,7 +531,6 @@ mod tests {
         let recording = Pres::Recording {
             chips: true,
             has_iphone: true,
-            stroke_count: 0,
         };
         let completed = Pres::Completed {
             label: "Copied".into(),
@@ -585,8 +587,8 @@ mod render_states {
     fn print_render_states() {
         let metrics = atlas::measure_metrics();
         let states = [
-            Pres::Recording { chips: false, has_iphone: false, stroke_count: 1 },
-            Pres::Recording { chips: true, has_iphone: false, stroke_count: 0 },
+            Pres::Recording { chips: false, has_iphone: false },
+            Pres::Recording { chips: true, has_iphone: false },
             Pres::Selecting { mode: SelectionMode::Window, hold: false, has_iphone: true },
             Pres::Processing,
             Pres::Completed { label: "Copied".into() },
