@@ -1136,7 +1136,7 @@ pub fn build_bundle_from_parts(
             autocrop: prep.autocrop,
             destination: None,
         };
-        let summary = summary_markdown(&bundle, bundle_dir);
+        let mut summary = summary_markdown(&bundle, bundle_dir);
         std::fs::create_dir_all(bundle_dir.join("frames"))
             .with_context(|| format!("could not create {}", bundle_dir.display()))?;
         #[cfg(unix)]
@@ -1191,6 +1191,9 @@ pub fn build_bundle_from_parts(
             format!("total {total_ms}ms"),
         ]);
         capture::scrawl_log(format!("finish timings: {}", parts.join(" · ")));
+        if let Some(remote_dir) = handoff::sync_for_agent_host(bundle_dir) {
+            summary = summary_markdown(&bundle, &remote_dir);
+        }
         mark_transcript_pending(bundle_dir, &bundle);
         return Ok((bundle_dir.to_path_buf(), bundle, summary));
     }
@@ -1301,7 +1304,7 @@ pub fn build_bundle_from_parts(
         render::stamp_keyframe_badges(full);
     }
     let rendered_at = std::time::Instant::now();
-    let summary = summary_markdown(&bundle, bundle_dir);
+    let mut summary = summary_markdown(&bundle, bundle_dir);
     std::thread::scope(|scope| -> Result<()> {
         let full_write = match (&cropped, &full_sheet) {
             (Some((info, full)), Some(sheet)) => {
@@ -1364,6 +1367,9 @@ pub fn build_bundle_from_parts(
         }
     }
 
+    if let Some(remote_dir) = handoff::sync_for_agent_host(bundle_dir) {
+        summary = summary_markdown(&bundle, &remote_dir);
+    }
     mark_transcript_pending(bundle_dir, &bundle);
     Ok((bundle_dir.to_path_buf(), bundle, summary))
 }
@@ -2326,12 +2332,15 @@ fn main() -> Result<()> {
             let dir = handoff::resolve_bundle_dir(&bundle)?;
             if clipboard {
                 handoff::copy_bundle_to_clipboard(&dir)?;
-                println!("Copied {} to clipboard", dir.display());
+                println!(
+                    "Copied {} to clipboard",
+                    handoff::shown_bundle_dir(&dir).display()
+                );
             } else {
                 let target_session = handoff::send_to_opencode(&dir, session.as_deref(), reroute)?;
                 println!(
                     "Sent {} to OpenCode session {target_session}",
-                    dir.display()
+                    handoff::shown_bundle_dir(&dir).display()
                 );
             }
             Ok(())
