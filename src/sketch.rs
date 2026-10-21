@@ -719,6 +719,9 @@ fn context_value(raw: &str) -> String {
     }
 }
 
+/// Agents given only the text fix what was said and skip the pictures, missing what only shows there.
+pub const LOOK_AT_IMAGES: &str = "Open contact-sheet.png and frames/ in that folder before changing anything: the marks and words only make sense on the images, which can show more than the text does.";
+
 pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> String {
     let agent_context = crate::handoff::experiment(crate::handoff::AGENT_CONTEXT);
     summary_markdown_with(bundle, bundle_dir, agent_context)
@@ -775,6 +778,10 @@ pub fn summary_markdown_with(
         if let Some(url) = &dest.url {
             out.push_str(&format!(" · page {url}"));
         }
+        out.push('\n');
+    }
+    if !bundle.keyframes.is_empty() {
+        out.push_str(LOOK_AT_IMAGES);
         out.push('\n');
     }
     // The screen at the start and the app's own values, on one line.
@@ -2166,12 +2173,15 @@ mod tests {
         let summary = summary_markdown(&phone, std::path::Path::new("/recordings/phone"));
         assert_eq!(
             summary,
-            "[scrawl 0:14 · iPhone · dev.example.App (42) · /recordings/phone]\n\
-             \x20 · 0:01 app: launched\n\
-             - #1 (0:05) “This row is too dense.”\n\
-             \x20 · 0:06 app: rest started\n\
-             - #2 (0:09) ⚑ flagged this moment\n\
-             \x20 · 0:09 app: Done tapped\n"
+            format!(
+                "[scrawl 0:14 · iPhone · dev.example.App (42) · /recordings/phone]\n\
+                 {LOOK_AT_IMAGES}\n\
+                 \x20 · 0:01 app: launched\n\
+                 - #1 (0:05) “This row is too dense.”\n\
+                 \x20 · 0:06 app: rest started\n\
+                 - #2 (0:09) ⚑ flagged this moment\n\
+                 \x20 · 0:09 app: Done tapped\n"
+            )
         );
         assert!(
             timeline(&phone)
@@ -2288,6 +2298,7 @@ mod tests {
             summary,
             format!(
                 "[scrawl 0:25 · iPhone · OpenCode 1.4 (354) · /recordings/phone]\n\
+                 {LOOK_AT_IMAGES}\n\
                  Screen: Sessions · server: studio · session: {session}\n\
                  - #1 (0:01) “So here.”\n\
                  - #2 (0:03) tapped “Settings” (x 0.10, y 0.90)\n\
@@ -2303,8 +2314,8 @@ mod tests {
         bundle.context_changes.clear();
         bundle.device.as_mut().unwrap().app_short_version = None;
         let summary = summary_markdown(&bundle, std::path::Path::new("/recordings/phone"));
-        assert!(summary.starts_with(
-            "[scrawl 0:25 · iPhone · OpenCode (354) · /recordings/phone]\n- #1 (0:01) “So here.”\n"
-        ));
+        assert!(summary.starts_with(&format!(
+            "[scrawl 0:25 · iPhone · OpenCode (354) · /recordings/phone]\n{LOOK_AT_IMAGES}\n- #1 (0:01) “So here.”\n"
+        )));
     }
 }

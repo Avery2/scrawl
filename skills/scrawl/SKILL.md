@@ -11,6 +11,7 @@ Scrawl records someone's screen, voice, clicks and red ink, then packs the resul
 
 ```text
 [scrawl 0:33 · OpenCode “Settings” · /Users/me/Library/Application Support/scrawl/captures/scrawl-1792432139176.scrawl]
+Open contact-sheet.png and frames/ in that folder before changing anything: the marks and words only make sense on the images, which can show more than the text does.
 Cropped to: the activity in OpenCode (full frames in frames-full/)
 - #1 (0:04) [clicked “New tab”] “Command T makes a new session, but here it should make a tab.”
 - #2 (0:07) “No, it doesn't.”
@@ -19,6 +20,7 @@ Cropped to: the activity in OpenCode (full frames in frames-full/)
 ```
 
 - The first line has the length, the app and window recorded, and the bundle path.
+- The next line asks you to open the images first. Do: the text is only what was said and done, and a problem can show in a frame without being marked or mentioned.
 - Each `#N (M:SS)` line is a keyframe: what they did at that moment in brackets, then what they said while it was on screen. A line with no quote has the action alone.
 - `⚑` means they flagged the moment on purpose. `⟨Name⟩` means the app reported a new screen. Lines starting `·` are events or values the app logged.
 - Optional lines near the top: `For session:` (where Scrawl sent it), `Screen:` with app context, `Note:`, and `Cropped to:`.
