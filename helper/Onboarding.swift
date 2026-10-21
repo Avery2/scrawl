@@ -89,9 +89,11 @@ struct PermissionRow: Decodable, Equatable, Identifiable {
 /// Apple's speech model, which Scrawl installs in the background (`src/speech_model.rs`).
 struct SpeechStatus: Decodable, Equatable {
   var state = "unknown"
+  var engine: String?
   var locale: String?
   var progress = 0.0
   var locales: [String]?
+  var error: String?
 
   private var language: String {
     locale.flatMap { Locale.current.localizedString(forIdentifier: $0) } ?? "your language"
@@ -104,9 +106,13 @@ struct SpeechStatus: Decodable, Equatable {
   var line: String? {
     switch state {
     case "checking": return "Checking for the speech model…"
+    // macOS 15 has nothing to download; this is the Speech Recognition prompt and Dictation check.
+    case "downloading" where engine == "SFSpeechRecognizer": return "Checking for the speech model…"
     case "downloading": return "Downloading the speech model…\(percent)"
     case "ready": return "Speech model ready (\(language))"
     case "unavailable": return "No Apple speech model for \(language) on this Mac"
+    // On macOS 15 the error says what to turn on (Speech Recognition, or Dictation's model).
+    case "failed" where engine == "SFSpeechRecognizer" && error != nil: return error
     case "failed": return "The speech model didn't download. Scrawl will try again."
     default: return nil
     }
@@ -579,7 +585,7 @@ struct OnboardingView: View {
           note(pickerNoteText).padding(.top, 12)
         }
         if state.speech?.notReady == true, let line = state.speech?.line {
-          note(state.speech?.state == "downloading" || state.speech?.state == "checking"
+          note((state.speech?.state == "downloading" || state.speech?.state == "checking") && state.speech?.engine != "SFSpeechRecognizer"
             ? "The speech model is still downloading\(state.speech?.percentInParens ?? ""). If it isn't done when you finish, Scrawl adds the transcript to your capture afterwards."
             : line)
             .padding(.top, 12)

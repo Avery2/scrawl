@@ -124,8 +124,9 @@ struct Transcript {
     error: Option<String>,
 }
 
-/// On-device SpeechAnalyzer transcription with measured word timings. Without a speech model
-/// the transcript is empty and `missing` says why.
+/// On-device transcription with measured word timings: SpeechAnalyzer on macOS 26,
+/// SFSpeechRecognizer on macOS 15. Without a speech model the transcript is empty and `missing`
+/// says why.
 pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
     let locale = crate::speech_model::locale_args();
     let mut args = vec![os("transcribe"), audio.as_os_str()];
@@ -140,6 +141,8 @@ pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
     Ok(TranscriptData {
         source: if missing.is_some() {
             "offline".into()
+        } else if engine == "SFSpeechRecognizer" {
+            "sf-speech-recognizer".into()
         } else {
             "speech-analyzer".into()
         },
