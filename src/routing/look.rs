@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use super::served;
 use super::smart::{Address, Candidate, Clue, Evidence, Folder, Pointer, Source, words};
 use super::{Hooks, WebUrl, parse_url, project_root, run_with_timeout};
 use crate::handoff::{ApiGet, query_escape};
@@ -29,6 +30,10 @@ pub struct Senses {
     pub own_port: fn(&WebUrl) -> Option<u16>,
     /// The folder and title of a terminal app's focused pane.
     pub terminal: fn(&str) -> Option<(PathBuf, String)>,
+    /// URL prefixes and the folders they serve (`routing.servers`).
+    pub servers: fn() -> Vec<(String, PathBuf)>,
+    /// Tool calls in OpenCode's history that named a folder around the time a file in it changed.
+    pub writes: fn(&str, u64, u64) -> Vec<served::Write>,
 }
 
 impl Default for Senses {
@@ -37,6 +42,8 @@ impl Default for Senses {
             hooks: Hooks::default(),
             own_port,
             terminal: terminal_pane,
+            servers: crate::handoff::routing_servers,
+            writes: served::opencode_writes,
         }
     }
 }
@@ -78,13 +85,155 @@ pub fn look_live(front: Option<&str>, target: Option<&str>, senses: &Senses) -> 
             ));
         }
     }
-    let (candidates, error) = read_for(&clues, None, senses);
+    let (mut candidates, error) = read_for(&clues, None, senses);
+    look_at_page(url.as_deref(), &mut clues, &mut candidates, senses);
     Live {
         url,
         clues,
         candidates,
         error,
     }
+}
+
+/// How long finding a page's publisher may spend on OpenCode's API (resolving a marker's
+/// subagent session to its root, reading sessions not read yet).
+const PUBLISHER_BUDGET: Duration = Duration::from_secs(1);
+
+/// When the server behind the tab serves the page from outside its own project (a shared
+/// artifact gallery), or runs inside a folder sessions publish into (`served::content_root`),
+/// the port's clue drops (to [`served::SERVER_ONLY`] or [`served::SERVER_IN_CONTENT`]) and the
+/// page's files give the clues instead: who published them, and the words of their path.
+/// Sessions those name that weren't read are added to `candidates`. Does nothing twice.
+pub fn look_at_page(
+    url: Option<&str>,
+    clues: &mut Vec<Clue>,
+    candidates: &mut Vec<Candidate>,
+    senses: &Senses,
+) {
+    if clues
+        .iter()
+        .any(|c| matches!(c.source, Source::Publisher | Source::Document))
+    {
+        return;
+    }
+    let Some(port) = clues
+        .iter_mut()
+        .find(|c| c.source == Source::Port && c.points.is_none())
+    else {
+        return;
+    };
+    let Pointer::Folder(folder) = &port.pointer else {
+        return;
+    };
+    let dir = folder.path.clone();
+    let servers = (senses.servers)();
+    let mut roots: Vec<PathBuf> = candidates
+        .iter()
+        .flat_map(|c| [c.directory.clone(), c.repo.clone()])
+        .flatten()
+        .collect();
+    roots.sort();
+    roots.dedup();
+    let elsewhere = url.and_then(|url| match served::locate(url, &dir, &servers, &roots) {
+        served::Served::Elsewhere(page) => Some(page),
+        _ => None,
+    });
+    let (page, changed, what) = if let Some(page) = elsewhere {
+        port.points = Some(served::SERVER_ONLY);
+        port.note = format!(
+            "{}, but the page is {}, from outside it",
+            port.note,
+            page.file.display()
+        );
+        let changed: Vec<u64> = page.modified_ms().into_iter().collect();
+        let what = page.file.file_name().map_or_else(
+            || page.file.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        (page, changed, what)
+    } else if let Some(root) = served::content_root(&dir, &servers)
+        && !candidates
+            .iter()
+            .any(|c| c.directory.as_deref().is_some_and(|d| d.starts_with(&dir)))
+    {
+        port.points = Some(served::SERVER_IN_CONTENT);
+        port.note = format!(
+            "{}, inside {}, where sessions publish: its repository says nothing about who made it",
+            port.note,
+            root.display()
+        );
+        let what = format!(
+            "{}/",
+            dir.file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+        );
+        let page = served::Page {
+            file: dir.join("index.html"),
+            root,
+        };
+        (page, served::changes(&dir), what)
+    } else {
+        return;
+    };
+    let mut api = super::within(senses.hooks.api, PUBLISHER_BUDGET);
+    let mut found = Vec::new();
+    if let Some((id, how)) = served::marker(&page) {
+        let id = root_session(&mut api, &id);
+        found.push(
+            Clue::new(
+                Source::Publisher,
+                Pointer::Session {
+                    id,
+                    directory: None,
+                },
+                how,
+            )
+            .worth(served::MARKED),
+        );
+    } else if let (Some(needle), Some((from, to))) = (page.needle(), served::window(&changed)) {
+        found.extend(served::writer_clues(
+            &changed,
+            &what,
+            &(senses.writes)(&needle, from, to),
+        ));
+    }
+    found.extend(served::path_clue(&page));
+    let missing: Vec<String> = found
+        .iter()
+        .filter_map(|clue| match &clue.pointer {
+            Pointer::Session { id, .. } if !candidates.iter().any(|c| &c.id == id) => {
+                Some(id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    if !missing.is_empty()
+        && let Ok(more) = read_candidates(&mut api, &[], &missing, 0)
+    {
+        candidates.extend(more);
+    }
+    clues.extend(found);
+}
+
+/// The root session of `id` (a subagent's session names its parent), or `id` when that can't
+/// be read.
+fn root_session(get: &mut ApiGet, id: &str) -> String {
+    let mut current = id.to_owned();
+    for _ in 0..5 {
+        let Some(parent) = get(&format!("/api/session/{}", query_escape(&current)))
+            .ok()
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+            .and_then(|value| {
+                serde_json::from_value::<RawSession>(value.get("data").unwrap_or(&value).clone())
+                    .ok()
+            })
+            .and_then(|session| session.parent_id)
+        else {
+            break;
+        };
+        current = parent;
+    }
+    current
 }
 
 /// Reads the sessions the clues and address could name.
@@ -175,6 +324,7 @@ pub fn evidence_for(bundle: &ScrawlBundle, dir: &Path, live: Live) -> Evidence {
         clues,
         candidates: live.candidates,
         now_ms: bundle.created_at_ms,
+        url: live.url,
     }
 }
 
@@ -185,7 +335,11 @@ pub fn replay(saved: Evidence, bundle: &ScrawlBundle, apps: &[(String, PathBuf)]
         .clues
         .into_iter()
         .filter(|clue| match clue.source {
-            Source::Page | Source::Port | Source::Terminal | Source::Document => true,
+            Source::Page
+            | Source::Port
+            | Source::Publisher
+            | Source::Terminal
+            | Source::Document => true,
             Source::Title => clue.note.starts_with(TERMINAL_TITLE),
             Source::Viewed | Source::App | Source::Speech => false,
         })
@@ -568,24 +722,30 @@ pub fn evidence_for_bundle(
     url: Option<&str>,
     senses: &Senses,
 ) -> (Evidence, Option<String>, bool) {
+    let recorded_url = || bundle.destination.as_ref().and_then(|d| d.url.clone());
     if url.is_none()
         && let Some(saved) = super::read_record(dir)
     {
-        return (
-            replay(saved, bundle, &crate::handoff::routing_apps()),
-            None,
-            true,
+        let mut evidence = replay(saved, bundle, &crate::handoff::routing_apps());
+        // Captures saved before pages from file servers were looked at get that look now.
+        evidence.url = evidence.url.take().or_else(recorded_url);
+        let url = evidence.url.clone();
+        look_at_page(
+            url.as_deref(),
+            &mut evidence.clues,
+            &mut evidence.candidates,
+            senses,
         );
+        return (evidence, None, true);
     }
-    let url = url
-        .map(str::to_owned)
-        .or_else(|| bundle.destination.as_ref().and_then(|d| d.url.clone()));
-    let clues = url
+    let url = url.map(str::to_owned).or_else(recorded_url);
+    let mut clues = url
         .as_deref()
         .map(|url| url_clues(url, senses, true))
         .unwrap_or_default();
     let address = crate::handoff::recorded_destination(dir).map(Address::Recorded);
-    let (candidates, error) = read_for(&clues, address.as_ref(), senses);
+    let (mut candidates, error) = read_for(&clues, address.as_ref(), senses);
+    look_at_page(url.as_deref(), &mut clues, &mut candidates, senses);
     let live = Live {
         url,
         clues,
@@ -1116,6 +1276,7 @@ mod tests {
             },
             own_port: world_own_port,
             terminal: no_terminal,
+            ..Senses::default()
         };
         let mut sent = 0;
         for (url, mut world) in cases {
@@ -1129,6 +1290,7 @@ mod tests {
                 clues,
                 candidates,
                 now_ms: 0,
+                url: None,
             };
             let ladder = destination(&decide(&evidence, Policy::Ladder), Some(url));
             assert_eq!(ladder, today, "{url}");
@@ -1143,7 +1305,11 @@ mod tests {
     use super::super::smart::{Decision, Judgement, Policy, decide, explain};
 
     const OPENCODE_INTERFACE: &str = include_str!("fixtures/opencode-interface.json");
-    const DEV_SITE_TAILSCALE: &str = include_str!("fixtures/dev-site-tailscale.json");
+    const ARTIFACTS: [&str; 3] = [
+        include_str!("fixtures/artifact-hex-shout2.json"),
+        include_str!("fixtures/artifact-hex-motion.json"),
+        include_str!("fixtures/artifact-lot.json"),
+    ];
     const DEV_SITE_KNOBS: &str = include_str!("fixtures/dev-site-knobs.json");
     const DEVICE_HUB: [&str; 2] = [
         include_str!("fixtures/device-hub-ios.json"),
@@ -1231,7 +1397,7 @@ mod tests {
 
     #[test]
     fn dev_sites_and_device_hub_captures_decide_as_before() {
-        for json in [DEV_SITE_TAILSCALE, DEV_SITE_KNOBS] {
+        for json in [DEV_SITE_KNOBS] {
             let (bundle, saved, then) = fixture(json);
             let (_, judgement) = replayed(&bundle, saved);
             match &judgement.decision {
@@ -1323,6 +1489,7 @@ mod tests {
             },
             own_port: tailnet,
             terminal: no_terminal,
+            ..Senses::default()
         };
         let started = std::time::Instant::now();
         let live = look_live(None, None, &senses);
@@ -1341,6 +1508,7 @@ mod tests {
             },
             own_port: tailnet,
             terminal: no_terminal,
+            ..Senses::default()
         };
         let url = "https://studio.example.ts.net:4948/board";
         assert!(url_clues(url, &senses, false).is_empty());
@@ -1354,6 +1522,7 @@ mod tests {
             clues,
             candidates,
             now_ms: 15,
+            url: None,
         };
         let j = super::super::smart::decide(&evidence, super::super::smart::Policy::Weigh);
         let dest = super::super::smart::destination(&j, Some(url)).unwrap();
@@ -1362,5 +1531,273 @@ mod tests {
             ("ses_board", "localhost")
         );
         assert_eq!(dest.directory.as_deref(), Some("/p/board"));
+    }
+
+    // MARK: Pages from a file server
+
+    /// What a fixture's page needs: the folder `routing.servers` maps its URL prefix to, and the
+    /// tool calls OpenCode's history holds for it.
+    #[derive(Clone, Default)]
+    struct PageWorld {
+        servers: Vec<(String, PathBuf)>,
+        writes: Vec<served::Write>,
+    }
+
+    thread_local! {
+        static PAGE: std::cell::RefCell<PageWorld> = std::cell::RefCell::default();
+    }
+
+    fn page_servers() -> Vec<(String, PathBuf)> {
+        PAGE.with(|p| p.borrow().servers.clone())
+    }
+    fn page_writes(_: &str, _: u64, _: u64) -> Vec<served::Write> {
+        PAGE.with(|p| p.borrow().writes.clone())
+    }
+    fn page_senses() -> Senses {
+        fn down(_: &str, _: Duration) -> Result<Vec<u8>> {
+            anyhow::bail!("no server in tests")
+        }
+        Senses {
+            hooks: Hooks {
+                sdk: no_sdk,
+                listener_dir: listener,
+                api: down,
+            },
+            own_port: tailnet,
+            terminal: no_terminal,
+            servers: page_servers,
+            writes: page_writes,
+        }
+    }
+
+    /// Replays an artifact fixture: its file laid out under a temporary served folder with the
+    /// modification time it had, and `writes` as OpenCode's history.
+    fn replay_page(json: &str, with_history: bool) -> (Evidence, Judgement) {
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let page = &value["page"];
+        let (bundle, saved, _) = fixture(json);
+        let root = std::env::temp_dir().join(format!("scrawl-page-{}", crate::make_bundle_id()));
+        let file = root.join(page["file"].as_str().unwrap());
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let handle = std::fs::File::create(&file).unwrap();
+        let modified =
+            std::time::UNIX_EPOCH + Duration::from_millis(page["modifiedMs"].as_u64().unwrap());
+        handle.set_modified(modified).unwrap();
+        let writes = if with_history {
+            serde_json::from_value(page["writes"].clone()).unwrap()
+        } else {
+            Vec::new()
+        };
+        PAGE.with(|p| {
+            *p.borrow_mut() = PageWorld {
+                servers: vec![(page["served"].as_str().unwrap().to_owned(), root.clone())],
+                writes,
+            }
+        });
+        let url = page["url"].as_str().unwrap();
+        let mut evidence = replay(saved, &bundle, &[]);
+        look_at_page(
+            Some(url),
+            &mut evidence.clues,
+            &mut evidence.candidates,
+            &page_senses(),
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        let judgement = decide(&evidence, Policy::Weigh);
+        (evidence, judgement)
+    }
+
+    const CANVAS: &str = "ses_ec318a614ffeQvPht0qntUnIcP";
+    const HEX: &str = "ses_ec3d5c5d4ffeYKYSkmxIUdMuzn";
+    const GAME_ENGINE: &str = "ses_ee2d10e0bffeibMGwlBmCwZoQI";
+
+    /// Three captures of pages on the shared artifact gallery (`:8444/raw/…`, served by a server
+    /// whose working directory is gpu-gallery) were all sent to CANVAS, the session in
+    /// gpu-gallery, on the port's 95 points. Their pages were published by HEX, HEX and GAME
+    /// ENGINE.
+    #[test]
+    fn artifact_gallery_pages_go_to_whoever_published_them() {
+        for (json, publisher) in ARTIFACTS.iter().zip([HEX, HEX, GAME_ENGINE]) {
+            let (_, _, then) = fixture(json);
+            assert_eq!(then, "send CANVAS");
+            let (evidence, judgement) = replay_page(json, true);
+            let text = explain(&evidence, &judgement);
+            match &judgement.decision {
+                Decision::Send { to, instead } => {
+                    assert_eq!(to.candidate.id, publisher, "{text}");
+                    // The server's session is one click away during the undo window.
+                    assert!(ids(instead).contains(&CANVAS), "{text}");
+                }
+                other => panic!("expected a send to {publisher}, got {other:?}\n{text}"),
+            }
+            assert!(text.contains("call was running when"), "{text}");
+            assert!(text.contains("from outside it"), "{text}");
+        }
+    }
+
+    /// Without OpenCode's history the page's words still lead, and nothing goes to CANVAS.
+    #[test]
+    fn without_history_an_artifact_page_never_goes_to_the_servers_session() {
+        for (json, publisher) in ARTIFACTS.iter().zip([Some(HEX), Some(HEX), None]) {
+            let (evidence, judgement) = replay_page(json, false);
+            let text = explain(&evidence, &judgement);
+            match (&judgement.decision, publisher) {
+                (Decision::Offer { choices }, Some(publisher)) => {
+                    assert_eq!(ids(choices)[0], publisher, "{text}");
+                }
+                (Decision::Keep { .. }, None) => {}
+                (other, _) => panic!("{other:?}\n{text}"),
+            }
+        }
+    }
+
+    /// A page that names its session (a subagent's, here) goes there, whatever the history says.
+    #[test]
+    fn a_marked_page_names_its_publisher() {
+        fn api(path: &str, _: Duration) -> Result<Vec<u8>> {
+            let body = match path {
+                "/api/session/ses_child" => {
+                    r#"{"id":"ses_child","title":"sub","parentID":"ses_ec3d5c5d4ffeYKYSkmxIUdMuzn"}"#
+                }
+                _ => r#"{"id":"ses_ec3d5c5d4ffeYKYSkmxIUdMuzn","title":"HEX"}"#,
+            };
+            Ok(body.as_bytes().to_vec())
+        }
+        let json = ARTIFACTS[2];
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let (bundle, saved, _) = fixture(json);
+        let root = std::env::temp_dir().join(format!("scrawl-mark-{}", crate::make_bundle_id()));
+        let file = root.join(value["page"]["file"].as_str().unwrap());
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "").unwrap();
+        std::fs::write(
+            file.parent().unwrap().join(".opencode-session"),
+            "ses_child\n",
+        )
+        .unwrap();
+        PAGE.with(|p| {
+            *p.borrow_mut() = PageWorld {
+                servers: vec![(
+                    value["page"]["served"].as_str().unwrap().to_owned(),
+                    root.clone(),
+                )],
+                writes: serde_json::from_value(value["page"]["writes"].clone()).unwrap(),
+            }
+        });
+        let senses = Senses {
+            hooks: Hooks {
+                api,
+                ..page_senses().hooks
+            },
+            ..page_senses()
+        };
+        let mut evidence = replay(saved, &bundle, &[]);
+        let url = value["page"]["url"].as_str().unwrap();
+        look_at_page(
+            Some(url),
+            &mut evidence.clues,
+            &mut evidence.candidates,
+            &senses,
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        let judgement = decide(&evidence, Policy::Weigh);
+        match &judgement.decision {
+            Decision::Send { to, .. } => assert_eq!(to.candidate.id, HEX),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    const ONBOARDING: &str = include_str!("fixtures/artifact-server-onboarding.json");
+    const HOME: &str = "ses_efcd8972fffeT5zZbj9YtIl3LU";
+    const KNOBS: &str = "ses_ec91ede28ffeFpn6L7FZtGoka0";
+
+    /// Windows opens a folder only with `FILE_FLAG_BACKUP_SEMANTICS`, and setting its time needs
+    /// write access.
+    fn set_modified(path: &std::path::Path, at: std::time::SystemTime) {
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(0x0200_0000)
+                .open(path)
+        };
+        #[cfg(not(windows))]
+        let file = std::fs::File::open(path);
+        file.unwrap().set_modified(at).unwrap();
+    }
+
+    /// Replays the onboarding-story fixture: its server's folder laid out inside a temporary
+    /// repository's `artifacts/`, with the entries' times it had.
+    fn replay_server(with_history: bool) -> (Evidence, Judgement) {
+        let value: serde_json::Value = serde_json::from_str(ONBOARDING).unwrap();
+        let server = &value["server"];
+        let (bundle, mut saved, _) = fixture(ONBOARDING);
+        let repo = std::env::temp_dir().join(format!("scrawl-story-{}", crate::make_bundle_id()));
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let dir = repo.join(server["folder"].as_str().unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        for entry in server["entries"].as_array().unwrap() {
+            let path = dir.join(entry["name"].as_str().unwrap());
+            if entry["kind"] == "dir" {
+                std::fs::create_dir_all(&path).unwrap();
+            } else {
+                std::fs::write(&path, "").unwrap();
+            }
+        }
+        for entry in server["entries"].as_array().unwrap() {
+            let at = std::time::UNIX_EPOCH
+                + Duration::from_millis(entry["modifiedMs"].as_u64().unwrap());
+            set_modified(&dir.join(entry["name"].as_str().unwrap()), at);
+        }
+        let port = saved
+            .clues
+            .iter_mut()
+            .find(|c| c.source == Source::Port)
+            .unwrap();
+        port.pointer = Pointer::Folder(folder_of(&dir));
+        PAGE.with(|p| {
+            *p.borrow_mut() = PageWorld {
+                servers: Vec::new(),
+                writes: if with_history {
+                    serde_json::from_value(server["writes"].clone()).unwrap()
+                } else {
+                    Vec::new()
+                },
+            }
+        });
+        let mut evidence = replay(saved, &bundle, &[]);
+        look_at_page(
+            Some("https://studio.taila8e7c7.ts.net:4660/"),
+            &mut evidence.clues,
+            &mut evidence.candidates,
+            &page_senses(),
+        );
+        std::fs::remove_dir_all(repo).unwrap();
+        let judgement = decide(&evidence, Policy::Weigh);
+        (evidence, judgement)
+    }
+
+    /// Nine captures of the onboarding story (`:4660`, a server running in
+    /// `~/code/home/artifacts/2026-10-20-onboarding/story`) went to HOME, the newest session in
+    /// the repository around it. KNOBS wrote the story; HOME's subagent only added its assets.
+    #[test]
+    fn a_server_running_inside_artifacts_goes_to_whoever_wrote_it() {
+        let (_, _, then) = fixture(ONBOARDING);
+        assert_eq!(then, "send HOME");
+        let (evidence, judgement) = replay_server(true);
+        let text = explain(&evidence, &judgement);
+        match &judgement.decision {
+            Decision::Send { to, .. } => assert_eq!(to.candidate.id, KNOBS, "{text}"),
+            Decision::Offer { choices } => assert_eq!(ids(choices)[0], KNOBS, "{text}"),
+            other => panic!("{other:?}\n{text}"),
+        }
+        assert!(text.contains("where sessions publish"), "{text}");
+        let (evidence, judgement) = replay_server(false);
+        let text = explain(&evidence, &judgement);
+        assert!(
+            !matches!(&judgement.decision, Decision::Send { to, .. } if to.candidate.id == HOME),
+            "{text}"
+        );
     }
 }
