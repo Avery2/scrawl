@@ -78,6 +78,9 @@ cargo run -- import ~/Downloads/20261013T164000.mp4 --timeline ~/Downloads/20261
 # Rebuild an existing bundle with the current transcriber and keyframe rules
 cargo run -- reprocess latest --out /tmp/again.scrawl
 
+# Build a capture whose build never ran (the app died first), in place; the app does this at launch
+cargo run -- recover ~/Library/Application\ Support/scrawl/captures/scrawl-….scrawl
+
 # Tune auto-crop on a Screen capture, live
 cargo run -- autocrop latest --serve --open
 

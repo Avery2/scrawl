@@ -294,12 +294,14 @@ enum Command {
         #[arg(long = "experiment", value_name = "NAME")]
         experiments: Vec<String>,
     },
-    /// Build the bundles whose build died with the app (`unfinished.json`, no `scrawl.json`) from
-    /// their video, audio and input log, in place, once each. The app runs it at launch.
-    #[command(hide = true)]
+    /// Build the bundles whose build died with the app (no `scrawl.json`) in place, once each:
+    /// from their input log (`unfinished.json`) if they have one, else from `recording.mp4` and
+    /// `audio.wav` alone. The app runs it at launch.
     Recover {
+        /// One bundle to build now, even if it was tried before.
+        bundle: Option<PathBuf>,
         /// Captures folder (defaults to Scrawl's).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "bundle")]
         captures: Option<PathBuf>,
     },
     /// Motion lab: replay the capsule's states on a fixed timeline with nothing captured, for
@@ -810,8 +812,18 @@ pub fn movie_frames_at(
     offset_ms: u64,
     max_edge: u32,
 ) -> Result<Vec<RgbaFrame>> {
+    movie_frames_at_with(helper::frames, movie, times, offset_ms, max_edge)
+}
+
+fn movie_frames_at_with(
+    decode: fn(&Path, helper::FrameTimes, u32) -> Result<Vec<RgbaFrame>>,
+    movie: &Path,
+    times: &[u64],
+    offset_ms: u64,
+    max_edge: u32,
+) -> Result<Vec<RgbaFrame>> {
     let at: Vec<u64> = times.iter().map(|t| t.saturating_sub(offset_ms)).collect();
-    let mut frames = helper::frames(movie, helper::FrameTimes::At(&at), max_edge)?;
+    let mut frames = decode(movie, helper::FrameTimes::At(&at), max_edge)?;
     // The helper stamps each frame with the time it was asked for, clamped to the movie (the
     // last keyframe can fall just past its end); map it back to the bundle time.
     for frame in &mut frames {
@@ -966,6 +978,16 @@ pub fn finalize_capture_bundle(
 /// Builds a Screen capture's bundle in `out`, which holds its video and `audio.wav`, from them
 /// and what the recording logged: `scrawl reprocess` and `scrawl recover`.
 pub fn rebuild_screen_bundle(out: &Path, old: recover::Unfinished) -> Result<String> {
+    rebuild_screen_bundle_with(out, old, None, &recover::Media::SYSTEM)
+}
+
+/// `autocrop` as in `SourceExtras`: `None` follows the config, `Some(None)` keeps the whole frame.
+pub fn rebuild_screen_bundle_with(
+    out: &Path,
+    old: recover::Unfinished,
+    autocrop: Option<Option<autocrop::Settings>>,
+    media: &recover::Media,
+) -> Result<String> {
     let started_at = std::time::Instant::now();
     let video = old
         .video
@@ -983,12 +1005,11 @@ pub fn rebuild_screen_bundle(out: &Path, old: recover::Unfinished) -> Result<Str
     let ((transcript, transcribe_ms), joined) = std::thread::scope(|scope| {
         let frames = scope.spawn(|| {
             let t0 = std::time::Instant::now();
-            let res = helper::frames(&video, helper::FrameTimes::Every(220), 640);
+            let res = (media.frames)(&video, helper::FrameTimes::Every(220), 640);
             (res, t0.elapsed().as_millis() as u64)
         });
         let t0 = std::time::Instant::now();
-        let tr =
-            transcribe::transcribe(recorded.as_ref().map(|_| wav.as_path()), recorded.as_ref());
+        let tr = (media.transcribe)(recorded.as_ref().map(|_| wav.as_path()), recorded.as_ref());
         ((tr, t0.elapsed().as_millis() as u64), frames.join())
     });
     let (frames, candidates_ms) = joined.map_err(|_| anyhow::anyhow!("Frame decoding panicked"))?;
@@ -996,7 +1017,10 @@ pub fn rebuild_screen_bundle(out: &Path, old: recover::Unfinished) -> Result<Str
     for frame in &mut frames {
         frame.t_ms += offset;
     }
-    let full_frames = Some(movie_keyframes(video.clone(), offset));
+    let (decode, movie) = (media.frames, video.clone());
+    let full_frames: Option<FullFrames> = Some(Box::new(move |times: &[u64]| {
+        movie_frames_at_with(decode, &movie, times, offset, 0)
+    }));
     Ok(build_bundle_from_parts(
         out,
         old.target,
@@ -1015,6 +1039,7 @@ pub fn rebuild_screen_bundle(out: &Path, old: recover::Unfinished) -> Result<Str
             },
             full_frames,
             video_offset_ms: offset,
+            autocrop,
             timings: StageTimings {
                 started_at: Some(started_at),
                 candidates_ms: Some(candidates_ms),
@@ -1925,7 +1950,17 @@ fn main() -> Result<()> {
             print!("{summary}");
             Ok(())
         }
-        Command::Recover { captures } => {
+        Command::Recover {
+            bundle: Some(bundle),
+            ..
+        } => {
+            print!("{}", recover::rebuild(&bundle, &recover::Media::SYSTEM)?);
+            Ok(())
+        }
+        Command::Recover {
+            bundle: None,
+            captures,
+        } => {
             let captures = captures.unwrap_or_else(handoff::default_captures_dir);
             let results = recover::run(&captures);
             let failed = results.iter().filter(|(_, r)| r.is_err()).count();
