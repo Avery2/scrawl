@@ -1,0 +1,48 @@
+# Checks a Windows build directory (scrawl.exe and transcribe.cpp's DLLs) for #58: no AVX-512
+# outside the ggml CPU backends that are only loaded on a CPU that has it.
+#
+#   pwsh scripts/check-windows-cpu-tiers.ps1 target\x86_64-pc-windows-msvc\release
+
+param([Parameter(Mandatory = $true)][string]$Dir)
+$ErrorActionPreference = "Stop"
+
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$vs = & $vswhere -latest -products * -property installationPath
+$dumpbin = (Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1).FullName
+
+# An EVEX prefix (0x62, which no other x86-64 instruction starts with, after at most a segment or
+# address-size prefix) is AVX-512, whatever register width it uses.
+function Avx512Lines([string]$file) {
+  @(& $dumpbin /nologo /disasm $file |
+    Select-String -Pattern '^\s+[0-9A-F]+: (6[4-7] )?62 [0-9A-F]{2} [0-9A-F]{2} [0-9A-F]{2} ' -CaseSensitive)
+}
+
+$imports = & $dumpbin /nologo /dependents (Join-Path $Dir "scrawl.exe")
+if (-not ($imports -match '^\s+transcribe\.dll\s*$')) {
+  throw "scrawl.exe doesn't load transcribe.dll: ggml is linked in, compiled for the build machine's CPU"
+}
+
+# Loaded on every CPU, or on CPUs without AVX-512 (ggml scores each tier against CPUID).
+$baseline = @("transcribe.dll", "ggml.dll", "ggml-base.dll",
+  "ggml-cpu-x64.dll", "ggml-cpu-sse42.dll", "ggml-cpu-sandybridge.dll",
+  "ggml-cpu-haswell.dll", "ggml-cpu-alderlake.dll")
+$failed = $false
+foreach ($name in $baseline) {
+  $file = Join-Path $Dir $name
+  if (-not (Test-Path $file)) { throw "missing $name in $Dir" }
+  $hits = Avx512Lines $file
+  if ($hits.Count -gt 0) {
+    "$name has $($hits.Count) AVX-512 instructions, e.g.:"
+    $hits | Select-Object -First 5 | ForEach-Object { "  $($_.Line.Trim())" }
+    $failed = $true
+  } else {
+    "$name`: no AVX-512"
+  }
+}
+
+# The check has to be able to see AVX-512 at all.
+$skx = Join-Path $Dir "ggml-cpu-skylakex.dll"
+if (-not (Test-Path $skx)) { throw "missing ggml-cpu-skylakex.dll in $Dir" }
+if ((Avx512Lines $skx).Count -eq 0) { throw "found no AVX-512 even in ggml-cpu-skylakex.dll: the check is broken" }
+
+if ($failed) { throw "AVX-512 in code every CPU runs (#58)" }
