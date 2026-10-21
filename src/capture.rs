@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -717,6 +717,11 @@ pub struct SharedCaptureTelemetry {
     /// Scrawl's windows that let clicks through (the ink overlay), skipped when deciding whether
     /// a click landed on Scrawl itself.
     pub passthrough_window_ids: Mutex<Vec<u32>>,
+    /// The `scrawl-helper` whose window is what's being recorded (the iPhone mirror): its clicks
+    /// count, unlike those on other helper windows (Settings, onboarding). 0 when none.
+    capture_source_pid: AtomicI32,
+    /// The last `on_scrawl_window` answer (when, where, what), reused for a burst of scrolls.
+    scrawl_hit: Mutex<Option<(Instant, f64, f64, bool)>>,
     /// macOS's key event tap (`CFMachPortRef`), made once Accessibility is on (`check_key_tap`).
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     tap_port: AtomicU64,
@@ -778,6 +783,8 @@ impl SharedCaptureTelemetry {
             window_log_request: Arc::new(AtomicBool::new(false)),
             ui_sender,
             passthrough_window_ids: Mutex::new(Vec::new()),
+            capture_source_pid: AtomicI32::new(0),
+            scrawl_hit: Mutex::new(None),
             tap_port: AtomicU64::new(0),
             tap_run_loop: AtomicU64::new(0),
             tap_starting: AtomicBool::new(false),
@@ -1144,17 +1151,55 @@ impl SharedCaptureTelemetry {
         true
     }
 
+    /// The helper process whose window is the capture target (the iPhone mirror).
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub fn set_capture_source_pid(&self, pid: u32) {
+        self.capture_source_pid
+            .store(i32::try_from(pid).unwrap_or(0), Ordering::Release);
+    }
 
-    /// Whether the topmost window at a global point is Scrawl's own (ignoring the click-through
-    /// ink overlay).
+    /// Whether the topmost window at a global point is Scrawl's own or a `scrawl-helper`'s other
+    /// than the capture source (ignoring the click-through ink overlay). Asked once per press, and
+    /// for scrolls, which come in bursts at one point, at most every 250 ms.
     fn on_scrawl_window(&self, x: f64, y: f64) -> bool {
+        let mut hit = self
+            .scrawl_hit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, hx, hy, on)) = *hit
+            && at.elapsed() < Duration::from_millis(250)
+            && (hx - x).abs() <= 2.0
+            && (hy - y).abs() <= 2.0
+        {
+            return on;
+        }
+        let on = self.scrawl_window_in(
+            &platform::raw_windows_now(),
+            x,
+            y,
+            platform::is_helper_process,
+        );
+        *hit = Some((Instant::now(), x, y, on));
+        on
+    }
+
+    fn scrawl_window_in(
+        &self,
+        windows: &[crate::windows::RawWindow],
+        x: f64,
+        y: f64,
+        is_helper: impl Fn(i32) -> bool,
+    ) -> bool {
         let passthrough = self
             .passthrough_window_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let windows = platform::raw_windows_now();
-        crate::windows::owned_window_at(&windows, x, y, std::process::id() as i32, &passthrough)
+        let own = std::process::id() as i32;
+        let source = self.capture_source_pid.load(Ordering::Acquire);
+        crate::windows::owned_window_at(windows, x, y, &passthrough, |pid| {
+            pid == own || (pid != source && is_helper(pid))
+        })
     }
 
     pub fn normalize_point(&self, screen_x: f64, screen_y: f64) -> (f32, f32, u32, u32) {
@@ -1512,6 +1557,40 @@ mod tests {
         assert_eq!(recording.video.as_ref(), Some(&path));
         assert_eq!(recording.video_offset_ms, 120);
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// Clicks on `scrawl-helper`'s windows (the SwiftUI capsule, Settings, onboarding) are
+    /// Scrawl's own, except on the iPhone mirror, which is what's being recorded.
+    #[test]
+    fn helper_windows_are_scrawl_s_except_the_capture_source() {
+        let (sender, _receiver) = flume::unbounded();
+        let telemetry = SharedCaptureTelemetry::new(sender);
+        let window = |id, pid, bounds| crate::windows::RawWindow {
+            id,
+            pid,
+            owner: String::new(),
+            title: String::new(),
+            bounds,
+            layer: 0,
+            alpha: 1.0,
+        };
+        let own = std::process::id() as i32;
+        let (settings, mirror, app) = (own + 1, own + 2, own + 3);
+        let windows = [
+            window(1, own, [0.0, 0.0, 1728.0, 1117.0]), // the ink overlay, click-through
+            window(2, settings, [100.0, 100.0, 600.0, 400.0]),
+            window(3, mirror, [1300.0, 100.0, 300.0, 650.0]),
+            window(4, app, [0.0, 0.0, 1728.0, 1117.0]),
+        ];
+        telemetry.passthrough_window_ids.lock().unwrap().push(1);
+        telemetry.set_capture_source_pid(mirror as u32);
+        let helper = |pid| pid == settings || pid == mirror;
+        let at = |x, y| telemetry.scrawl_window_in(&windows, x, y, helper);
+        assert!(at(300.0, 300.0), "Settings");
+        assert!(!at(1400.0, 400.0), "the iPhone mirror");
+        assert!(!at(1000.0, 900.0), "the app under the ink overlay");
+        telemetry.set_capture_source_pid(0);
+        assert!(at(1400.0, 400.0), "a helper that isn't the source");
     }
 
     /// Kit's Screen capture on the Pro: the old listen-only event tap was off (no Input
