@@ -1297,13 +1297,21 @@ fn serve_http(port: u16, config: IngestConfig) -> Result<()> {
     if config.route_opencode {
         crate::delivery::spawn_retries(config.captures_dir(), config.hooks.forward, mark_sent);
     }
+    let connections = crate::ingest_http::Connections::default();
     for stream in listener.incoming().flatten() {
+        let Some(permit) = connections.acquire() else {
+            drop(stream);
+            continue;
+        };
         let cfg = config.clone();
-        std::thread::spawn(move || {
-            if let Err(err) = handle_ingest_connection(stream, &cfg) {
-                scrawl_log(format!("ingest http: {err:#}"));
-            }
-        });
+        let _ = std::thread::Builder::new()
+            .name("scrawl-ingest-client".into())
+            .spawn(move || {
+                let _permit = permit;
+                if let Err(err) = handle_ingest_connection(stream, &cfg) {
+                    scrawl_log(format!("ingest http: {err:#}"));
+                }
+            });
     }
     Ok(())
 }
@@ -1566,18 +1574,11 @@ fn handle_ingest_connection_with_token(
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
 
-    let mut header = Vec::with_capacity(2048);
-    let mut byte = [0_u8; 1];
-    while header.len() < 16_384 && !header.ends_with(b"\r\n\r\n") {
-        if stream.read(&mut byte)? == 0 {
-            break;
-        }
-        header.push(byte[0]);
-    }
-    if header.is_empty() {
+    let Some(header) =
+        crate::ingest_http::read_header(&mut stream, crate::ingest_http::HEADER_TIMEOUT)?
+    else {
         return Ok(());
-    }
-    let header = String::from_utf8_lossy(&header);
+    };
     // The dev-page SDK's routes check their own access (loopback pages, or the token).
     if crate::web::handle(&mut stream, &header, expected_token)? {
         return Ok(());
