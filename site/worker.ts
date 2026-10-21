@@ -25,6 +25,27 @@ export default {
     if (url.protocol === "https:") headers.set("Strict-Transport-Security", "max-age=31536000")
     headers.set("X-Content-Type-Options", "nosniff")
     headers.set("Referrer-Policy", "strict-origin-when-cross-origin")
+    if (url.pathname.endsWith(".mp4")) return ranged(request, response, headers)
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
   },
+}
+
+// Static assets ignore Range, but Safari and AVFoundation need byte ranges to play video.
+async function ranged(request: Request, response: Response, headers: Headers): Promise<Response> {
+  headers.set("Accept-Ranges", "bytes")
+  const match = /^bytes=(\d*)-(\d*)$/.exec(request.headers.get("Range") ?? "")
+  if (request.method !== "GET" || response.status !== 200 || !match || (!match[1] && !match[2])) {
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+  }
+  const body = await response.arrayBuffer()
+  const size = body.byteLength
+  const start = match[1] ? Number(match[1]) : Math.max(0, size - Number(match[2]))
+  const end = match[1] && match[2] ? Math.min(Number(match[2]), size - 1) : size - 1
+  if (start > end) {
+    headers.set("Content-Range", `bytes */${size}`)
+    return new Response(null, { status: 416, headers })
+  }
+  headers.set("Content-Range", `bytes ${start}-${end}/${size}`)
+  headers.set("Content-Length", String(end - start + 1))
+  return new Response(body.slice(start, end + 1), { status: 206, headers })
 }
