@@ -148,6 +148,9 @@ impl PhoneSession {
             .stderr(Stdio::piped())
             .spawn()
             .context("Could not start the iPhone mirror")?;
+        if let Some(telemetry) = &telemetry {
+            telemetry.set_capture_source_pid(child.id());
+        }
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().context("No mirror output")?;
         if let Some(stderr) = child.stderr.take() {

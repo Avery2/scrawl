@@ -391,6 +391,11 @@ pub(super) fn raw_windows_now() -> Vec<crate::windows::RawWindow> {
     crate::windows::raw_windows()
 }
 
+/// Windows has no `scrawl-helper`: every Scrawl window is in its own process.
+pub(super) fn is_helper_process(_pid: i32) -> bool {
+    false
+}
+
 // MARK: Synthetic input
 
 fn keyboard_input(vk: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
