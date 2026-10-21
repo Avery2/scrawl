@@ -332,10 +332,14 @@ pub enum ElemId {
     DoneLead = 13,
     Paste = 14,
     Inspect = 15,
+    /// The Completed island's sessions one click away (smart routing).
+    Route0 = 16,
+    Route1 = 17,
 }
 
 impl ElemId {
-    pub const COUNT: usize = 16;
+    pub const COUNT: usize = 18;
+    pub const ROUTES: [ElemId; 2] = [Self::Route0, Self::Route1];
     pub const ALL: [ElemId; Self::COUNT] = [
         Self::Lead,
         Self::DividerLead,
@@ -353,6 +357,8 @@ impl ElemId {
         Self::DoneLead,
         Self::Paste,
         Self::Inspect,
+        Self::Route0,
+        Self::Route1,
     ];
 
     pub const fn trace_key(self) -> &'static str {
@@ -373,6 +379,8 @@ impl ElemId {
             Self::DoneLead => "done.lead",
             Self::Paste => "paste",
             Self::Inspect => "inspect",
+            Self::Route0 => "route:0",
+            Self::Route1 => "route:1",
         }
     }
 
@@ -418,6 +426,7 @@ impl ElemId {
             Self::DoneLead => "Completed",
             Self::Paste => "Paste",
             Self::Inspect => "Inspect",
+            Self::Route0 | Self::Route1 => "Send to session",
         }
     }
 }
@@ -435,8 +444,10 @@ pub enum Pres {
         has_iphone: bool,
     },
     Processing,
+    /// `routes`: the labels of sessions offered one click away, beside Paste.
     Completed {
         label: String,
+        routes: Vec<String>,
     },
 }
 
@@ -468,7 +479,16 @@ impl Pres {
                     has_iphone: ib,
                 },
             ) => ia == ib && ma.shows_record() == mb.shows_record(),
-            (Self::Completed { label: a }, Self::Completed { label: b }) => a == b,
+            (
+                Self::Completed {
+                    label: a,
+                    routes: ra,
+                },
+                Self::Completed {
+                    label: b,
+                    routes: rb,
+                },
+            ) => a == b && ra == rb,
             _ => false,
         }
     }
@@ -577,11 +597,27 @@ impl Layout {
     }
 }
 
+/// Widths of the Completed island's changing labels, measured as their sprites are drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LabelWidths {
+    pub completed: f32,
+    pub routes: [f32; 2],
+}
+
+impl Default for LabelWidths {
+    fn default() -> Self {
+        Self {
+            completed: 46.0,
+            routes: [0.0; 2],
+        }
+    }
+}
+
 /// Computes the resting capsule bounds and item boxes for `pres`.
 pub fn layout_of(
     pres: &Pres,
     clock: &str,
-    completed_label_w: f32,
+    labels: LabelWidths,
     m: &Metrics,
 ) -> (Layout, Vec<LayoutItem>) {
     let y0 = TOP + ISLAND_INSET;
@@ -662,8 +698,8 @@ pub fn layout_of(
             let w = CHIP_H + 6.0 + m.processing + CHIP_PX;
             raw.push((ElemId::Processing, w, CHIP_CORE_ROUND, 0.0, false));
         }
-        Pres::Completed { .. } => {
-            let lead_w = CHIP_H + 8.0 + completed_label_w + LEAD_TRAIL;
+        Pres::Completed { routes, .. } => {
+            let lead_w = CHIP_H + 8.0 + labels.completed + LEAD_TRAIL;
             raw.push((ElemId::DoneLead, lead_w, CHIP_CORE_ROUND, 0.0, true));
             raw.push((ElemId::DividerLead, DIVIDER_W, 0.0, 0.0, false));
             raw.push((
@@ -673,6 +709,15 @@ pub fn layout_of(
                 0.0,
                 true,
             ));
+            for (i, id) in ElemId::ROUTES.into_iter().enumerate().take(routes.len()) {
+                raw.push((
+                    id,
+                    Metrics::chip_width(labels.routes[i]),
+                    CHIP_CORE_ROUND,
+                    0.0,
+                    true,
+                ));
+            }
             raw.push((
                 ElemId::Inspect,
                 Metrics::chip_width(m.inspect),
@@ -813,7 +858,7 @@ pub struct PillModel {
     pub hovered: Option<ElemId>,
     pub pressed: Option<ElemId>,
     pub clock: String,
-    pub completed_label_w: f32,
+    pub labels: LabelWidths,
     pub metrics: Metrics,
 }
 
@@ -843,7 +888,7 @@ impl PillModel {
             hovered: None,
             pressed: None,
             clock: "0:00".to_owned(),
-            completed_label_w: 46.0,
+            labels: LabelWidths::default(),
             metrics,
         }
     }
@@ -857,9 +902,8 @@ impl PillModel {
         let was_visible = !matches!(self.pres, Pres::Hidden);
         let now_hidden = matches!(next, Pres::Hidden);
         let (prev_lay, prev_items) =
-            layout_of(&self.geo_pres, &self.clock, self.completed_label_w, &self.metrics);
-        let (next_lay, next_items) =
-            layout_of(&next, &self.clock, self.completed_label_w, &self.metrics);
+            layout_of(&self.geo_pres, &self.clock, self.labels, &self.metrics);
+        let (next_lay, next_items) = layout_of(&next, &self.clock, self.labels, &self.metrics);
 
         // Update element metadata for the new presentation immediately (e.g. highlight or enabled state).
         if !now_hidden {
@@ -909,7 +953,7 @@ impl PillModel {
             && (self.shell_alpha.x < 0.02 || matches!(self.geo_pres, Pres::Hidden) && self.shell_alpha.x < 0.08);
         self.entering_from_hidden = from_hidden;
         self.geo_pres = next.clone();
-        let (lay, items) = layout_of(&next, &self.clock, self.completed_label_w, &self.metrics);
+        let (lay, items) = layout_of(&next, &self.clock, self.labels, &self.metrics);
 
         if from_hidden && !self.reduced {
             // Entry in place (no lozenge growth): snap width/height to the entering state's layout
@@ -1056,13 +1100,15 @@ impl PillModel {
         }
     }
 
-    pub fn set_completed_label(&mut self, label: String, label_w: f32) {
-        let width_changed = (self.completed_label_w - label_w).abs() > 0.5;
-        self.completed_label_w = label_w;
-        if let Pres::Completed { label: ref cur } = self.pres
-            && (*cur != label || width_changed)
-        {
-            self.pres = Pres::Completed { label };
+    /// Takes the Completed island's measured label widths; a change while it shows re-lays it
+    /// out smoothly.
+    /// `next` is the presentation about to be set: when it's already showing, only the widths
+    /// changed and the layout follows them now; otherwise `set_pres` lays it out.
+    pub fn set_label_widths(&mut self, labels: LabelWidths, next: &Pres) {
+        let changed = (self.labels.completed - labels.completed).abs() > 0.5
+            || (0..2).any(|i| (self.labels.routes[i] - labels.routes[i]).abs() > 0.5);
+        self.labels = labels;
+        if changed && self.pres == *next && matches!(next, Pres::Completed { .. }) {
             self.apply_geometry();
         }
     }
@@ -1095,7 +1141,7 @@ impl PillModel {
         if matches!(self.pres, Pres::Hidden) {
             return false;
         }
-        let (lay, _) = layout_of(&self.pres, &self.clock, self.completed_label_w, &self.metrics);
+        let (lay, _) = layout_of(&self.pres, &self.clock, self.labels, &self.metrics);
         let slop = 6.0;
         x >= lay.l - slop && x <= lay.r + slop && y >= lay.t - slop && y <= lay.b + slop
     }
@@ -1105,7 +1151,7 @@ impl PillModel {
         if matches!(self.pres, Pres::Hidden) {
             return None;
         }
-        let (_, items) = layout_of(&self.pres, &self.clock, self.completed_label_w, &self.metrics);
+        let (_, items) = layout_of(&self.pres, &self.clock, self.labels, &self.metrics);
         for item in &items {
             if !item.id.is_interactive() || !item.enabled {
                 continue;
@@ -1267,10 +1313,8 @@ impl PillModel {
         };
         let settled_geo = self.geo_pres == self.pres;
         let grown = self.grown_enough();
-        let (_, geo_items) =
-            layout_of(&self.geo_pres, &self.clock, self.completed_label_w, &self.metrics);
-        let (_, active_items) =
-            layout_of(&self.pres, &self.clock, self.completed_label_w, &self.metrics);
+        let (_, geo_items) = layout_of(&self.geo_pres, &self.clock, self.labels, &self.metrics);
+        let (_, active_items) = layout_of(&self.pres, &self.clock, self.labels, &self.metrics);
 
         let inn = if reduced {
             SpringCfg::new(REDUCED_FADE_S, 0.0)
@@ -1282,6 +1326,15 @@ impl PillModel {
         } else {
             CONTENT_OUT_SPRING
         };
+
+        // Boxes of shared items still travelling: a session chip inserted between them waits until
+        // they've cleared its spot, so it never fades in underneath one.
+        let movers: Vec<[f32; 4]> = ElemId::ALL
+            .iter()
+            .map(|id| &self.elems[*id as usize])
+            .filter(|st| st.travelling && st.a.x > 0.03)
+            .map(|st| [st.x.x, st.y.x, st.w, st.h])
+            .collect();
 
         for id in ElemId::ALL {
             let idx = id as usize;
@@ -1361,10 +1414,14 @@ impl PillModel {
             let d = box_clearance(&now, box_rect, k, st.round, [CX, TOP], dy);
             let d_rest = box_clearance(&now, box_rect, k_shell, st.round, [CX, TOP], 0.0);
 
+            let covered = ElemId::ROUTES.contains(&id)
+                && movers
+                    .iter()
+                    .any(|m| m[0] < box_rect[0] + box_rect[2] && box_rect[0] < m[0] + m[2]);
             let gate = reduced
                 || st.travelling
                 || st.want
-                || (settled_geo && grown && d_rest >= CLEAR + EDGE_BAND - 0.8);
+                || (settled_geo && grown && !covered && d_rest >= CLEAR + EDGE_BAND - 0.8);
             let want = in_pres && gate;
             if st.want != want {
                 st.want = want;
@@ -1775,6 +1832,7 @@ mod tests {
                     2.8,
                     Pres::Completed {
                         label: "Copied".into(),
+                        routes: Vec::new(),
                     },
                 ),
                 (4.2, Pres::Hidden),
@@ -1856,6 +1914,7 @@ mod tests {
             Pres::Processing,
             Pres::Completed {
                 label: "Copied".into(),
+                routes: Vec::new(),
             },
         ];
 
@@ -1980,6 +2039,7 @@ mod tests {
         }
         m.set_pres(Pres::Completed {
             label: "Copied".into(),
+            routes: Vec::new(),
         });
         let done_target_w = m.r.target - m.l.target;
         let mut max_w = 0.0_f32;

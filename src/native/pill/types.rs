@@ -56,6 +56,8 @@ pub enum PillAction {
     Paste(Option<[f32; 2]>),
     Inspect,
     DismissCompleted,
+    /// A session chip on the Completed island (smart routing), by position.
+    Route(usize),
 }
 
 /// Coordinator state snapshot synced to `NativePill`.

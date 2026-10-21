@@ -459,7 +459,7 @@ pub fn judge_capture(
         scrawl_log(format!("routing: couldn't save {RECORD}: {err:#}"));
     }
     let outcome = match &judgement.decision {
-        smart::Decision::Send { to } => {
+        smart::Decision::Send { to, .. } => {
             format!("send to {} ({})", to.candidate.label(), to.candidate.id)
         }
         smart::Decision::Offer { choices } => format!(
@@ -509,7 +509,10 @@ pub fn explain_bundle(bundle: &Path, url: Option<&str>) -> Result<String> {
         .map(str::to_owned)
         .or_else(|| loaded.destination.as_ref().and_then(|d| d.url.clone()));
     if replayed {
-        let _ = writeln!(out, "Evidence  saved at capture time ({RECORD})");
+        let _ = writeln!(
+            out,
+            "Evidence  saved at capture time ({RECORD}); the bundle's clues read again with today's rules"
+        );
     } else {
         let _ = writeln!(
             out,
