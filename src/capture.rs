@@ -1126,9 +1126,13 @@ impl SharedCaptureTelemetry {
     }
 
     /// Whether the topmost window at a global point is Scrawl's own or a `scrawl-helper`'s other
-    /// than the capture source (ignoring the click-through ink overlay). Asked once per press, and
-    /// for scrolls, which come in bursts at one point, at most every 250 ms.
+    /// than the capture source (ignoring the click-through ink overlay), or the pointer is on the
+    /// SwiftUI capsule. Asked once per press, and for scrolls, which come in bursts at one point,
+    /// at most every 250 ms.
     fn on_scrawl_window(&self, x: f64, y: f64) -> bool {
+        if crate::native::capsule::pointer_on_helper_pill() {
+            return true;
+        }
         let mut hit = self
             .scrawl_hit
             .lock()
@@ -1157,11 +1161,14 @@ impl SharedCaptureTelemetry {
         y: f64,
         is_helper: impl Fn(i32) -> bool,
     ) -> bool {
-        let passthrough = self
+        // The SwiftUI capsule's window spans more than the capsule and lets the rest through;
+        // `pointer_on_helper_pill` says when a click is the capsule's.
+        let mut passthrough = self
             .passthrough_window_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        passthrough.extend(crate::native::capsule::helper_window());
         let own = std::process::id() as i32;
         let source = self.capture_source_pid.load(Ordering::Acquire);
         crate::windows::owned_window_at(windows, x, y, &passthrough, |pid| {
@@ -1570,6 +1577,40 @@ mod tests {
         assert!(!at(1000.0, 900.0), "the app under the ink overlay");
         telemetry.set_capture_source_pid(0);
         assert!(at(1400.0, 400.0), "a helper that isn't the source");
+    }
+
+    /// The SwiftUI capsule's Finish, Cancel and chips were recorded as clicks ("clicked text
+    /// “Finish”"). Its window spans more than the capsule and lets the rest through, so the
+    /// helper's hover report, not the window, decides.
+    #[test]
+    fn the_swiftui_capsule_s_clicks_are_scrawl_s_and_its_see_through_window_is_not() {
+        let (sender, _receiver) = flume::unbounded();
+        let telemetry = SharedCaptureTelemetry::new(sender);
+        let window = |id, pid, bounds| crate::windows::RawWindow {
+            id,
+            pid,
+            owner: String::new(),
+            title: String::new(),
+            bounds,
+            layer: 0,
+            alpha: 1.0,
+        };
+        let own = std::process::id() as i32;
+        let (pill, app) = (own + 1, own + 2);
+        let windows = [
+            window(18512, pill, [960.0, 34.0, 640.0, 112.0]),
+            window(2, app, [0.0, 0.0, 2560.0, 1440.0]),
+        ];
+        let helper = |pid| pid == pill;
+        crate::native::capsule::set_helper_window(18512);
+        let tab_bar = telemetry.scrawl_window_in(&windows, 1000.0, 40.0, helper);
+        crate::native::capsule::set_pointer_on_helper_pill(true);
+        let finish = telemetry.on_scrawl_window(1341.0, 78.0);
+        crate::native::capsule::set_helper_window(0);
+        let after = crate::native::capsule::pointer_on_helper_pill();
+        assert!(!tab_bar, "a browser tab under the capsule's empty window");
+        assert!(finish, "Finish");
+        assert!(!after, "the Metal capsule took over");
     }
 
     /// Kit's Screen capture on the Pro: the old listen-only event tap was off (no Input

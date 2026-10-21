@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use super::capsule;
 use super::pill::model::{self, ElemId, Metrics, PillOpts, Pres, SpringCfg, layout_of};
 use super::pill::{PillAction, PillSnapshot, atlas, panel_origin_at};
 use crate::capture::scrawl_log;
@@ -185,11 +186,17 @@ impl SwiftPill {
                 for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
                     match parse_event(&line) {
                         Some(event) => {
+                            // Straight away, not at the next `pump`: the mouse monitor reads it
+                            // for the very next click.
+                            if let Event::Hover(on) = event {
+                                capsule::set_pointer_on_helper_pill(on);
+                            }
                             let _ = tx.send(event);
                         }
                         None => scrawl_log(format!("pill helper: {line}")),
                     }
                 }
+                capsule::set_pointer_on_helper_pill(false);
                 let _ = tx.send(Event::Exited);
             })
             .map_err(|e| e.to_string())?;

@@ -35,7 +35,33 @@ static HELPER_WINDOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU3
 
 /// Whether `id` is the SwiftUI capsule's window, which recordings must leave out.
 pub fn is_helper_window(id: u32) -> bool {
-    id != 0 && HELPER_WINDOW.load(std::sync::atomic::Ordering::Relaxed) == id
+    helper_window() == Some(id)
+}
+
+/// Records the SwiftUI capsule's window (0: Metal draws, so nothing is on a helper capsule).
+pub(crate) fn set_helper_window(id: u32) {
+    HELPER_WINDOW.store(id, std::sync::atomic::Ordering::Relaxed);
+    if id == 0 {
+        set_pointer_on_helper_pill(false);
+    }
+}
+
+/// The SwiftUI capsule's window, if it draws.
+pub fn helper_window() -> Option<u32> {
+    Some(HELPER_WINDOW.load(std::sync::atomic::Ordering::Relaxed)).filter(|&id| id != 0)
+}
+
+/// The pointer is on the SwiftUI capsule, as `scrawl-helper pill` last reported. Its window lets
+/// clicks through everywhere else, so this, not the window, says a click is the capsule's (Finish,
+/// Cancel, a chip) and must stay out of the recording.
+static HELPER_HOVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn pointer_on_helper_pill() -> bool {
+    HELPER_HOVER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn set_pointer_on_helper_pill(on: bool) {
+    HELPER_HOVER.store(on, std::sync::atomic::Ordering::Release);
 }
 
 /// How often `sync` (called every few ms) re-reads `pillRenderer` from `config.json`.
@@ -111,10 +137,7 @@ impl Capsule {
 
     fn exclude_window(&self) {
         let num = self.window_number();
-        HELPER_WINDOW.store(
-            if self.renderer() == Renderer::SwiftUi { num } else { 0 },
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        set_helper_window(if self.renderer() == Renderer::SwiftUi { num } else { 0 });
         if num > 0 {
             let mut ids = self
                 .excluded
