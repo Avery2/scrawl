@@ -12,6 +12,7 @@ import SwiftUI
 //   Accepted     The new keys bob once, left to right.
 //   Refused      The pressed keys stay a moment in red and shake, then the old ones come back
 //                and the caption says why.
+//   Off          No keys: "Set shortcut" sits in the field (paste only).
 //
 // Every value is a spring evaluated in closed form at a time, so a moment draws the same live
 // from a TimelineView or frame by frame for `scrawl-helper settings --render`. Retargeting
@@ -125,6 +126,8 @@ final class KeyMotion {
   private(set) var order: [String] = []
   var width: Track
   var listen = Track(0, KeySprings.enter)
+  /// 1 while there are no keys and nothing listens: the "Set shortcut" placeholder.
+  var blank = Track(0, KeySprings.enter)
   var caret = Track(0, KeySprings.slide)
   /// 0…1…0 after a new shortcut lands.
   var flourish = Track(0, KeySprings.draw)
@@ -156,6 +159,9 @@ final class KeyMotion {
       x += w
     }
     var caretCentre = x
+    let blankNow = !listening && labels.isEmpty
+    if blankNow { x += m.empty }
+    move(&blank, blankNow ? 1 : 0, at: t, instant: instant)
     if listening {
       if labels.isEmpty {
         caretCentre = x + m.empty / 2
@@ -251,7 +257,7 @@ final class KeyMotion {
   }
 
   func still(_ t: Double) -> Bool {
-    pending.isEmpty && listen.to == 0 && listen.still(t) && width.still(t) && caret.still(t)
+    pending.isEmpty && listen.to == 0 && listen.still(t) && blank.still(t) && width.still(t) && caret.still(t)
       && flourish.still(t) && flourishFade.still(t) && t - shakeAt >= 0.55
       && keys.values.allSatisfy { $0.x.still(t) && $0.presence.still(t) && $0.press.still(t) && $0.ink.still(t) }
   }
@@ -532,6 +538,13 @@ struct ShortcutField: View {
         .opacity(listen * max(0, 1 - 2 * keyed))
         .blur(radius: k.reduce ? 0 : (1 - listen * max(0, 1 - 2 * keyed)) * 2)
         .offset(x: k.m.pad + k.m.lead, y: h / 2 - 8)
+      Text("Set shortcut")
+        .font(.system(size: 12))
+        .foregroundStyle(theme.secondary)
+        .fixedSize()
+        .frame(width: w, height: h)
+        .opacity(k.blank.value(t))
+        .blur(radius: k.reduce ? 0 : (1 - k.blank.value(t)) * 2)
       Capsule().fill(keyInk).frame(width: 1.5, height: 14)
         .opacity(listen * keyed * (0.35 + 0.65 * breath))
         .offset(x: w + CGFloat(k.caret.value(t)) - 0.75, y: h / 2 - 7)

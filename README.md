@@ -166,7 +166,7 @@ granted and each on-demand sheet: `target/debug/scrawl-helper onboarding --rende
 **Settings…** in the menu bar (⌘, while the menu is open) opens a small window with six panes:
 
 - **General**: Launch at login, Send dev-site captures to OpenCode, and the two shortcuts, Record
-  (`⌥⇧S`) and Paste last capture (`⌥⇧V`).
+  (`⌥⇧S`) and Paste last capture (`⌥⇧V`, which can be turned off).
 - **Recording**: the microphone, with its input level, the transcriber (Apple Speech with its
   language, Hex while it runs, with its model and language, or Command when it's configured) and,
   under Experimental, Video export.
