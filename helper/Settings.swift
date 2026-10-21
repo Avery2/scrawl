@@ -151,6 +151,8 @@ struct SettingsState: Decodable, Equatable {
   var microphone = SettingsMicrophone()
   var transcriber = SettingsTranscriber()
   var videoExport = false
+  var lowerPlayback = false
+  var playbackLevel = 20
   var retention = SettingsRetention()
   var capturesSize: String?
   var permissions: [SettingsPermission] = ["screen-recording", "microphone", "accessibility", "camera"]
@@ -893,6 +895,14 @@ struct SettingsView: View {
         SettingsRow(title: "Send dev-site captures to OpenCode") {
           SettingsSwitch(on: state.autoSend) { model.set("autoSend", $0) }
         }
+        SettingsSeparator()
+        SettingsRow(title: "Lower other audio while recording") {
+          SettingsSwitch(on: state.lowerPlayback) { model.set("lowerPlayback", $0) }
+        }
+        if state.lowerPlayback {
+          SettingsSeparator()
+          PlaybackLevelRow(model: model, level: state.playbackLevel)
+        }
       }
       if state.login.needsApproval {
         SettingsCaption(text: "Allow Scrawl in System Settings › General › Login Items.")
@@ -1516,6 +1526,8 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
     pasteOff.shortcuts[1] = SettingsShortcut(kind: "paste", title: "Paste last capture", label: "", key: "", shift: false, option: false, isDefault: false, clearable: true)
     var pasteListening = base
     pasteListening.shortcuts[1].recording = true
+    var lowered = base
+    lowered.lowerPlayback = true
     // The shortcut keys are drawn at a moment after a few steps: (time, step).
     let rest: [(Double, (SettingsModel) -> Void)] = [(0, { $0.show(base, at: 0) })]
     let listen = rest + [(1, { $0.show(listening, at: 1) })]
@@ -1607,6 +1619,7 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
       ("general-paste-listening", .general, pasteListening),
       ("general-paste-cleared", .general, pasteOff),
       ("general-paste-off", .general, pasteOff),
+      ("general-lower-playback", .general, lowered),
       ("recording", .recording, base),
       ("recording-hex", .recording, hex),
       ("recording-mic-chosen", .recording, micChosen),
@@ -1665,6 +1678,41 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
 }
 
 /// Commit on Return or Apply, so intermediate edits never reach the transcriber.
+/// Sends the level when the slider is let go, not on every step of the drag.
+private struct PlaybackLevelRow: View {
+  @Environment(\.settingsTheme) private var theme
+  @ObservedObject var model: SettingsModel
+  let level: Int
+  @State private var draft: Double
+
+  init(model: SettingsModel, level: Int) {
+    self.model = model
+    self.level = level
+    _draft = State(initialValue: Double(level))
+  }
+
+  var body: some View {
+    SettingsRow(title: "Lower to") {
+      // ImageRenderer cannot draw the AppKit-backed slider; previews get a plain track.
+      if model.rendering {
+        Capsule().fill(theme.track)
+          .overlay(alignment: .leading) { Capsule().fill(theme.accent).frame(width: 150 * draft / 100) }
+          .frame(width: 150, height: 4)
+      } else {
+        Slider(value: $draft, in: 0...100) { editing in
+          if !editing { model.set("playbackLevel", Int(draft.rounded())) }
+        }
+        .frame(width: 150)
+      }
+      Text("\(Int(draft.rounded()))%")
+        .font(.system(size: 14).monospacedDigit())
+        .foregroundStyle(theme.secondary)
+        .frame(width: 40, alignment: .trailing)
+    }
+    .onChange(of: level) { _, value in draft = Double(value) }
+  }
+}
+
 private struct HexLanguageField: View {
   @ObservedObject var model: SettingsModel
   let language: String

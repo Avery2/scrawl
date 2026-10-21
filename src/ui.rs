@@ -673,6 +673,7 @@ impl ActiveRecording {
 pub struct ScrawlCoordinator {
     telemetry: Arc<SharedCaptureTelemetry>,
     active_recording: Option<ActiveRecording>,
+    playback: Option<crate::playback::Guard>,
     picker_metal_overlay: Option<LaserOverlay>,
     native_pill: Option<crate::native::pill::NativePill>,
     iphone_preview: Option<PhoneSession>,
@@ -781,9 +782,11 @@ impl ScrawlCoordinator {
         telemetry: Arc<SharedCaptureTelemetry>,
         initial_bundle: Option<(PathBuf, ScrawlBundle)>,
     ) -> Self {
+        crate::playback::warm_up();
         Self {
             telemetry,
             active_recording: None,
+            playback: None,
             picker_metal_overlay: None,
             native_pill: None,
             iphone_preview: None,
@@ -1174,6 +1177,12 @@ impl ScrawlCoordinator {
         }
     }
 
+    fn begin_playback(&mut self) {
+        if !self.lab && self.playback.is_none() {
+            self.playback = crate::playback::Guard::start();
+        }
+    }
+
     /// The capture shortcut went down (from Carbon, the event tap or the HID poller).
     pub fn press_shortcut(&mut self, cx: &mut Context<Self>) {
         let activity = self.activity();
@@ -1188,6 +1197,7 @@ impl ScrawlCoordinator {
                 scrawl_log("Shortcut held back: a required permission is off");
                 return;
             }
+            self.begin_playback();
             self.hold_mods = crate::capture::modifier_flags();
             // An Esc from before this press doesn't cancel it.
             self.telemetry.take_escape();
@@ -1218,7 +1228,11 @@ impl ScrawlCoordinator {
             scrawl_log(format!("shortcut -> {action:?}"));
         }
         match action {
-            Action::None | Action::Cancel => {}
+            Action::None => {}
+            Action::Cancel => {
+                // Esc can cancel before the picker or a recording exists.
+                self.playback.take();
+            }
             Action::RecordScreen => self.record_screen_now(cx),
             Action::RecordSelected => self.record_selected_mode(cx),
             Action::Finish => self.finish_recording(cx),
@@ -1911,6 +1925,9 @@ impl ScrawlCoordinator {
     }
 
     pub fn dismiss_island(&mut self, cx: &mut Context<Self>) {
+        if !self.is_recording() {
+            self.playback.take();
+        }
         if matches!(
             self.island_phase,
             IslandPhase::Hidden | IslandPhase::Dismissing
@@ -2489,6 +2506,7 @@ impl ScrawlCoordinator {
             self.cancel_recording(cx);
             return;
         }
+        self.begin_playback();
         let started = Instant::now();
         scrawl_log(format!(
             "start_recording_with_target invoked: mode={:?} frame={:?}",
@@ -2645,6 +2663,7 @@ impl ScrawlCoordinator {
             self.cancel_recording(cx);
             return;
         }
+        self.begin_playback();
         self.remember_mode(SelectionMode::Iphone);
         self.recording_shortcut_key = false;
         self.selection_drag = None;
@@ -2750,12 +2769,14 @@ impl ScrawlCoordinator {
     }
 
     pub fn cancel_recording(&mut self, cx: &mut Context<Self>) {
+        self.playback.take();
         scrawl_log("cancel_recording invoked");
         self.discard_recording();
         self.dismiss_island(cx);
     }
 
     pub fn finish_recording(&mut self, cx: &mut Context<Self>) {
+        self.playback.take();
         scrawl_log("finish_recording invoked");
         set_escape_hotkey_enabled(false);
         let Some(rec) = self.active_recording.take() else {
