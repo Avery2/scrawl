@@ -687,7 +687,7 @@ struct ShortcutRecorder: View {
                 .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .help("Reset to \(shortcut.kind == "paste" ? "⌥⇧V" : "⌥⇧S")")
+            .help("Reset to \(["paste": "⌥⇧V", "screenshot": "⌥⇧4"][shortcut.kind] ?? "⌥⇧S")")
             .transition(SettingsMotion.replace)
           }
           if shortcut.clearable && !shortcut.off && !shortcut.recording {
@@ -758,9 +758,11 @@ struct ShortcutRecorder: View {
   private var caption: String {
     if shortcut.recording { return shortcut.clearable ? "Esc cancels. Delete turns it off." : "Esc cancels." }
     if let error = shortcut.error { return error }
-    return shortcut.kind == "paste"
-      ? "Pastes the last capture into the app in front."
-      : "Records the screen. Press again to finish."
+    switch shortcut.kind {
+    case "paste": return "Pastes the last capture into the app in front."
+    case "screenshot": return "Takes a screenshot of an area, a window or the screen."
+    default: return "Records the screen. Press again to finish."
+    }
   }
 }
 

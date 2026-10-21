@@ -832,7 +832,11 @@ fn build_card(spec: &CardSpec, scale: f64) -> CardLayers {
         objc2_app_kit::NSFontWeightMedium
     });
     let regular = NSFont::systemFontOfSize_weight(11.0, unsafe { objc2_app_kit::NSFontWeightMedium });
-    let clock = format!("{}:{:02}", spec.duration_ms / 60_000, spec.duration_ms / 1000 % 60);
+    let clock = if spec.screenshot {
+        "PNG".to_owned()
+    } else {
+        format!("{}:{:02}", spec.duration_ms / 60_000, spec.duration_ms / 1000 % 60)
+    };
     let duration = text_layer(&clock, &digits, 11.0, [1.0, 1.0, 1.0, 0.5], scale);
     let text_y = card_h - FOOTER_H + (FOOTER_H - 14.0) * 0.5 - 1.0;
     duration.setFrame(ns_rect([INSET + 6.0, text_y, 36.0, 14.0], card_h));
@@ -994,6 +998,21 @@ pub fn tile_of(sizes: &[(u32, u32)], index: usize) -> ([f32; 2], [f32; 4]) {
 /// A card for a finished bundle: its contact sheet, its last keyframe (full-size if the bundle
 /// kept one) and where that keyframe sits in the sheet.
 pub fn card_for_bundle(id: u64, dir: &Path, duration_ms: u64, destination: &str) -> Option<CardSpec> {
+    // A screenshot is its own thumbnail: one picture, no sheet around it.
+    let shot = dir.join(crate::screenshot::FILE);
+    if let Some((w, h)) = png_size(&shot) {
+        return Some(CardSpec {
+            id,
+            bundle: dir.to_path_buf(),
+            sheet: shot.clone(),
+            frame: Some(shot),
+            sheet_size: [w as f32, h as f32],
+            tile: [0.0, 0.0, 1.0, 1.0],
+            duration_ms,
+            screenshot: true,
+            destination: destination.to_owned(),
+        });
+    }
     let sheet = dir.join("contact-sheet.png");
     let mut frames: Vec<PathBuf> = std::fs::read_dir(dir.join("frames"))
         .ok()?
@@ -1022,6 +1041,7 @@ pub fn card_for_bundle(id: u64, dir: &Path, duration_ms: u64, destination: &str)
         sheet_size,
         tile,
         duration_ms,
+        screenshot: false,
         destination: destination.to_owned(),
     })
 }

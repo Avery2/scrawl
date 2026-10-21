@@ -39,6 +39,7 @@ mod render;
 mod retention;
 mod routing;
 mod screens;
+mod screenshot;
 mod settings;
 mod settings_window;
 mod shortcut;

@@ -183,6 +183,34 @@ pub fn copy_png_to_clipboard(png_bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// One clipboard item with both the image and `text` (a screenshot's path): apps that take
+/// images paste the picture, terminals paste the path.
+#[cfg(target_os = "macos")]
+pub fn copy_png_and_text_to_clipboard(png_bytes: &[u8], text: &str) -> Result<()> {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString};
+    use objc2_foundation::{NSArray, NSData, NSString};
+
+    let data = NSData::with_bytes(png_bytes);
+    let text = NSString::from_str(text);
+    let pasteboard = NSPasteboard::generalPasteboard();
+    unsafe {
+        let types = NSArray::from_slice(&[NSPasteboardTypePNG, NSPasteboardTypeString]);
+        pasteboard.clearContents();
+        pasteboard.declareTypes_owner(&types, None);
+        ensure!(
+            pasteboard.setData_forType(Some(&data), NSPasteboardTypePNG)
+                && pasteboard.setString_forType(&text, NSPasteboardTypeString),
+            "Could not copy the screenshot to the clipboard"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub fn copy_png_and_text_to_clipboard(png_bytes: &[u8], _text: &str) -> Result<()> {
+    copy_png_to_clipboard(png_bytes)
+}
+
 #[cfg(target_os = "windows")]
 pub fn copy_string_to_clipboard(content: &str) -> Result<()> {
     crate::win::clipboard::set_text(content)
@@ -196,6 +224,11 @@ pub fn copy_png_to_clipboard(png_bytes: &[u8]) -> Result<()> {
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn copy_bundle_to_clipboard(bundle_dir: &Path) -> Result<()> {
     let (directory, bundle) = load_bundle(bundle_dir)?;
+    if crate::screenshot::is_screenshot(&bundle) {
+        let path = directory.join(&bundle.contact_sheet);
+        let image = fs::read(&path).context("Could not read the screenshot")?;
+        return copy_png_and_text_to_clipboard(&image, &path.display().to_string());
+    }
     let summary = crate::sketch::summary_markdown(&bundle, &directory);
     copy_string_to_clipboard(&summary)
 }
@@ -223,6 +256,14 @@ pub fn paste_bundle_image_and_text(bundle_dir: &Path) -> Result<()> {
     let summary = crate::sketch::summary_markdown(&bundle, &directory);
 
     crate::capture::wait_for_modifiers_released(350);
+
+    if crate::screenshot::is_screenshot(&bundle) {
+        // One paste: the image, or its path in a terminal.
+        copy_png_and_text_to_clipboard(&image, &sheet_path.display().to_string())?;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        crate::capture::post_synthetic_cmd_v();
+        return Ok(());
+    }
 
     if crate::capture::is_frontmost_terminal() {
         // In terminals (Ghostty / OpenCode TUI / Claude Code), pasting the image path first

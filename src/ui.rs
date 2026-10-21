@@ -76,6 +76,7 @@ const PILL_WINDOW_W: f32 = 520.0;
 const PILL_WINDOW_H: f32 = 84.0;
 
 mod lab;
+mod screenshot_hook;
 mod stack_hook;
 mod stack_lab;
 pub(crate) mod motion;
@@ -779,6 +780,11 @@ pub struct ScrawlCoordinator {
     lab: bool,
     /// Finished captures as cards (experiment `captureStack`, `stack_hook`).
     capture_stack: Option<stack_hook::StackState>,
+    /// The picker is open for a screenshot (`screenshot_hook`): its pick is captured as one
+    /// still instead of recorded.
+    still: bool,
+    /// When `tick_screenshot_shortcut` last looked at the config.
+    screenshot_polled: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -857,6 +863,8 @@ impl ScrawlCoordinator {
             hold_mods: 0,
             lab: false,
             capture_stack: None,
+            still: false,
+            screenshot_polled: Instant::now(),
         }
     }
 
@@ -958,6 +966,11 @@ impl ScrawlCoordinator {
             });
         })
         .detach();
+    }
+
+    /// Whether the picker offers iPhone: a phone is cabled and this isn't a screenshot.
+    fn picker_has_iphone(&self) -> bool {
+        self.iphone.is_some() && !self.still
     }
 
     pub fn is_recording(&self) -> bool {
@@ -1637,7 +1650,7 @@ impl ScrawlCoordinator {
         if mods.platform || mods.control || mods.alt {
             return false;
         }
-        let has_iphone = self.iphone.is_some();
+        let has_iphone = self.picker_has_iphone();
         // The record shortcut's key ("S") also records on its own while the picker is up.
         let label = self.shortcut_label();
         let record_key = crate::capture::shortcut_parts(&label).1;
@@ -1852,6 +1865,9 @@ impl ScrawlCoordinator {
             if let Some([x, y, w, h]) = area_rect(start, [sx, sy], self.display_rect) {
                 let target = region_target(x, y, w, h, &self.selectable_windows);
                 self.start_recording_with_target(target, cx);
+            } else if self.still && (sx - start[0]).hypot(sy - start[1]) < 4.0 {
+                // A screenshot's click without a drag takes the screen under the pointer.
+                self.start_recording_full_screen(cx);
             } else {
                 self.sync_picker_overlay();
                 cx.notify();
@@ -1889,7 +1905,7 @@ impl ScrawlCoordinator {
             .map(ActiveRecording::elapsed_ms);
         let elapsed_ms = recording_ms.unwrap_or(self.last_elapsed_ms);
         let clock = format_clock(elapsed_ms);
-        let has_iphone = self.iphone.is_some();
+        let has_iphone = self.picker_has_iphone();
 
         let pres = match self.island_phase {
             IslandPhase::Hidden | IslandPhase::Dismissing => Pres::Hidden,
@@ -1940,6 +1956,7 @@ impl ScrawlCoordinator {
         if !self.is_recording() {
             self.playback.take();
         }
+        self.still = false;
         if matches!(
             self.island_phase,
             IslandPhase::Hidden | IslandPhase::Dismissing
@@ -2513,6 +2530,10 @@ impl ScrawlCoordinator {
         if self.is_recording() || self.is_processing() {
             return;
         }
+        if self.still && !self.lab {
+            self.take_screenshot(target, cx);
+            return;
+        }
         if self.lab {
             self.start_lab_recording(target, cx);
             return;
@@ -2668,6 +2689,11 @@ impl ScrawlCoordinator {
     /// normalize straight into phone-screen coordinates (kept current as the window moves).
     pub fn start_recording_iphone(&mut self, cx: &mut Context<Self>) {
         if self.is_recording() || self.is_processing() {
+            return;
+        }
+        if self.still {
+            // A screenshot has no iPhone mode.
+            self.cancel_recording(cx);
             return;
         }
         scrawl_log("start_recording_iphone invoked");
@@ -3140,7 +3166,7 @@ impl Render for HudPillWindow {
         let highlight_prev = coord.highlight_prev;
         let highlight_p = ease_out_cubic(motion::age(coord.highlight_since) / HIGHLIGHT_FADE_S);
         let clock = format_clock(elapsed_ms);
-        let has_iphone = coord.iphone.is_some();
+        let has_iphone = coord.picker_has_iphone();
         let completed_note = coord.completed_note.clone();
         let routes = coord.route_chip_labels();
         // The Recording capsule's trailing group: switch chips or controls, and the swap between.
@@ -5518,6 +5544,7 @@ pub fn run_app(
                     while let Ok(ev) = ui_receiver.try_recv() {
                         loop_coord.update(cx, |coord, cx| match ev {
                             LiveOverlayEvent::CaptureShortcut => coord.press_shortcut(cx),
+                            LiveOverlayEvent::ScreenshotShortcut => coord.press_screenshot(cx),
                             LiveOverlayEvent::PasteLatestShortcut => {
                                 if !coord.is_recording() && !coord.is_selecting() {
                                     coord.paste_latest(cx);
@@ -5577,6 +5604,7 @@ pub fn run_app(
                     if loop_coord.read(cx).gate.is_pending() {
                         loop_coord.update(cx, |coord, _| coord.tick_gate());
                     }
+                    loop_coord.update(cx, |coord, _| coord.tick_screenshot_shortcut());
                     if loop_coord.read(cx).is_island_visible() {
                         record_external_frontmost_app();
                         loop_coord.update(cx, |coord, cx| coord.island_tick(cx));

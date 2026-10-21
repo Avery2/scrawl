@@ -124,6 +124,9 @@ pub enum LiveOverlayEvent {
     /// ⌥⇧S (or the configured shortcut) went down; `shortcut::Shortcut` decides what it means.
     CaptureShortcut,
     PasteLatestShortcut,
+    /// The screenshot shortcut (⌥⇧4) went down; only registered under the `screenshots`
+    /// experiment.
+    ScreenshotShortcut,
     UndoStroke,
     /// macOS's Esc hotkey; Windows polls Esc from key state.
     #[cfg_attr(target_os = "windows", allow(dead_code))]
@@ -162,7 +165,7 @@ impl Default for ShortcutConfig {
     }
 }
 
-/// Scrawl's two global shortcuts.
+/// Scrawl's global shortcuts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ShortcutKind {
@@ -170,23 +173,27 @@ pub enum ShortcutKind {
     Record,
     /// Paste the latest capture into the app in front (⌥⇧V).
     Paste,
+    /// Take a screenshot (⌥⇧4), only while the `screenshots` experiment is on.
+    Screenshot,
 }
 
 impl ShortcutKind {
-    pub const ALL: [Self; 2] = [Self::Record, Self::Paste];
+    pub const ALL: [Self; 3] = [Self::Record, Self::Paste, Self::Screenshot];
 
     pub fn default_config(self) -> ShortcutConfig {
         match self {
             Self::Record => ShortcutConfig::default_record(),
             Self::Paste => ShortcutConfig::default_paste(),
+            Self::Screenshot => ShortcutConfig::default_screenshot(),
         }
     }
 
-    /// The letter of the default, on the active layout (Dvorak's S is not ANSI's).
+    /// The key of the default, on the active layout (Dvorak's S is not ANSI's).
     fn default_char(self) -> char {
         match self {
             Self::Record => 's',
             Self::Paste => 'v',
+            Self::Screenshot => '4',
         }
     }
 
@@ -194,6 +201,7 @@ impl ShortcutKind {
         match self {
             Self::Record => KEY_S,
             Self::Paste => KEY_V,
+            Self::Screenshot => KEY_4,
         }
     }
 
@@ -201,12 +209,19 @@ impl ShortcutKind {
         match self {
             Self::Record => "Record",
             Self::Paste => "Paste last capture",
+            Self::Screenshot => "Take screenshot",
         }
     }
 
     /// Whether it can be turned off. Record can't: it's the way into Scrawl.
     pub fn can_unset(self) -> bool {
-        self == Self::Paste
+        self != Self::Record
+    }
+
+    /// Whether its default also answers to ⌃/⌘ added and ⌃⌥⌘ (the screenshot one doesn't:
+    /// ⌘⇧4 is macOS's own and ⌃ changes it to "copy").
+    fn has_aliases(self) -> bool {
+        self != Self::Screenshot
     }
 }
 
@@ -227,8 +242,15 @@ impl ShortcutConfig {
         }
     }
 
-    /// No shortcut: nothing is registered and no key press matches. Only the paste shortcut can
-    /// be turned off.
+    pub fn default_screenshot() -> Self {
+        Self {
+            key_code: u32::from(key_code_for_char('4').unwrap_or(KEY_4)),
+            carbon_modifiers: CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
+            label: shortcut_label(CARBON_OPTION_KEY | CARBON_SHIFT_KEY, "4"),
+        }
+    }
+
+    /// No shortcut: nothing is registered and no key press matches. Record can't be turned off.
     pub fn unset() -> Self {
         Self {
             key_code: u32::MAX,
@@ -427,7 +449,7 @@ pub fn shortcut_matches(
         return true;
     }
     let is_key = keycode == layout_code || keycode == kind.ansi_code();
-    cfg.is_default_for(kind) && is_key && alt && (shift || (ctrl && cmd))
+    kind.has_aliases() && cfg.is_default_for(kind) && is_key && alt && (shift || (ctrl && cmd))
 }
 
 /// The active layout's key for `kind`'s default letter (Windows' hooks and poller match on it).
@@ -443,7 +465,7 @@ pub(crate) fn hotkey_combos(kind: ShortcutKind, cfg: &ShortcutConfig) -> Vec<(u3
         return Vec::new();
     }
     let mut combos = vec![(cfg.key_code, cfg.carbon_modifiers)];
-    if !cfg.is_default_for(kind) {
+    if !kind.has_aliases() || !cfg.is_default_for(kind) {
         return combos;
     }
     let mut codes = vec![cfg.key_code];
@@ -698,6 +720,9 @@ pub struct SharedCaptureTelemetry {
     /// The record shortcut (`crate::settings` loads and saves it).
     pub shortcut: Mutex<ShortcutConfig>,
     pub paste_shortcut: Mutex<ShortcutConfig>,
+    /// The screenshot shortcut as registered: unset while the `screenshots` experiment is off
+    /// (`crate::screenshot::registered`).
+    pub screenshot_shortcut: Mutex<ShortcutConfig>,
     /// Settings is recording a new shortcut: none of Scrawl's fire (`pause_shortcuts`).
     pub shortcuts_paused: AtomicBool,
     pub started_at: Mutex<Instant>,
@@ -765,6 +790,10 @@ impl SharedCaptureTelemetry {
             shift_held: AtomicBool::new(false),
             capture_mode: AtomicU64::new(0),
             shortcut: Mutex::new(shortcuts.record),
+            screenshot_shortcut: Mutex::new(crate::screenshot::registered(
+                crate::handoff::experiment(crate::screenshot::SCREENSHOTS),
+                &shortcuts.screenshot,
+            )),
             paste_shortcut: Mutex::new(shortcuts.paste),
             shortcuts_paused: AtomicBool::new(false),
             started_at: Mutex::new(Instant::now()),
@@ -846,6 +875,47 @@ impl SharedCaptureTelemetry {
                 .ui_sender
                 .try_send(LiveOverlayEvent::PasteLatestShortcut);
         }
+    }
+
+    pub fn emit_screenshot_shortcut(&self) {
+        if self.shortcuts_paused.load(Ordering::Acquire) {
+            return;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let prev = self.last_shortcut_ms.load(Ordering::Acquire);
+        if now_ms.saturating_sub(prev) >= 90
+            && self
+                .last_shortcut_ms
+                .compare_exchange(prev, now_ms, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            scrawl_log("emit_screenshot_shortcut");
+            let _ = self.ui_sender.try_send(LiveOverlayEvent::ScreenshotShortcut);
+        }
+    }
+
+    /// Whether a key press is the screenshot shortcut (never while it's unset).
+    pub fn matches_screenshot_shortcut(
+        &self,
+        keycode: u16,
+        cmd: bool,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+    ) -> bool {
+        let cfg = self.screenshot_shortcut();
+        let layout = key_code_for_char('4').unwrap_or(KEY_4);
+        shortcut_matches(ShortcutKind::Screenshot, &cfg, layout, keycode, cmd, ctrl, alt, shift)
+    }
+
+    pub fn screenshot_shortcut(&self) -> ShortcutConfig {
+        self.screenshot_shortcut
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn matches_shortcut(

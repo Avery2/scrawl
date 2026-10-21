@@ -958,6 +958,8 @@ impl SettingsWindow {
             error.clone()
         } else if kind == ShortcutKind::Paste {
             "Pastes the last capture into the app in front.".to_owned()
+        } else if kind == ShortcutKind::Screenshot {
+            "Takes a screenshot of an area, a window or the screen.".to_owned()
         } else {
             "Records the screen. Press again to finish.".to_owned()
         };

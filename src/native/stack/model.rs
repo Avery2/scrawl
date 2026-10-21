@@ -28,6 +28,8 @@ pub struct CardSpec {
     /// Where `frame` sits in the contact sheet, normalized (x, y, w, h).
     pub tile: [f32; 4],
     pub duration_ms: u64,
+    /// A screenshot (`crate::screenshot`): the footer says PNG instead of a duration.
+    pub screenshot: bool,
     /// "Copied", "Sent to SCRAWL", …
     pub destination: String,
 }
@@ -727,6 +729,7 @@ mod tests {
             sheet_size: [1600.0, 506.0],
             tile: [0.5, 0.0, 0.5, 1.0],
             duration_ms: 9_000,
+            screenshot: false,
             destination: "Copied".into(),
         }
     }

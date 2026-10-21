@@ -733,6 +733,9 @@ pub fn summary_markdown_with(
     bundle_dir: &std::path::Path,
     agent_context: bool,
 ) -> String {
+    if crate::screenshot::is_screenshot(bundle) {
+        return crate::screenshot::summary(bundle, bundle_dir);
+    }
     let mut target = bundle
         .target
         .app

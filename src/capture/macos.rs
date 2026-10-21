@@ -95,6 +95,7 @@ pub const KEY_S: u16 = 1;
 const KEY_ESCAPE: u16 = 53;
 const KEY_Z: u16 = 6;
 pub const KEY_V: u16 = 9;
+pub const KEY_4: u16 = 21;
 
 // Carbon HIToolbox global hotkey constants (requires zero TCC permissions).
 const K_EVENT_CLASS_KEYBOARD: u32 = u32::from_be_bytes(*b"keyb");
@@ -106,6 +107,7 @@ const HOTKEY_ID_TOGGLE: u32 = 1;
 const HOTKEY_ID_ESCAPE: u32 = 2;
 const HOTKEY_ID_ALT1: u32 = 3;
 const HOTKEY_ID_PASTE_BASE: u32 = 100;
+const HOTKEY_ID_SCREENSHOT_BASE: u32 = 200;
 
 #[repr(C, packed(2))]
 #[derive(Clone, Copy)]
@@ -397,6 +399,9 @@ unsafe extern "C" fn carbon_hotkey_handler(
                     .ui_sender
                     .try_send(LiveOverlayEvent::CancelCapture);
             }
+            id if id >= HOTKEY_ID_SCREENSHOT_BASE => {
+                telemetry.emit_screenshot_shortcut();
+            }
             id if id >= HOTKEY_ID_PASTE_BASE => {
                 telemetry.emit_paste_shortcut();
             }
@@ -459,7 +464,8 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
         Mutex::new(CarbonHotKeyState { refs: Vec::new() })
     });
     let (record, paste) = telemetry.shortcuts();
-    if let Err(kind) = register_shortcuts(state_mutex, &record, &paste) {
+    let screenshot = telemetry.screenshot_shortcut();
+    if let Err(kind) = register_shortcuts(state_mutex, &record, &paste, &screenshot) {
         scrawl_log(format!(
             "install_global_hotkeys: {kind:?} shortcut could not be registered"
         ));
@@ -483,12 +489,14 @@ fn unregister_all(state: &mut CarbonHotKeyState) {
     }
 }
 
-/// Replaces every registered hotkey with `record`'s and `paste`'s. Fails with the shortcut whose
-/// own combo macOS refused (another app may hold it); its aliases are best effort.
+/// Replaces every registered hotkey with `record`'s, `paste`'s and `screenshot`'s (unset while
+/// its experiment is off). Fails with the shortcut whose own combo macOS refused (another app
+/// may hold it); its aliases are best effort.
 fn register_shortcuts(
     state_mutex: &Mutex<CarbonHotKeyState>,
     record: &ShortcutConfig,
     paste: &ShortcutConfig,
+    screenshot: &ShortcutConfig,
 ) -> Result<(), ShortcutKind> {
     let mut state = state_mutex
         .lock()
@@ -496,13 +504,18 @@ fn register_shortcuts(
     unregister_all(&mut state);
     let target = hotkey_target();
     let mut failed = None;
-    for (kind, cfg) in [(ShortcutKind::Record, record), (ShortcutKind::Paste, paste)] {
+    for (kind, cfg) in [
+        (ShortcutKind::Record, record),
+        (ShortcutKind::Paste, paste),
+        (ShortcutKind::Screenshot, screenshot),
+    ] {
         for (i, (code, mods)) in hotkey_combos(kind, cfg).into_iter().enumerate() {
             let mut r: *mut c_void = ptr::null_mut();
             let id = match (kind, i) {
                 (ShortcutKind::Record, 0) => HOTKEY_ID_TOGGLE,
                 (ShortcutKind::Record, i) => HOTKEY_ID_ALT1 + i as u32,
                 (ShortcutKind::Paste, i) => HOTKEY_ID_PASTE_BASE + i as u32,
+                (ShortcutKind::Screenshot, i) => HOTKEY_ID_SCREENSHOT_BASE + i as u32,
             };
             let rc = unsafe {
                 RegisterEventHotKey(
@@ -539,11 +552,12 @@ pub fn set_shortcuts(
     paste: ShortcutConfig,
 ) -> Result<(), ShortcutKind> {
     let (old_record, old_paste) = telemetry.shortcuts();
+    let screenshot = telemetry.screenshot_shortcut();
     if let Some(state) = CARBON_HOTKEYS.get()
         && !telemetry.shortcuts_paused.load(Ordering::Acquire)
-        && let Err(kind) = register_shortcuts(state, &record, &paste)
+        && let Err(kind) = register_shortcuts(state, &record, &paste, &screenshot)
     {
-        let _ = register_shortcuts(state, &old_record, &old_paste);
+        let _ = register_shortcuts(state, &old_record, &old_paste, &screenshot);
         return Err(kind);
     }
     *telemetry
@@ -574,8 +588,30 @@ pub fn pause_shortcuts(telemetry: &SharedCaptureTelemetry, paused: bool) {
         );
     } else {
         let (record, paste) = telemetry.shortcuts();
-        let _ = register_shortcuts(state, &record, &paste);
+        let _ = register_shortcuts(state, &record, &paste, &telemetry.screenshot_shortcut());
     }
+}
+
+/// Sets the screenshot shortcut (unset turns it off) and registers it with the other two. If
+/// macOS refuses it, the old one is put back.
+pub fn set_screenshot_shortcut(
+    telemetry: &SharedCaptureTelemetry,
+    screenshot: ShortcutConfig,
+) -> Result<(), ShortcutKind> {
+    let (record, paste) = telemetry.shortcuts();
+    let old = telemetry.screenshot_shortcut();
+    if let Some(state) = CARBON_HOTKEYS.get()
+        && !telemetry.shortcuts_paused.load(Ordering::Acquire)
+        && let Err(kind) = register_shortcuts(state, &record, &paste, &screenshot)
+    {
+        let _ = register_shortcuts(state, &record, &paste, &old);
+        return Err(kind);
+    }
+    *telemetry
+        .screenshot_shortcut
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = screenshot;
+    Ok(())
 }
 
 /// The review window's own recorder: sets and saves the record shortcut.
@@ -1193,6 +1229,31 @@ fn build_sck_filter_and_config(
     Some((filter, sck_config(target, long_edge)))
 }
 
+/// One still of `target` at the display's own scale, without the cursor or Scrawl's overlays
+/// (`excluded_window_ids` and Scrawl's panels). For `scrawl`'s screenshots.
+pub fn capture_still(target: &TargetInfo, excluded_window_ids: &[u32]) -> anyhow::Result<RgbaFrame> {
+    use anyhow::Context as _;
+    let (filter, config) = build_sck_filter_and_config(target, excluded_window_ids)
+        .context("ScreenCaptureKit has no content for the target")?;
+    let (width, height) = crate::screenshot::native_size(&target.frame);
+    let config = config
+        .with_width(width)
+        .with_height(height)
+        .with_shows_cursor(false);
+    let image = SCScreenshotManager::capture_image(&filter, &config)
+        .map_err(|e| anyhow::anyhow!("SCScreenshotManager: {e:?}"))?;
+    let (w, h) = (image.width() as u32, image.height() as u32);
+    anyhow::ensure!(w > 0 && h > 0, "SCScreenshotManager: empty image");
+    let rgba = image
+        .rgba_data()
+        .map_err(|e| anyhow::anyhow!("SCScreenshotManager: {e:?}"))?;
+    anyhow::ensure!(
+        rgba.len() == (w as usize) * (h as usize) * 4,
+        "SCScreenshotManager: unexpected buffer"
+    );
+    Ok(RgbaFrame::new(0, w, h, rgba))
+}
+
 fn sck_config(target: &TargetInfo, long_edge: f64) -> SCStreamConfiguration {
     let (width, height) = capture_size(target, long_edge);
     let mut config = SCStreamConfiguration::new()
@@ -1637,6 +1698,12 @@ unsafe extern "C" fn key_tap_callback(
         // Holding S repeats the key; only a fresh press counts.
         if unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_AUTOREPEAT) } == 0 {
             telemetry.emit_capture_shortcut();
+        }
+        return event;
+    }
+    if telemetry.matches_screenshot_shortcut(keycode, cmd, ctrl, alt, shift) {
+        if unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_AUTOREPEAT) } == 0 {
+            telemetry.emit_screenshot_shortcut();
         }
         return event;
     }

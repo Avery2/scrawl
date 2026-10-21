@@ -51,6 +51,7 @@ pub(super) const NO_KEY_SOURCE: &str = "polled key state (keyboard hook off)";
 /// `VK_S` on Dvorak too.
 pub const KEY_S: u16 = 0x53;
 pub const KEY_V: u16 = 0x56;
+pub const KEY_4: u16 = 0x34;
 const KEY_Z: u16 = 0x5A;
 /// An unassigned virtual key, sent around Alt or Win coming up after a shortcut so the app in
 /// front doesn't open its menu bar (or the Start menu) on the lone modifier release.
@@ -531,7 +532,8 @@ fn hotkey_id(kind: ShortcutKind, index: usize) -> i32 {
     match (kind, index) {
         (ShortcutKind::Record, 0) => HOTKEY_ID_TOGGLE,
         (ShortcutKind::Record, i) => HOTKEY_ID_ALT1 + i as i32,
-        (ShortcutKind::Paste, i) => HOTKEY_ID_PASTE_BASE + i as i32,
+        // Screenshots are a macOS experiment; Windows never registers one.
+        (ShortcutKind::Paste | ShortcutKind::Screenshot, i) => HOTKEY_ID_PASTE_BASE + i as i32,
     }
 }
 
@@ -681,6 +683,26 @@ pub fn set_shortcuts(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = paste;
     Ok(())
+}
+
+/// Screenshots are a macOS experiment: Windows keeps the setting but registers nothing.
+pub fn set_screenshot_shortcut(
+    telemetry: &SharedCaptureTelemetry,
+    screenshot: ShortcutConfig,
+) -> Result<(), ShortcutKind> {
+    *telemetry
+        .screenshot_shortcut
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = screenshot;
+    Ok(())
+}
+
+/// Screenshots are a macOS experiment.
+pub fn capture_still(
+    _target: &crate::model::TargetInfo,
+    _excluded_window_ids: &[u32],
+) -> anyhow::Result<crate::model::RgbaFrame> {
+    anyhow::bail!("screenshots are macOS only")
 }
 
 /// While Settings records a new shortcut, Scrawl's own stop answering, so pressing the current

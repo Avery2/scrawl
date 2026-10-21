@@ -25,11 +25,13 @@ use crate::onboarding::{Grants, Permission, Status};
 
 // MARK: Shortcuts in the config
 
-/// Scrawl's two shortcuts.
+/// Scrawl's shortcuts. The screenshot one is only registered and shown under the
+/// `screenshots` experiment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shortcuts {
     pub record: ShortcutConfig,
     pub paste: ShortcutConfig,
+    pub screenshot: ShortcutConfig,
 }
 
 impl Default for Shortcuts {
@@ -37,6 +39,7 @@ impl Default for Shortcuts {
         Self {
             record: ShortcutConfig::default_record(),
             paste: ShortcutConfig::default_paste(),
+            screenshot: ShortcutConfig::default_screenshot(),
         }
     }
 }
@@ -54,6 +57,7 @@ impl Shortcuts {
         match kind {
             ShortcutKind::Record => &self.record,
             ShortcutKind::Paste => &self.paste,
+            ShortcutKind::Screenshot => &self.screenshot,
         }
     }
 
@@ -61,6 +65,7 @@ impl Shortcuts {
         match kind {
             ShortcutKind::Record => self.record = cfg,
             ShortcutKind::Paste => self.paste = cfg,
+            ShortcutKind::Screenshot => self.screenshot = cfg,
         }
     }
 
@@ -127,6 +132,7 @@ fn kind_key(kind: ShortcutKind) -> &'static str {
     match kind {
         ShortcutKind::Record => "record",
         ShortcutKind::Paste => "paste",
+        ShortcutKind::Screenshot => "screenshot",
     }
 }
 
@@ -443,10 +449,24 @@ fn reserved(modifiers: u32, key: &str) -> bool {
 }
 
 /// Checks a pressed combination for `kind` and names it. `other` is Scrawl's other shortcut.
+#[cfg(test)]
 pub fn validate(
     kind: ShortcutKind,
     pressed: &Pressed,
     other: &ShortcutConfig,
+) -> Result<ShortcutConfig, Rejection> {
+    let other_kind = match kind {
+        ShortcutKind::Record => ShortcutKind::Paste,
+        ShortcutKind::Paste | ShortcutKind::Screenshot => ShortcutKind::Record,
+    };
+    validate_against(kind, pressed, &[(other_kind, other)])
+}
+
+/// Checks a pressed combination for `kind` and names it, against Scrawl's `others` in use.
+pub fn validate_against(
+    kind: ShortcutKind,
+    pressed: &Pressed,
+    others: &[(ShortcutKind, &ShortcutConfig)],
 ) -> Result<ShortcutConfig, Rejection> {
     let modifiers = pressed.modifiers
         & (CARBON_CMD_KEY | CARBON_CONTROL_KEY | CARBON_OPTION_KEY | CARBON_SHIFT_KEY);
@@ -464,14 +484,14 @@ pub fn validate(
         carbon_modifiers: modifiers,
         label,
     };
-    let other_kind = match kind {
-        ShortcutKind::Record => ShortcutKind::Paste,
-        ShortcutKind::Paste => ShortcutKind::Record,
-    };
-    if cfg.key_code == other.key_code && cfg.carbon_modifiers == other.carbon_modifiers
-        || cfg.label == other.label
-    {
-        return Err(Rejection::Taken(other_kind));
+    for &(other_kind, other) in others {
+        if other_kind != kind
+            && !other.is_unset()
+            && (cfg.key_code == other.key_code && cfg.carbon_modifiers == other.carbon_modifiers
+                || cfg.label == other.label)
+        {
+            return Err(Rejection::Taken(other_kind));
+        }
     }
     Ok(if cfg.is_default_for(kind) {
         kind.default_config()
@@ -1064,11 +1084,12 @@ impl Panel {
                     self.apply(kind, ShortcutConfig::unset(), &mut shortcuts, host);
                     return Effect::None;
                 }
-                let other = match kind {
-                    ShortcutKind::Record => &shortcuts.paste,
-                    ShortcutKind::Paste => &shortcuts.record,
-                };
-                match validate(kind, &pressed, other) {
+                let others: Vec<(ShortcutKind, &ShortcutConfig)> = ShortcutKind::ALL
+                    .into_iter()
+                    .filter(|k| *k != kind)
+                    .map(|k| (k, shortcuts.get(k)))
+                    .collect();
+                match validate_against(kind, &pressed, &others) {
                     Ok(cfg) => self.apply(kind, cfg, &mut shortcuts, host),
                     Err(rejection) => self.error = Some((kind, rejection.message())),
                 }
@@ -1287,6 +1308,14 @@ impl Panel {
             auto_send: config.auto_send.unwrap_or(true),
             shortcuts: ShortcutKind::ALL
                 .into_iter()
+                .filter(|kind| {
+                    *kind != ShortcutKind::Screenshot
+                        || config
+                            .experiments
+                            .get(crate::screenshot::SCREENSHOTS)
+                            .copied()
+                            .unwrap_or(false)
+                })
                 .map(|kind| {
                     let error = self
                         .error
@@ -1389,10 +1418,17 @@ pub struct AppHost<'a> {
 impl Host for AppHost<'_> {
     fn shortcuts(&self) -> Shortcuts {
         let (record, paste) = self.telemetry.shortcuts();
-        Shortcuts { record, paste }
+        Shortcuts {
+            record,
+            paste,
+            screenshot: self.telemetry.screenshot_shortcut(),
+        }
     }
 
     fn set_shortcuts(&mut self, shortcuts: &Shortcuts) -> Result<(), ShortcutKind> {
+        if shortcuts.screenshot != self.telemetry.screenshot_shortcut() {
+            crate::capture::set_screenshot_shortcut(self.telemetry, shortcuts.screenshot.clone())?;
+        }
         crate::capture::set_shortcuts(
             self.telemetry,
             shortcuts.record.clone(),
