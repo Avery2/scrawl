@@ -707,12 +707,10 @@ Or in
 `parakeet_unified_en`, `parakeet_v3`, `parakeet_v2`, `whisper_large_v3_turbo`. Scrawl never
 downloads or prepares a Hex model: install it in Hex first.
 
-**Language** in Settings › Recording picks the language Apple Speech transcribes. **Automatic**
-follows the Mac's language as before. You can also set `"appleLocale": "zh-TW"` in
-`~/.config/scrawl/config.json`, for example for Traditional Chinese (Taiwan). Missing, blank or
-`"auto"` means Automatic. If this Mac doesn't support a saved language, Scrawl falls back to
-Automatic and Settings says which language it is using. Changing the language checks and, if
-needed, downloads its model in the background while Apple Speech is the configured transcriber.
+**Language** in Settings › Recording picks the language Apple Speech transcribes; **Automatic**
+(the default) follows the Mac's language. In config it's `"appleLocale"`, e.g. `"zh-TW"` for
+Traditional Chinese (Taiwan). Scrawl downloads that language's model in the background, and a
+language this Mac doesn't support falls back to Automatic (Settings names the one it uses).
 
 **Hex language** in Settings › Recording (or `"hexLanguage"` in config) sets the language
 code sent to Hex. It defaults to `en` to preserve existing behavior; use `nl` for Dutch or

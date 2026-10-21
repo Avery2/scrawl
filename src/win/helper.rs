@@ -55,7 +55,6 @@ pub struct SpeechModelLine {
 /// Windows transcribes with Parakeet (`win::speech`): Hex's installed model, else Scrawl's own
 /// copy, downloaded and checked here.
 pub fn install_speech_model(
-    _locale: Option<&str>,
     _stop: &dyn Fn() -> bool,
     line: impl FnMut(SpeechModelLine),
 ) -> Result<()> {

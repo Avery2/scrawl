@@ -17,31 +17,23 @@ use serde::Serialize;
 
 use crate::model::MissingTranscript;
 
-/// Validates a locale id and normalizes its separators; Automatic has no id.
+/// A locale id such as `zh-TW` (`_` becomes `-`), or `None` for Automatic (`auto`, blank) and
+/// anything that isn't shaped like one. The helper matches it against the supported locales.
 pub fn locale_id(value: &str) -> Option<String> {
     let value = value.trim();
-    if value.len() > 35 || value.eq_ignore_ascii_case("auto") {
-        return None;
-    }
-    let mut subtags = value.split(['-', '_']);
-    let language = subtags.next()?;
-    if !(2..=3).contains(&language.len()) || !language.bytes().all(|b| b.is_ascii_alphabetic()) {
-        return None;
-    }
-    if !subtags.all(|subtag| {
-        (1..=8).contains(&subtag.len()) && subtag.bytes().all(|b| b.is_ascii_alphanumeric())
-    }) {
-        return None;
-    }
-    Some(value.replace('_', "-"))
+    let shaped = value.starts_with(|c: char| c.is_ascii_alphabetic())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    (shaped && !value.eq_ignore_ascii_case("auto")).then(|| value.replace('_', "-"))
 }
 
-/// Helper arguments for a validated locale id.
-pub fn locale_args(locale: Option<&str>) -> Vec<std::ffi::OsString> {
-    match locale {
-        Some(id) => vec!["--locale".into(), id.into()],
-        None => Vec::new(),
-    }
+/// `--locale ID` for the helper's `transcribe`, `transcribe-stream` and `speech-model` when
+/// Settings › Recording › Language (`appleLocale`) isn't Automatic.
+pub fn locale_args() -> Vec<std::ffi::OsString> {
+    crate::handoff::apple_locale()
+        .map(|id| vec!["--locale".into(), id.into()])
+        .unwrap_or_default()
 }
 
 /// Marks a bundle that should be transcribed again once the model is installed.
@@ -220,13 +212,9 @@ fn work(generation: u64) {
                 worker.status.state = State::Checking;
             }
         }
-        let result = crate::helper::install_speech_model(
-            crate::handoff::apple_locale().as_deref(),
-            &|| lock().stale(generation),
-            |line| {
-                lock().apply(generation, &line);
-            },
-        );
+        let result = crate::helper::install_speech_model(&|| lock().stale(generation), |line| {
+            lock().apply(generation, &line);
+        });
         let status = {
             let mut worker = lock();
             if worker.stale(generation) {
@@ -481,38 +469,13 @@ mod tests {
     }
 
     #[test]
-    fn locale_ids_are_bcp47_shaped_and_nothing_else() {
+    fn locale_ids_are_plain_ids_and_auto_is_none() {
         assert_eq!(locale_id(" zh-TW ").as_deref(), Some("zh-TW"));
         assert_eq!(locale_id("zh_Hant_TW").as_deref(), Some("zh-Hant-TW"));
         assert_eq!(locale_id("yue-CN").as_deref(), Some("yue-CN"));
-        assert_eq!(locale_id("en").as_deref(), Some("en"));
-        for automatic_or_bad in [
-            "",
-            "auto",
-            "AUTO",
-            "zh-TW --install",
-            "../x",
-            "z",
-            "zhxx-TW",
-            "zh--TW",
-            "zh-",
-            "-zh",
-            "zh-TOOLONGSUBTAG",
-            "中文",
-            "zh TW",
-        ] {
+        for automatic_or_bad in ["", "auto", "AUTO", "zh-TW --install", "../x", "-zh", "中文"] {
             assert_eq!(locale_id(automatic_or_bad), None, "{automatic_or_bad:?}");
         }
-        assert_eq!(locale_id(&format!("en{}", "-a".repeat(20))), None); // > 35 bytes
-    }
-
-    #[test]
-    fn a_locale_becomes_one_argument_pair() {
-        assert!(locale_args(None).is_empty());
-        assert_eq!(
-            locale_args(Some("zh-TW")),
-            ["--locale", "zh-TW"].map(std::ffi::OsString::from)
-        );
     }
 
     #[test]

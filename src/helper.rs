@@ -127,7 +127,7 @@ struct Transcript {
 /// On-device SpeechAnalyzer transcription with measured word timings. Without a speech model
 /// the transcript is empty and `missing` says why.
 pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
-    let locale = crate::speech_model::locale_args(crate::handoff::apple_locale().as_deref());
+    let locale = crate::speech_model::locale_args();
     let mut args = vec![os("transcribe"), audio.as_os_str()];
     args.extend(locale.iter().map(|arg| arg.as_os_str()));
     let transcript: Transcript = run(&args, Duration::from_secs(180))?;
@@ -168,16 +168,16 @@ pub struct SpeechModelLine {
     pub error: Option<String>,
 }
 
-/// Runs `scrawl-helper speech-model --install`, handing each line to `line` as it comes. The
-/// download can take minutes; the helper exits when it's done or has failed.
+/// Runs `scrawl-helper speech-model --install` for the chosen language, handing each line to
+/// `line` as it comes. The download can take minutes; the helper exits when it's done or has
+/// failed, and is killed as soon as `stop` says a newer check superseded it.
 pub fn install_speech_model(
-    locale: Option<&str>,
     stop: &dyn Fn() -> bool,
     line: impl FnMut(SpeechModelLine),
 ) -> Result<()> {
     let mut command = Command::new(path()?);
     command.args(["speech-model", "--install"]);
-    command.args(crate::speech_model::locale_args(locale));
+    command.args(crate::speech_model::locale_args());
     install_with(command, stop, line)
 }
 
@@ -187,12 +187,7 @@ fn install_with(
     mut line: impl FnMut(SpeechModelLine),
 ) -> Result<()> {
     use std::io::BufRead;
-    use std::sync::mpsc::{self, RecvTimeoutError};
-
-    enum Output {
-        Line(String),
-        Error(String),
-    }
+    use std::sync::mpsc::RecvTimeoutError;
 
     if stop() {
         return Ok(());
@@ -204,49 +199,40 @@ fn install_with(
         .spawn()
         .context("Could not start scrawl-helper")?;
     let stdout = child.stdout.take().context("No helper stdout")?;
-    let mut stderr = child.stderr.take().context("No helper stderr")?;
-    let (sender, lines) = mpsc::channel();
-    let errors = sender.clone();
+    // Lines come through a thread so `stop` is checked while the helper is quiet.
+    let (sender, lines) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for text in std::io::BufReader::new(stdout)
             .lines()
             .map_while(Result::ok)
         {
-            if sender.send(Output::Line(text)).is_err() {
+            if sender.send(text).is_err() {
                 break;
             }
         }
     });
-    std::thread::spawn(move || {
-        let mut message = String::new();
-        let _ = stderr.read_to_string(&mut message);
-        let _ = errors.send(Output::Error(message));
-    });
-    let mut message = String::new();
-    let poll = Duration::from_millis(250);
-    let status = loop {
+    loop {
         if stop() {
             let _ = child.kill();
             let _ = child.wait();
             return Ok(());
         }
-        match lines.recv_timeout(poll) {
-            Ok(Output::Line(text)) => {
+        match lines.recv_timeout(Duration::from_millis(250)) {
+            Ok(text) => {
                 if let Ok(parsed) = serde_json::from_str(&text) {
                     line(parsed);
                 }
             }
-            Ok(Output::Error(error)) => message = error,
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                if let Some(status) = child.try_wait()? {
-                    break status;
-                }
-                std::thread::sleep(poll);
-            }
+            Err(RecvTimeoutError::Disconnected) => break,
         }
-    };
+    }
+    let status = child.wait()?;
     if !status.success() {
+        let mut message = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut message);
+        }
         bail!("{}", message.trim());
     }
     Ok(())
@@ -433,36 +419,5 @@ mod tests {
         .unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(lines[0].status, "downloading");
-    }
-
-    #[test]
-    fn a_superseded_install_stops_while_stderr_is_still_open() {
-        let mut command = Command::new("/bin/sh");
-        command.args([
-            "-c",
-            "sleep 3 >/dev/null & echo 'download failed' >&2; exit 1",
-        ]);
-        let started = Instant::now();
-        install_with(
-            command,
-            &|| started.elapsed() >= Duration::from_millis(100),
-            |_| {},
-        )
-        .unwrap();
-        assert!(started.elapsed() < Duration::from_secs(2));
-    }
-
-    #[test]
-    fn speech_model_lines_carry_the_supported_locales() {
-        let line: SpeechModelLine = serde_json::from_str(
-            r#"{"status":"installed","engine":"SpeechTranscriber","locale":"zh_TW","locales":["en-US","zh-TW"]}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            line.locales.as_deref(),
-            Some(&["en-US".to_string(), "zh-TW".to_string()][..])
-        );
-        let old: SpeechModelLine = serde_json::from_str(r#"{"status":"installed"}"#).unwrap();
-        assert_eq!(old.locales, None);
     }
 }

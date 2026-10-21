@@ -94,9 +94,7 @@ impl Live {
     pub fn start(samples: Arc<Mutex<Vec<f32>>>) -> Result<Self> {
         let mut command = Command::new(crate::helper::path()?);
         command.arg("transcribe-stream");
-        command.args(crate::speech_model::locale_args(
-            crate::handoff::apple_locale().as_deref(),
-        ));
+        command.args(crate::speech_model::locale_args());
         Self::start_with(command, samples)
     }
 

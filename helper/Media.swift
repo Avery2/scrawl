@@ -3,8 +3,9 @@ import CoreGraphics
 import Speech
 
 /// The on-device model that transcribes: SpeechTranscriber where this Mac supports it, else
-/// DictationTranscriber (Macs, and virtual machines, without SpeechTranscriber), for the user's
-/// locale, the nearest supported one in the same language, or en-US.
+/// DictationTranscriber (Macs, and virtual machines, without SpeechTranscriber), for the language
+/// chosen in Settings (`--locale`) when it's supported, else the user's locale, the nearest
+/// supported one in the same language, or en-US. `supported` lists the engine's locales.
 struct SpeechChoice {
   let dictation: Bool
   let locale: Locale
