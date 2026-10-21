@@ -196,9 +196,10 @@ fn off_line(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
 
 /// The tip of an arrow drawn in one stroke (pixels, `big` its box's long side): a straight shaft
 /// from the first point to the tip, where the stroke turns back into one or two straight barbs
-/// that end behind the tip, beside the shaft. Two barbs (out, back and out again, or out and
-/// across) lie on either side of it and are each at most 0.9 of the shaft; a lone barb is at
-/// most 0.6 of it and clearly off it. Check marks, V's and zigzags fail.
+/// that end behind the tip, and the head reaches both sides of the shaft. Two barbs (out, back
+/// and out again) are each at most 0.9 of the shaft; a lone barb, which must then run on across
+/// the shaft, is at most 0.6 of it and clearly off it. An underline whose end hooks back to one
+/// side, check marks, V's and zigzags fail.
 fn arrow_tip(points: &[[f32; 2]], big: f32) -> Option<usize> {
     let start = points[0];
     // The tip is where the stroke first heads back toward its start, once half its size away.
@@ -268,7 +269,7 @@ fn arrow_tip(points: &[[f32; 2]], big: f32) -> Option<usize> {
         barbs.push((near, out));
     }
     let cos = |deg: f32| deg.to_radians().cos();
-    // Each barb's length, the cosine of its angle to the shaft pointing back, and its side.
+    // Each barb's length and the cosine of its angle to the shaft pointing back.
     let mut measured = Vec::with_capacity(barbs.len());
     for (from, end) in barbs {
         let (a, z) = (points[from], points[end]);
@@ -285,13 +286,23 @@ fn arrow_tip(points: &[[f32; 2]], big: f32) -> Option<usize> {
         if d > 0.9 * shaft || c < cos(75.0) {
             return None;
         }
-        measured.push((d, c, dir[0] * e[1] - dir[1] * e[0]));
+        measured.push((d, c));
     }
-    match measured[..] {
-        [(d, c, _)] if d <= 0.6 * shaft && c <= cos(15.0) => Some(tip),
-        [(_, c0, s0), (_, c1, s1)] if s0 * s1 < 0.0 && c0.max(c1) <= cos(5.0) => Some(tip),
-        _ => None,
-    }
+    let head = match measured[..] {
+        [(d, c)] => d <= 0.6 * shaft && c <= cos(15.0),
+        [(_, c0), (_, c1)] => c0.max(c1) <= cos(5.0),
+        _ => false,
+    };
+    // The head spreads to both sides of the shaft; an underline that hooks back doesn't.
+    let side = |p: [f32; 2]| dir[0] * (p[1] - t[1]) - dir[1] * (p[0] - t[0]);
+    let reach = |sign: f32| {
+        points[tip..]
+            .iter()
+            .map(|&p| sign * side(p))
+            .fold(0.0, f32::max)
+    };
+    let (left, right) = (reach(1.0), reach(-1.0));
+    (head && left.min(right) > 0.3 * left.max(right)).then_some(tip)
 }
 
 pub fn marks_of(strokes: &[Stroke]) -> Vec<Mark> {
@@ -1585,6 +1596,40 @@ mod tests {
         3275, 917, 4458, 3283, 934, 4481, 3284, 1308,
     ];
 
+    /// Underlines from real captures (2560×1440) whose end hooks back like a lone barb.
+    const REAL_HOOKED_UNDERLINES: [&[i32]; 2] = [
+        &[
+            3589, 6331, 0, 3612, 6331, 30, 3665, 6347, 49, 3718, 6356, 68, 3787, 6365, 78, 3817,
+            6365, 86, 3856, 6365, 95, 3871, 6365, 105, 3963, 6365, 115, 4001, 6365, 134, 4062,
+            6365, 143, 4139, 6365, 153, 4169, 6365, 172, 4214, 6365, 182, 4244, 6377, 199, 4258,
+            6377, 218, 4272, 6381, 227, 4302, 6381, 247, 4355, 6390, 266, 4392, 6405, 276, 4407,
+            6405, 286, 4422, 6411, 295, 4429, 6415, 305, 4439, 6422, 314, 4445, 6431, 334, 4450,
+            6442, 353, 4453, 6451, 371, 4455, 6465, 401, 4450, 6476, 411, 4442, 6491, 430, 4436,
+            6500, 449, 4426, 6510, 458, 4415, 6519, 477, 4408, 6528, 487, 4394, 6544, 497, 4372,
+            6560, 506, 4357, 6567, 516, 4342, 6573, 524, 4305, 6573, 538, 4274, 6573, 548, 4267,
+            6573, 558, 4244, 6565, 567, 4223, 6559, 576,
+        ],
+        &[
+            7252, 494, 0, 7273, 484, 18, 7288, 477, 28, 7319, 468, 37, 7341, 468, 46, 7356, 461,
+            56, 7371, 461, 64, 7409, 461, 81, 7477, 461, 91, 7508, 461, 99, 7530, 469, 109, 7545,
+            476, 119, 7555, 476, 129, 7559, 485, 165, 7547, 504, 185, 7536, 524, 195, 7528, 532,
+            224, 7514, 541, 234, 7460, 567, 254, 7407, 601, 264,
+        ],
+    ];
+
+    #[test]
+    fn real_hooked_underlines_are_not_arrows() {
+        for pts in REAL_HOOKED_UNDERLINES {
+            let stroke = Stroke {
+                fw: 2560,
+                fh: 1440,
+                pts: pts.to_vec(),
+                ..stroke(&[], 0)
+            };
+            assert_ne!(marks_of(&[stroke])[0].shape, Shape::Arrow);
+        }
+    }
+
     fn norm(x: i32, y: i32) -> [f32; 2] {
         [x as f32 / SCALE as f32, y as f32 / SCALE as f32]
     }
@@ -1752,7 +1797,6 @@ mod tests {
     #[test]
     fn one_stroke_arrows_with_one_or_two_barbs() {
         for head in [
-            vec![[0.26, 0.24]],
             vec![[0.262, 0.236], [0.272, 0.275]],
             vec![[0.26, 0.23], [0.3, 0.25], [0.27, 0.27]],
         ] {
@@ -1823,6 +1867,10 @@ mod tests {
                     [0.415, 0.275],
                     [0.4, 0.265],
                 ]),
+            ),
+            (
+                "one-sided barb",
+                polyline(&[[0.1, 0.3], [0.3, 0.25], [0.26, 0.24]]),
             ),
             ("line", polyline(&[[0.1, 0.3], [0.4, 0.3]])),
             ("C", ellipse([0.3, 0.3], [0.1, 0.1], PI / 4.0, 1.75 * PI)),
