@@ -894,7 +894,6 @@ struct SettingsView: View {
     var engines: [(id: String, title: String, enabled: Bool)] = [("apple", "Apple Speech", true)]
     engines.append(("hex", t.hexTitle, t.hexEnabled))
     if let command = t.command { engines.append(("command", "Command (\(command))", true)) }
-    let engineTitle = ["hex": "Hex", "command": "Command"][t.engine] ?? "Apple Speech"
     let chosenModel = t.models.first(where: \.chosen)
     let mic = state.microphone
     return VStack(spacing: 0) {
@@ -916,7 +915,7 @@ struct SettingsView: View {
       Color.clear.frame(height: 20)
       SettingsGroup {
         SettingsRow(title: "Transcription") {
-          SettingsPopup(value: engineTitle, options: engines, selected: t.engine) {
+          SettingsPopup(value: engines.first { $0.id == t.engine }?.title ?? "Apple Speech", options: engines, selected: t.engine) {
             model.set("transcriber", $0)
           }
         }

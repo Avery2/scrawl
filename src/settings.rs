@@ -1202,10 +1202,8 @@ impl Panel {
             .and_then(crate::transcribe::Engine::parse)
             .unwrap_or_default();
         let menu = crate::transcribe::menu_state(engine, hex.as_ref(), config.hex_model.as_deref());
-        // Only Unix runs the program (`command_transcriber`), so elsewhere it isn't offered.
         let command = crate::command_transcriber::Program::load_from(&host.config_path())
             .ok()
-            .filter(|_| cfg!(unix))
             .map(|program| program.name());
         let policy = crate::retention::Policy::load_from(&host.config_path());
         let login = login_item();

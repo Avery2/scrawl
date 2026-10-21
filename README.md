@@ -752,10 +752,11 @@ stays in the file):
 
 - `transcribeCommand` is an argv array run directly: no shell, quoting, `~`, variables or globbing.
   `argv[0]` must be an absolute path. Every `{audio}` in the other arguments becomes the audio path;
-  without one, the path is the last argument. These keys are read on their own, so a mistake in them
-  never resets the rest of the config.
-- `transcribeTimeoutSeconds` is optional: by default the limit is `max(300, 60 + 10 × audio
-  seconds)`, wall clock from the start, model loading included.
+  without one, the path is the last argument. Put your model's language in it too (`--language nl`):
+  Settings' **Language** is Apple Speech's alone. These keys are read on their own, so a mistake in
+  them never resets the rest of the config.
+- `transcribeTimeoutSeconds` is optional, a positive number of seconds: by default the limit is
+  `max(300, 60 + 10 × audio seconds)`, wall clock from the start, model loading included.
 - The program gets the whole recording as one 16 kHz mono 16-bit WAV, `SCRAWL_TRANSCRIBE_VERSION=1`
   and `SCRAWL_AUDIO=<path>`, stdin `/dev/null`, and its own process group. Its stderr is discarded.
   It must not change the audio, daemonize or leave processes behind, and must cope with two runs at
@@ -774,7 +775,7 @@ stays in the file):
   ```
 
   `version` (the integer 1) and `text` (empty means no speech) are required; the rest may be
-  omitted or `null`, and unknown fields are ignored. Times are integer milliseconds from the first
+  omitted or `null`, and unknown fields (or a `model` or `estimated` of another type) are ignored. Times are integer milliseconds from the first
   sample. `segments` and `words`, when given, cover the whole text. `estimated` is `false` only if
   the word times were measured (by the recognizer or an aligner); it defaults to `true`, and spoken
   cues only cut keyframes from measured words. Without `words`, Scrawl spreads the text over the
@@ -782,10 +783,11 @@ stays in the file):
 - Spans may overlap or be zero-length; Scrawl sorts them by `t0`. Ends up to 500 ms past the audio
   are clamped. A negative, fractional or reversed span, or one further past the end, makes Scrawl
   drop that array and keep the text, spreading it as above when `words` are dropped.
-- The transcript says `"source": "command:<file name of argv[0]>"`. Anything else going wrong (the
-  program missing, a non-zero exit, a timeout, invalid JSON, another version) means Apple Speech
-  transcribes that recording. Each problem is one line in `~/Library/Logs/Scrawl`, never with the
-  program's output, arguments or what was said.
+- The transcript says `"source": "command:<file name of argv[0]>"`. Anything else going wrong (a
+  malformed `transcribeCommand` or timeout, the program missing, a non-zero exit, a timeout, invalid
+  JSON, another version) means Apple Speech transcribes that recording. Each problem is one line in
+  `~/Library/Logs/Scrawl` (a malformed config only once), never with the program's output,
+  arguments or what was said.
 
 ### Transcribing while recording (experiment)
 

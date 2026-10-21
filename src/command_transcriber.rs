@@ -11,7 +11,7 @@
 //! can hold what the user said, so none of it is logged or put in an error: every failure is a
 //! fixed reason, plus an exit status, a signal or a field location such as `words[12].t1`.
 //!
-//! Only Unix runs the program for now. Elsewhere every run fails with `Failure::Unsupported`,
+//! Only Unix runs the program for now. Elsewhere there's no `Program` (`Unusable::Unsupported`),
 //! so recordings use the local engine.
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
@@ -30,9 +30,9 @@ use serde_json::{Map, Value};
 use crate::model::{TranscriptData, TranscriptSegment, WordTiming};
 
 /// The only protocol version (`SCRAWL_TRANSCRIBE_VERSION`, the output's `version`).
-pub const VERSION: u64 = 1;
+const VERSION: u64 = 1;
 /// Most stdout read from the program.
-pub const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
+const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 
 const AUDIO: &str = "{audio}";
 const SAMPLES_PER_MS: u64 = 16;
@@ -48,15 +48,7 @@ const POLL: Duration = Duration::from_millis(10);
 #[derive(Clone, PartialEq, Eq)]
 pub struct Program {
     argv: Vec<String>,
-    timeout: Timeout,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Timeout {
-    Default,
-    Set(Duration),
-    /// Present but not a positive number: the default applies.
-    Invalid,
+    timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for Program {
@@ -75,6 +67,8 @@ pub enum Unusable {
     Missing,
     NotAList,
     NotAbsolute,
+    BadTimeout,
+    Unsupported,
 }
 
 impl std::fmt::Display for Unusable {
@@ -83,6 +77,8 @@ impl std::fmt::Display for Unusable {
             Self::Missing => "transcribeCommand is not set",
             Self::NotAList => "transcribeCommand is not a list of strings",
             Self::NotAbsolute => "transcribeCommand[0] is not an absolute path",
+            Self::BadTimeout => "transcribeTimeoutSeconds is not a positive number",
+            Self::Unsupported => "the command transcriber only runs on macOS for now",
         })
     }
 }
@@ -104,9 +100,6 @@ pub enum Failure {
     NoVersion,
     UnsupportedVersion,
     NoText,
-    /// This system can't run the program yet (only Unix can).
-    #[cfg(not(unix))]
-    Unsupported,
 }
 
 impl std::fmt::Display for Failure {
@@ -125,10 +118,6 @@ impl std::fmt::Display for Failure {
             Self::NoVersion => f.write_str("the output has no version"),
             Self::UnsupportedVersion => f.write_str("the output's version is not 1"),
             Self::NoText => f.write_str("the output's text is missing or not a string"),
-            #[cfg(not(unix))]
-            Self::Unsupported => {
-                f.write_str("the command transcriber doesn't run on this system yet")
-            }
         }
     }
 }
@@ -137,12 +126,10 @@ impl std::error::Error for Failure {}
 
 impl Program {
     /// `argv[0]` must be an absolute path; `timeout` replaces the default limit.
-    #[cfg(test)]
-    pub fn new(argv: Vec<String>, timeout: Option<Duration>) -> Result<Self, Unusable> {
-        Self::with(argv, timeout.map_or(Timeout::Default, Timeout::Set))
-    }
-
-    fn with(argv: Vec<String>, timeout: Timeout) -> Result<Self, Unusable> {
+    fn new(argv: Vec<String>, timeout: Option<Duration>) -> Result<Self, Unusable> {
+        if cfg!(not(unix)) {
+            return Err(Unusable::Unsupported);
+        }
         let program = argv.first().ok_or(Unusable::NotAList)?;
         if !Path::new(program).is_absolute() {
             return Err(Unusable::NotAbsolute);
@@ -167,15 +154,15 @@ impl Program {
             Some(_) => return Err(Unusable::NotAList),
         };
         let timeout = match config.get("transcribeTimeoutSeconds") {
-            None | Some(Value::Null) => Timeout::Default,
+            None | Some(Value::Null) => None,
             Some(value) => match value.as_f64() {
                 Some(seconds) if seconds > 0.0 && seconds.is_finite() => {
-                    Timeout::Set(Duration::from_secs_f64(seconds.min(MAX_TIMEOUT_SECONDS)))
+                    Some(Duration::from_secs_f64(seconds.min(MAX_TIMEOUT_SECONDS)))
                 }
-                _ => Timeout::Invalid,
+                _ => return Err(Unusable::BadTimeout),
             },
         };
-        Self::with(argv, timeout)
+        Self::new(argv, timeout)
     }
 
     /// The file name of `argv[0]`, as in `source: "command:<name>"`.
@@ -191,12 +178,11 @@ impl Program {
     /// The wall-clock limit for audio of `sample_count` 16 kHz samples: the configured timeout,
     /// else `max(300 s, 60 s + 10 × the audio's length)`.
     pub fn limit(&self, sample_count: usize) -> Duration {
-        match self.timeout {
-            Timeout::Set(limit) => limit,
-            Timeout::Default | Timeout::Invalid => MIN_LIMIT.max(Duration::from_millis(
+        self.timeout.unwrap_or_else(|| {
+            MIN_LIMIT.max(Duration::from_millis(
                 60_000 + 10 * sample_count as u64 / SAMPLES_PER_MS,
-            )),
-        }
+            ))
+        })
     }
 
     /// `argv[1..]` with every `{audio}` replaced by `wav`, or `wav` appended when none has one.
@@ -310,7 +296,7 @@ impl Program {
 
     #[cfg(not(unix))]
     fn run(&self, _wav: &Path, _limit: Duration) -> Result<Vec<u8>, Failure> {
-        Err(Failure::Unsupported)
+        unreachable!("there's no Program off Unix (Program::new)")
     }
 }
 
@@ -408,15 +394,13 @@ pub fn transcribe(
     sample_count: usize,
     log: &mut dyn FnMut(&str),
 ) -> Result<TranscriptData, Failure> {
-    if program.timeout == Timeout::Invalid {
-        log(
-            "Command transcriber: transcribeTimeoutSeconds is not a positive number; using the default limit",
-        );
-    }
     let stdout = program.run(wav, program.limit(sample_count))?;
-    let audio_ms = sample_count as u64 / SAMPLES_PER_MS;
-    let response = ResponseV1::parse(&stdout, audio_ms)?;
-    Ok(response.into_transcript(program.name(), audio_ms, log))
+    parse(
+        &stdout,
+        &program.name(),
+        sample_count as u64 / SAMPLES_PER_MS,
+        log,
+    )
 }
 
 /// A `{t0, t1, text}` entry of `segments` or `words`, clamped to the audio.
@@ -427,113 +411,80 @@ struct Span {
     text: String,
 }
 
-/// What a version 1 program printed, checked. Unusable arrays carry the location of their
-/// first problem.
-#[derive(Debug)]
-struct ResponseV1 {
-    model: Result<Option<String>, ()>,
-    text: String,
-    segments: Result<Vec<Span>, String>,
-    words: Result<Vec<Span>, String>,
-    estimated: Result<bool, ()>,
-}
-
-impl ResponseV1 {
-    fn parse(stdout: &[u8], audio_ms: u64) -> Result<Self, Failure> {
-        // serde's messages can quote the output, so none of them are passed on.
-        let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(stdout) else {
-            return Err(Failure::NotJson);
-        };
-        match object.get("version") {
-            None | Some(Value::Null) => return Err(Failure::NoVersion),
-            Some(version) if version.as_u64() == Some(VERSION) => {}
-            Some(_) => return Err(Failure::UnsupportedVersion),
-        }
-        let Some(Value::String(text)) = object.get("text") else {
-            return Err(Failure::NoText);
-        };
-        Ok(Self {
-            model: match object.get("model") {
-                None | Some(Value::Null) => Ok(None),
-                Some(Value::String(model)) => {
-                    Ok(Some(model.trim().to_owned()).filter(|model| !model.is_empty()))
-                }
-                Some(_) => Err(()),
-            },
-            text: text.trim().to_owned(),
-            segments: spans(&object, "segments", audio_ms),
-            words: spans(&object, "words", audio_ms),
-            estimated: match object.get("estimated") {
-                None | Some(Value::Null) => Ok(true),
-                Some(Value::Bool(estimated)) => Ok(*estimated),
-                Some(_) => Err(()),
-            },
-        })
+/// A version 1 program's stdout as a transcript. `model` or `estimated` of another type counts
+/// as absent; an unusable `segments` or `words` is dropped (logged with where it goes wrong).
+fn parse(
+    stdout: &[u8],
+    name: &str,
+    audio_ms: u64,
+    log: &mut dyn FnMut(&str),
+) -> Result<TranscriptData, Failure> {
+    // serde's messages can quote the output, so none of them are passed on.
+    let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(stdout) else {
+        return Err(Failure::NotJson);
+    };
+    match object.get("version") {
+        None | Some(Value::Null) => return Err(Failure::NoVersion),
+        Some(version) if version.as_u64() == Some(VERSION) => {}
+        Some(_) => return Err(Failure::UnsupportedVersion),
     }
-
-    fn into_transcript(
-        self,
-        name: String,
-        audio_ms: u64,
-        log: &mut dyn FnMut(&str),
-    ) -> TranscriptData {
-        let mut transcript = TranscriptData {
-            source: format!("command:{name}"),
-            model: self.model.unwrap_or_else(|()| {
-                log("Command transcriber: model is not a string; ignored");
-                None
-            }),
-            ..Default::default()
-        };
-        if self.text.is_empty() {
-            // No speech: timing for it would mean nothing.
-            return transcript;
-        }
-        transcript.estimated = self.estimated.unwrap_or_else(|()| {
-            log("Command transcriber: estimated is not true or false; word times count as estimated");
-            true
-        });
-        let segments = self.segments.unwrap_or_else(|location| {
+    let Some(Value::String(text)) = object.get("text") else {
+        return Err(Failure::NoText);
+    };
+    let text = text.trim();
+    let mut transcript = TranscriptData {
+        source: format!("command:{name}"),
+        model: object
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned),
+        ..Default::default()
+    };
+    if text.is_empty() {
+        // No speech: timing for it would mean nothing.
+        return Ok(transcript);
+    }
+    let mut usable = |field: &str, otherwise: &str| {
+        spans(&object, field, audio_ms).unwrap_or_else(|location| {
             log(&format!(
-                "Command transcriber: unusable segments ({location}); segments dropped"
+                "Command transcriber: unusable {field} ({location}); {otherwise}"
             ));
             Vec::new()
-        });
-        let words = self.words.unwrap_or_else(|location| {
-            log(&format!(
-                "Command transcriber: unusable words ({location}); spreading the text instead"
-            ));
-            Vec::new()
-        });
-        transcript.words = if words.is_empty() {
-            // No word times: spread the text over each segment, else over the recording.
-            transcript.estimated = true;
-            let mut spread: Vec<WordTiming> = if segments.is_empty() {
-                crate::hex::spread_words(&self.text, 0, audio_ms).1
-            } else {
-                segments
-                    .iter()
-                    .flat_map(|segment| {
-                        crate::hex::spread_words(&segment.text, segment.t0, segment.t1).1
-                    })
-                    .collect()
-            };
-            // Overlapping segments interleave their words.
-            spread.sort_by_key(|word| word.t0);
-            spread
+        })
+    };
+    let segments = usable("segments", "segments dropped");
+    let words = usable("words", "spreading the text instead");
+    transcript.estimated =
+        words.is_empty() || object.get("estimated").and_then(Value::as_bool) != Some(false);
+    transcript.words = if words.is_empty() {
+        // No word times: spread the text over each segment, else over the recording.
+        let mut spread: Vec<WordTiming> = if segments.is_empty() {
+            crate::hex::spread_words(text, 0, audio_ms).1
         } else {
-            words
-                .into_iter()
-                .map(|Span { t0, t1, text }| WordTiming { t0, t1, text })
+            segments
+                .iter()
+                .flat_map(|segment| {
+                    crate::hex::spread_words(&segment.text, segment.t0, segment.t1).1
+                })
                 .collect()
         };
-        transcript.segments = segments
+        // Overlapping segments interleave their words.
+        spread.sort_by_key(|word| word.t0);
+        spread
+    } else {
+        words
             .into_iter()
-            .map(|Span { t0, t1, text }| TranscriptSegment { t0, t1, text })
-            .collect();
-        transcript.text = self.text;
-        transcript
-    }
+            .map(|Span { t0, t1, text }| WordTiming { t0, t1, text })
+            .collect()
+    };
+    transcript.segments = segments
+        .into_iter()
+        .map(|Span { t0, t1, text }| TranscriptSegment { t0, t1, text })
+        .collect();
+    transcript.text = text.to_owned();
+    Ok(transcript)
 }
 
 /// The `field` array checked and sorted by `t0` (ties keep their order), or where it first
@@ -758,16 +709,24 @@ mod tests {
         .unwrap();
         assert_eq!(program.name(), "run");
         assert_eq!(program.limit(SECOND), Duration::from_secs(600));
-        // A malformed timeout leaves the default limit.
-        for timeout in ["0", "-5", r#""600""#, "[600]", "null"] {
-            let program = config(
+        let config_timeout = |timeout: &str| {
+            config(
                 &dir,
                 &format!(
                     r#"{{"transcribeCommand":["/bin/true"],"transcribeTimeoutSeconds":{timeout}}}"#
                 ),
             )
-            .unwrap();
-            assert_eq!(program.limit(SECOND), Duration::from_secs(300), "{timeout}");
+        };
+        assert_eq!(
+            config_timeout("null").unwrap().limit(SECOND),
+            Duration::from_secs(300)
+        );
+        for timeout in ["0", "-5", r#""600""#, "[600]"] {
+            assert_eq!(
+                config_timeout(timeout),
+                Err(Unusable::BadTimeout),
+                "{timeout}"
+            );
         }
     }
 
@@ -1360,13 +1319,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_run_fails_as_unsupported() {
+    fn there_is_no_program_off_unix() {
         let program = std::env::temp_dir().join("whisper-scrawl");
-        let program = Program::new(vec![program.to_string_lossy().into_owned()], None).unwrap();
-        let wav = std::env::temp_dir().join("audio.wav");
         assert_eq!(
-            transcribe(&program, &wav, 16_000, &mut |_| {}).unwrap_err(),
-            Failure::Unsupported
+            Program::new(vec![program.to_string_lossy().into_owned()], None),
+            Err(Unusable::Unsupported)
         );
     }
 }

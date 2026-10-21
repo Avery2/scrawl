@@ -97,10 +97,7 @@ fn hex_status() {
         }
     }
     let next = |hex_model: Option<&str>| match (preferred, hex_model, &command) {
-        // Only Unix runs the program; elsewhere a command recording uses the local engine.
-        (transcribe::Engine::Command, _, Ok(program)) if cfg!(unix) => {
-            format!("Command ({})", program.name())
-        }
+        (transcribe::Engine::Command, _, Ok(program)) => format!("Command ({})", program.name()),
         (transcribe::Engine::Hex, Some(model), _) => format!("Hex ({model})"),
         _ => transcribe::LOCAL_ENGINE_TITLE.to_owned(),
     };
