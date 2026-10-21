@@ -11,10 +11,20 @@ $vs = & $vswhere -latest -products * -property installationPath
 $dumpbin = (Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1).FullName
 
 # An EVEX prefix (0x62, which no other x86-64 instruction starts with, after at most a segment or
-# address-size prefix) is AVX-512, whatever register width it uses.
+# address-size prefix) is AVX-512, whatever register width it uses. MSVC's auto-vectorizer adds a
+# few on its own (vpmullq for 64-bit multiplies), behind its runtime check of the CRT's
+# `__isa_available` (`cmp <level>,6` then `jl` around the AVX-512 loop): those are allowed.
 function Avx512Lines([string]$file) {
   @(& $dumpbin /nologo /disasm $file |
-    Select-String -Pattern '^\s+[0-9A-F]+: (6[4-7] )?62 [0-9A-F]{2} [0-9A-F]{2} [0-9A-F]{2} ' -CaseSensitive -Context 40, 2)
+    Select-String -Pattern '^\s+[0-9A-F]+: (6[4-7] )?62 [0-9A-F]{2} [0-9A-F]{2} [0-9A-F]{2} ' -CaseSensitive -Context 60, 2)
+}
+
+function Guarded($hit) {
+  $before = @($hit.Context.PreContext)
+  for ($i = 0; $i -lt $before.Count - 1; $i++) {
+    if ($before[$i] -match '\scmp\s+\S.*,6\s*$' -and $before[$i + 1] -match '\sj(l|b)\s') { return $true }
+  }
+  $false
 }
 
 $imports = & $dumpbin /nologo /dependents (Join-Path $Dir "scrawl.exe")
@@ -30,13 +40,14 @@ $failed = $false
 foreach ($name in $baseline) {
   $file = Join-Path $Dir $name
   if (-not (Test-Path $file)) { throw "missing $name in $Dir" }
-  $hits = Avx512Lines $file
+  $all = Avx512Lines $file
+  $hits = @($all | Where-Object { -not (Guarded $_) })
   if ($hits.Count -gt 0) {
-    "$name has $($hits.Count) AVX-512 instructions, e.g.:"
+    "$name has $($hits.Count) AVX-512 instructions without a CPU check, e.g.:"
     $hits | Select-Object -First 2 | ForEach-Object { $_.Context.PreContext; ">> $($_.Line)"; $_.Context.PostContext; "" }
     $failed = $true
   } else {
-    "$name`: no AVX-512"
+    "$name`: no AVX-512 ($($all.Count) behind MSVC's __isa_available check)"
   }
 }
 

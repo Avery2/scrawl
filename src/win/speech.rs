@@ -378,9 +378,12 @@ mod tests {
     fn downloads_and_runs_parakeet() {
         let kept = std::env::var_os("SCRAWL_TEST_MODEL_DIR").map(PathBuf::from);
         let dir = kept.clone().unwrap_or_else(|| temp_dir("parakeet"));
+        let fresh = !dir.join(PARAKEET.filename).is_file();
         let mut last = 0.0;
         let model = download(&PARAKEET, &dir, &mut |done| last = done).unwrap();
-        assert_eq!(last, 1.0);
+        if fresh {
+            assert_eq!(last, 1.0);
+        }
         init_backends().unwrap();
         for device in transcribe_cpp::devices() {
             eprintln!("device: {} ({})", device.name, device.description);
