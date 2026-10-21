@@ -1711,6 +1711,22 @@ mod tests {
     const HOME: &str = "ses_efcd8972fffeT5zZbj9YtIl3LU";
     const KNOBS: &str = "ses_ec91ede28ffeFpn6L7FZtGoka0";
 
+    /// Windows opens a folder only with `FILE_FLAG_BACKUP_SEMANTICS`, and setting its time needs
+    /// write access.
+    fn set_modified(path: &std::path::Path, at: std::time::SystemTime) {
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(0x0200_0000)
+                .open(path)
+        };
+        #[cfg(not(windows))]
+        let file = std::fs::File::open(path);
+        file.unwrap().set_modified(at).unwrap();
+    }
+
     /// Replays the onboarding-story fixture: its server's folder laid out inside a temporary
     /// repository's `artifacts/`, with the entries' times it had.
     fn replay_server(with_history: bool) -> (Evidence, Judgement) {
@@ -1732,10 +1748,7 @@ mod tests {
         for entry in server["entries"].as_array().unwrap() {
             let at = std::time::UNIX_EPOCH
                 + Duration::from_millis(entry["modifiedMs"].as_u64().unwrap());
-            std::fs::File::open(dir.join(entry["name"].as_str().unwrap()))
-                .unwrap()
-                .set_modified(at)
-                .unwrap();
+            set_modified(&dir.join(entry["name"].as_str().unwrap()), at);
         }
         let port = saved
             .clues
