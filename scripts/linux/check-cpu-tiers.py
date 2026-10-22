@@ -18,7 +18,9 @@ def instructions(path):
         header = re.match(r"^[0-9a-f]+ <(.+)>:$", line)
         if header:
             symbol = header[1]
-        insn = re.match(r"^\s*[0-9a-f]+:\s+((?:[0-9a-f]{2} )+)\s*(\S+)(.*)", line)
+        # Binutils prints "{vex} vpdpbusd" to distinguish it from the EVEX
+        # encoding. The decoration is not the instruction mnemonic.
+        insn = re.match(r"^\s*[0-9a-f]+:\s+((?:[0-9a-f]{2} )+)\s*(?:\{\w+\}\s+)*(\S+)(.*)", line)
         if insn:
             yield symbol, bytes.fromhex(insn[1]), insn[2], line.strip()
 
