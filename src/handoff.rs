@@ -221,6 +221,18 @@ pub fn copy_png_to_clipboard(png_bytes: &[u8]) -> Result<()> {
     crate::win::clipboard::set_png(png_bytes)
 }
 
+/// The text Scrawl gives for a bundle (Paste's second half, a card's drag): the summary with
+/// its paths, or a screenshot's path.
+#[cfg(target_os = "macos")]
+pub fn bundle_text(bundle_dir: &Path) -> Result<String> {
+    let (directory, bundle) = load_bundle(bundle_dir)?;
+    Ok(if crate::screenshot::is_screenshot(&bundle) {
+        directory.join(&bundle.contact_sheet).display().to_string()
+    } else {
+        crate::sketch::summary_markdown(&bundle, &directory)
+    })
+}
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn copy_bundle_to_clipboard(bundle_dir: &Path) -> Result<()> {
     let (directory, bundle) = load_bundle(bundle_dir)?;

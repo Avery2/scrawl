@@ -5299,25 +5299,10 @@ fn open_review_window(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
             return;
         }
     }
-    let bounds = Bounds::centered(None, size(px(1120.0), px(740.0)), cx);
+    let started = Instant::now();
     let coord_clone = coord_entity.clone();
     let _ = cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(gpui::TitlebarOptions {
-                // The taskbar and Alt+Tab show it on Windows; macOS draws no title here.
-                title: cfg!(target_os = "windows").then(|| "Scrawl".into()),
-                appears_transparent: true,
-                traffic_light_position: Some(point(px(16.0), px(16.0))),
-            }),
-            app_id: Some("dev.kitlangton.scrawl".into()),
-            focus: true,
-            show: true,
-            kind: WindowKind::Normal,
-            is_resizable: true,
-            window_background: WindowBackgroundAppearance::Opaque,
-            ..Default::default()
-        },
+        review_window_options(cx, true),
         move |window, cx| {
             platform::decorate_app_window(window);
             let focus = cx.focus_handle();
@@ -5329,6 +5314,74 @@ fn open_review_window(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
         },
     );
     platform::take_keys(cx);
+    scrawl_log(format!(
+        "review window: opened in {} ms",
+        started.elapsed().as_millis()
+    ));
+}
+
+fn review_window_options(cx: &App, show: bool) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+            None,
+            size(px(1120.0), px(740.0)),
+            cx,
+        ))),
+        titlebar: Some(gpui::TitlebarOptions {
+            // The taskbar and Alt+Tab show it on Windows; macOS draws no title here.
+            title: cfg!(target_os = "windows").then(|| "Scrawl".into()),
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(16.0), px(16.0))),
+        }),
+        app_id: Some("dev.kitlangton.scrawl".into()),
+        focus: show,
+        show,
+        kind: WindowKind::Normal,
+        is_resizable: true,
+        window_background: WindowBackgroundAppearance::Opaque,
+        ..Default::default()
+    }
+}
+
+/// The first review window in a process takes ~60–200 ms to make (its renderer and fonts; later
+/// ones ~15 ms). When a capture card shows up, one is made hidden and dropped soon after, so the
+/// card's Open is quick. If Open comes first, it shows this one.
+pub(super) fn prewarm_review_window(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
+    if cx
+        .windows()
+        .iter()
+        .any(|h| h.downcast::<BundleReviewWindow>().is_some())
+    {
+        return;
+    }
+    let started = Instant::now();
+    let coord = coord_entity.clone();
+    let opened = cx.open_window(review_window_options(cx, false), move |window, cx| {
+        platform::decorate_app_window(window);
+        let focus = cx.focus_handle();
+        window.focus(&focus);
+        cx.new(|cx| {
+            cx.observe(&coord, |_, _, cx| cx.notify()).detach();
+            BundleReviewWindow::new(coord, focus)
+        })
+    });
+    scrawl_log(format!(
+        "review window: prewarmed in {} ms",
+        started.elapsed().as_millis()
+    ));
+    if let Ok(handle) = opened {
+        cx.spawn(async move |cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            let _ = handle.update(cx, |_, window, _| {
+                if !window.is_window_active() {
+                    window.remove_window();
+                }
+            });
+        })
+        .detach();
+    }
 }
 
 pub(crate) fn start_metric(name: &str, started: Instant) {

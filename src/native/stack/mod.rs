@@ -26,10 +26,11 @@ use objc2::{AnyThread, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly
 use objc2_app_kit::{
     NSBackingStoreType, NSColor, NSCursor, NSDragOperation, NSDraggingContext, NSDraggingItem,
     NSDraggingSession, NSDraggingSource, NSEvent, NSEventModifierFlags, NSEventPhase, NSFont,
-    NSImage, NSPanel, NSScreen, NSStatusWindowLevel, NSView, NSWindowCollectionBehavior,
+    NSImage, NSPanel, NSPasteboardItem, NSPasteboardTypeFileURL, NSPasteboardTypePNG,
+    NSPasteboardTypeString, NSScreen, NSStatusWindowLevel, NSView, NSWindowCollectionBehavior,
     NSWindowStyleMask,
 };
-use objc2_foundation::{NSArray, NSPoint, NSRect, NSSize, NSString, NSURL};
+use objc2_foundation::{NSArray, NSData, NSPoint, NSRect, NSSize, NSString, NSURL};
 use objc2_quartz_core::{CALayer, CATextLayer, CATransaction, CATransform3D};
 
 pub use self::model::{CardSpec, Geometry, Variant};
@@ -80,6 +81,7 @@ struct CardLayers {
     destination: Retained<CATextLayer>,
     destination_text: String,
     close: Retained<CALayer>,
+    close_face: Retained<CALayer>,
 }
 
 struct Runtime {
@@ -264,7 +266,6 @@ impl CaptureStack {
 
         let (action_tx, action_rx) = flume::unbounded();
         let geometry = Geometry {
-            display: [display[2], display[3]],
             capsule,
             usable_max,
         };
@@ -505,7 +506,11 @@ impl Shared {
             st.window.setIgnoresMouseEvents(ignore);
         }
         st.model.advance(dt);
-        st.render(pointer);
+        if st.render(pointer) {
+            // A new card's first frame builds its layers and decodes its pictures, which can take
+            // a frame or two; that time isn't the card's to travel, or its next step would jump.
+            st.last_tick = motion::now();
+        }
         if st.trace.is_some() {
             st.trace();
         }
@@ -539,13 +544,16 @@ impl Shared {
         let frame = st.model.frames().into_iter().find(|f| f.id == hit.card)?;
         st.drag_started = true;
         st.model.pressed = None;
+        // The image and the words Paste would give: Finder and chat apps take the PNG (as a
+        // file, or its data), text fields and terminals the summary. ⌥ drags the whole bundle.
         let whole_bundle = event.modifierFlags().contains(NSEventModifierFlags::Option);
-        let path = if whole_bundle { &spec.bundle } else { &spec.sheet };
-        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
-        let item = NSDraggingItem::initWithPasteboardWriter(
-            mtm.alloc(),
-            ProtocolObject::from_ref(&*url),
-        );
+        let item = if whole_bundle {
+            let url = NSURL::fileURLWithPath(&NSString::from_str(&spec.bundle.to_string_lossy()));
+            NSDraggingItem::initWithPasteboardWriter(mtm.alloc(), ProtocolObject::from_ref(&*url))
+        } else {
+            let pb = drag_pasteboard_item(&spec);
+            NSDraggingItem::initWithPasteboardWriter(mtm.alloc(), ProtocolObject::from_ref(&*pb))
+        };
         let r = frame.thumb;
         let drag_frame = NSRect::new(
             NSPoint::new(f64::from(r[0]), f64::from(st.display[3] - r[1] - r[3])),
@@ -619,6 +627,7 @@ impl Runtime {
             }
             if f.hover > 0.001 {
                 out.push((format!("paste:{}", f.id), g(f.paste), f.hover * f.opacity, 0.0, Some("card"), Some(card)));
+                out.push((format!("close:{}", f.id), g(f.close), f.hover * f.chrome * f.opacity, model::CLOSE_D * 0.5, Some("card"), None));
             }
         }
         if let Some(t) = self.trace.as_mut() {
@@ -638,12 +647,15 @@ impl Runtime {
                 let _ = self.action_tx.try_send(StackAction::Paste(spec.bundle));
             }
             Elem::Open | Elem::Body => {
+                crate::capture::scrawl_log(format!("stack: Open clicked ({})", spec.bundle.display()));
                 let _ = self.action_tx.try_send(StackAction::Open(spec.bundle));
             }
         }
     }
 
-    fn render(&mut self, pointer: Option<[f32; 2]>) {
+    /// Draws this frame; true when it had to build a new card's layers.
+    fn render(&mut self, pointer: Option<[f32; 2]>) -> bool {
+        let mut built = false;
         let frames = self.model.frames();
         CATransaction::begin();
         CATransaction::setDisableActions(true);
@@ -661,6 +673,7 @@ impl Runtime {
                 let layers = build_card(&spec, self.scale);
                 self.host.addSublayer(&layers.root);
                 self.layers.insert(f.id, layers);
+                built = true;
             }
             let dest = self.model.card(f.id).map(|s| s.destination.clone());
             let display_h = self.display[3];
@@ -694,6 +707,11 @@ impl Runtime {
             }
         }
         CATransaction::commit();
+        if built {
+            // Decode the new pictures now, inside this frame, rather than on the next one.
+            CATransaction::flush();
+        }
+        built
     }
 }
 
@@ -739,6 +757,28 @@ fn text_layer(text: &str, font: &NSFont, size: f64, rgba: [f64; 4], scale: f64) 
     text_color(&layer, rgba);
     layer.setContentsScale(scale);
     layer
+}
+
+/// One pasteboard item for a card's drag: the contact sheet (or screenshot) as a file URL and as
+/// PNG data, and the text Paste puts on the clipboard (`handoff::bundle_text`).
+fn drag_pasteboard_item(spec: &CardSpec) -> Retained<NSPasteboardItem> {
+    let item = NSPasteboardItem::new();
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&spec.sheet.to_string_lossy()));
+    unsafe {
+        if let Some(abs) = url.absoluteString() {
+            item.setString_forType(&abs, NSPasteboardTypeFileURL);
+        }
+        if let Ok(png) = std::fs::read(&spec.sheet) {
+            item.setData_forType(&NSData::with_bytes(&png), NSPasteboardTypePNG);
+        }
+        match crate::handoff::bundle_text(&spec.bundle) {
+            Ok(text) => {
+                item.setString_forType(&NSString::from_str(&text), NSPasteboardTypeString);
+            }
+            Err(err) => crate::capture::scrawl_log(format!("stack: drag text: {err:#}")),
+        }
+    }
+    item
 }
 
 fn load_image(path: &Path) -> Option<Retained<NSImage>> {
@@ -878,20 +918,38 @@ fn build_card(spec: &CardSpec, scale: f64) -> CardLayers {
     dest_box.addSublayer(&destination);
     chrome.addSublayer(&dest_box);
 
+    // The close badge: a bright disc over the card's top-left corner with a dark ×, like a
+    // screenshot thumbnail's. `close` carries the shadow and the hover scale; `close_face` the
+    // fill, which darkens when pressed.
+    let d = f64::from(model::CLOSE_D);
     let close = CALayer::new();
-    color(&close, [0.17, 0.17, 0.19, 0.97]);
-    close.setCornerRadius(f64::from(model::CLOSE_D) * 0.5);
-    close.setBorderWidth(0.5);
+    close.setBounds(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(d, d)));
+    close.setCornerRadius(d * 0.5);
+    close.setShadowOpacity(0.45);
+    close.setShadowRadius(3.0);
+    close.setShadowOffset(NSSize::new(0.0, -1.0));
+    let close_face = CALayer::new();
+    close_face.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(d, d)));
+    close_face.setCornerRadius(d * 0.5);
+    color(&close_face, [0.96, 0.96, 0.97, 1.0]);
+    close_face.setBorderWidth(0.5);
     unsafe {
-        let border = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.22);
+        let border = NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 0.18);
         let cg: *const OpaqueCGColor = msg_send![&*border, CGColor];
-        let _: () = msg_send![&*close, setBorderColor: cg];
+        let _: () = msg_send![&*close_face, setBorderColor: cg];
     }
-    let xmark = NSFont::systemFontOfSize_weight(10.0, unsafe { objc2_app_kit::NSFontWeightBold });
-    let x = text_layer("✕", &xmark, 10.0, [1.0, 1.0, 1.0, 0.9], scale);
-    x.setAlignmentMode(&NSString::from_str("center"));
-    x.setFrame(ns_rect([0.0, 3.5, model::CLOSE_D, 13.0], model::CLOSE_D));
-    close.addSublayer(&x);
+    close.addSublayer(&close_face);
+    // Two rounded bars, crisper at this size than a glyph.
+    for angle in [std::f64::consts::FRAC_PI_4, -std::f64::consts::FRAC_PI_4] {
+        let bar = CALayer::new();
+        let (len, thick) = (d * 0.42, 1.8);
+        bar.setBounds(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(len, thick)));
+        bar.setPosition(NSPoint::new(d * 0.5, d * 0.5));
+        bar.setCornerRadius(thick * 0.5);
+        color(&bar, [0.11, 0.11, 0.12, 0.92]);
+        bar.setTransform(linear([angle.cos(), angle.sin(), -angle.sin(), angle.cos()]));
+        close.addSublayer(&bar);
+    }
     close.setOpacity(0.0);
     root.addSublayer(&close);
 
@@ -907,6 +965,17 @@ fn build_card(spec: &CardSpec, scale: f64) -> CardLayers {
         destination,
         destination_text: spec.destination.clone(),
         close,
+        close_face,
+    }
+}
+
+/// A 2D linear map `[a, b, c, d]` (x' = a·x + c·y, y' = b·x + d·y) as a layer transform.
+fn linear([a, b, c, d]: [f64; 4]) -> CATransform3D {
+    CATransform3D {
+        m11: a, m12: b, m13: 0.0, m14: 0.0,
+        m21: c, m22: d, m23: 0.0, m24: 0.0,
+        m31: 0.0, m32: 0.0, m33: 1.0, m34: 0.0,
+        m41: 0.0, m42: 0.0, m43: 0.0, m44: 1.0,
     }
 }
 
@@ -915,7 +984,10 @@ fn place_card(l: &CardLayers, f: &CardFrame, display_h: f32) {
     l.root.setFrame(ns_rect(v, display_h));
     l.root.setCornerRadius(f64::from(f.radius));
     l.root.setOpacity(f.opacity);
-    l.root.setShadowOpacity(0.38 * f.shadow);
+    // Lifted mid-flight: a deeper, softer shadow that settles as the card lands.
+    l.root.setShadowOpacity(0.38 * f.shadow + 0.14 * f.lift);
+    l.root.setShadowRadius(16.0 + 14.0 * f64::from(f.lift));
+    l.root.setShadowOffset(NSSize::new(0.0, -6.0 - 8.0 * f64::from(f.lift)));
     l.root.setBorderWidth(0.5 * f64::from(f.chrome));
     let local = |r: [f32; 4]| [r[0] - v[0], r[1] - v[1], r[2], r[3]];
     l.clip.setFrame(ns_rect([0.0, 0.0, v[2], v[3]], v[3]));
@@ -948,14 +1020,22 @@ fn place_card(l: &CardLayers, f: &CardFrame, display_h: f32) {
         &l.open,
         [1.0, 1.0, 1.0, if pressed(Elem::Open) { 0.34 } else if hovered(Elem::Open) { 0.28 } else { 0.18 }],
     );
-    l.close.setFrame(ns_rect(local(f.close), v[3]));
-    l.close.setOpacity(f.hover * f.chrome);
+    let c = ns_rect(local(f.close), v[3]);
+    l.close.setPosition(NSPoint::new(
+        c.origin.x + c.size.width * 0.5,
+        c.origin.y + c.size.height * 0.5,
+    ));
+    let shown = f.hover * f.chrome;
+    l.close.setOpacity(shown);
+    // In from a little smaller as the card is hovered, and a touch larger under the pointer.
+    let k = 0.86 + 0.14 * f64::from(shown) + if hovered(Elem::Close) { 0.06 } else { 0.0 };
+    l.close.setTransform(linear([k, 0.0, 0.0, k]));
     color(
-        &l.close,
-        if hovered(Elem::Close) || pressed(Elem::Close) {
-            [0.30, 0.30, 0.33, 0.98]
+        &l.close_face,
+        if pressed(Elem::Close) {
+            [0.80, 0.80, 0.82, 1.0]
         } else {
-            [0.17, 0.17, 0.19, 0.97]
+            [0.96, 0.96, 0.97, 1.0]
         },
     );
 }
@@ -1054,3 +1134,42 @@ fn png_size(path: &Path) -> Option<(u32, u32)> {
     Some((info.width, info.height))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{CaptureMode, TargetFrame, TargetInfo};
+
+    /// A card's drag carries the picture as a file and as PNG data, and the text Paste gives, on
+    /// one pasteboard item, so each drop target takes what it understands.
+    #[test]
+    fn a_drag_carries_the_picture_and_the_text() {
+        let dir = std::env::temp_dir().join(format!("{}.scrawl", crate::make_bundle_id()));
+        let png = crate::render::encode_png(&crate::model::RgbaFrame::new(
+            0,
+            40,
+            30,
+            vec![200; 40 * 30 * 4],
+        ))
+        .unwrap();
+        let target = TargetInfo {
+            mode: CaptureMode::Region,
+            app: None,
+            bundle_id: None,
+            window_title: None,
+            window_id: None,
+            display_id: 1,
+            frame: TargetFrame { x: 0.0, y: 0.0, width: 40.0, height: 30.0, scale: 1.0 },
+        };
+        crate::screenshot::write_bundle(&dir, target, &png).unwrap();
+        let spec = card_for_bundle(1, &dir, 0, "Copied").unwrap();
+        let item = drag_pasteboard_item(&spec);
+        let text = unsafe { item.stringForType(NSPasteboardTypeString) }.unwrap().to_string();
+        assert_eq!(text, crate::handoff::bundle_text(&dir).unwrap());
+        let url = unsafe { item.stringForType(NSPasteboardTypeFileURL) }.unwrap().to_string();
+        assert!(url.starts_with("file://") && url.ends_with("screenshot.png"), "{url}");
+        let data = unsafe { item.dataForType(NSPasteboardTypePNG) }.unwrap();
+        assert_eq!(data.to_vec(), png);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

@@ -99,6 +99,7 @@ enum Target {
     /// The `n`th newest card's body, Paste button or ✕.
     Body(usize),
     Paste(usize),
+    Open(usize),
     Close(usize),
     Away,
 }
@@ -147,7 +148,14 @@ fn steps(scene: Scene, variant: LabVariant) -> Vec<(f32, Step)> {
             at(0.7, Step::Point(Target::Close(1), 0.35), &mut out);
             at(0.9, Step::Click, &mut out);
         }
-        at(0.5, Step::Point(Target::Paste(0), 0.45), &mut out);
+        // `SCRAWL_LAB_OPEN=1`: Open instead of Paste, which opens the review window for real
+        // (and logs how long that took).
+        let last = if std::env::var_os("SCRAWL_LAB_OPEN").is_some() {
+            Target::Open(0)
+        } else {
+            Target::Paste(0)
+        };
+        at(0.5, Step::Point(last, 0.45), &mut out);
         at(0.6, Step::Click, &mut out);
         at(0.55, Step::Point(Target::Away, 0.5), &mut out);
         at(0.0, Step::PointerOff, &mut out);
@@ -463,6 +471,14 @@ pub fn run(options: Options) {
                             if let StackAction::Paste(dir) | StackAction::Open(dir) = &action {
                                 eprintln!("lab: {action:?} ({})", dir.display());
                             }
+                            if let StackAction::Open(dir) = action
+                                && let Ok(loaded) = crate::handoff::load_bundle(&dir)
+                            {
+                                let started = std::time::Instant::now();
+                                loop_coord.update(cx, |coord, _| coord.set_review_bundle(loaded, None));
+                                super::open_review_window(&loop_coord, cx);
+                                eprintln!("lab: review window opened in {} ms", started.elapsed().as_millis());
+                            }
                         }
                     }
                 });
@@ -604,6 +620,7 @@ fn pointer_target(s: &CaptureStack, target: Target) -> [f32; 2] {
             [f.rect[0] + f.rect[2] * 0.72, f.rect[1] + f.rect[3] * 0.38]
         }),
         Target::Paste(n) => card(n).map_or([d[0], d[1]], |f| centre(f.paste)),
+        Target::Open(n) => card(n).map_or([d[0], d[1]], |f| centre(f.open)),
         Target::Close(n) => card(n).map_or([d[0], d[1]], |f| centre(f.close)),
         Target::Away => match frames.last() {
             Some(f) => [f.rect[0] + f.rect[2] + 260.0, f.rect[1] + f.rect[3] + 220.0],

@@ -53,7 +53,14 @@ pub const BUTTON_H: f32 = 26.0;
 pub const PASTE_W: f32 = 64.0;
 pub const OPEN_W: f32 = 58.0;
 pub const BUTTON_GAP: f32 = 8.0;
-pub const CLOSE_D: f32 = 20.0;
+/// The close badge over the card's top-left corner, and how far past it the pointer still hits.
+pub const CLOSE_D: f32 = 22.0;
+pub const CLOSE_HIT_PAD: f32 = 6.0;
+/// The badge's centre, in from the card's corner.
+const CLOSE_IN: f32 = 3.0;
+/// How far a card travels as it leaves: lifted toward the capsule, or toward the screen's edge.
+const LIFT: f32 = 28.0;
+const SLIDE: f32 = 140.0;
 
 /// Seconds, as `duration / bounce 0` springs (ω = 2π / duration).
 #[derive(Clone, Copy, Debug)]
@@ -62,7 +69,7 @@ pub struct Timing {
     pub flight: f32,
     /// Siblings moving to make room, unfolding, folding.
     pub reflow: f32,
-    /// A card closed in place.
+    /// A card leaving (✕, Paste, a swipe, a drop): shorter than its flight in.
     pub exit: f32,
     pub hover: f32,
     /// The stack leaves on its own after this long without a new card or the pointer on it.
@@ -76,7 +83,7 @@ impl Default for Timing {
         Self {
             flight: 0.5,
             reflow: 0.4,
-            exit: 0.25,
+            exit: 0.3,
             hover: 0.2,
             auto_close: 8.0,
             reduced_fade: 0.18,
@@ -123,10 +130,10 @@ pub struct Hit {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Leave {
-    /// Closed: shrinks a little in place and fades.
-    InPlace,
-    /// Slides past the right edge of the display.
-    Edge,
+    /// Under the capsule: lifts a little toward it, shrinking slightly, and fades.
+    Lift,
+    /// Toward the left (-1) or right (1) edge of the screen, fading on the way.
+    Side(f32),
     /// Folds up into the capsule.
     Capsule,
 }
@@ -139,6 +146,8 @@ pub struct Card {
     opacity: Spring,
     hover: Spring,
     leave: Option<Leave>,
+    /// Where it's going as it leaves, fixed when it starts to.
+    leave_to: [f32; 4],
     /// The rect's spring: the flight's until it lands, then the reflow's.
     landing: bool,
     /// A sideways swipe, applied 1:1 while the fingers are down.
@@ -151,7 +160,6 @@ pub struct Card {
 /// Where the capsule and the usable area are.
 #[derive(Clone, Copy, Debug)]
 pub struct Geometry {
-    pub display: [f32; 2],
     /// The capsule's island at rest.
     pub capsule: [f32; 4],
     /// The bottom-right of the usable area (above the Dock).
@@ -188,6 +196,8 @@ pub struct CardFrame {
     pub frame_alpha: f32,
     pub opacity: f32,
     pub shadow: f32,
+    /// 0 at rest, up to 1 mid-flight: the card is lifted off the screen (a deeper shadow).
+    pub lift: f32,
     /// Footer text and the thumbnail's own corner.
     pub chrome: f32,
     /// The card's scale against a resting card (text and buttons scale with it).
@@ -287,6 +297,7 @@ impl StackModel {
                 opacity: Spring::at(1.0),
                 hover: Spring::at(0.0),
                 leave: None,
+                leave_to: from,
                 landing: true,
                 swipe: 0.0,
                 swiping: false,
@@ -294,7 +305,7 @@ impl StackModel {
             },
         );
         if self.reduced {
-            let target = self.target_for(0, &self.cards[0].spec);
+            let target = self.target_for(0);
             let c = &mut self.cards[0];
             c.rect = target.map(Spring::at);
             c.flight = Spring::at(1.0);
@@ -303,20 +314,36 @@ impl StackModel {
         }
         self.idle = 0.0;
         for i in self.live_indices().into_iter().skip(MAX_CARDS) {
-            self.cards[i].leave = Some(Leave::InPlace);
+            let leave = self.default_leave(&self.cards[i]);
+            self.start_leave(i, leave);
         }
+    }
+
+    fn default_leave(&self, c: &Card) -> Leave {
+        match self.variant {
+            Variant::Dock if c.swipe.abs() > 1.0 => Leave::Side(c.swipe.signum()),
+            Variant::Dock => Leave::Lift,
+            Variant::Edge => Leave::Side(1.0),
+        }
+    }
+
+    fn start_leave(&mut self, i: usize, leave: Leave) {
+        let to = self.leave_target(&self.cards[i], leave);
+        let c = &mut self.cards[i];
+        c.leave = Some(leave);
+        c.leave_to = to;
+        c.swiping = false;
     }
 
     /// Closes one card (✕, a swipe, a paste or a drop somewhere).
     pub fn close(&mut self, id: u64) {
-        let variant = self.variant;
-        if let Some(c) = self.cards.iter_mut().find(|c| c.spec.id == id) {
-            c.leave = Some(match variant {
-                Variant::Dock if c.swipe.abs() > 1.0 => Leave::Edge,
-                Variant::Dock => Leave::InPlace,
-                Variant::Edge => Leave::Edge,
-            });
-            c.swiping = false;
+        if let Some(i) = self
+            .cards
+            .iter()
+            .position(|c| c.spec.id == id && c.leave.is_none())
+        {
+            let leave = self.default_leave(&self.cards[i]);
+            self.start_leave(i, leave);
         }
         if self.pressed.is_some_and(|h| h.card == id) {
             self.pressed = None;
@@ -327,12 +354,10 @@ impl StackModel {
     pub fn close_all(&mut self) {
         let leave = match self.variant {
             Variant::Dock => Leave::Capsule,
-            Variant::Edge => Leave::Edge,
+            Variant::Edge => Leave::Side(1.0),
         };
-        for c in &mut self.cards {
-            if c.leave.is_none() {
-                c.leave = Some(leave);
-            }
+        for i in self.live_indices() {
+            self.start_leave(i, leave);
         }
         self.expanded = false;
     }
@@ -388,9 +413,15 @@ impl StackModel {
         (0..self.cards.len()).filter(|&i| self.cards[i].leave.is_none()).collect()
     }
 
-    /// The resting rect of the `slot`-th live card (0 = newest).
-    fn target_for(&self, slot: usize, spec: &CardSpec) -> [f32; 4] {
+    /// The resting rect of `self.cards[index]`, after the newer cards still in front of it.
+    fn target_for(&self, index: usize) -> [f32; 4] {
+        let spec = &self.cards[index].spec;
         let [w, h] = spec.card_size();
+        let ahead: Vec<&Card> = self.cards[..index]
+            .iter()
+            .filter(|c| c.leave.is_none())
+            .collect();
+        let room: f32 = ahead.iter().map(|c| c.spec.card_size()[1] + GAP).sum();
         let g = &self.geometry;
         match self.variant {
             Variant::Dock => {
@@ -399,13 +430,9 @@ impl StackModel {
                 if self.expanded {
                     // A column down from the capsule, newest at the top, each card at its own
                     // height.
-                    let mut y = top;
-                    for c in self.cards.iter().filter(|c| c.leave.is_none()).take(slot) {
-                        y += c.spec.card_size()[1] + GAP;
-                    }
-                    [cx - w * 0.5, y, w, h]
+                    [cx - w * 0.5, top + room, w, h]
                 } else {
-                    let i = slot.min(PEEK_VISIBLE - 1) as f32;
+                    let i = ahead.len().min(PEEK_VISIBLE - 1) as f32;
                     let front_h = self
                         .cards
                         .iter()
@@ -421,36 +448,25 @@ impl StackModel {
             }
             Variant::Edge => {
                 let right = g.usable_max[0] - EDGE_MARGIN;
-                let mut bottom = g.usable_max[1] - EDGE_MARGIN;
-                for c in self.cards.iter().filter(|c| c.leave.is_none()).take(slot) {
-                    bottom -= c.spec.card_size()[1] + GAP;
-                }
+                let bottom = g.usable_max[1] - EDGE_MARGIN - room;
                 [right - w, bottom - h, w, h]
             }
         }
     }
 
-    fn leave_target(&self, card: &Card, leave: Leave) -> ([f32; 4], f32) {
+    /// Where a card that starts leaving now ends up (it fades out on the way).
+    fn leave_target(&self, card: &Card, leave: Leave) -> [f32; 4] {
         let r = card.rect.map(|s| s.x);
+        let shrunk = scaled_about(r, 0.96, r[0] + r[2] * 0.5, r[1] + r[3] * 0.5);
         match leave {
-            Leave::InPlace => (
-                scaled_about(r, 0.96, r[0] + r[2] * 0.5, r[1] + r[3] * 0.5),
-                0.0,
-            ),
-            Leave::Edge => {
-                let x = if card.swipe < 0.0 && self.variant == Variant::Dock {
-                    -r[2] - 24.0
-                } else {
-                    self.geometry.display[0] + 24.0
-                };
-                ([x, r[1], r[2], r[3]], 1.0)
-            }
+            Leave::Lift => [shrunk[0], shrunk[1] - LIFT, shrunk[2], shrunk[3]],
+            Leave::Side(dir) => [shrunk[0] + dir * SLIDE, shrunk[1], shrunk[2], shrunk[3]],
             Leave::Capsule => {
                 let g = &self.geometry;
                 let cx = g.capsule[0] + g.capsule[2] * 0.5;
                 let cy = g.capsule[1] + g.capsule[3] * 0.5;
                 let s = (g.capsule[3] / r[3].max(1.0)).clamp(0.1, 1.0);
-                ([cx - r[2] * s * 0.5, cy - r[3] * s * 0.5, r[2] * s, r[3] * s], 0.0)
+                [cx - r[2] * s * 0.5, cy - r[3] * s * 0.5, r[2] * s, r[3] * s]
             }
         }
     }
@@ -503,27 +519,24 @@ impl StackModel {
 
         let hovered = self.pointer.and_then(|p| self.hit(p)).map(|h| h.card);
         let live = self.live_indices();
-        let targets: Vec<(usize, [f32; 4])> = live
-            .iter()
-            .enumerate()
-            .map(|(slot, &i)| (i, self.target_for(slot, &self.cards[i].spec)))
-            .collect();
+        let targets: Vec<(usize, [f32; 4])> =
+            live.iter().map(|&i| (i, self.target_for(i))).collect();
         let peek_hidden: Vec<usize> = if self.variant == Variant::Dock && !self.expanded {
             live.iter().skip(PEEK_VISIBLE).copied().collect()
         } else {
             Vec::new()
         };
-        let leaving: Vec<(usize, [f32; 4], f32)> = (0..self.cards.len())
-            .filter_map(|i| {
-                let c = &self.cards[i];
-                c.leave.map(|l| {
-                    let (r, o) = self.leave_target(c, l);
-                    (i, r, o)
-                })
-            })
+        let leaving: Vec<usize> = (0..self.cards.len())
+            .filter(|&i| self.cards[i].leave.is_some())
             .collect();
 
         let reduced = self.reduced;
+        // While a card flies in, the others make room on the flight's own curve (both start from
+        // rest), so they move in step with it rather than ahead of it.
+        let arriving = self
+            .cards
+            .iter()
+            .any(|c| c.landing && c.leave.is_none());
         for (i, target) in targets {
             let c = &mut self.cards[i];
             let opacity_target = if peek_hidden.contains(&i) { 0.0 } else { 1.0 };
@@ -532,7 +545,7 @@ impl StackModel {
                 c.flight = Spring::at(1.0);
                 c.opacity.step(opacity_target, t.reduced_fade, dt);
             } else {
-                let d = if c.landing { t.flight } else { t.reflow };
+                let d = if c.landing || arriving { t.flight } else { t.reflow };
                 for (k, s) in c.rect.iter_mut().enumerate() {
                     if k == 0 && c.swiping {
                         continue;
@@ -548,7 +561,7 @@ impl StackModel {
             let h = if hovered == Some(c.spec.id) && !c.dragging { 1.0 } else { 0.0 };
             c.hover.step(h, t.hover, dt);
         }
-        for (i, target, opacity) in leaving {
+        for i in leaving {
             let c = &mut self.cards[i];
             c.hover.step(0.0, t.hover, dt);
             if reduced {
@@ -559,20 +572,16 @@ impl StackModel {
                 Some(Leave::Capsule) => t.reflow,
                 _ => t.exit,
             };
+            let target = c.leave_to;
             for (k, s) in c.rect.iter_mut().enumerate() {
                 s.step(target[k], d, dt);
             }
             c.flight.step(1.0, t.flight, dt);
             // Exits fade a little ahead of their travel.
-            c.opacity.step(opacity, d * 0.8, dt);
+            c.opacity.step(0.0, d * 0.7, dt);
         }
-        let display_w = self.geometry.display[0];
-        self.cards.retain(|c| {
-            let Some(leave) = c.leave else { return true };
-            let r = c.rect.map(|s| s.x);
-            let offscreen = r[0] > display_w + 2.0 || r[0] + r[2] < -2.0;
-            !(c.opacity.x < 0.01 || (leave == Leave::Edge && offscreen))
-        });
+        self.cards
+            .retain(|c| c.leave.is_none() || c.opacity.x >= 0.01);
     }
 
     fn layout(&self, c: &Card) -> CardFrame {
@@ -621,14 +630,14 @@ impl StackModel {
             BUTTON_H * k,
         ];
         let close = [
-            v[0] - CLOSE_D * 0.3,
-            v[1] - CLOSE_D * 0.3,
+            v[0] + CLOSE_IN - CLOSE_D * 0.5,
+            v[1] + CLOSE_IN - CLOSE_D * 0.5,
             CLOSE_D,
             CLOSE_D,
         ];
         let hovered = if c.hover.x > 0.5 {
             self.pointer.and_then(|p| {
-                if contains(close, p, 2.0) {
+                if contains(close, p, CLOSE_HIT_PAD) {
                     Some(Elem::Close)
                 } else if contains(paste, p, 0.0) {
                     Some(Elem::Paste)
@@ -656,6 +665,7 @@ impl StackModel {
             },
             opacity: c.opacity.x.clamp(0.0, 1.0) * if c.dragging { 0.5 } else { 1.0 },
             shadow: smoothstep(0.0, 0.3, q),
+            lift: if c.leave.is_some() { 0.0 } else { 4.0 * q * (1.0 - q) },
             chrome: smoothstep(0.7, 1.0, q),
             k,
             thumb,
@@ -682,7 +692,7 @@ impl StackModel {
                 continue;
             }
             let f = self.layout(c);
-            if c.hover.x > 0.5 && contains(f.close, p, 2.0) {
+            if c.hover.x > 0.5 && contains(f.close, p, CLOSE_HIT_PAD) {
                 return Some(Hit { card: c.spec.id, elem: Elem::Close });
             }
             if !contains(f.rect, p, 0.0) {
@@ -714,7 +724,6 @@ mod tests {
 
     fn geometry() -> Geometry {
         Geometry {
-            display: [1512.0, 982.0],
             capsule: [656.0, 56.0, 200.0, 40.0],
             usable_max: [1512.0, 982.0],
         }
@@ -888,6 +897,97 @@ mod tests {
         let g = &m.frames()[0];
         assert_eq!(f.rect, g.rect);
         assert!(g.opacity > 0.99);
+    }
+
+    #[test]
+    fn older_cards_make_room_in_step_with_the_new_one_s_flight() {
+        let mut m = StackModel::new(Variant::Edge, geometry());
+        m.timing.auto_close = 100.0;
+        m.push(spec(1), [0.0, 0.0, 1512.0, 982.0]);
+        run(&mut m, 1.0);
+        let start = m.frames()[0].rect[1];
+        m.push(spec(2), [0.0, 0.0, 1512.0, 982.0]);
+        run(&mut m, 1.5);
+        let end = m.frames().iter().find(|f| f.id == 1).unwrap().rect[1];
+        let mut m = StackModel::new(Variant::Edge, geometry());
+        m.timing.auto_close = 100.0;
+        m.push(spec(1), [0.0, 0.0, 1512.0, 982.0]);
+        run(&mut m, 1.0);
+        m.push(spec(2), [0.0, 0.0, 1512.0, 982.0]);
+        let mut last = start;
+        for _ in 0..180 {
+            m.advance(1.0 / 120.0);
+            let q = m.cards.iter().find(|c| c.spec.id == 2).unwrap().flight.x;
+            let y = m.frames().iter().find(|f| f.id == 1).unwrap().rect[1];
+            let moved = (y - start) / (end - start);
+            assert!(moved <= q + 0.02, "the old card ran ahead: {moved} of the way at flight {q}");
+            assert!(y <= last + 1e-3, "and only ever up");
+            last = y;
+        }
+    }
+
+    #[test]
+    fn exits_travel_toward_the_edge_fading_and_the_gap_closes() {
+        let mut m = StackModel::new(Variant::Edge, geometry());
+        m.timing.auto_close = 100.0;
+        m.push(spec(1), [0.0, 0.0, 1512.0, 982.0]);
+        run(&mut m, 1.0);
+        let bottom = m.frames()[0].rect;
+        m.push(spec(2), [0.0, 0.0, 1512.0, 982.0]);
+        run(&mut m, 1.5);
+        m.close(2);
+        let (mut x, mut o) = (f32::MIN, f32::MAX);
+        let mut old_y = f32::MIN;
+        while m.ids().contains(&2) {
+            m.advance(1.0 / 120.0);
+            let frames = m.frames();
+            if let Some(f) = frames.iter().find(|f| f.id == 2) {
+                assert!(f.rect[0] >= x - 1e-3 && f.opacity <= o + 1e-3);
+                assert!(f.rect[0] < bottom[0] + 200.0, "a short move, not a fling off the screen");
+                (x, o) = (f.rect[0], f.opacity);
+            }
+            let y = frames.iter().find(|f| f.id == 1).unwrap().rect[1];
+            assert!(y >= old_y - 1e-3, "the older card slides down into the gap");
+            old_y = y;
+        }
+        run(&mut m, 1.0);
+        assert!((m.frames()[0].rect[1] - bottom[1]).abs() < 0.5);
+    }
+
+    #[test]
+    fn a_closed_card_under_the_capsule_lifts_toward_it_and_fades() {
+        let mut m = StackModel::new(Variant::Dock, geometry());
+        m.timing.auto_close = 100.0;
+        m.push(spec(1), [0.0, 0.0, 1512.0, 982.0]);
+        run(&mut m, 1.0);
+        let rest = m.frames()[0].rect;
+        m.close(1);
+        let mut y = rest[1];
+        while !m.is_empty() {
+            m.advance(1.0 / 120.0);
+            if let Some(f) = m.frames().first() {
+                assert!(f.rect[1] <= y + 1e-3);
+                y = f.rect[1];
+            }
+        }
+        assert!(y < rest[1] - 5.0 && y > rest[1] - 40.0, "{y} from {}", rest[1]);
+    }
+
+    #[test]
+    fn the_close_badge_sits_on_the_corner_with_room_to_hit_it() {
+        let mut m = StackModel::new(Variant::Edge, geometry());
+        m.timing.auto_close = 100.0;
+        m.push(spec(1), [0.0, 0.0, 1512.0, 982.0]);
+        run(&mut m, 1.0);
+        let r = m.frames()[0].rect;
+        m.set_pointer(Some([r[0] + 40.0, r[1] + 40.0]));
+        run(&mut m, 0.5);
+        let c = m.frames()[0].close;
+        let centre = [c[0] + c[2] * 0.5, c[1] + c[3] * 0.5];
+        assert!(centre[0] > r[0] && centre[0] < r[0] + 6.0 && centre[1] > r[1] && centre[1] < r[1] + 6.0);
+        // Just outside the badge and the card, up and to the left.
+        let near = [c[0] - 4.0, c[1] - 4.0];
+        assert_eq!(m.hit(near).map(|h| h.elem), Some(Elem::Close));
     }
 
     #[test]

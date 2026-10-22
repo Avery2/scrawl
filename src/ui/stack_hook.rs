@@ -16,6 +16,10 @@ use crate::native::stack::{self, CaptureStack, StackAction, Variant};
 pub const CAPTURE_STACK: &str = "captureStack";
 pub const CAPTURE_STACK_EDGE: &str = "captureStackEdge";
 
+/// The review window is prewarmed this long after the first card, once its flight is over and
+/// before the capsule folds.
+const WARM_AFTER: Duration = Duration::from_millis(900);
+
 /// With the stack on, the Completed capsule stays this long, then folds.
 const CAPSULE_AFTER_CARD: Duration = Duration::from_millis(1_300);
 
@@ -24,6 +28,9 @@ pub(super) struct StackState {
     variant: Variant,
     cards: Vec<(u64, PathBuf)>,
     next_id: u64,
+    /// When the first card came: `prewarm_review_window` runs once it has landed (a stall while
+    /// it flies would show), then this is cleared.
+    warm_from: Option<std::time::Instant>,
 }
 
 pub(super) fn variant() -> Option<Variant> {
@@ -91,6 +98,7 @@ impl ScrawlCoordinator {
                         variant,
                         cards: Vec::new(),
                         next_id: 1,
+                        warm_from: Some(std::time::Instant::now()),
                     });
                 }
                 Err(err) => {
@@ -198,6 +206,7 @@ impl ScrawlCoordinator {
                     });
                 }
                 StackAction::Open(_) => {
+                    scrawl_log(format!("stack: opening {}", dir.display()));
                     self.mark_handled(&dir);
                     if let Ok((_, bundle)) = crate::handoff::load_bundle(&dir) {
                         self.set_review_bundle((dir, bundle), None);
@@ -210,10 +219,26 @@ impl ScrawlCoordinator {
                 }
             }
         }
+        if let Some(state) = self.capture_stack.as_mut()
+            && state.warm_from.is_some_and(|t| t.elapsed() >= WARM_AFTER)
+        {
+            state.warm_from = None;
+            let entity = cx.entity().clone();
+            cx.defer(move |cx| super::prewarm_review_window(&entity, cx));
+        }
         if let Some(state) = self.capture_stack.as_mut() {
             let frames = state.stack.frames_global();
             state.cards.retain(|(id, _)| frames.iter().any(|f| f.id == *id));
-            self.set_stack_rects(frames.iter().flat_map(|f| [f.rect, f.close]).collect());
+            let pad = stack::model::CLOSE_HIT_PAD;
+            self.set_stack_rects(
+                frames
+                    .iter()
+                    .flat_map(|f| {
+                        let c = f.close;
+                        [f.rect, [c[0] - pad, c[1] - pad, c[2] + 2.0 * pad, c[3] + 2.0 * pad]]
+                    })
+                    .collect(),
+            );
         }
         let pointer_on_pill = self
             .native_pill
