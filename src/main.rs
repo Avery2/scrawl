@@ -2123,7 +2123,7 @@ fn main() -> Result<()> {
             let captures = captures.unwrap_or_else(handoff::default_captures_dir);
             let policy = retention::Policy::load();
             let ahead = Duration::from_secs_f64(days_ahead.max(0.0) * 86_400.0);
-            let (actions, report) = retention::run_pass(&captures, &policy, dry_run, ahead);
+            let (actions, report) = retention::run_pass(&captures, &policy, dry_run, ahead, true);
             for action in &actions {
                 let line = match action {
                     retention::Action::TrashMedia { bundle, .. } => {

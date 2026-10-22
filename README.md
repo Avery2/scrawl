@@ -656,12 +656,12 @@ scrawl export latest --crop 0.1,0.2,0.6,0.5       # x,y,w,h as fractions, or pix
 ## Keeping captures small
 
 Captures would otherwise pile up (mostly video). The app cleans up shortly after launch and then
-daily, at low priority, and logs what it did:
+hourly, at low priority, and logs what it did:
 
-- **Video, audio and full-size frames** (`recording.mp4`/`.mov`, `audio.wav`, `frames-full/`) go
-  to the Trash after 7 days, as one `<bundle> media` folder. The prompt (`summary.md`,
-  `scrawl.json`, `contact-sheet.png`, `frames/`) stays, so pasting and reading still work;
-  `scrawl zoom` says the video was cleaned up.
+- **Video, audio and full-size frames** (`recording.mp4`/`.mov`, `audio.wav`, `frames-full/`),
+  plus the `zoom/` sheets made from them, go to the Trash after 7 days, as one `<bundle> media`
+  folder. The prompt (`summary.md`, `scrawl.json`, `contact-sheet.png`, `frames/`) stays, so
+  pasting and reading still work; `scrawl zoom` says the video was cleaned up.
 - **Whole bundles** go to the Trash after 30 days.
 - **Keep recordings** in Settings › Storage picks Video for 7 Days (bundles 30), Video for 30 Days
   (bundles 90), or Forever. It's stored as `"retention": {"mediaDays": 7, "bundleDays": 30}` in
@@ -674,8 +674,8 @@ daily, at low priority, and logs what it did:
 - **iPhone video** from the cable is ~18 Mbps at 1320×2868. A minute after the capture (after any
   copy to another Mac finishes, and never during a recording) `scrawl-helper shrink` re-encodes it
   to HEVC at a 1600 px long edge, audio copied as is and every frame at its original time, and
-  swaps it in place: a 4.5-minute capture goes from 750 MB to 72 MB in about 20 s. Daily passes
-  shrink any native iPhone video that was missed.
+  swaps it in place: a 4.5-minute capture goes from 750 MB to 72 MB in about 20 s. One pass a day
+  shrinks any native iPhone video that was missed.
 
 `scrawl clean --dry-run` prints what a pass would do now.
 
