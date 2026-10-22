@@ -70,6 +70,11 @@ and deltas as the beta. Sparkle's job runs again after the metadata change. The 
 aliases advance, the site deploys, GitHub marks the stable release latest, and a stable Homebrew
 cask bump PR opens. Re-running is safe; promoting behind a newer stable build is refused.
 
+In the promotion's appcast PR, change `"status": "main"` entries in `site/src/features.json` to
+`"stable@<version>"` for features present in the promoted commit. Keep later main-only work as
+`main`, and experiments behind their flags. Cutting a beta never marks features stable. The map's
+release version, like the download buttons and agent files, ignores beta appcast items.
+
 **The app's signed identity still says `0.3.14-beta.2`.** Changing its Info.plist would change the
 tested artifact. The stable release listing and appcast display `0.3.14`, but About and issue
 reports retain the original beta identity and build. Beta users already have those exact bytes

@@ -513,7 +513,7 @@ impl SelectionMode {
     }
 
     fn last_used_path() -> Option<PathBuf> {
-        crate::handoff::default_captures_dir()
+        crate::handoff::builtin_captures_dir()
             .parent()
             .map(|dir| dir.join("last-mode"))
     }

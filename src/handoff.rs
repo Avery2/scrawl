@@ -7,23 +7,75 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::ScrawlBundle;
 
+/// Where captures go: `SCRAWL_CAPTURES_DIR`, else `"capturesDir"` in `config.json` (Settings ›
+/// Storage), else `builtin_captures_dir`. Tests never see the config file.
+pub fn default_captures_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SCRAWL_CAPTURES_DIR") {
+        return PathBuf::from(dir);
+    }
+    let configured = if cfg!(test) {
+        None
+    } else {
+        config().captures_dir
+    };
+    configured
+        .as_deref()
+        .and_then(configured_captures_dir)
+        .filter(|dir| usable_captures_dir(dir))
+        .unwrap_or_else(builtin_captures_dir)
+}
+
+/// A chosen folder that exists (or can be made) and takes writes; otherwise it's logged once and the
+/// built-in folder is used, so a capture is never lost to a missing or unplugged drive.
+fn usable_captures_dir(dir: &Path) -> bool {
+    let usable = fs::create_dir_all(dir).is_ok()
+        && fs::metadata(dir).is_ok_and(|meta| meta.is_dir() && !meta.permissions().readonly());
+    if !usable {
+        log_config_once(format!(
+            "config.json: \"capturesDir\" {} can't be used (missing or not writable); captures go to {}",
+            dir.display(),
+            builtin_captures_dir().display()
+        ));
+    }
+    usable
+}
+
+/// A `"capturesDir"` value as a folder: `~` is the home folder, and only an absolute path counts
+/// (anything else is logged and skipped, so captures never land relative to the app's cwd).
+pub fn configured_captures_dir(value: &str) -> Option<PathBuf> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let path = match value.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => {
+            dirs::home_dir()?.join(rest.trim_start_matches(['/', '\\']))
+        }
+        _ => PathBuf::from(value),
+    };
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        log_config_once(format!(
+            "config.json: ignoring \"capturesDir\": {value} is not an absolute path"
+        ));
+        None
+    }
+}
+
 /// `~/Library/Application Support/scrawl/captures` on macOS, `%LOCALAPPDATA%\scrawl\captures`
 /// on Windows (local, not roaming: the movies are large).
-pub fn default_captures_dir() -> PathBuf {
-    std::env::var_os("SCRAWL_CAPTURES_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "windows") {
-                dirs::data_local_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("scrawl")
-                    .join("captures")
-            } else {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("Library/Application Support/scrawl/captures")
-            }
-        })
+pub fn builtin_captures_dir() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("scrawl")
+            .join("captures")
+    } else {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Library/Application Support/scrawl/captures")
+    }
 }
 
 /// Opens a file, folder or URL with its default app (Finder, Explorer, the browser).
@@ -435,6 +487,9 @@ pub struct Config {
     /// Smart routing's settings (`routing::look`).
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
+    /// Where new captures go (`default_captures_dir`); absent keeps the built-in folder.
+    #[serde(default)]
+    pub captures_dir: Option<String>,
 }
 
 impl Config {
@@ -1949,6 +2004,35 @@ mod tests {
         let cfg_after = load_config_from(&missing);
         assert_eq!(cfg_after.ingest_token.as_deref(), Some(token.as_str()));
         assert!(cfg_after.usb_apps.is_empty());
+    }
+
+    #[test]
+    fn an_unusable_captures_folder_is_refused() {
+        let root = std::env::temp_dir().join(format!("scrawl-usable-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("file");
+        fs::write(&file, "x").unwrap();
+        assert!(!usable_captures_dir(&file.join("inside")));
+        assert!(usable_captures_dir(&root.join("new folder")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn captures_dir_takes_absolute_and_home_paths_only() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(configured_captures_dir("~"), Some(home.clone()));
+        assert_eq!(
+            configured_captures_dir(" ~/Scrawl Captures "),
+            Some(home.join("Scrawl Captures"))
+        );
+        let absolute = std::env::temp_dir().join("captures");
+        assert_eq!(
+            configured_captures_dir(&absolute.display().to_string()),
+            Some(absolute)
+        );
+        assert_eq!(configured_captures_dir("captures"), None);
+        assert_eq!(configured_captures_dir("~someone/captures"), None);
+        assert_eq!(configured_captures_dir("  "), None);
     }
 
     #[test]
