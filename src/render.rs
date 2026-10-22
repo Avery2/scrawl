@@ -680,13 +680,6 @@ fn polyline(frame: &mut RgbaFrame, points: &[[f32; 2]], radius: f32, color: Colo
     }
 }
 
-pub fn render_contact_sheet(
-    bundle: &ScrawlBundle,
-    annotated_frames: &[(Keyframe, RgbaFrame)],
-) -> RgbaFrame {
-    render_contact_sheet_for_duration(bundle.duration_ms, annotated_frames)
-}
-
 const SHEET_PAD: u32 = 6;
 const SHEET_GAP: u32 = 6;
 const SHEET_BG: Color = [28, 29, 34, 255];
@@ -1813,52 +1806,6 @@ mod tests {
         }
     }
 
-    fn bundle() -> ScrawlBundle {
-        ScrawlBundle {
-            version: 1,
-            id: "render-test".into(),
-            created_at_ms: 0,
-            duration_ms: 8000,
-            target: TargetInfo {
-                mode: CaptureMode::Window,
-                app: Some("Demo".into()),
-                bundle_id: None,
-                window_title: Some("Tool activity".into()),
-                window_id: None,
-                display_id: 1,
-                frame: TargetFrame {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 320.0,
-                    height: 200.0,
-                    scale: 1.0,
-                },
-            },
-            transcript: TranscriptData {
-                text: "Click the tool header and inspect the layout shift.".into(),
-                ..Default::default()
-            },
-            note: None,
-            strokes: vec![],
-            marks: vec![],
-            events: vec![],
-            keyframes: vec![],
-            contact_sheet: "contact-sheet.png".into(),
-            video: None,
-            video_offset_ms: 0,
-            audio: None,
-            source: None,
-            device: None,
-            context: Default::default(),
-            context_changes: Vec::new(),
-            screens: Vec::new(),
-            windows: Vec::new(),
-            cursor: Vec::new(),
-            autocrop: None,
-            destination: None,
-        }
-    }
-
     #[test]
     fn opaque_rounded_spans_match_source_over_edges_and_clipping() {
         for rect in [
@@ -2192,7 +2139,7 @@ mod tests {
                         )
                     })
                     .collect();
-                let sheet = render_contact_sheet(&bundle(), &frames);
+                let sheet = render_contact_sheet_for_duration(8000, &frames);
                 assert!(
                     sheet.width <= SHEET_MAX_EDGE as u32 && sheet.height <= SHEET_MAX_EDGE as u32,
                     "Sheet {}x{} exceeded max edge for count={count} size={size:?}",
@@ -2255,7 +2202,7 @@ mod tests {
                 (key(i), solid(w, h, [50 + i as u8 * 15, 90, 130, 255]))
             })
             .collect();
-        let sheet = render_contact_sheet(&bundle(), &frames);
+        let sheet = render_contact_sheet_for_duration(8000, &frames);
         let w = sheet.width as usize;
         let h = sheet.height as usize;
         let pad = SHEET_PAD as usize;
@@ -2347,7 +2294,7 @@ mod tests {
         );
         assert!(lines.len() > 2);
         assert!(lines.iter().all(|s| text_width(s, 16.0, false) <= 81.0));
-        let sheet = render_contact_sheet(&bundle(), &[]);
+        let sheet = render_contact_sheet_for_duration(8000, &[]);
         assert!(sheet.width > 0 && sheet.height > 0);
     }
 }

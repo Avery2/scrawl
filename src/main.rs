@@ -69,7 +69,7 @@ use crate::model::{
     TargetFrame, TargetInfo, TranscriptData, TranscriptSegment, WordTiming, keyframe_budget,
     parse_clock_ms,
 };
-use crate::render::{render_contact_sheet, render_synthetic_demo_frame};
+use crate::render::render_synthetic_demo_frame;
 use crate::sketch::{marks_of, summary_markdown};
 
 #[derive(Parser)]
@@ -1127,169 +1127,118 @@ pub fn build_bundle_from_parts(
                     && a.file == b.file
             })
     });
-    if matches_prepared {
+    enum BundleOutput {
+        Prepared(PreparedVisuals),
+        Rendered {
+            annotated: Vec<(model::Keyframe, RgbaFrame)>,
+            cropped: Option<(model::AutocropInfo, Vec<(model::Keyframe, RgbaFrame)>)>,
+            full_sheet: Option<RgbaFrame>,
+            contact_sheet: RgbaFrame,
+        },
+    }
+
+    let mut extras = extras;
+    let (keyframes, autocrop, selected_at, annotated_at, rendered_at, output) = if matches_prepared
+    {
         drop(frames);
-        let prep = extras.prepared.unwrap();
+        let mut prep = extras.prepared.take().unwrap();
         let keyframes: Vec<model::Keyframe> = selected.into_iter().map(|(kf, _)| kf).collect();
         let selected_at = std::time::Instant::now();
-        let annotated_at = selected_at;
-        let rendered_at = selected_at;
-        let id = bundle_dir
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("scrawl-bundle")
-            .to_string();
-        let video_rel = video_path.and_then(|p| {
-            p.exists()
-                .then(|| p.file_name()?.to_str().map(str::to_owned))
-                .flatten()
-        });
-        let audio_rel = bundle_dir
-            .join("audio.wav")
-            .exists()
-            .then(|| "audio.wav".to_string());
-        let bundle = ScrawlBundle {
-            version: 1,
-            id,
-            created_at_ms: now_epoch_ms(),
-            duration_ms,
-            target,
-            transcript,
-            note,
-            strokes,
-            marks,
-            events,
+        let autocrop = prep.autocrop.take();
+        (
             keyframes,
-            contact_sheet: "contact-sheet.png".into(),
-            video: video_rel,
-            video_offset_ms: extras.video_offset_ms,
-            audio: audio_rel,
-            source: extras.source,
-            device: extras.device,
-            context: extras.context,
-            context_changes: extras.context_changes,
-            screens: extras.screens,
-            windows: extras.activity.windows,
-            cursor: extras.activity.cursor,
-            autocrop: prep.autocrop,
-            destination: None,
+            autocrop,
+            selected_at,
+            selected_at,
+            selected_at,
+            BundleOutput::Prepared(prep),
+        )
+    } else {
+        // Only the first candidate is needed from here on (auto-crop's baseline); free the rest
+        // before the full-size keyframes arrive.
+        let baseline = {
+            let mut frames = frames;
+            frames.truncate(1);
+            frames.pop()
         };
-        let summary = summary_markdown(&bundle, bundle_dir);
-        std::fs::create_dir_all(bundle_dir.join("frames"))
-            .with_context(|| format!("could not create {}", bundle_dir.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(bundle_dir, std::fs::Permissions::from_mode(0o700));
-        }
-        std::fs::write(
-            bundle_dir.join(&bundle.contact_sheet),
-            &prep.contact_sheet_png,
-        )?;
-        for (rel, bytes) in &prep.frame_pngs {
-            std::fs::write(bundle_dir.join(rel), bytes)?;
-        }
-        if let (Some(info), Some(full_sheet_png)) = (&bundle.autocrop, &prep.full_sheet_png) {
-            let full_dir = bundle_dir.join(&info.full_frames);
-            std::fs::create_dir_all(&full_dir)?;
-            std::fs::write(bundle_dir.join(&info.full_contact_sheet), full_sheet_png)?;
-            for (name, bytes) in &prep.full_frame_pngs {
-                std::fs::write(full_dir.join(name), bytes)?;
-            }
-        }
-        let manifest_bytes = serde_json::to_vec_pretty(&bundle)?;
-        std::fs::write(bundle_dir.join("scrawl.json"), manifest_bytes)?;
-        std::fs::write(bundle_dir.join("summary.md"), summary.as_bytes())?;
-        let finished = std::time::Instant::now();
-        let select_ms = (select_only_at - started).as_millis() as u64;
-        let decode_ms = (selected_at - select_only_at).as_millis() as u64;
-        let autocrop_ms = (annotated_at - selected_at).as_millis() as u64;
-        let sheet_ms = (rendered_at - annotated_at).as_millis() as u64;
-        let write_ms = (finished - rendered_at).as_millis() as u64;
-        let total_ms = (finished - total_started).as_millis() as u64;
-        let mut parts = Vec::with_capacity(10);
-        if let Some(ms) = extras.timings.stop_ms {
-            parts.push(format!("stop {ms}ms"));
-        }
-        if let Some(ms) = extras.timings.audio_ms {
-            parts.push(format!("audio {ms}ms"));
-        }
-        if let Some(ms) = extras.timings.candidates_ms {
-            parts.push(format!("candidates {ms}ms"));
-        }
-        if let Some(ms) = extras.timings.transcribe_ms {
-            parts.push(format!("transcribe {ms}ms"));
-        }
-        parts.extend([
-            format!("select {select_ms}ms"),
-            format!("decode {decode_ms}ms"),
-            format!("autocrop {autocrop_ms}ms"),
-            format!("sheet {sheet_ms}ms"),
-            format!("write {write_ms}ms"),
-            format!("total {total_ms}ms"),
-        ]);
-        capture::scrawl_log(format!("finish timings: {}", parts.join(" · ")));
-        mark_transcript_pending(bundle_dir, &bundle);
-        return Ok((bundle_dir.to_path_buf(), bundle, summary));
-    }
-    // Only the first candidate is needed from here on (auto-crop's baseline); free the rest
-    // before the full-size keyframes arrive.
-    let baseline = {
-        let mut frames = frames;
-        frames.truncate(1);
-        frames.pop()
-    };
-    let selected = match &extras.full_frames {
-        Some(decode) if !selected.is_empty() => {
-            let times: Vec<u64> = selected.iter().map(|(k, _)| k.t).collect();
-            match decode(&times) {
-                Ok(full) => {
-                    let total = selected.len();
-                    let (merged, matched) = merge_full_keyframes(selected, full);
-                    if matched < total {
-                        capture::scrawl_log(format!(
-                            "Full-quality keyframes: decoded {matched} of {total}"
-                        ));
+        let selected = match &extras.full_frames {
+            Some(decode) if !selected.is_empty() => {
+                let times: Vec<u64> = selected.iter().map(|(k, _)| k.t).collect();
+                match decode(&times) {
+                    Ok(full) => {
+                        let total = selected.len();
+                        let (merged, matched) = merge_full_keyframes(selected, full);
+                        if matched < total {
+                            capture::scrawl_log(format!(
+                                "Full-quality keyframes: decoded {matched} of {total}"
+                            ));
+                        }
+                        merged
                     }
-                    merged
-                }
-                Err(error) => {
-                    capture::scrawl_log(format!("Full-quality keyframes failed: {error:#}"));
-                    selected
+                    Err(error) => {
+                        capture::scrawl_log(format!("Full-quality keyframes failed: {error:#}"));
+                        selected
+                    }
                 }
             }
-        }
-        _ => selected,
-    };
-    let selected_at = std::time::Instant::now();
+            _ => selected,
+        };
+        let selected_at = std::time::Instant::now();
 
-    let crop_settings = match extras.autocrop {
-        Some(settings) => settings,
-        None if target.mode == CaptureMode::Display => autocrop::Settings::configured(),
-        None => None,
+        let crop_settings = match extras.autocrop {
+            Some(settings) => settings,
+            None if target.mode == CaptureMode::Display => autocrop::Settings::configured(),
+            None => None,
+        };
+        let (mut annotated_frames, mut cropped) = autocrop::annotate_and_crop(
+            selected,
+            baseline.as_ref(),
+            crop_settings.as_ref(),
+            &target,
+            duration_ms,
+            &strokes,
+            &marks,
+            &events,
+            &extras.activity.windows,
+            &extras.activity.cursor,
+        );
+        let keyframes: Vec<model::Keyframe> =
+            annotated_frames.iter().map(|(kf, _)| kf.clone()).collect();
+        let annotated_at = std::time::Instant::now();
+
+        let (full_sheet, contact_sheet) = std::thread::scope(|scope| {
+            let full_handle = cropped.as_ref().map(|(_, full)| {
+                scope.spawn(|| render::render_contact_sheet_for_duration(duration_ms, full))
+            });
+            let sheet = render::render_contact_sheet_for_duration(duration_ms, &annotated_frames);
+            (full_handle.map(|h| h.join().unwrap()), sheet)
+        });
+        render::stamp_keyframe_badges(&mut annotated_frames);
+        if let Some((_, full)) = &mut cropped {
+            render::stamp_keyframe_badges(full);
+        }
+        let rendered_at = std::time::Instant::now();
+        let autocrop = cropped.as_ref().map(|(info, _)| info.clone());
+        (
+            keyframes,
+            autocrop,
+            selected_at,
+            annotated_at,
+            rendered_at,
+            BundleOutput::Rendered {
+                annotated: annotated_frames,
+                cropped,
+                full_sheet,
+                contact_sheet,
+            },
+        )
     };
-    let (mut annotated_frames, mut cropped) = autocrop::annotate_and_crop(
-        selected,
-        baseline.as_ref(),
-        crop_settings.as_ref(),
-        &target,
-        duration_ms,
-        &strokes,
-        &marks,
-        &events,
-        &extras.activity.windows,
-        &extras.activity.cursor,
-    );
-    let keyframes: Vec<model::Keyframe> =
-        annotated_frames.iter().map(|(kf, _)| kf.clone()).collect();
-    let annotated_at = std::time::Instant::now();
 
     let id = bundle_dir
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("scrawl-bundle")
         .to_string();
-
     let video_rel = video_path.and_then(|p| {
         p.exists()
             .then(|| p.file_name()?.to_str().map(str::to_owned))
@@ -1323,44 +1272,64 @@ pub fn build_bundle_from_parts(
         screens: extras.screens,
         windows: extras.activity.windows,
         cursor: extras.activity.cursor,
-        autocrop: cropped.as_ref().map(|(info, _)| info.clone()),
+        autocrop,
         destination: None,
     };
-
-    let (full_sheet, contact_sheet) = std::thread::scope(|scope| {
-        let full_handle = cropped
-            .as_ref()
-            .map(|(_, full)| scope.spawn(|| render_contact_sheet(&bundle, full)));
-        let sheet = render_contact_sheet(&bundle, &annotated_frames);
-        (full_handle.map(|h| h.join().unwrap()), sheet)
-    });
-    render::stamp_keyframe_badges(&mut annotated_frames);
-    if let Some((_, full)) = &mut cropped {
-        render::stamp_keyframe_badges(full);
-    }
-    let rendered_at = std::time::Instant::now();
     let summary = summary_markdown(&bundle, bundle_dir);
-    std::thread::scope(|scope| -> Result<()> {
-        let full_write = match (&cropped, &full_sheet) {
-            (Some((info, full)), Some(sheet)) => {
-                Some(scope.spawn(|| autocrop::write_full_frames(bundle_dir, info, full, sheet)))
+
+    match output {
+        BundleOutput::Prepared(prep) => {
+            std::fs::create_dir_all(bundle_dir.join("frames"))
+                .with_context(|| format!("could not create {}", bundle_dir.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(bundle_dir, std::fs::Permissions::from_mode(0o700));
             }
-            _ => None,
-        };
-        write_bundle_artifacts(
-            bundle_dir,
-            &bundle,
-            &annotated_frames,
-            &contact_sheet,
-            &summary,
-        )?;
-        if let Some(handle) = full_write {
-            handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("Full-frame writer panicked"))??;
+            std::fs::write(
+                bundle_dir.join(&bundle.contact_sheet),
+                &prep.contact_sheet_png,
+            )?;
+            for (rel, bytes) in &prep.frame_pngs {
+                std::fs::write(bundle_dir.join(rel), bytes)?;
+            }
+            if let (Some(info), Some(full_sheet_png)) = (&bundle.autocrop, &prep.full_sheet_png) {
+                let full_dir = bundle_dir.join(&info.full_frames);
+                std::fs::create_dir_all(&full_dir)?;
+                std::fs::write(bundle_dir.join(&info.full_contact_sheet), full_sheet_png)?;
+                for (name, bytes) in &prep.full_frame_pngs {
+                    std::fs::write(full_dir.join(name), bytes)?;
+                }
+            }
+            let manifest_bytes = serde_json::to_vec_pretty(&bundle)?;
+            std::fs::write(bundle_dir.join("scrawl.json"), manifest_bytes)?;
+            std::fs::write(bundle_dir.join("summary.md"), summary.as_bytes())?;
         }
-        Ok(())
-    })?;
+        BundleOutput::Rendered {
+            annotated,
+            cropped,
+            full_sheet,
+            contact_sheet,
+        } => {
+            std::thread::scope(|scope| -> Result<()> {
+                let full_write = match (&cropped, &full_sheet) {
+                    (Some((info, full)), Some(sheet)) => Some(
+                        scope.spawn(|| autocrop::write_full_frames(bundle_dir, info, full, sheet)),
+                    ),
+                    _ => None,
+                };
+                write_bundle_artifacts(bundle_dir, &bundle, &annotated, &contact_sheet, &summary)?;
+                if let Some(handle) = full_write {
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("Full-frame writer panicked"))??;
+                }
+                Ok(())
+            })?;
+        }
+    }
+
     let finished = std::time::Instant::now();
     let select_ms = (select_only_at - started).as_millis() as u64;
     let decode_ms = (selected_at - select_only_at).as_millis() as u64;
@@ -1390,7 +1359,7 @@ pub fn build_bundle_from_parts(
         format!("total {total_ms}ms"),
     ]);
     capture::scrawl_log(format!("finish timings: {}", parts.join(" · ")));
-    if bench {
+    if bench && !matches_prepared {
         for (name, elapsed) in [
             ("selection_ms", selected_at - started),
             ("annotation_ms", annotated_at - selected_at),
@@ -1775,19 +1744,23 @@ fn main() -> Result<()> {
             if let Some(iters) = bench {
                 let iters = iters.max(1);
                 let video_name = video.file_name().context("Bad video name")?.to_owned();
+                let prep_iter = |i: u32| -> Result<(PathBuf, PathBuf)> {
+                    let iter_out = if i + 1 == iters {
+                        out.clone()
+                    } else {
+                        out.with_file_name(format!("bench-{i}.scrawl"))
+                    };
+                    let _ = std::fs::remove_dir_all(&iter_out);
+                    std::fs::create_dir_all(&iter_out)?;
+                    let linked = iter_out.join(&video_name);
+                    std::fs::hard_link(&video, &linked)
+                        .or_else(|_| std::fs::copy(&video, &linked).map(|_| ()))?;
+                    Ok((iter_out, linked))
+                };
                 let mut runs_ms = Vec::with_capacity(iters as usize);
                 if let Some(device) = old.device.clone() {
                     for i in 0..iters {
-                        let iter_out = if i + 1 == iters {
-                            out.clone()
-                        } else {
-                            out.with_file_name(format!("bench-{i}.scrawl"))
-                        };
-                        let _ = std::fs::remove_dir_all(&iter_out);
-                        std::fs::create_dir_all(&iter_out)?;
-                        let linked = iter_out.join(&video_name);
-                        std::fs::hard_link(&video, &linked)
-                            .or_else(|_| std::fs::copy(&video, &linked).map(|_| ()))?;
+                        let (iter_out, linked) = prep_iter(i)?;
                         let t0 = std::time::Instant::now();
                         phone::build_movie_bundle(
                             &iter_out,
@@ -1841,16 +1814,7 @@ fn main() -> Result<()> {
                         .map(std::fs::read)
                         .transpose()?;
                     for i in 0..iters {
-                        let iter_out = if i + 1 == iters {
-                            out.clone()
-                        } else {
-                            out.with_file_name(format!("bench-{i}.scrawl"))
-                        };
-                        let _ = std::fs::remove_dir_all(&iter_out);
-                        std::fs::create_dir_all(&iter_out)?;
-                        let linked = iter_out.join(&video_name);
-                        std::fs::hard_link(&video, &linked)
-                            .or_else(|_| std::fs::copy(&video, &linked).map(|_| ()))?;
+                        let (iter_out, linked) = prep_iter(i)?;
                         let iter_frames = candidates.clone();
                         let iter_strokes = old.strokes.clone();
                         let iter_events = old.events.clone();
@@ -2391,29 +2355,21 @@ fn main() -> Result<()> {
         Command::Route {
             url,
             browser,
-            explain: Some(bundle),
+            explain,
         } => {
-            let url = match browser {
-                Some(browser) => Some(
+            let url = match (url, browser) {
+                (Some(url), _) => Some(url),
+                (None, Some(browser)) => Some(
                     routing::browser_tab_url(&browser)
                         .with_context(|| format!("Couldn't read the front tab of {browser}"))?,
                 ),
-                None => url,
+                (None, None) => None,
             };
-            print!("{}", routing::explain_bundle(&bundle, url.as_deref())?);
-            Ok(())
-        }
-        Command::Route {
-            url,
-            browser,
-            explain: None,
-        } => {
-            let url = match (url, browser) {
-                (Some(url), _) => url,
-                (None, Some(browser)) => routing::browser_tab_url(&browser)
-                    .with_context(|| format!("Couldn't read the front tab of {browser}"))?,
-                (None, None) => anyhow::bail!("Pass --url or --browser"),
-            };
+            if let Some(bundle) = explain {
+                print!("{}", routing::explain_bundle(&bundle, url.as_deref())?);
+                return Ok(());
+            }
+            let url = url.context("Pass --url or --browser")?;
             match routing::route(&url, &routing::Hooks::default()) {
                 Ok(dest) => println!("{}", serde_json::to_string_pretty(&dest)?),
                 Err(reason) => println!("{url}: clipboard only ({reason})"),

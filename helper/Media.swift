@@ -252,13 +252,7 @@ enum Recognizer {
       segments.append(contentsOf: segs)
       words.append(contentsOf: wrds)
     }
-    return [
-      "engine": choice.name,
-      "locale": choice.locale.identifier,
-      "text": segments.compactMap { $0["text"] as? String }.joined(separator: " "),
-      "segments": segments,
-      "words": words,
-    ]
+    return Transcriber.result(choice, segments: segments, words: words)
   }
 
   /// The final transcription, or nil for audio without speech. Cancelled after `timeout` seconds.
@@ -357,7 +351,7 @@ enum Transcriber {
         return result
       }
     }
-    let locale = choice.locale
+    let (segments, words): ([[String: Any]], [[String: Any]])
     if let chunks = try? splitWavAtSilences(url), chunks.files.count > 1 {
       defer { try? FileManager.default.removeItem(at: chunks.dir) }
       let ordered = try await withThrowingTaskGroup(of: (Int, [[String: Any]], [[String: Any]]).self) { group in
@@ -373,28 +367,12 @@ enum Transcriber {
         }
         return collected.sorted { $0.0 < $1.0 }
       }
-      var segments: [[String: Any]] = []
-      var words: [[String: Any]] = []
-      for (_, segs, wrds) in ordered {
-        segments.append(contentsOf: segs)
-        words.append(contentsOf: wrds)
-      }
-      return [
-        "engine": choice.name,
-        "locale": locale.identifier,
-        "text": segments.compactMap { $0["text"] as? String }.joined(separator: " "),
-        "segments": segments,
-        "words": words,
-      ]
+      segments = ordered.flatMap(\.1)
+      words = ordered.flatMap(\.2)
+    } else {
+      (segments, words) = try await transcribeSingle(url, choice: choice, offsetMs: 0)
     }
-    let (segments, words) = try await transcribeSingle(url, choice: choice, offsetMs: 0)
-    return [
-      "engine": choice.name,
-      "locale": locale.identifier,
-      "text": segments.compactMap { $0["text"] as? String }.joined(separator: " "),
-      "segments": segments,
-      "words": words,
-    ]
+    return result(choice, segments: segments, words: words)
   }
 
   @available(macOS 26, *)
@@ -424,6 +402,16 @@ enum Transcriber {
     return (segments, words)
   }
   #endif
+
+  static func result(_ choice: SpeechChoice, segments: [[String: Any]], words: [[String: Any]]) -> [String: Any] {
+    [
+      "engine": choice.name,
+      "locale": choice.locale.identifier,
+      "text": segments.compactMap { $0["text"] as? String }.joined(separator: " "),
+      "segments": segments,
+      "words": words,
+    ]
+  }
 
   static func missing(_ choice: SpeechChoice?, _ reason: String) -> [String: Any] {
     var result: [String: Any] = ["locale": choice?.locale.identifier ?? Locale.current.identifier, "text": "", "segments": [], "words": [], "missing": reason]
@@ -496,20 +484,9 @@ enum Transcriber {
       let c1 = cuts[idx + 1]
       let byte0 = pcmStart + c0 * 32
       let byte1 = min(data.count, pcmStart + c1 * 32)
-      let sliceLen = byte1 - byte0
-      guard sliceLen > 0 else { continue }
-      var header = Data()
-      func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { header.append(contentsOf: $0) } }
-      func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { header.append(contentsOf: $0) } }
-      header.append(contentsOf: Array("RIFF".utf8)); u32(UInt32(36 + sliceLen))
-      header.append(contentsOf: Array("WAVE".utf8))
-      header.append(contentsOf: Array("fmt ".utf8)); u32(16); u16(1); u16(1); u32(16000); u32(32000); u16(2); u16(16)
-      header.append(contentsOf: Array("data".utf8)); u32(UInt32(sliceLen))
-      var chunkData = Data(capacity: 44 + sliceLen)
-      chunkData.append(header)
-      chunkData.append(data[byte0..<byte1])
+      guard byte1 > byte0 else { continue }
       let chunkUrl = dir.appending(path: "chunk-\(idx).wav")
-      try chunkData.write(to: chunkUrl)
+      try Media.wav16kMono(data[byte0..<byte1]).write(to: chunkUrl)
       files.append((c0, chunkUrl))
     }
     return WavChunks(dir: dir, files: files)
@@ -752,14 +729,19 @@ enum Media {
       pcm.append(chunk)
     }
     if reader.status == .failed { throw HelperError(reader.error?.localizedDescription ?? "Audio export failed") }
-    var header = Data()
-    func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { header.append(contentsOf: $0) } }
-    func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { header.append(contentsOf: $0) } }
-    header.append(contentsOf: Array("RIFF".utf8)); u32(UInt32(36 + pcm.count))
-    header.append(contentsOf: Array("WAVE".utf8))
-    header.append(contentsOf: Array("fmt ".utf8)); u32(16); u16(1); u16(1); u32(16000); u32(32000); u16(2); u16(16)
-    header.append(contentsOf: Array("data".utf8)); u32(UInt32(pcm.count))
-    try (header + pcm).write(to: wav)
+    try wav16kMono(pcm).write(to: wav)
     return ["path": wav.path, "samples": pcm.count / 2, "durationMs": pcm.count / 32]
+  }
+
+  static func wav16kMono(_ pcm: Data) -> Data {
+    var out = Data(capacity: 44 + pcm.count)
+    func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { out.append(contentsOf: $0) } }
+    func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { out.append(contentsOf: $0) } }
+    out.append(contentsOf: Array("RIFF".utf8)); u32(UInt32(36 + pcm.count))
+    out.append(contentsOf: Array("WAVE".utf8))
+    out.append(contentsOf: Array("fmt ".utf8)); u32(16); u16(1); u16(1); u32(16000); u32(32000); u16(2); u16(16)
+    out.append(contentsOf: Array("data".utf8)); u32(UInt32(pcm.count))
+    out.append(pcm)
+    return out
   }
 }
