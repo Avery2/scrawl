@@ -1052,6 +1052,17 @@ pub fn import(
 
 pub const DEFAULT_INGEST_PORT: u16 = 47777;
 
+/// The port this process serves on. `SCRAWL_INGEST_PORT` moves a second copy of Scrawl (a fork,
+/// or `scrawl serve --port`) off the installed app's port, so both can listen at once and
+/// `web::lookup` asks the right one.
+pub fn ingest_port() -> u16 {
+    std::env::var("SCRAWL_INGEST_PORT")
+        .ok()
+        .and_then(|port| port.trim().parse().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(DEFAULT_INGEST_PORT)
+}
+
 pub type IngestCallback = Arc<dyn Fn(PathBuf, ScrawlBundle, Option<String>) + Send + Sync>;
 
 #[derive(Clone, Default)]
@@ -1260,10 +1271,11 @@ pub fn start_ingest_server(ui_sender: flume::Sender<LiveOverlayEvent>) {
         ..IngestConfig::default()
     };
     let http_cfg = config.clone();
+    let port = ingest_port();
     let _ = std::thread::Builder::new()
         .name("scrawl-ingest-http".into())
         .spawn(move || {
-            if let Err(err) = serve_http(DEFAULT_INGEST_PORT, http_cfg) {
+            if let Err(err) = serve_http(port, http_cfg) {
                 scrawl_log(format!("ingest server: {err:#}"));
             }
         });

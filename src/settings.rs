@@ -148,10 +148,7 @@ fn from_stored(kind: ShortcutKind, stored: Stored) -> Option<ShortcutConfig> {
 }
 
 fn legacy_path() -> PathBuf {
-    crate::handoff::builtin_captures_dir()
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
-        .join("config.json")
+    crate::handoff::state_dir().join("config.json")
 }
 
 fn read_json(path: &Path) -> serde_json::Value {
@@ -864,8 +861,10 @@ impl CapturesDirView {
             .and_then(crate::handoff::configured_captures_dir);
         Self {
             custom: chosen.is_some(),
+            // The folder captures actually land in: `SCRAWL_CAPTURES_DIR` can point elsewhere
+            // than `"capturesDir"` does, and the pane should name the one in use.
             path: crate::command_line::tilde(
-                &chosen.unwrap_or_else(crate::handoff::builtin_captures_dir),
+                &chosen.unwrap_or_else(crate::handoff::default_captures_dir),
             ),
         }
     }

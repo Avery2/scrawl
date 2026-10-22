@@ -79,10 +79,7 @@ pub struct Inbox {
 
 impl Inbox {
     pub fn default_path() -> PathBuf {
-        crate::handoff::builtin_captures_dir()
-            .parent()
-            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
-            .join("inbox.json")
+        crate::handoff::state_dir().join("inbox.json")
     }
 
     pub fn load_default() -> Self {

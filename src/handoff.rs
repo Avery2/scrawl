@@ -63,6 +63,16 @@ pub fn configured_captures_dir(value: &str) -> Option<PathBuf> {
     }
 }
 
+/// Where Scrawl's small state files live (`inbox.json`, `last-mode`, a 0.3.x `config.json`):
+/// beside the captures folder it actually uses, so a build pointed at another captures folder
+/// (`SCRAWL_CAPTURES_DIR`, or a fork's own `"capturesDir"`) keeps its state over there too
+/// instead of sharing the installed app's.
+pub fn state_dir() -> PathBuf {
+    default_captures_dir()
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
 /// `~/Library/Application Support/scrawl/captures` on macOS, `%LOCALAPPDATA%\scrawl\captures`
 /// on Windows (local, not roaming: the movies are large).
 pub fn builtin_captures_dir() -> PathBuf {

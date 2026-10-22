@@ -512,24 +512,18 @@ impl SelectionMode {
         Self::ALL.into_iter().find(|mode| mode.key() == key.trim())
     }
 
-    fn last_used_path() -> Option<PathBuf> {
-        crate::handoff::builtin_captures_dir()
-            .parent()
-            .map(|dir| dir.join("last-mode"))
+    fn last_used_path() -> PathBuf {
+        crate::handoff::state_dir().join("last-mode")
     }
 
     /// The mode the last recording used; the picker opens on it.
     fn load_last_used() -> Self {
-        Self::last_used_path()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|text| Self::from_key(&text))
+        Self::from_key(&std::fs::read_to_string(Self::last_used_path()).unwrap_or_default())
             .unwrap_or(Self::Area)
     }
 
     fn save_last_used(self) {
-        if let Some(path) = Self::last_used_path() {
-            let _ = std::fs::write(path, self.key());
-        }
+        let _ = std::fs::write(Self::last_used_path(), self.key());
     }
 
     /// Modes shown in the HUD, in order; iPhone only while one is cabled.

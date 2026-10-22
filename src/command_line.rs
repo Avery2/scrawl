@@ -10,7 +10,19 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-const NAME: &str = "scrawl";
+/// The name of the command-line link, `scrawl` unless `SCRAWL_CLI_NAME` says otherwise. A fork
+/// sets it (`scrawl-fork`) so its Settings › Agents can't re-point the installed Scrawl's link,
+/// which would run the fork's binary against the installed app's config and captures.
+fn name() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::var("SCRAWL_CLI_NAME")
+            .ok()
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty() && !name.contains(['/', '\\']))
+            .unwrap_or_else(|| "scrawl".to_owned())
+    })
+}
 
 /// The binary to link and the folders to look in.
 #[derive(Clone, Debug)]
@@ -92,7 +104,7 @@ fn links_to(link: &Path, target: &Path) -> bool {
 fn from_homebrew(link: &Path) -> bool {
     link.parent()
         .and_then(Path::parent)
-        .is_some_and(|prefix| prefix.join("Caskroom").join(NAME).is_dir())
+        .is_some_and(|prefix| prefix.join("Caskroom").join(name()).is_dir())
 }
 
 pub fn state(places: &Places) -> State {
@@ -103,7 +115,7 @@ pub fn state(places: &Places) -> State {
         .install
         .iter()
         .chain(&places.also)
-        .map(|dir| dir.join(NAME))
+        .map(|dir| dir.join(name()))
         .find(|link| links_to(link, target))
     {
         let homebrew = from_homebrew(&link);
@@ -119,7 +131,7 @@ pub fn state(places: &Places) -> State {
     else {
         return State::Nowhere;
     };
-    let link = dir.join(NAME);
+    let link = dir.join(name());
     if link.symlink_metadata().is_err() {
         State::Missing { link }
     } else if scrawl_link(&link) {
@@ -143,7 +155,7 @@ pub fn install(places: &Places) -> Result<PathBuf> {
     let dir = link.parent().context("no folder")?;
     std::fs::create_dir_all(dir).with_context(|| format!("couldn't create {}", tilde(dir)))?;
     // Made beside it and renamed over, so a stale link is replaced in one step.
-    let temp = dir.join(format!(".{NAME}-{}", std::process::id()));
+    let temp = dir.join(format!(".{}-{}", name(), std::process::id()));
     let _ = std::fs::remove_file(&temp);
     symlink(target, &temp).with_context(|| format!("couldn't write to {}", tilde(dir)))?;
     std::fs::rename(&temp, &link).inspect_err(|_| {

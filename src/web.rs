@@ -117,10 +117,7 @@ pub fn lookup(url: &str) -> Option<Registration> {
         return registry().lookup(url, now);
     }
     // `SCRAWL_INGEST_PORT` points at a `scrawl serve --port` other than the app's.
-    let port = std::env::var("SCRAWL_INGEST_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(crate::phone::DEFAULT_INGEST_PORT);
+    let port = crate::phone::ingest_port();
     let mut remote = Registry::default();
     for reg in fetch_registrations(port).ok()? {
         remote.entries.push(reg);
