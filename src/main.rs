@@ -887,22 +887,16 @@ pub fn finalize_capture_bundle(
         }
     }
     let has_wav = wav_path.exists();
-    recover::write(
+    write_capture_journal(
         bundle_dir,
-        &recover::Unfinished {
-            target: target.clone(),
-            duration_ms,
-            video: video_path
-                .as_ref()
-                .and_then(|v| v.file_name())
-                .map(|name| name.to_string_lossy().into_owned()),
-            video_offset_ms,
-            strokes: strokes.clone(),
-            events: events.clone(),
-            note: note.clone(),
-            windows: activity.windows.clone(),
-            cursor: activity.cursor.clone(),
-        },
+        &target,
+        duration_ms,
+        video_path.as_deref(),
+        video_offset_ms,
+        &strokes,
+        &events,
+        note.as_deref(),
+        &activity,
     );
     let crop_settings = (target.mode == CaptureMode::Display)
         .then(autocrop::Settings::configured)
@@ -1000,6 +994,39 @@ pub fn finalize_capture_bundle(
         recover::finished(bundle_dir);
     }
     built
+}
+
+/// Writes the journal `scrawl recover` rebuilds a bundle from: the target, ink, clicks, windows
+/// and cursor that only live in memory. The build writes it before it starts, and a cancelled
+/// capture writes it without building at all, so neither loses the marks.
+#[allow(clippy::too_many_arguments)]
+pub fn write_capture_journal(
+    bundle_dir: &Path,
+    target: &TargetInfo,
+    duration_ms: u64,
+    video: Option<&Path>,
+    video_offset_ms: u64,
+    strokes: &[Stroke],
+    events: &[InteractionEvent],
+    note: Option<&str>,
+    activity: &windows::ActivityLog,
+) {
+    recover::write(
+        bundle_dir,
+        &recover::Unfinished {
+            target: target.clone(),
+            duration_ms,
+            video: video
+                .and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned()),
+            video_offset_ms,
+            strokes: strokes.to_vec(),
+            events: events.to_vec(),
+            note: note.map(str::to_owned),
+            windows: activity.windows.clone(),
+            cursor: activity.cursor.clone(),
+        },
+    );
 }
 
 /// Builds a Screen capture's bundle in `out`, which holds its video and `audio.wav`, from them

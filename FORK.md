@@ -35,6 +35,7 @@ Everything here is either outside the Rust sources or a small, commented patch, 
 | `src/handoff.rs` (`state_dir`) + `src/inbox.rs`, `src/ui.rs`, `src/settings.rs` | `inbox.json`, `last-mode` and the 0.3.x config migration follow the captures folder actually in use | they used to sit beside the *built-in* folder, so the fork and the installed app shared (and clobbered) each other's iPhone inbox and picker mode |
 | `src/settings.rs` (`CapturesDirView`) | Storage shows `default_captures_dir()`, the folder captures actually land in | it showed `"capturesDir"` or the built-in folder while sizing the effective one |
 | `src/main.rs`, `src/audio.rs`, `src/ui.rs`, `src/native/pill/` | a capture that fails says so: `Pres::Failed` / `IslandPhase::Failed` shows a red ✕ and "Couldn't save audio" or "Couldn't build capture" instead of a green check and "Copied", and a WAV the disk refuses keeps its journal for `scrawl recover` | before, the `let _ = std::fs::write("audio.wav")` was discarded and a failed build fell through to the Completed island, so the pill claimed a copy that never happened |
+| `src/ui.rs` (`discard_recording`, `quit_keeping_capture`), `src/main.rs` (`write_capture_journal`) | Escape keeps a capture past 1.5 s (video + narration + journal, built by `scrawl recover`), and ⌘Q finishes a recording or build before quitting | Escape deleted the bundle outright, and ⌘Q killed the process mid-capture, keeping nothing (or half a bundle) |
 
 The fork's own config is seeded once, on first install, at `~/.config/scrawl-fork/config.json`:
 `"capturesDir"`, record **⌥⇧D** and paste **⌥⇧F** (so the two apps' Carbon hotkeys don't collide —
@@ -80,18 +81,23 @@ Already solved in Scrawl, by a stronger mechanism — don't port:
 - *Acknowledge the stop / cancelled session*: the Completed pill says Copied / Sent / couldn't
   reach, and Escape is handled explicitly.
 
-Cheap, real gaps worth doing first (all in `src/ui.rs` unless noted):
+Real gaps still open:
 
 1. A dead microphone still looks like a recording: `AudioRecorder::start().ok()` and no level or
    state on the pill.
-2. Escape `remove_dir_all`s the bundle (`discard_recording`); Hex's lesson is that cancelling is
-   about the paste, not keeping the words.
-3. ⌘Q during a recording quits mid-capture and keeps nothing.
 
-Done in this fork: a failed build or a WAV the disk refused now shows `Couldn't build capture` /
-`Couldn't save audio` on a red island instead of a green "Copied".
+Done in this fork:
+
+- **A failed build no longer says "Copied"**: `Pres::Failed` / `IslandPhase::Failed` shows a red ✕
+  with `Couldn't save audio` (the disk refused the WAV, whose journal is kept) or `Couldn't build
+  capture`, and there is no Paste or Inspect over a bundle that isn't there.
+- **Escape keeps the capture.** `discard_recording` used to `remove_dir_all` the bundle. Past
+  1.5 s it now keeps the video, the narration and the journal (ink, clicks, windows, cursor), so
+  `scrawl recover` builds it at the next launch; a shorter one is still deleted.
+- **⌘Q finishes the capture first** (keyboard and the menu's Quit): it used to kill the process
+  mid-recording and keep nothing, or mid-build and keep half a bundle.
 
 Real work, in value order: durable audio written while recording (Hex's `DurableAudioWriter`
 equivalent) so a crash keeps the narration; the live transcript on the pill (Hex shows the newest
 words while you speak — Scrawl's `liveTranscribe` experiment only speeds up the final transcript
-and publishes nothing); and honest failure states during a capture.
+and publishes nothing).

@@ -231,6 +231,10 @@ fn completed_label(inbox_count: usize, note: Option<&str>) -> String {
 /// How long a smart-routed capture waits, showing "Sending to …", before it is sent.
 const SMART_SEND_UNDO: Duration = Duration::from_millis(3_000);
 
+/// A recording cancelled with Escape is kept once it has this much in it: enough that the screen
+/// or the narration caught something worth rebuilding, not a shortcut pressed by mistake.
+const CANCELLED_KEEPS_AFTER: Duration = Duration::from_millis(1_500);
+
 fn truncate_title(title: &str, max: usize) -> String {
     if title.chars().count() > max {
         format!(
@@ -790,6 +794,9 @@ pub struct ScrawlCoordinator {
     /// `scrawl lab pill`: recordings are pretend (`CaptureSource::Lab`), the picker takes no
     /// input and opens no overlay, and nothing looks for windows or phones.
     lab: bool,
+    /// ⌘Q pressed while a capture was recording or building: quit once its bundle is on disk
+    /// instead of killing the process mid-capture.
+    quit_after_capture: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -866,6 +873,7 @@ impl ScrawlCoordinator {
             shortcut: crate::shortcut::Shortcut::default(),
             hold_mods: 0,
             lab: false,
+            quit_after_capture: false,
         }
     }
 
@@ -1382,22 +1390,59 @@ impl ScrawlCoordinator {
         }
     }
 
-    /// Stops the active recording and deletes its bundle, leaving the island as it is. Returns
-    /// its target and overlay.
+    /// Stops the active recording, leaving the island as it is. Returns its target and overlay.
+    ///
+    /// A cancelled capture is one we won't build or deliver, not one that never happened: past a
+    /// moment of real recording, its video, narration and journal stay on disk and
+    /// `scrawl recover` builds it later, ink and clicks included. Only a capture cancelled before
+    /// it caught anything is deleted. (The iPhone has no journal to keep: `session.cancel()`
+    /// drops its native video.)
     fn discard_recording(&mut self) -> Option<(TargetInfo, Option<LaserOverlay>)> {
         let rec = self.active_recording.take()?;
-        let _ = self.telemetry.finish_session();
+        let (events, strokes) = self.telemetry.finish_session();
+        let keep = rec.started.elapsed() >= CANCELLED_KEEPS_AFTER;
         match rec.source {
-            CaptureSource::Screen { session, audio, .. } => {
-                let _ = session.stop();
-                if let Some(audio) = audio {
-                    let _ = audio.stop();
+            CaptureSource::Screen {
+                session,
+                audio,
+                windows,
+            } => {
+                let recording = session.stop();
+                let recorded_audio = audio.and_then(|audio| audio.stop().ok());
+                if keep {
+                    if let Some(recorded) = recorded_audio {
+                        let _ = std::fs::create_dir_all(&rec.bundle_dir);
+                        let _ = std::fs::write(
+                            rec.bundle_dir.join("audio.wav"),
+                            &recorded.wav_bytes,
+                        );
+                    }
+                    let activity = windows
+                        .map(crate::windows::WindowLogger::stop)
+                        .unwrap_or_default();
+                    crate::write_capture_journal(
+                        &rec.bundle_dir,
+                        &rec.target,
+                        recording.duration_ms,
+                        recording.video.as_deref(),
+                        recording.video_offset_ms,
+                        &strokes,
+                        &events,
+                        None,
+                        &activity,
+                    );
+                    crate::capture::scrawl_log(format!(
+                        "cancelled capture kept at {}; `scrawl recover` builds it",
+                        rec.bundle_dir.display()
+                    ));
                 }
             }
             CaptureSource::Phone(session) => session.cancel(),
             CaptureSource::Lab => return Some((rec.target, rec._metal_overlay)),
         }
-        let _ = std::fs::remove_dir_all(rec.bundle_dir);
+        if !keep {
+            let _ = std::fs::remove_dir_all(&rec.bundle_dir);
+        }
         Some((rec.target, rec._metal_overlay))
     }
 
@@ -1592,7 +1637,11 @@ impl ScrawlCoordinator {
             return false;
         }
         match keystroke.key.as_str() {
-            "q" => cx.quit(),
+            "q" => {
+                if self.quit_keeping_capture(cx) {
+                    cx.quit();
+                }
+            }
             "," => {
                 if self.is_selecting() {
                     self.cancel_recording(cx);
@@ -2794,6 +2843,22 @@ impl ScrawlCoordinator {
         }
     }
 
+    /// ⌘Q, and the menu's Quit. A capture in flight is finished first: quitting mid-recording
+    /// kept the video and threw away the words, and quitting mid-build left a half-written
+    /// bundle. One second of building is worth more than a capture you can't get back.
+    pub fn quit_keeping_capture(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.is_recording() {
+            self.quit_after_capture = true;
+            self.finish_recording(cx);
+            false
+        } else if self.is_processing() {
+            self.quit_after_capture = true;
+            false
+        } else {
+            true
+        }
+    }
+
     pub fn cancel_recording(&mut self, cx: &mut Context<Self>) {
         self.playback.take();
         scrawl_log("cancel_recording invoked");
@@ -2979,6 +3044,10 @@ impl ScrawlCoordinator {
                             inbox_count: 0,
                         },
                     });
+                    // ⌘Q waited for this: the bundle (or the failure) is on disk and on screen.
+                    if std::mem::take(&mut coord.quit_after_capture) {
+                        cx.quit();
+                    }
                     cx.notify();
                     routed
                 })
@@ -5568,7 +5637,9 @@ pub fn run_app(
                                     platform::check_for_updates();
                                 }
                                 MenuAction::Quit => {
-                                    should_quit = true;
+                                    should_quit = loop_coord.update(cx, |coord, cx| {
+                                        coord.quit_keeping_capture(cx)
+                                    });
                                 }
                             }
                         }
