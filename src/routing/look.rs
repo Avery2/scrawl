@@ -8,12 +8,14 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use super::served;
 use super::smart::{Address, Candidate, Clue, Evidence, Folder, Pointer, Source, words};
 use super::{Hooks, WebUrl, parse_url, project_root, run_with_timeout};
-use crate::handoff::{ApiGet, query_escape};
+use crate::handoff::{
+    ApiGet, OpenCodeSession, Scan, find_root_session, get_session, normalize_slug, query_escape,
+};
 use crate::model::ScrawlBundle;
 
 /// Pages of newest root sessions read (100 each), besides the exact-folder and by-ID reads.
@@ -220,15 +222,7 @@ pub fn look_at_page(
 fn root_session(get: &mut ApiGet, id: &str) -> String {
     let mut current = id.to_owned();
     for _ in 0..5 {
-        let Some(parent) = get(&format!("/api/session/{}", query_escape(&current)))
-            .ok()
-            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
-            .and_then(|value| {
-                serde_json::from_value::<RawSession>(value.get("data").unwrap_or(&value).clone())
-                    .ok()
-            })
-            .and_then(|session| session.parent_id)
-        else {
+        let Some(parent) = get_session(get, &current).ok().and_then(|s| s.parent_id) else {
             break;
         };
         current = parent;
@@ -501,7 +495,7 @@ fn app_checkout(
         };
         let named = path
             .file_name()
-            .is_some_and(|name| names.contains(&squash(&name.to_string_lossy())));
+            .is_some_and(|name| names.contains(&normalize_slug(&name.to_string_lossy())));
         if named && !super::smart::is_home_or_root(path) && !found.iter().any(|(p, _)| *p == path) {
             found.push((path, repo));
         }
@@ -529,23 +523,15 @@ fn app_names(app: &str, bundle_id: &str) -> Vec<String> {
         "nightly", "canary", "preview", "mac", "macos", "helper", "client",
     ];
     let mut names = Vec::new();
-    let parts = std::iter::once(squash(app))
-        .chain(app.split_whitespace().map(squash))
-        .chain(bundle_id.split('.').map(squash));
+    let parts = std::iter::once(normalize_slug(app))
+        .chain(app.split_whitespace().map(normalize_slug))
+        .chain(bundle_id.split('.').map(normalize_slug));
     for name in parts {
         if name.len() >= 3 && !GENERIC.contains(&name.as_str()) && !names.contains(&name) {
             names.push(name);
         }
     }
     names
-}
-
-/// Lowercase letters and digits only: "OpenCode Beta" → "opencodebeta".
-fn squash(text: &str) -> String {
-    text.chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|c| c.to_ascii_lowercase())
-        .collect()
 }
 
 /// What a capture of OpenCode Desktop is about: OpenCode's own interface (the composer, a
@@ -798,80 +784,19 @@ pub fn repo_of(dir: &Path) -> Option<PathBuf> {
 
 // MARK: Sessions
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawSession {
-    id: String,
-    #[serde(default)]
-    title: String,
-    #[serde(default, rename = "parentID")]
-    parent_id: Option<String>,
-    #[serde(default)]
-    time: RawTime,
-    #[serde(default)]
-    location: Option<RawLocation>,
-    #[serde(default)]
-    directory: Option<String>,
-}
-
-#[derive(serde::Deserialize, Default)]
-struct RawTime {
-    #[serde(default)]
-    updated: u64,
-    #[serde(default)]
-    viewed: Option<u64>,
-    #[serde(default)]
-    archived: Option<u64>,
-}
-
-#[derive(serde::Deserialize)]
-struct RawLocation {
-    #[serde(default)]
-    directory: Option<String>,
-}
-
-impl RawSession {
-    fn open_root(&self) -> bool {
-        self.parent_id.is_none() && self.time.archived.is_none()
+fn candidate(session: OpenCodeSession, repos: &mut HashMap<PathBuf, Option<PathBuf>>) -> Candidate {
+    let directory = session.directory().map(PathBuf::from);
+    let repo = directory
+        .as_ref()
+        .and_then(|d| repos.entry(d.clone()).or_insert_with(|| repo_of(d)).clone());
+    Candidate {
+        id: session.id,
+        title: session.title,
+        directory,
+        repo,
+        updated_ms: session.time.updated,
+        viewed_ms: session.time.viewed,
     }
-
-    fn candidate(self, repos: &mut HashMap<PathBuf, Option<PathBuf>>) -> Candidate {
-        let directory = self
-            .location
-            .and_then(|l| l.directory)
-            .or(self.directory)
-            .filter(|d| !d.is_empty())
-            .map(PathBuf::from);
-        let repo = directory
-            .as_ref()
-            .and_then(|d| repos.entry(d.clone()).or_insert_with(|| repo_of(d)).clone());
-        Candidate {
-            id: self.id,
-            title: self.title,
-            directory,
-            repo,
-            updated_ms: self.time.updated,
-            viewed_ms: self.time.viewed,
-        }
-    }
-}
-
-fn session_list(body: &[u8]) -> Result<(Vec<RawSession>, Option<String>)> {
-    let response: serde_json::Value =
-        serde_json::from_slice(body).context("Invalid OpenCode session response")?;
-    let data = response
-        .as_array()
-        .or_else(|| response.get("data").and_then(|d| d.as_array()))
-        .context("Missing OpenCode session list")?;
-    let sessions = data
-        .iter()
-        .filter_map(|s| serde_json::from_value::<RawSession>(s.clone()).ok())
-        .collect();
-    let next = response
-        .pointer("/cursor/next")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned);
-    Ok((sessions, next))
 }
 
 /// Open root sessions: the newest `pages` pages, the newest page in each of `roots`, and each
@@ -882,58 +807,38 @@ pub fn read_candidates(
     ids: &[String],
     pages: usize,
 ) -> Result<Vec<Candidate>> {
-    let mut raw: Vec<RawSession> = Vec::new();
-    let add = |raw: &mut Vec<RawSession>, session: RawSession| {
+    let mut raw: Vec<OpenCodeSession> = Vec::new();
+    let add = |raw: &mut Vec<OpenCodeSession>, session: OpenCodeSession| {
         if !raw.iter().any(|s| s.id == session.id) {
             raw.push(session);
         }
     };
-    let mut path = "/api/session?parentID=null&limit=100".to_owned();
-    let mut cursors = std::collections::HashSet::new();
-    for _ in 0..pages {
-        let (sessions, next) = session_list(&get(&path)?)?;
-        let empty = sessions.is_empty();
-        for session in sessions.into_iter().filter(RawSession::open_root) {
-            add(&mut raw, session);
-        }
-        match next {
-            Some(next) if !empty && cursors.insert(next.clone()) => {
-                path = format!("/api/session?cursor={}&limit=100", query_escape(&next));
-            }
-            _ => break,
-        }
-    }
+    find_root_session(get, "", pages, |session| {
+        add(&mut raw, session.clone());
+        Scan::Skip
+    })?;
     for root in roots {
         if super::smart::is_home_or_root(root) {
             continue;
         }
-        let path = format!(
-            "/api/session?parentID=null&limit=100&directory={}",
-            query_escape(&root.to_string_lossy())
-        );
-        let (sessions, _) = session_list(&get(&path)?)?;
-        for session in sessions.into_iter().filter(RawSession::open_root) {
-            add(&mut raw, session);
-        }
+        let query = format!("&directory={}", query_escape(&root.to_string_lossy()));
+        find_root_session(get, &query, 1, |session| {
+            add(&mut raw, session.clone());
+            Scan::Skip
+        })?;
     }
     for id in ids {
-        if raw.iter().any(|s| &s.id == id) {
-            continue;
-        }
-        let Ok(body) = get(&format!("/api/session/{}", query_escape(id))) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
-            continue;
-        };
-        if let Ok(session) =
-            serde_json::from_value::<RawSession>(value.get("data").unwrap_or(&value).clone())
+        if !raw.iter().any(|s| &s.id == id)
+            && let Ok(session) = get_session(get, id)
         {
             add(&mut raw, session);
         }
     }
     let mut repos = HashMap::new();
-    Ok(raw.into_iter().map(|s| s.candidate(&mut repos)).collect())
+    Ok(raw
+        .into_iter()
+        .map(|s| candidate(s, &mut repos))
+        .collect())
 }
 
 // MARK: This Mac's own names

@@ -932,11 +932,10 @@ fn shortcut_view(
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum Action {
-    /// A settings control: `launchAtLogin`, `autoSend`, `videoExport` (bool), `microphone`
-    /// ("default" or a device id), `transcriber` ("apple"/"hex"), `hexModel` (an id),
-    /// `hexLanguage` (a code), `appleLocale` (a locale id or "auto"), `retention` (a preset id).
-    /// ("default" or a device id), `transcriber` ("apple"/"hex"/"command"), `hexModel` (an id),
-    /// `hexLanguage` (a code), `retention` (a preset id).
+    /// A settings control: `launchAtLogin`, `autoSend`, `videoExport`, `lowerPlayback` (bool),
+    /// `playbackLevel` (u8), `microphone` ("default" or a device id), `transcriber`
+    /// ("apple"/"hex"/"command"), `hexModel` (an id), `hexLanguage` (a code), `appleLocale`
+    /// (a locale id or "auto"), `retention` (a preset id).
     Set {
         key: String,
         value: serde_json::Value,

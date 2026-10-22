@@ -125,9 +125,6 @@ pub enum LiveOverlayEvent {
     CaptureShortcut,
     PasteLatestShortcut,
     UndoStroke,
-    /// macOS's Esc hotkey; Windows polls Esc from key state.
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
-    CancelCapture,
     RequestSnapshot,
     /// The iPhone mirror ended on its own (unplugged, never found, or access denied).
     PhoneEnded,
@@ -464,10 +461,6 @@ pub(crate) fn hotkey_combos(kind: ShortcutKind, cfg: &ShortcutConfig) -> Vec<(u3
     }
     combos
 }
-
-/// No-op: do not register a global Escape hotkey because Karabiner maps CapsLock (Control)
-/// with `to_if_alone: escape`, which would cancel recordings when releasing Control.
-pub fn set_escape_hotkey_enabled(_enabled: bool) {}
 
 fn clean_label(input: &str) -> String {
     let squashed = input.split_whitespace().collect::<Vec<_>>().join(" ");

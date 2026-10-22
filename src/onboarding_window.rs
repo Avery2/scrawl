@@ -318,9 +318,7 @@ fn set_visible(window: Option<&mut Window>, visible: bool) {
 #[cfg(not(target_os = "windows"))]
 fn set_visible(_window: Option<&mut Window>, _visible: bool) {}
 
-fn ease_out_cubic(t: f32) -> f32 {
-    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
-}
+use crate::ui::ease_out_cubic;
 
 fn number_word(n: usize) -> String {
     ["zero", "one", "two", "three", "four", "five"]

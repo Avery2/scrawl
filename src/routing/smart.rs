@@ -133,13 +133,7 @@ impl Source {
         match self {
             Self::Page => "sdk",
             Self::Port => "localhost",
-            Self::Publisher => "publisher",
-            Self::Terminal => "terminal",
-            Self::Document => "document",
-            Self::Viewed => "viewed",
-            Self::App => "app",
-            Self::Title => "title",
-            Self::Speech => "speech",
+            other => other.label(),
         }
     }
 
