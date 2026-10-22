@@ -171,7 +171,8 @@ granted and each on-demand sheet: `target/debug/scrawl-helper onboarding --rende
 - **Recording**: the microphone, with its input level, the transcriber (Apple Speech with its
   language, Hex while it runs, with its model and language, or Command when it's configured) and,
   under Experimental, Video export.
-- **Storage**: how long recordings are kept, how much space the captures take, and Show in Finder.
+- **Storage**: how long recordings are kept, where new captures go (Change…/Reset on macOS, `"capturesDir"` in
+  `~/.config/scrawl/config.json` everywhere; captures already made stay put, and an unusable folder falls back to the built-in one), how much space they take, and Show in Finder.
 - **Permissions**: the onboarding checklist, so a permission can be turned on later.
 - **Agents**: Install or Uninstall the `scrawl` command (see [Agents](#agents)), and the skill's
   install command with Copy. A `scrawl` that belongs to another program is left alone.
