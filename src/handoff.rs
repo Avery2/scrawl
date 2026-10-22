@@ -313,6 +313,8 @@ pub struct OpenCodeSessionLocation {
 pub struct OpenCodeSessionTime {
     #[serde(default)]
     pub updated: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewed: Option<u64>,
     #[serde(default)]
     pub archived: Option<u64>,
 }
@@ -1085,28 +1087,13 @@ fn non_empty(value: Option<&str>) -> Option<String> {
 /// The socket address in `http://127.0.0.1:4096…` when its host is an IP or `localhost` (no
 /// lookups).
 fn server_address(url: &str) -> Option<std::net::SocketAddr> {
-    let rest = url.split_whitespace().next()?;
-    let (scheme, rest) = rest.split_once("://")?;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let default_port = if scheme == "https" { 443 } else { 80 };
-    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
-        let (host, rest) = v6.split_once(']')?;
-        match rest.strip_prefix(':') {
-            Some(port) => (host, port.parse().ok()?),
-            None => (host, default_port),
-        }
-    } else {
-        match authority.rsplit_once(':') {
-            Some((host, port)) => (host, port.parse().ok()?),
-            None => (authority, default_port),
-        }
-    };
-    let ip = if host.eq_ignore_ascii_case("localhost") {
+    let parsed = crate::routing::parse_url(url.split_whitespace().next()?)?;
+    let ip = if parsed.host == "localhost" {
         std::net::IpAddr::from([127, 0, 0, 1])
     } else {
-        host.parse().ok()?
+        parsed.host.parse().ok()?
     };
-    Some(std::net::SocketAddr::new(ip, port))
+    Some(std::net::SocketAddr::new(ip, parsed.port))
 }
 
 fn resolve_server(
@@ -1284,8 +1271,10 @@ pub fn find_root_session(
             .as_array()
             .or_else(|| response.get("data").and_then(|data| data.as_array()))
             .context("Missing OpenCode session list")?;
-        for session in data {
-            let session = serde_json::from_value::<OpenCodeSession>(session.clone())?;
+        for session in data
+            .iter()
+            .filter_map(|s| serde_json::from_value::<OpenCodeSession>(s.clone()).ok())
+        {
             // The API has no archived filter.
             if !session.is_open_root() {
                 continue;
@@ -1311,7 +1300,7 @@ pub fn find_root_session(
     Ok(None)
 }
 
-fn normalize_slug(text: &str) -> String {
+pub(crate) fn normalize_slug(text: &str) -> String {
     text.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
@@ -2179,6 +2168,7 @@ pub(crate) mod fake_api {
             parent_id: None,
             time: OpenCodeSessionTime {
                 updated,
+                viewed: None,
                 archived: None,
             },
             location: Some(OpenCodeSessionLocation {
@@ -2188,30 +2178,15 @@ pub(crate) mod fake_api {
         }
     }
 
-    fn decode(text: &str) -> String {
-        let bytes = text.as_bytes();
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%' {
-                out.push(u8::from_str_radix(&text[i + 1..i + 3], 16).unwrap());
-                i += 3;
-            } else {
-                out.push(bytes[i]);
-                i += 1;
-            }
-        }
-        String::from_utf8(out).unwrap()
-    }
-
     /// Answers `GET /api/session/{id}` and `GET /api/session?…` like OpenCode 2: newest first,
     /// `parentID=null`, exact `directory`, `limit` (default 50), and a cursor carrying the filters.
     pub fn serve(sessions: &[OpenCodeSession], path: &str) -> Result<Vec<u8>> {
+        use crate::ax::percent_decode;
         let (route, query) = path.split_once('?').unwrap_or((path, ""));
         if let Some(id) = route.strip_prefix("/api/session/") {
             let session = sessions
                 .iter()
-                .find(|s| s.id == decode(id))
+                .find(|s| s.id == percent_decode(id))
                 .context("404 Not Found")?;
             return Ok(serde_json::to_vec(&serde_json::json!({ "data": session }))?);
         }
@@ -2219,7 +2194,7 @@ pub(crate) mod fake_api {
         let mut params: std::collections::HashMap<String, String> = query
             .split('&')
             .filter_map(|pair| pair.split_once('='))
-            .map(|(k, v)| (k.to_owned(), decode(v)))
+            .map(|(k, v)| (k.to_owned(), percent_decode(v)))
             .collect();
         let mut offset = 0;
         if let Some(cursor) = params.remove("cursor") {

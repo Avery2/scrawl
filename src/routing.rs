@@ -311,8 +311,7 @@ pub fn session_for_directory(
     whole_tree: bool,
 ) -> Result<Option<OpenCodeSession>> {
     use crate::handoff::{ROOT_SEARCH_PAGES, Scan, find_root_session, query_escape};
-    let home = dirs::home_dir();
-    if root == Path::new("/") || Some(root) == home.as_deref() {
+    if smart::is_home_or_root(root) {
         return Ok(None);
     }
     let directory = format!("&directory={}", query_escape(&root.to_string_lossy()));
@@ -422,12 +421,16 @@ pub fn route(url: &str, hooks: &Hooks) -> std::result::Result<Destination, Strin
     by_directory(&mut api, &dir, "localhost")
 }
 
+fn routing_enabled() -> bool {
+    crate::handoff::auto_send() && std::env::var_os("SCRAWL_NO_OPENCODE").is_none()
+}
+
 /// Decides where a capture that just finished goes; `None` (logged) keeps it on the clipboard.
 pub fn route_capture(
     front_bundle_id: Option<&str>,
     target_bundle_id: Option<&str>,
 ) -> Option<Destination> {
-    if !crate::handoff::auto_send() || std::env::var_os("SCRAWL_NO_OPENCODE").is_some() {
+    if !routing_enabled() {
         return None;
     }
     let url = capture_url(front_bundle_id, target_bundle_id)?;
@@ -452,14 +455,13 @@ pub fn look_capture(
     front_bundle_id: Option<&str>,
     target_bundle_id: Option<&str>,
 ) -> Option<look::Live> {
-    if !crate::handoff::auto_send() || std::env::var_os("SCRAWL_NO_OPENCODE").is_some() {
-        return None;
-    }
-    Some(look::look_live(
-        front_bundle_id,
-        target_bundle_id,
-        &look::Senses::default(),
-    ))
+    routing_enabled().then(|| {
+        look::look_live(
+            front_bundle_id,
+            target_bundle_id,
+            &look::Senses::default(),
+        )
+    })
 }
 
 /// Smart routing's second half, once the bundle is built: decides, saves the evidence beside
@@ -593,22 +595,9 @@ pub fn record_destination(dir: &Path, bundle: &mut ScrawlBundle, dest: Destinati
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handoff::{OpenCodeSessionLocation, OpenCodeSessionTime};
 
     fn session(id: &str, dir: &str, updated: u64) -> OpenCodeSession {
-        OpenCodeSession {
-            id: id.into(),
-            title: id.to_uppercase(),
-            parent_id: None,
-            time: OpenCodeSessionTime {
-                updated,
-                archived: None,
-            },
-            location: Some(OpenCodeSessionLocation {
-                directory: Some(dir.into()),
-            }),
-            directory: None,
-        }
+        crate::handoff::fake_api::session(id, &id.to_uppercase(), dir, updated)
     }
 
     #[test]
