@@ -1,6 +1,6 @@
 //! Hex (the local dictation app) as an optional transcriber, through its desktop local API v2
-//! (`HEX_APPLICATION_SUPPORT_DIR` or `~/Library/Application Support/voice-control/local-api.json`
-//! holds the port and bearer token; `GET /health`, `GET /models`, `POST /transcriptions`).
+//! (`HEX_APPLICATION_SUPPORT_DIR` or `~/Library/Application Support/hex/local-api.json`, or
+//! `voice-control` before Hex moved it, holds the port and bearer token; `GET /health`, `GET /models`, `POST /transcriptions`).
 //!
 //! Hex returns text and a duration but no word times, and Scrawl needs them to hand each
 //! keyframe its words. So the recording is cut into speech islands (`audio::speech_islands`),
@@ -89,15 +89,24 @@ struct Discovery {
 }
 
 /// Hex's support folder, as Hex's `app_paths::support_dir` resolves it: `~/Library/Application
-/// Support/voice-control` on macOS, `%APPDATA%\voice-control` on Windows.
+/// Support/hex` on macOS (`voice-control` before Hex moved it), `%APPDATA%\voice-control` on Windows.
 pub fn support_dir() -> PathBuf {
     std::env::var_os("HEX_APPLICATION_SUPPORT_DIR")
         .map(PathBuf::from)
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or_else(|| {
-            dirs::data_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("voice-control")
+            let data = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+            let legacy = data.join("voice-control");
+            // Hex on macOS moved its data from voice-control to hex, leaving a symlink; an
+            // unmigrated voice-control folder stays in use. Windows keeps voice-control.
+            if cfg!(target_os = "macos")
+                && (std::fs::read_link(&legacy).is_ok_and(|target| target.ends_with("hex"))
+                    || !legacy.exists())
+            {
+                data.join("hex")
+            } else {
+                legacy
+            }
         })
 }
 
