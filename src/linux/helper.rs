@@ -44,6 +44,8 @@ pub struct SpeechModelLine {
     #[serde(default)]
     pub locale: Option<String>,
     #[serde(default)]
+    pub locales: Option<Vec<String>>,
+    #[serde(default)]
     pub progress: Option<f64>,
     #[serde(default)]
     pub error: Option<String>,

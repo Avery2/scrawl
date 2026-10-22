@@ -958,7 +958,7 @@ impl SettingsWindow {
         let caption_text = if recording && shortcut.clearable {
             format!(
                 "Press the new shortcut. Esc cancels, {} turns it off.",
-                if WINDOWS { "Backspace" } else { "Delete" }
+                if WINDOWS || LINUX { "Backspace" } else { "Delete" }
             )
         } else if recording {
             "Press the new shortcut. Esc cancels.".to_owned()

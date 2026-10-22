@@ -250,11 +250,12 @@ impl Pressed {
     }
 }
 
-#[cfg(target_os = "windows")]
+/// Windows virtual keys (Linux stores shortcuts the same way): Backspace, Delete.
+#[cfg(not(target_os = "macos"))]
 const DELETE_KEYS: [u32; 2] = [0x08, 0x2E];
 
 /// `kVK_Delete`, `kVK_ForwardDelete`.
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
 const DELETE_KEYS: [u32; 2] = [51, 117];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
