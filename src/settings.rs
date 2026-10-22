@@ -148,7 +148,7 @@ fn from_stored(kind: ShortcutKind, stored: Stored) -> Option<ShortcutConfig> {
 }
 
 fn legacy_path() -> PathBuf {
-    crate::handoff::default_captures_dir()
+    crate::handoff::builtin_captures_dir()
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
         .join("config.json")
@@ -684,6 +684,7 @@ pub struct View {
     pub retention: RetentionView,
     /// How much the captures folder takes, once measured.
     pub captures_size: Option<String>,
+    pub captures_dir: CapturesDirView,
     pub permissions: Vec<PermissionView>,
     pub updates: bool,
     pub command_line: CommandLineView,
@@ -901,6 +902,31 @@ pub struct ModelView {
     pub id: String,
     pub title: String,
     pub chosen: bool,
+}
+
+/// Settings › Storage › Location: where new captures go (`"capturesDir"`).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapturesDirView {
+    /// The folder, with the home folder as `~`.
+    pub path: String,
+    /// Chosen in Settings rather than the built-in folder, so Reset shows.
+    pub custom: bool,
+}
+
+impl CapturesDirView {
+    fn new(config: &crate::handoff::Config) -> Self {
+        let chosen = config
+            .captures_dir
+            .as_deref()
+            .and_then(crate::handoff::configured_captures_dir);
+        Self {
+            custom: chosen.is_some(),
+            path: crate::command_line::tilde(
+                &chosen.unwrap_or_else(crate::handoff::builtin_captures_dir),
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1265,6 +1291,23 @@ impl Panel {
                     return Effect::SpeechModel;
                 }
             }
+            // An absolute folder from the helper's open panel; "" or null is the built-in one.
+            // Captures already made stay where they are.
+            ("capturesDir", serde_json::Value::Null) => {
+                write(key, serde_json::Value::Null);
+                return Effect::Measure;
+            }
+            ("capturesDir", serde_json::Value::String(dir)) => {
+                if dir.trim().is_empty() {
+                    write(key, serde_json::Value::Null);
+                    return Effect::Measure;
+                }
+                if crate::handoff::configured_captures_dir(dir).is_some() {
+                    write(key, dir.trim().into());
+                    return Effect::Measure;
+                }
+                crate::capture::scrawl_log(format!("Settings: ignoring capturesDir={dir}"));
+            }
             ("retention", serde_json::Value::String(id)) => {
                 if let Some(preset) = crate::retention::Preset::ALL
                     .into_iter()
@@ -1403,6 +1446,7 @@ impl Panel {
                 note: retention_note(&policy),
             },
             captures_size: self.captures_size.map(crate::retention::format_bytes),
+            captures_dir: CapturesDirView::new(&config),
             permissions: order
                 .iter()
                 .filter(|p| p.asked(self.grants.as_ref()))
@@ -2409,6 +2453,48 @@ mod tests {
         set(&mut panel, &mut host, "retention", "forever".into());
         // "Forever" says it all; no caption.
         assert_eq!(panel.view(&host).retention.note, "");
+    }
+
+    #[test]
+    fn the_captures_folder_can_be_chosen_and_reset() {
+        let dir = TempDir::new("captures-dir");
+        let mut host = fake(&dir);
+        let mut panel = Panel::default();
+        let set = |panel: &mut Panel, host: &mut Fake, value: serde_json::Value| {
+            panel.on(
+                Action::Set {
+                    key: "capturesDir".into(),
+                    value,
+                },
+                host,
+            )
+        };
+        let chosen = dir.0.join("My Captures").display().to_string();
+
+        assert_eq!(
+            set(&mut panel, &mut host, chosen.clone().into()),
+            Effect::Measure
+        );
+        assert_eq!(read_json(&host.path)["capturesDir"], chosen.as_str());
+        // A relative folder is turned down and the chosen one kept.
+        assert_eq!(set(&mut panel, &mut host, "captures".into()), Effect::None);
+        assert_eq!(read_json(&host.path)["capturesDir"], chosen.as_str());
+
+        let view = panel.view(&host).captures_dir;
+        assert!(view.custom);
+        assert_eq!(
+            view.path,
+            crate::command_line::tilde(&dir.0.join("My Captures"))
+        );
+
+        assert_eq!(set(&mut panel, &mut host, "".into()), Effect::Measure);
+        assert!(read_json(&host.path).get("capturesDir").is_none());
+        let view = panel.view(&host).captures_dir;
+        assert!(!view.custom);
+        assert_eq!(
+            view.path,
+            crate::command_line::tilde(&crate::handoff::builtin_captures_dir())
+        );
     }
 
     #[test]
