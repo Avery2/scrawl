@@ -58,6 +58,59 @@ for binary in scrawl scrawl-helper; do
   [ -x "target/debug/$binary" ] || { echo "target/debug/$binary is missing" >&2; exit 1; }
 done
 
+# The app is stopped before its bundle is touched. Writing over a running Mach-O can kill it
+# (the kernel faults mapped pages that changed underneath), so assembly happens after the quit,
+# and the quit itself is never blind: a capture in flight is finished first.
+in_flight() {
+  running=0
+  pgrep -f "${APP_DIR}/Contents/MacOS/scrawl" >/dev/null && running=1
+  for dir in "$CAPTURES"/*.scrawl; do
+    [ -d "$dir" ] || continue
+    [ -f "$dir/scrawl.json" ] && continue
+    # A live recording is the only thing that keeps the bundle changing.
+    if [ "$running" = "1" ] && [ -n "$(find "$dir" -maxdepth 1 -mmin -2 2>/dev/null | head -1)" ]; then
+      echo "$dir"
+      return 0
+    fi
+  done
+  return 1
+}
+
+echo "==> Stopping ${APP_NAME}"
+if in_flight_dir=$(in_flight); then
+  if [ "${SCRAWL_FORK_FORCE:-0}" != "1" ]; then
+    echo "A capture is in flight: ${in_flight_dir}" >&2
+    echo "Stop it (or let it finish), then run this again. Nothing was changed." >&2
+    exit 1
+  fi
+  echo "note: SCRAWL_FORK_FORCE=1, restarting over a live capture anyway" >&2
+fi
+
+# Only this bundle's process: a running Scrawl.app from Kit is left alone. SIGTERM asks the app
+# to finish a capture and quit, so this waits instead of killing it; if it doesn't go, nothing
+# here is worth a lost recording.
+pkill -TERM -f "${APP_DIR}/Contents/MacOS/scrawl" 2>/dev/null || true
+for _ in $(seq 1 300); do
+  pgrep -f "${APP_DIR}/Contents/MacOS/scrawl" >/dev/null || break
+  sleep 0.1
+done
+if pgrep -f "${APP_DIR}/Contents/MacOS/scrawl" >/dev/null; then
+  if [ "${SCRAWL_FORK_FORCE:-0}" != "1" ]; then
+    echo "The old ${APP_NAME} is still running (it may be finishing a capture)." >&2
+    echo "Quit it yourself, or rerun with SCRAWL_FORK_FORCE=1 to kill it. Nothing was changed." >&2
+    exit 1
+  fi
+  pkill -KILL -f "${APP_DIR}/Contents/MacOS/scrawl" 2>/dev/null || true
+  sleep 1
+fi
+
+# Left over from an earlier run: nothing is recording it now, so say that recovery owns it.
+for dir in "$CAPTURES"/*.scrawl; do
+  [ -d "$dir" ] || continue
+  [ -f "$dir/scrawl.json" ] && continue
+  echo "note: $(basename "$dir") has no bundle yet; \`scrawl recover $dir\` builds it" >&2
+done
+
 echo "==> Assembling ${APP_DIR}"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 cp -f target/debug/scrawl "$MACOS_DIR/scrawl"
@@ -163,13 +216,6 @@ if [ "${SCRAWL_NO_LAUNCH:-0}" = "1" ]; then
   exit 0
 fi
 
-echo "==> Restarting ${APP_NAME}"
-# Only this bundle's process: a running Scrawl.app from Kit is left alone.
-pkill -f "${APP_DIR}/Contents/MacOS/scrawl" 2>/dev/null || true
-for _ in $(seq 1 40); do
-  pgrep -f "${APP_DIR}/Contents/MacOS/scrawl" >/dev/null || break
-  sleep 0.05
-done
 open -a "$APP_DIR" 2>/dev/null || open -n -a "$APP_DIR"
 sleep 1
 if pgrep -f "${APP_DIR}/Contents/MacOS/scrawl" >/dev/null; then

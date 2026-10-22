@@ -2646,7 +2646,7 @@ impl ScrawlCoordinator {
         });
         start_metric("metal_open_ms", stage);
         let stage = Instant::now();
-        let audio_recorder = AudioRecorder::start().ok();
+        let audio_recorder = AudioRecorder::start(Some(&bundle_dir)).ok();
         start_metric("audio_start_ms", stage);
         let stage = Instant::now();
         let screen_session = ScreenCaptureSession::start(
@@ -5498,6 +5498,42 @@ pub fn run_start_benchmark() {
 
 /// Runs the GPUI desktop app, optionally opening an initial `.scrawl` bundle in the Review window
 /// or starting recording immediately.
+/// Set by SIGTERM/SIGINT: a launcher restarting the app, `pkill`, or a logout asks the app's
+/// loop to finish a capture in flight instead of killing it mid-recording.
+#[cfg(unix)]
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Async-signal-safe: one atomic store, nothing else.
+#[cfg(unix)]
+extern "C" fn request_stop(_signal: libc::c_int) {
+    STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A termination request becomes something the main loop can act on: `quit_keeping_capture`
+/// finishes the recording and its build first. Without this, any `kill` lost the capture.
+#[cfg(unix)]
+fn install_stop_handler() {
+    unsafe {
+        libc::signal(libc::SIGTERM, request_stop as extern "C" fn(libc::c_int) as libc::sighandler_t);
+        libc::signal(libc::SIGINT, request_stop as extern "C" fn(libc::c_int) as libc::sighandler_t);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_stop_handler() {}
+
+/// True only on the first check after a signal arrives, so one request asks once.
+fn take_stop_request() -> bool {
+    #[cfg(unix)]
+    {
+        return STOP_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 pub fn run_app(
     initial_bundle: Option<(PathBuf, ScrawlBundle)>,
     start_recording_immediately: bool,
@@ -5507,6 +5543,7 @@ pub fn run_app(
     let app = Application::new().with_assets(crate::icons::Assets);
     app.run(move |cx: &mut App| {
         scrawl_log(format!("run_app started pid={}", std::process::id()));
+        install_stop_handler();
         platform::keep_alive(cx);
         // ⌘W, Esc, the close button or Scrawl itself: every way a window closes ends up here.
         cx.on_window_closed(|cx| cx.defer(platform::hand_back_keys)).detach();
@@ -5693,6 +5730,13 @@ pub fn run_app(
                     }
 
                     motion::poll_tune();
+                    // SIGTERM or SIGINT: finish a capture in flight, then quit.
+                    if take_stop_request() {
+                        scrawl_log("termination requested; finishing the capture first");
+                        should_quit = loop_coord.update(cx, |coord, cx| {
+                            coord.quit_keeping_capture(cx)
+                        });
+                    }
                     if loop_coord.read(cx).shortcut.is_pending() {
                         loop_coord.update(cx, |coord, cx| coord.tick_shortcut(cx));
                     } else if loop_coord.read(cx).telemetry.take_escape()

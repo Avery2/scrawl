@@ -81,6 +81,9 @@ Already solved in Scrawl, by a stronger mechanism — don't port:
 - *Acknowledge the stop / cancelled session*: the Completed pill says Copied / Sent / couldn't
   reach, and Escape is handled explicitly.
 
+| `src/audio.rs`, `src/main.rs` | the narration is written to `bundle_dir/audio.wav` while it's recorded (header patched at stop, sizes recomputed by `repair_wav_header` after a crash), and `rebuild_screen_bundle_with` repairs before reading it | the samples only ever existed in RAM, so anything that ended the process before `stop()` lost every word of a capture whose video was already on disk |
+| `src/ui.rs` (`install_stop_handler`, `quit_keeping_capture`), `install-fork.sh` | SIGTERM/SIGINT now means "finish the capture, then quit", and the install script stops the app before touching its bundle and refuses to restart while a capture is in flight | `pkill` (mine) killed the app mid-recording; writing over a running Mach-O can kill it on its own |
+
 Real gaps still open:
 
 1. A dead microphone still looks like a recording: `AudioRecorder::start().ok()` and no level or

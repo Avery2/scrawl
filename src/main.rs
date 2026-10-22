@@ -1051,6 +1051,11 @@ pub fn rebuild_screen_bundle_with(
         .context("The bundle has no video")?;
     let wav = out.join("audio.wav");
     let recorded = if wav.is_file() {
+        // A crash leaves the sizes in a durable WAV at their placeholders; fix them before hound
+        // reads it, so a killed capture keeps its words.
+        if let Err(error) = audio::repair_wav_header(&wav) {
+            crate::capture::scrawl_log(format!("recover: {} won't open: {error:#}", wav.display()));
+        }
         Some(audio::recorded_audio_from_wav(std::fs::read(&wav)?)?)
     } else {
         None
@@ -1075,10 +1080,22 @@ pub fn rebuild_screen_bundle_with(
     let full_frames: Option<FullFrames> = Some(Box::new(move |times: &[u64]| {
         movie_frames_at_with(decode, &movie, times, offset, 0)
     }));
+    // A journal written at the start of a recording has no duration yet; the decoded frames do.
+    let duration_ms = if old.duration_ms > 0 {
+        old.duration_ms
+    } else {
+        frames
+            .iter()
+            .map(|frame| frame.t_ms)
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(offset)
+            .saturating_add(250)
+    };
     Ok(build_bundle_from_parts(
         out,
         old.target,
-        old.duration_ms,
+        duration_ms,
         frames,
         old.strokes,
         old.events,
@@ -1686,7 +1703,7 @@ fn main() -> Result<()> {
             std::fs::create_dir_all(&bundle_dir)?;
             let video_path = bundle_dir.join("recording.mp4");
             let playback = playback::Guard::start();
-            let audio = AudioRecorder::start().ok();
+            let audio = AudioRecorder::start(None).ok();
             let session = ScreenCaptureSession::start(
                 target.clone(),
                 Some(video_path),
