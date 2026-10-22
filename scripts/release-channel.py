@@ -175,6 +175,19 @@ def gui_build(manifest, folder):
 
 
 def appcast(manifest, channel):
+    request_path = STORE / "appcast-request.json"
+    job = f"gui/{os.getuid()}/dev.kit.scrawl-appcast"
+    if request_path.exists():
+        previous = json.loads(request_path.read_text())
+        previous_result = Path(previous["result"])
+        if not previous_result.exists():
+            # A caller may have exited after submitting. Finish that request before replacing
+            # it; kickstart leaves an already-running job alone.
+            run("launchctl", "kickstart", job)
+            wait_file(previous_result)
+        if (previous["manifest"] == manifest and previous["channel"] == channel
+                and not json.loads(previous_result.read_text()).get("error")):
+            return
     script = STORE / "appcast.sh"
     backup = STORE / "appcast-before-channels.sh"
     if script.exists() and not backup.exists():
@@ -183,8 +196,8 @@ def appcast(manifest, channel):
     script.chmod(0o755)
     shutil.copy2(Path(__file__), STORE / "release-channel.py")
     result = STORE / f"appcast-result-{uuid.uuid4().hex}.json"
-    save(STORE / "appcast-request.json", {"manifest": manifest, "channel": channel, "result": str(result)})
-    run("launchctl", "kickstart", f"gui/{os.getuid()}/dev.kit.scrawl-appcast")
+    save(request_path, {"manifest": manifest, "channel": channel, "result": str(result)})
+    run("launchctl", "kickstart", job)
     wait_file(result)
 
 

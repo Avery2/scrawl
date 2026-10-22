@@ -16,6 +16,12 @@ brew install --cask kitlangton/tap/scrawl
 
 The app updates itself (Sparkle), so Homebrew leaves updates to it.
 
+On Windows 10 (2004) or later (x64), download the zip from the same page or the
+[latest GitHub release](https://github.com/kitlangton/scrawl/releases/latest), unzip it and run
+`scrawl.exe`. The Windows build is a preview and isn't signed yet, so Windows may say "Windows
+protected your PC": click **More info**, then **Run anyway**. It doesn't update itself yet; see
+[Windows](#windows).
+
 ### Beta updates
 
 On macOS, turn on **Settings › General › Get beta updates**, then choose **Check for Updates…**.
@@ -30,12 +36,6 @@ If an older stable app has no toggle, install a beta DMG first.
 
 Windows and Linux beta archives are GitHub prereleases and are updated manually. Stable downloads
 stay on the website. See [Releasing Scrawl](docs/release.md) for cutting and promoting builds.
-
-On Windows 10 (2004) or later (x64), download the zip from the same page or the
-[latest GitHub release](https://github.com/kitlangton/scrawl/releases/latest), unzip it and run
-`scrawl.exe`. The Windows build is a preview and isn't signed yet, so Windows may say "Windows
-protected your PC": click **More info**, then **Run anyway**. It doesn't update itself yet; see
-[Windows](#windows).
 
 ## Agents
 

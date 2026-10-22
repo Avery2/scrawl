@@ -108,6 +108,20 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn("SUPublicEDKey", json.loads((store / "result.json").read_text())["error"])
             self.assertFalse((store / "updates").exists())
 
+    def test_interrupted_appcast_submission_resumes_the_same_request(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory, patch.object(release, "STORE", Path(directory)):
+            store = Path(directory)
+            manifest = {"build": 18}
+            result = store / "result.json"
+            request = {"manifest": manifest, "channel": "beta", "result": str(result)}
+            (store / "appcast-request.json").write_text(json.dumps(request))
+            with patch.object(release, "run") as run, patch.object(release, "wait_file", side_effect=lambda p: p.write_text("{}")):
+                release.appcast(manifest, "beta")
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(run.call_args.args[:2], ("launchctl", "kickstart"))
+            self.assertEqual(json.loads((store / "appcast-request.json").read_text()), request)
+
 
 if __name__ == "__main__":
     unittest.main()
