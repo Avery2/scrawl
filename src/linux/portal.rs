@@ -301,7 +301,7 @@ fn portal_screencast(window: bool, stopping: &AtomicBool) -> Result<Stream> {
 /// before 48), so the caller can fall back to a desktop keybinding (`bind_gnome_keybindings`).
 pub fn global_shortcuts(
     record_trigger: String,
-    paste_trigger: String,
+    paste_trigger: Option<String>,
     pressed: impl Fn(&str) + Send + 'static,
 ) -> Result<()> {
     use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
@@ -313,12 +313,16 @@ pub fn global_shortcuts(
                 let setup = async {
                     let proxy = GlobalShortcuts::new().await?;
                     let session = proxy.create_session().await?;
-                    let shortcuts = [
+                    let mut shortcuts = vec![
                         NewShortcut::new("record", "Record the screen, or finish recording")
                             .preferred_trigger(record_trigger.as_str()),
-                        NewShortcut::new("paste", "Paste the latest capture")
-                            .preferred_trigger(paste_trigger.as_str()),
                     ];
+                    if let Some(paste_trigger) = &paste_trigger {
+                        shortcuts.push(
+                            NewShortcut::new("paste", "Paste the latest capture")
+                                .preferred_trigger(paste_trigger.as_str()),
+                        );
+                    }
                     let bound = proxy
                         .bind_shortcuts(&session, &shortcuts, None)
                         .await?
@@ -326,6 +330,7 @@ pub fn global_shortcuts(
                     // Plasma 5.27 returns success with an empty list. That is not a binding:
                     // let the caller try native bindings rather than silently losing shortcuts.
                     if !shortcuts_bound(
+                        paste_trigger.is_some(),
                         bound
                             .shortcuts()
                             .iter()
@@ -355,8 +360,13 @@ pub fn global_shortcuts(
         .map_err(|_| anyhow!("The shortcuts portal didn't answer"))?
 }
 
-fn shortcuts_bound<'a>(shortcuts: impl Iterator<Item = (&'a str, &'a str)> + Clone) -> bool {
-    ["record", "paste"].iter().all(|id| {
+/// Whether every shortcut that was requested (paste only while it is set) came back bound.
+fn shortcuts_bound<'a>(
+    paste: bool,
+    shortcuts: impl Iterator<Item = (&'a str, &'a str)> + Clone,
+) -> bool {
+    let ids: &[&str] = if paste { &["record", "paste"] } else { &["record"] };
+    ids.iter().all(|id| {
         shortcuts
             .clone()
             .any(|(bound, trigger)| bound == *id && !trigger.is_empty())
@@ -526,10 +536,13 @@ mod tests {
     fn an_empty_success_from_plasma_is_not_a_working_shortcut_backend() {
         let record = ("record", "Alt+Shift+S");
         let paste = ("paste", "Alt+Shift+V");
-        assert!(!shortcuts_bound([].into_iter()));
-        assert!(!shortcuts_bound([record].into_iter()));
-        assert!(!shortcuts_bound([record, ("paste", "")].into_iter()));
-        assert!(shortcuts_bound([record, paste].into_iter()));
+        assert!(!shortcuts_bound(true, [].into_iter()));
+        assert!(!shortcuts_bound(true, [record].into_iter()));
+        assert!(!shortcuts_bound(true, [record, ("paste", "")].into_iter()));
+        assert!(shortcuts_bound(true, [record, paste].into_iter()));
+        // A cleared paste shortcut is not requested, so only record has to come back.
+        assert!(shortcuts_bound(false, [record].into_iter()));
+        assert!(!shortcuts_bound(false, [].into_iter()));
     }
 
     #[test]

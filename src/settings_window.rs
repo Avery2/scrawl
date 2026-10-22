@@ -121,6 +121,7 @@ struct Transcriber {
     engine: String,
     hex_title: String,
     hex_enabled: bool,
+    command: Option<String>,
     models: Vec<ModelOption>,
     speech: Speech,
 }
@@ -1087,17 +1088,26 @@ impl SettingsWindow {
     fn recording_pane(&self, theme: Theme, state: &ViewState, cx: &mut Context<Self>) -> Div {
         let t = &state.transcriber;
         let hex = t.engine == "hex";
+        let command = t.engine == "command";
         let local = crate::transcribe::LOCAL_ENGINE_TITLE;
-        let engines = vec![
+        let mut engines = vec![
             ("apple".to_owned(), local.to_owned(), true),
             ("hex".to_owned(), t.hex_title.clone(), t.hex_enabled),
         ];
+        if let Some(program) = &t.command {
+            engines.push(("command".to_owned(), format!("Command ({program})"), true));
+        }
+        let engine_title = match (&t.command, hex) {
+            (Some(program), _) if command => format!("Command ({program})"),
+            (_, true) => "Hex".to_owned(),
+            _ => local.to_owned(),
+        };
         let chosen = t.models.iter().find(|m| m.chosen);
         let mut rows = vec![row(
             theme,
             "Transcription",
             true,
-            popup(theme, "settings-transcriber", if hex { "Hex" } else { local }).on_click(
+            popup(theme, "settings-transcriber", &engine_title).on_click(
                 cx.listener({
                     let selected = t.engine.clone();
                     move |view, event: &ClickEvent, _, cx| {
@@ -1137,6 +1147,12 @@ impl SettingsWindow {
         }
         let here = if LINUX { "this computer" } else { "this PC" };
         let note = match (WINDOWS || LINUX, t.hex_enabled || hex) {
+            _ if command => {
+                let fallback = if WINDOWS || LINUX { "Parakeet" } else { "Apple Speech" };
+                format!(
+                "Command runs transcribeCommand from config.json. If it fails, that recording uses {fallback}."
+                )
+            }
             (true, true) => format!(
                 "Parakeet runs on {here} and times each word. Hex uses a model you have in Hex, and its word times are estimates."
             ),
@@ -1151,7 +1167,7 @@ impl SettingsWindow {
             }
         };
         let speech = match t.speech.state.as_str() {
-            _ if !(WINDOWS || LINUX) || hex => None,
+            _ if !(WINDOWS || LINUX) || hex || command => None,
             "downloading" => Some((
                 format!(
                     "Downloading the speech model: {:.0}%",
@@ -1824,5 +1840,19 @@ impl Render for SettingsWindow {
             .child(self.content(theme, &state, cx))
             .children(caption_buttons(theme))
             .children(self.menu_layer(theme, viewport, cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_command_transcriber_is_read_from_the_view() {
+        let t: Transcriber =
+            serde_json::from_str(r#"{"engine":"command","command":"whisper-scrawl"}"#).unwrap();
+        assert_eq!(t.engine, "command");
+        assert_eq!(t.command.as_deref(), Some("whisper-scrawl"));
+        assert_eq!(Transcriber::default().command, None);
     }
 }

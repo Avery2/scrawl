@@ -482,13 +482,11 @@ pub fn stamp_keyframe_badges(frames: &mut [(Keyframe, RgbaFrame)]) {
 }
 
 /// Where the vertical middle of a digit sits below the top of a text mask, as a fraction of the
-/// font size: Helvetica Neue through CoreText, Arial through `ab_glyph`, the 5×7 fallback.
+/// font size: Helvetica Neue through CoreText, Arial (Linux: Liberation Sans, same metrics) through `ab_glyph`.
 const DIGIT_MIDDLE: f32 = if cfg!(target_os = "macos") {
     0.59
-} else if cfg!(target_os = "windows") {
-    0.55
 } else {
-    0.5
+    0.55
 };
 
 /// The keyframe's number, bold black on a small white rounded square with a thin dark ring,

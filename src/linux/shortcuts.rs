@@ -42,6 +42,14 @@ fn key(cfg: &ShortcutConfig) -> Option<i32> {
     Some(key)
 }
 
+/// The chords to request: none while paused or for a shortcut that is turned off.
+fn requested_keys(cfg: &ShortcutConfig, paused: bool) -> Result<Vec<i32>> {
+    if paused || cfg.is_unset() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![key(cfg).context("Unsupported key")?])
+}
+
 pub fn bind(
     record: &ShortcutConfig,
     paste: &ShortcutConfig,
@@ -57,11 +65,7 @@ pub fn bind(
         )?;
         let action = action(id).to_vec();
         proxy.call_method("doRegister", &(&action,))?;
-        let requested = if paused {
-            Vec::new()
-        } else {
-            vec![key(cfg).context("Unsupported key")?]
-        };
+        let requested = requested_keys(cfg, paused)?;
         // SetPresent | NoAutoloading: Scrawl's configured chord, active while the bus is alive.
         let bound: Vec<i32> = proxy.call("setShortcut", &(&action, &requested, 6_u32))?;
         if bound != requested {
@@ -122,4 +126,17 @@ pub fn listen(
             }
         })?;
     ready_rx.recv_timeout(std::time::Duration::from_secs(5))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cleared_or_paused_shortcut_requests_no_chord() {
+        let record = ShortcutConfig::default_record();
+        assert!(requested_keys(&ShortcutConfig::unset(), false).unwrap().is_empty());
+        assert!(requested_keys(&record, true).unwrap().is_empty());
+        assert_eq!(requested_keys(&record, false).unwrap().len(), 1);
+    }
 }

@@ -729,7 +729,13 @@ fn emit(telemetry: &SharedCaptureTelemetry, kind: ShortcutKind) {
     match kind {
         ShortcutKind::Record => telemetry.emit_capture_shortcut(),
         ShortcutKind::Paste => {
-            if !telemetry.active.load(Ordering::Acquire) {
+            // The portal's binding belongs to the desktop and can't be removed in place.
+            let unset = telemetry
+                .paste_shortcut
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_unset();
+            if !unset && !telemetry.active.load(Ordering::Acquire) {
                 telemetry.emit_paste_shortcut();
             }
         }
@@ -780,7 +786,7 @@ fn shortcut_key(cfg: &ShortcutConfig) -> String {
 /// GNOME's keybindings for both shortcuts, or empty ones while paused.
 fn bind_gnome(record: &ShortcutConfig, paste: &ShortcutConfig, paused: bool) -> anyhow::Result<()> {
     let binding = |cfg: &ShortcutConfig| {
-        if paused {
+        if paused || cfg.is_unset() {
             String::new()
         } else {
             linux::portal::gnome_binding(cfg.carbon_modifiers, &shortcut_key(cfg))
@@ -826,7 +832,9 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
                 let portal_telemetry = Arc::clone(&telemetry);
                 let bound = linux::portal::global_shortcuts(
                     linux::portal::portal_trigger(record.carbon_modifiers, &shortcut_key(&record)),
-                    linux::portal::portal_trigger(paste.carbon_modifiers, &shortcut_key(&paste)),
+                    (!paste.is_unset()).then(|| {
+                        linux::portal::portal_trigger(paste.carbon_modifiers, &shortcut_key(&paste))
+                    }),
                     move |id| match id {
                         "record" => emit(&portal_telemetry, ShortcutKind::Record),
                         "paste" => emit(&portal_telemetry, ShortcutKind::Paste),
@@ -1125,6 +1133,21 @@ pub(super) fn run_sampler(sampler: Sampler) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_portal_press_is_ignored_once_the_paste_shortcut_is_turned_off() {
+        let (tx, rx) = flume::unbounded();
+        let telemetry = SharedCaptureTelemetry::new(tx);
+        *telemetry.paste_shortcut.lock().unwrap() = ShortcutConfig::unset();
+        emit(&telemetry, ShortcutKind::Paste);
+        assert!(rx.try_recv().is_err(), "a cleared paste shortcut must not paste");
+        *telemetry.paste_shortcut.lock().unwrap() = ShortcutConfig::default_paste();
+        emit(&telemetry, ShortcutKind::Paste);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(LiveOverlayEvent::PasteLatestShortcut)
+        ));
+    }
 
     #[test]
     fn virtual_keys_round_trip_through_keysyms() {

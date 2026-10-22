@@ -5130,8 +5130,19 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
     restack_soon(cx);
     for handle in cx.windows() {
         if let Some(pill) = handle.downcast::<HudPillWindow>() {
+            let telemetry = Arc::clone(&coord_entity.read(cx).telemetry);
             let _ = pill.update(cx, |view, _, cx| {
                 view.chrome.raise();
+                // A new session cleared the excluded windows; the open pill is still on screen.
+                if let Some(num) = view.chrome.window_number() {
+                    let mut ids = telemetry
+                        .excluded_window_ids
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !ids.contains(&num) {
+                        ids.push(num);
+                    }
+                }
                 cx.notify();
             });
             return;
