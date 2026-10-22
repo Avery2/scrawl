@@ -152,8 +152,7 @@ pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
         return Ok(transcript);
     }
 
-    transcribe_cpp::disable_logging();
-    transcribe_cpp::init_backends_default().context("transcribe.cpp backends")?;
+    init_backends()?;
     let model = Model::load(&path).with_context(|| format!("Could not load {}", path.display()))?;
     let mut session = model.session()?;
     let options = RunOptions {
@@ -217,6 +216,18 @@ pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
     }
     transcript.text = texts.join(" ");
     Ok(transcript)
+}
+
+/// Register the runtime-selected CPU backend once, before any thread loads a model.
+/// The native registry cannot be mutated concurrently with model loading.
+fn init_backends() -> Result<()> {
+    static INIT: std::sync::OnceLock<std::result::Result<(), String>> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        transcribe_cpp::disable_logging();
+        transcribe_cpp::init_backends_default().map_err(|error| format!("{error:#}"))
+    })
+    .clone()
+    .map_err(|error| anyhow::anyhow!("transcribe.cpp backends: {error}"))
 }
 
 /// Makes sure a model is on disk: `installed` when Hex's or Scrawl's own is there, else downloads
@@ -407,16 +418,39 @@ mod tests {
         assert!(verified_in(&dir).is_empty());
     }
 
-    /// Downloads the real model (731 MB) and loads it. CI's release job runs it.
+    /// Exercise the actual compute kernels, not just model loading. Linux release CI
+    /// also runs this with the packaged libraries under SDE Ice Lake (no AVX-VNNI).
     #[test]
     #[ignore]
-    fn downloads_and_loads_parakeet() {
-        let dir = temp_dir("parakeet");
+    fn downloads_and_runs_parakeet() {
+        let kept = std::env::var_os("SCRAWL_TEST_MODEL_DIR").map(PathBuf::from);
+        let dir = kept.clone().unwrap_or_else(|| temp_dir("parakeet"));
+        let fresh = !dir.join(PARAKEET.filename).is_file();
         let mut last = 0.0;
         let model = download(&PARAKEET, &dir, &mut |done| last = done).unwrap();
-        assert_eq!(last, 1.0);
-        transcribe_cpp::init_backends_default().unwrap();
-        Model::load(&model).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+        if fresh {
+            assert_eq!(last, 1.0);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::env::var_os("SCRAWL_TEST_NO_AVX_VNNI").is_some() {
+            assert!(!std::arch::is_x86_feature_detected!("avxvnni"));
+            assert!(std::arch::is_x86_feature_detected!("avx512vnni"));
+        }
+        init_backends().unwrap();
+        for device in transcribe_cpp::devices() {
+            eprintln!("device: {} ({})", device.name, device.description);
+        }
+        let model = Model::load(&model).unwrap();
+        let pcm: Vec<f32> = (0..32_000)
+            .map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / 16_000.0).sin() * 0.1)
+            .collect();
+        model
+            .session()
+            .unwrap()
+            .run(&pcm, &RunOptions::default())
+            .unwrap();
+        if kept.is_none() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
