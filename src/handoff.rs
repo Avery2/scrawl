@@ -197,6 +197,13 @@ pub fn copy_png_to_clipboard(png_bytes: &[u8]) -> Result<()> {
 pub fn copy_bundle_to_clipboard(bundle_dir: &Path) -> Result<()> {
     let (directory, bundle) = load_bundle(bundle_dir)?;
     let summary = crate::sketch::summary_markdown(&bundle, &directory);
+    #[cfg(target_os = "windows")]
+    if experiment("clipboardImage")
+        && let Ok(image) = fs::read(directory.join(&bundle.contact_sheet))
+        && crate::win::clipboard::set_png_and_text(&image, Some(&summary)).is_ok()
+    {
+        return Ok(());
+    }
     copy_string_to_clipboard(&summary)
 }
 
