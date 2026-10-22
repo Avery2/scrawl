@@ -771,6 +771,12 @@ pub fn video_export() -> bool {
     config().video_export.unwrap_or(false)
 }
 
+/// `updateChannel` as written; `updates::beta_updates` decides what it means.
+#[cfg(target_os = "macos")]
+pub fn update_channel() -> Option<String> {
+    config().update_channel
+}
+
 /// The configured transcriber name (`transcriber`) as written, unvalidated.
 pub fn transcriber() -> Option<String> {
     config().transcriber

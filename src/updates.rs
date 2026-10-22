@@ -1,7 +1,15 @@
-//! Release identity is the signed bundle's identity, not the Cargo package version.
+//! The running build's identity, and whether it takes beta updates. A build never knows its
+//! channel: every build of a version is a candidate with a plain version and its own build number,
+//! "beta" is a property of the appcast item, and `"updateChannel": "beta"` opts this Mac in.
 
 pub fn beta_enabled(channel: Option<&str>) -> bool {
     channel == Some("beta")
+}
+
+/// `"updateChannel": "beta"` in `config.json`, read fresh: Settings can change it at any time.
+#[cfg(target_os = "macos")]
+pub fn beta_updates() -> bool {
+    beta_enabled(crate::handoff::update_channel().as_deref())
 }
 
 pub fn version() -> String {
@@ -10,17 +18,17 @@ pub fn version() -> String {
 }
 
 pub fn build() -> String {
-    bundle_value("CFBundleVersion").unwrap_or_else(|| "dev".into())
+    bundle_value("CFBundleVersion").unwrap_or_else(|| env!("SCRAWL_RELEASE_BUILD").to_owned())
 }
 
-pub fn is_beta() -> bool {
-    version()
-        .split_once("-beta.")
-        .is_some_and(|(_, n)| n.parse::<u32>().is_ok_and(|n| n > 0))
+/// `0.3.14 (18)`, plus `· Beta updates on` when this Mac takes betas.
+pub fn display(beta: bool) -> String {
+    label(&version(), &build(), beta)
 }
 
-pub fn display_version() -> String {
-    format!("{} ({})", version(), build())
+fn label(version: &str, build: &str, beta: bool) -> String {
+    let suffix = if beta { " · Beta updates on" } else { "" };
+    format!("{version} ({build}){suffix}")
 }
 
 #[cfg(target_os = "macos")]
@@ -74,5 +82,11 @@ mod tests {
             assert!(!beta_enabled(value));
         }
         assert!(beta_enabled(Some("beta")));
+    }
+
+    #[test]
+    fn the_label_names_the_setting_not_the_build() {
+        assert_eq!(label("0.3.14", "18", false), "0.3.14 (18)");
+        assert_eq!(label("0.3.14", "18", true), "0.3.14 (18) · Beta updates on");
     }
 }

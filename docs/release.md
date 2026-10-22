@@ -1,110 +1,125 @@
 # Releasing Scrawl
 
-Merge → cut a beta → Kit uses it → promote that build. Beta is opt-in; the site, public download
-aliases and agent files advertise stable only. Windows and Linux betas are GitHub prereleases,
-installed manually. They do not use Sparkle channels.
+Merge to `main` → cut a build as a beta → Kit uses it → promote that exact build to stable.
+
+Every build is a candidate: the app carries a plain version and an increasing build number
+(`0.3.14 (18)`), never the word "beta". Beta is a property of the build's appcast item
+(`<sparkle:channel>beta</sparkle:channel>`) and of the user's `"updateChannel": "beta"` setting.
+Promotion removes that one element, so each build has exactly one appcast item and stable users
+get the bytes beta users tested. The site, its download aliases, agent files and feature map
+follow the newest stable item only.
+
+| | Beta build | Stable (promoted) |
+| --- | --- | --- |
+| App says | `0.3.14 (18)` | `0.3.14 (18)` (same bytes) |
+| GitHub | prerelease `v0.3.14-b18`: `Scrawl-0.3.14-b18-arm64.dmg/.zip`, `…-windows-x64.zip` | latest `v0.3.14`: the same files as `Scrawl-0.3.14-*` |
+| Appcast | item for build 18 with `sparkle:channel` beta | the same item, channel removed |
+| Homebrew | `scrawl@beta` → `0.3.14-b18` | `scrawl` → `0.3.14` |
 
 ## Cut a beta
 
-Use a clean checkout of merged `main` on **Pro**, the release host. These scripts do not pull or
-switch your checkout. Signing runs in a one-off GUI-session launchd job so it can use the login
-keychain; Cargo builds go through HiveMind. The script waits for jobs with skulk.
+On **Pro** (the release host), in a clean checkout of merged `main`:
 
 ```sh
 ./scripts/release-beta.sh --dry-run
-./scripts/release-beta.sh
+./scripts/release-beta.sh                    # the next build of the version in flight
+./scripts/release-beta.sh --version 0.3.15   # start a new version
 ```
 
-The script chooses the next `-beta.N` (for example `0.3.14-beta.2`) from GitHub tags and the durable
-release records. It reserves a build number greater than every published feed item and every
-reserved build, including failed builds. Re-running at the same commit resumes the same version
-and build. Change the commit to cut another beta. `Cargo.toml` and `Cargo.lock` need no beta bump.
+Without `--version` the build belongs to the newest version that has builds or tags. Once that
+version is stable the script stops and asks for `--version`. The build number is one more than
+every appcast item, archived build (failed ones included) and `-bN` tag. Re-running at the same
+commit resumes the same build; commit something to cut another. `Cargo.toml`'s version is only
+the development default: release builds get theirs from `SCRAWL_VERSION`.
 
-It builds, Developer ID signs, notarizes and staples the DMG and Sparkle zip with `release-app.sh`.
-Missing signing or notarization credentials fail the release. The signed files and SHA-256s are
-archived under `~/.local/share/scrawl-release/builds/<build>/release.json`; once archived, retries
-reuse those exact bytes and reject any changed file. Keep that directory backed up.
+The script reserves the build in `~/.local/share/scrawl-release/builds/<build>/release.json`, then
+runs `release-app.sh` in a one-off GUI-session launchd job (the login keychain signs): HiveMind
+builds with `SCRAWL_VERSION`/`SCRAWL_BUILD_NUMBER`, fetches both binaries back and checks
+`scrawl --version` says this build; then Developer ID signing, notarization and stapling. The DMG
+and Sparkle zip are archived with their SHA-256s; retries reuse those exact bytes and refuse
+changed ones. Keep `builds/` backed up.
 
-The script creates `v<version>` and a GitHub **prerelease**, uploads the Mac artifacts, and the tag
-starts the Windows packaging workflow. The Windows executable takes its identity from the tag;
-workflow retries do not overwrite uploaded assets. Linux packaging, when available, must attach
-its beta archive to that same prerelease. Never mark a beta latest.
-
-The script adds the zip to Pro's existing `~/.local/share/scrawl-release/updates/`, then uses
-`dev.kit.scrawl-appcast` to generate the signed item with Sparkle **2.9.4**:
+It tags `v<version>-b<build>`, publishes a GitHub **prerelease** with the DMG and zip (the tag
+starts `.github/workflows/release-windows.yml`, which attaches `Scrawl-<version>-b<build>-windows-x64.zip`
+and never replaces an uploaded zip), copies the zip into Pro's `updates/` and asks the
+`dev.kit.scrawl-appcast` job for a beta item:
 
 ```sh
-generate_appcast --versions <build> --channel beta --maximum-versions 0 \
+generate_appcast --ed-key-file - --versions <build> --channel beta --maximum-versions 0 \
   --download-url-prefix https://scrawl.kitlangton.com/releases/ <updates>
 ```
 
-The script checks the tool's `--help` for `--channel`. Only the specified build gets a new beta
-item, with `<sparkle:channel>beta</sparkle:channel>`. Historical entries and archives are retained
-for delta generation. The job reads the signing key directly from its login keychain. The first
-run backs up the old `appcast.sh`, installs `scripts/appcast-job.sh` and its Python helper, and
-sends the job a request in `appcast-request.json`. Its log stays at `appcast.log`.
+`--versions` adds only this build; `--maximum-versions 0` keeps every older item and archive (deltas
+need them). The job reads the ed25519 key with `security`, as before, backs the feed up to
+`feed-backups/`, and restores it if anything is off: a build with more than one item, another
+item's channel changed, an archive moved out of `updates/`, or this build's enclosure unsigned
+(what `generate_appcast` does when the key doesn't match the app's `SUPublicEDKey`). The first run
+saves the old `appcast.sh` as `appcast-before-channels.sh` and installs `scripts/appcast-job.sh`
+and this script; requests go through `appcast-request.json`, the log is `appcast.log`.
 
-The site deploy runs on Pro with its existing Wrangler login, through skulk's heavy slot. It first
-hydrates prior GitHub downloads and feed enclosures so a fresh checkout cannot remove old assets.
-Beta publication leaves `Scrawl-latest-*` pointing to stable. A Homebrew `scrawl@beta` update PR is
-opened through REST. Kit merges cask PRs.
+Then it deploys the site from Pro (Wrangler's login is there) through skulk's heavy slot, after
+fetching every published download so a fresh checkout drops none. `Scrawl-latest-*` stays on
+stable. The `scrawl@beta` cask PR updates (the first beta updates draft PR
+kitlangton/homebrew-tap#39). Kit merges cask PRs.
 
-Wait for the beta Windows workflow before promotion. Inspect its fresh-profile screenshot and
-test the beta on the target machines. For macOS, check startup, permissions, capture, paste and
-update checks, including opting in and back out. Test the changed feature on real captures.
+Before promoting, wait for the Windows workflow and look at its fresh-profile screenshot. On macOS
+check startup, permissions, capture, paste, and update checks with beta updates on and off, and
+the changed feature on real captures.
 
-## Promote the tested build
+## Promote a tested build
 
 ```sh
 ./scripts/promote.sh 18 --dry-run
 ./scripts/promote.sh 18
 ```
 
-Use the **build number**, not the beta sequence. The script verifies the archived hashes, creates
-the stable version tag on the beta's commit, and uploads byte-identical artifacts under stable
-filenames. Windows and Linux archives are copied from the beta prerelease, never rebuilt. Stable
-tags do not trigger a Windows rebuild. Promotion requires the Windows beta archive to exist.
+It checks the archived hashes, tags `v<version>` on the build's commit (refused if that version is
+already stable as another build), and publishes a GitHub release with the same DMG and zip named
+`Scrawl-<version>-*`, plus the Windows zip (and a Linux one, once Linux builds attach theirs) copied from the `-b<build>` prerelease
+with a fresh `.sha256`. Stable tags don't run the Windows workflow. It refuses until the Windows
+zip exists, and refuses to promote behind a newer stable build.
 
-The feed gains a stable item without `sparkle:channel`, using the same build, enclosure, signature
-and deltas as the beta. Sparkle's job runs again after the metadata change. The public download
-aliases advance, the site deploys, GitHub marks the stable release latest, and a stable Homebrew
-cask bump PR opens. Re-running is safe; promoting behind a newer stable build is refused.
+The appcast job removes the build's `<sparkle:channel>` line and nothing else; nothing is
+regenerated or re-signed. The site deploys with `Scrawl-latest-*` on the new version, GitHub marks
+the release latest, and a `scrawl` cask PR opens.
 
-In the promotion's appcast PR, change `"status": "main"` entries in `site/src/features.json` to
-`"stable@<version>"` for features present in the promoted commit. Keep later main-only work as
-`main`, and experiments behind their flags. Cutting a beta never marks features stable. The map's
-release version, like the download buttons and agent files, ignores beta appcast items.
+In the appcast PR, change `"status": "main"` entries in `site/src/features.json` to
+`"stable@<version>"` for features in the promoted commit. Later main-only work stays `main`.
 
-**The app's signed identity still says `0.3.14-beta.2`.** Changing its Info.plist would change the
-tested artifact. The stable release listing and appcast display `0.3.14`, but About and issue
-reports retain the original beta identity and build. Beta users already have those exact bytes
-and receive no redundant update. Users who turn beta off keep their installed build until a
-newer stable build appears; they never downgrade. The opt-in is `"updateChannel": "beta"` in
-`~/.config/scrawl/config.json`; absent, null or unknown values mean stable.
+## What users get
+
+Sparkle drops items whose channel isn't allowed (`allowedChannelsForUpdater:` in `src/sparkle.rs`
+returns `beta` only with the setting on; items without a channel are always allowed), then offers
+the newest item only if its `CFBundleVersion` is higher than the running one. So:
+
+- Stable users never see a beta item.
+- Beta users get every new build, beta or stable. A promotion offers them nothing new: they
+  already run that build.
+- Turning beta off never downgrades: Scrawl stays on its build until a stable one with a higher
+  build number arrives.
+- When two builds share a version, Sparkle's alert shows both build numbers ("0.3.14 (19) — you
+  have 0.3.14 (18)").
 
 ## Recovery and checks
 
-Both commands accept `--dry-run`, which reads the live feed and REST metadata but writes nothing,
-launches no jobs and publishes nothing. Promotion dry-runs need the build archive on Pro.
-Only one release can run at a time (`release.lock`). A retry permits the generated site appcast
-to be dirty only if it matches the durable job output. Commit the resulting
-`site/public/appcast.xml` in an appcast PR after publication.
+`--dry-run` reads the live appcast, the archive and GitHub (REST) and prints the plan and anything
+that would stop it; it writes nothing, fetches no git refs and starts no jobs. Promotion dry runs
+need the archive, so run them on Pro. One release runs at a time (`release.lock`). A retry
+accepts a dirty `site/public/appcast.xml` only when it matches `updates/appcast.xml`. After
+publishing, commit `site/public/appcast.xml` in an appcast PR.
 
-Never delete or replace `~/.local/share/scrawl-release/updates/`; never move Sparkle's tools or
-the release archive into `target/` or `/tmp`. `setup-sparkle.sh` verifies the pinned download's
-checksum. `release-app.sh` is the low-level packager; use the channel scripts for published
-releases so all beta and stable builds share one monotonic sequence.
+Never delete or replace `~/.local/share/scrawl-release/updates/`, and keep Sparkle's tools and the
+archive out of `target/` and `/tmp`. `setup-sparkle.sh` checks the pinned Sparkle download.
+`release-app.sh` only builds, signs and notarizes; publish through the two scripts so every build
+shares one build-number sequence.
 
-After deploying, check the live appcast and download hashes, validate the Sparkle signature and
-run `spctl` against the downloaded DMG and app. Check that the site's Mac and Windows buttons,
-`llms.txt`, and feature map show stable. Check the Windows zip contains `scrawl.exe`, transcription
-and CPU-backend DLLs, the Visual C++ runtime DLLs, README and LICENSE (see [windows.md](windows.md)).
-
-Pure release checks:
+After deploying, check the live appcast and download hashes, the Sparkle signature, and `spctl`
+on the downloaded DMG and app; that the site's Mac and Windows buttons, `llms.txt` and the feature
+map show the stable version; and that the Windows zip has `scrawl.exe`, the transcription and CPU
+backend DLLs, the Visual C++ runtime DLLs, README and LICENSE (see [windows.md](windows.md)).
 
 ```sh
 python3 -m unittest discover -s scripts -p test_release_channel.py
 bun test site/tests/appcast.test.ts
-hivemind run --kind cargo -- cargo +stable test settings::tests::toggles_and_popups_write_their_keys
-hivemind run --kind cargo -- cargo +stable test updates::tests
+hivemind run --kind cargo -- cargo test -- updates:: settings::tests::toggles_and_popups_write_their_keys
 ```

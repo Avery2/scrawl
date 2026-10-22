@@ -1660,7 +1660,7 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
     micNotAllowed.microphone.meter = nil
     var beta = base
     beta.betaUpdates = true
-    beta.version = "0.3.14-beta.2 (18)"
+    beta.version = "0.3.14 (18) · Beta updates on"
     let samples: [(String, SettingsPane, SettingsState)] = [
       ("general", .general, base),
       ("general-beta", .general, beta),

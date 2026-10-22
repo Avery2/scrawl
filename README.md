@@ -25,17 +25,19 @@ protected your PC": click **More info**, then **Run anyway**. It doesn't update 
 ### Beta updates
 
 On macOS, turn on **Settings › General › Get beta updates**, then choose **Check for Updates…**.
-It is off by default. Turn it off to receive stable releases again; your installed beta stays
-until a newer stable build is available. Beta builds show their version in the menu and About,
-and **Report a Problem…** opens a GitHub issue with the version, build and macOS version filled in.
+It is off by default. Turn it off to go back to stable releases: Scrawl keeps the build it has
+until a newer stable one arrives, and never downgrades. With it on, the menu and About say
+`0.3.14 (18) · Beta updates on`, and the menu adds **Report a Problem…**, which opens a GitHub
+issue with the version, build and macOS version filled in. A beta build that passes testing
+becomes the stable release unchanged, so it reads the same either way.
 
-You can also install the beta DMG from [GitHub prereleases](https://github.com/kitlangton/scrawl/releases).
-The `kitlangton/tap/scrawl@beta` cask follows that channel once its cask PR is merged. It installs
-the same Scrawl.app, so use one cask at a time and enable beta updates in Settings.
-If an older stable app has no toggle, install a beta DMG first.
+You can also install a beta DMG from [GitHub prereleases](https://github.com/kitlangton/scrawl/releases)
+(tags like `v0.3.14-b18`). The `kitlangton/tap/scrawl@beta` cask follows betas once its cask PR is
+merged. It installs the same Scrawl.app, so use one cask at a time and turn on beta updates in
+Settings. If your Scrawl has no toggle yet, install a beta DMG first.
 
-Windows and Linux beta archives are GitHub prereleases and are updated manually. Stable downloads
-stay on the website. See [Releasing Scrawl](docs/release.md) for cutting and promoting builds.
+On Windows, each beta's zip is on its GitHub prerelease; Scrawl doesn't update itself there yet,
+so install betas by hand. Stable downloads stay on the website. See [Releasing Scrawl](docs/release.md) for cutting and promoting builds.
 
 ## Agents
 

@@ -43,7 +43,6 @@ mod retention;
 mod routing;
 mod screens;
 mod settings;
-mod updates;
 mod settings_window;
 mod shortcut;
 mod sketch;
@@ -52,6 +51,7 @@ mod sparkle;
 mod speech_model;
 mod transcribe;
 mod ui;
+mod updates;
 mod web;
 #[cfg(target_os = "windows")]
 mod win;
@@ -78,7 +78,7 @@ use crate::sketch::{marks_of, summary_markdown};
 #[derive(Parser)]
 #[command(
     name = "scrawl",
-    version = env!("SCRAWL_RELEASE_VERSION"),
+    version = concat!(env!("SCRAWL_RELEASE_VERSION"), " (", env!("SCRAWL_RELEASE_BUILD"), ")"),
     about = "Shortcut-triggered screen, voice, and drawing capture for agents"
 )]
 struct Cli {

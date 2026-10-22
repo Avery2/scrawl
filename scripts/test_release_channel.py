@@ -1,9 +1,9 @@
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-import xml.etree.ElementTree as ET
 
 spec = importlib.util.spec_from_file_location("release_channel", Path(__file__).with_name("release-channel.py"))
 release = importlib.util.module_from_spec(spec)
@@ -12,54 +12,208 @@ NS = release.NS
 
 
 def item(build, version, channel=None):
-    channel = f"<sparkle:channel>{channel}</sparkle:channel>" if channel else ""
-    return f'''<item><title>{version}</title><sparkle:version>{build}</sparkle:version>
-      <sparkle:shortVersionString>{version}</sparkle:shortVersionString>{channel}
-      <enclosure url="https://example.org/Scrawl-{version}-arm64.zip" length="123" sparkle:edSignature="signed-bytes"/>
-      <sparkle:deltas><enclosure url="delta" sparkle:edSignature="signed-delta"/></sparkle:deltas></item>'''
+    channel = f"\n            <sparkle:channel>{channel}</sparkle:channel>" if channel else ""
+    return f'''
+        <item>
+            <title>{version}</title>
+            <sparkle:version>{build}</sparkle:version>
+            <sparkle:shortVersionString>{version}</sparkle:shortVersionString>{channel}
+            <enclosure url="https://example.org/releases/Scrawl-{version}-b{build}-arm64.zip" length="123" sparkle:edSignature="sig-{build}"/>
+            <sparkle:deltas><enclosure url="https://example.org/releases/Scrawl{build}-1.delta" sparkle:edSignature="delta-{build}"/></sparkle:deltas>
+        </item>'''
 
 
 def feed(*items):
-    return f'<rss xmlns:sparkle="{NS}"><channel><title>Scrawl</title>{"".join(items)}</channel></rss>'
+    return f'<?xml version="1.0" standalone="yes"?>\n<rss xmlns:sparkle="{NS}" version="2.0">\n    <channel>\n        <title>Scrawl</title>{"".join(items)}\n    </channel>\n</rss>'
 
 
-class ReleaseTests(unittest.TestCase):
-    def test_version_ordering(self):
-        versions = ["0.3.14", "0.3.14-beta.10", "0.3.13", "0.3.14-beta.2"]
-        self.assertEqual(sorted(versions, key=release.parse_version),
-                         ["0.3.13", "0.3.14-beta.2", "0.3.14-beta.10", "0.3.14"])
+class Args:
+    def __init__(self, command="beta", version=None, build=None):
+        self.command, self.version, self.build = command, version, build
 
-    def test_invalid_versions(self):
-        for version in ["0.3", "0.3.14-beta.0", "0.3.14-beta.x", "0.3.14;exit", "0.3.14-rc.1"]:
+
+class VersionTests(unittest.TestCase):
+    def test_versions_are_plain(self):
+        for version in ["0.3", "0.3.14-beta.1", "0.3.14-b18", "v0.3.14", "0.3.14;exit"]:
             with self.assertRaises(ValueError):
                 release.parse_version(version)
 
-    def test_next_beta_after_stable(self):
-        self.assertEqual(release.next_beta("0.3.13", ["v0.3.13"]), "0.3.14-beta.1")
-        self.assertEqual(release.next_beta("0.3.14", ["v0.3.13", "v0.3.14-beta.9"]), "0.3.14-beta.10")
-        self.assertEqual(release.next_beta("0.3.13", ["v0.4.0-beta.2"]), "0.4.0-beta.3")
-        self.assertEqual(release.next_beta("0.3.13", ["v0.3.14", "v0.3.14-beta.9"]), "0.3.15-beta.1")
+    def test_tags(self):
+        self.assertEqual(release.parse_tag("v0.3.14"), ("0.3.14", None))
+        self.assertEqual(release.parse_tag("v0.3.14-b18"), ("0.3.14", 18))
+        for name in ["v0.3.14-beta.2", "v0.3.14-b0", "0.3.14", "release-1"]:
+            self.assertIsNone(release.parse_tag(name))
 
-    def test_builds_include_failed_reservations_and_both_channels(self):
-        xml = feed(item(16, "0.3.13"), item(18, "0.3.14-beta.2", "beta"))
-        self.assertEqual(release.next_build(xml, [{"build": 19}]), 20)
+    def test_the_version_in_flight_is_kept_until_asked(self):
+        tags = ["v0.3.13", "v0.3.14-b17"]
+        self.assertEqual(release.choose_version(None, tags, []), "0.3.14")
+        self.assertEqual(release.choose_version("0.3.15", tags, []), "0.3.15")
+        self.assertEqual(release.choose_version(None, ["v0.3.13"], [{"version": "0.3.14"}]), "0.3.14")
 
-    def test_promote_preserves_signed_enclosure_and_beta(self):
-        xml = feed(item(16, "0.3.13"), item(18, "0.3.14-beta.2", "beta"))
-        promoted = release.promoted_feed(xml, 18, "0.3.14")
-        items = release.feed_items(promoted)
-        self.assertEqual(len(items), 3)
-        same_build = [i for i in items if release.build_number(i) == 18]
-        self.assertEqual({i.findtext(f"{{{NS}}}channel") for i in same_build}, {None, "beta"})
-        self.assertEqual(ET.tostring(same_build[0].find("enclosure")), ET.tostring(same_build[1].find("enclosure")))
-        self.assertEqual(ET.tostring(same_build[0].find(f"{{{NS}}}deltas")), ET.tostring(same_build[1].find(f"{{{NS}}}deltas")))
-        self.assertEqual(release.promoted_feed(promoted, 18, "0.3.14"), promoted)
+    def test_a_stable_version_needs_an_explicit_bump(self):
+        with self.assertRaisesRegex(ValueError, "--version 0.3.14"):
+            release.choose_version(None, ["v0.3.13"], [])
+        with self.assertRaisesRegex(ValueError, "already stable"):
+            release.choose_version(None, ["v0.3.14", "v0.3.14-b18"], [])
+        with self.assertRaisesRegex(ValueError, "older"):
+            release.choose_version("0.3.13", ["v0.3.14-b18"], [])
 
-    def test_promote_refuses_downgrade(self):
-        xml = feed(item(20, "0.3.15"), item(18, "0.3.14-beta.2", "beta"))
-        with self.assertRaises(ValueError):
-            release.promoted_feed(xml, 18, "0.3.14")
+    def test_build_numbers_never_repeat_across_channels_failures_or_tags(self):
+        xml = feed(item(16, "0.3.13"), item(18, "0.3.14", "beta"))
+        self.assertEqual(release.next_build(xml, [], []), 19)
+        self.assertEqual(release.next_build(xml, [{"build": 20}], []), 21)
+        self.assertEqual(release.next_build(xml, [], ["v0.3.14-b22"]), 23)
 
+
+class FeedTests(unittest.TestCase):
+    def test_promotion_makes_the_same_item_stable(self):
+        xml = feed(item(19, "0.3.14", "beta"), item(18, "0.3.14", "beta"), item(16, "0.3.13"))
+        promoted = release.promoted_feed(xml, 18)
+        self.assertEqual(release.item_channels(promoted), {19: "beta", 18: None, 16: None})
+        # Only the channel line goes; signatures, deltas and every other byte stay.
+        self.assertEqual(promoted, xml.replace("\n            <sparkle:channel>beta</sparkle:channel>\n            <enclosure url=\"https://example.org/releases/Scrawl-0.3.14-b18",
+                                               "\n            <enclosure url=\"https://example.org/releases/Scrawl-0.3.14-b18"))
+        self.assertEqual(release.promoted_feed(promoted, 18), promoted)
+
+    def test_promotion_refuses_a_downgrade_or_unknown_build(self):
+        xml = feed(item(20, "0.3.15"), item(18, "0.3.14", "beta"))
+        with self.assertRaisesRegex(ValueError, "behind"):
+            release.promoted_feed(xml, 18)
+        with self.assertRaisesRegex(ValueError, "not in the feed"):
+            release.promoted_feed(xml, 17)
+
+    def test_one_item_per_build(self):
+        with self.assertRaisesRegex(ValueError, "more than one item"):
+            release.item_channels(feed(item(18, "0.3.14"), item(18, "0.3.14", "beta")))
+
+
+class PlanTests(unittest.TestCase):
+    xml = feed(item(17, "0.3.14", "beta"), item(16, "0.3.13"))
+    built = {"version": "0.3.14", "build": 17, "label": "0.3.14-b17", "commit": "a" * 40,
+             "dmg": "Scrawl-0.3.14-b17-arm64.dmg", "zip": "Scrawl-0.3.14-b17-arm64.zip", "sha256": {}}
+
+    def test_a_new_commit_is_the_next_build_of_the_version_in_flight(self):
+        plan = release.plan(Args(), self.xml, [self.built], "b" * 40, {"v0.3.13": "x", "v0.3.14-b17": "a" * 40})
+        self.assertEqual((plan["version"], plan["build"], plan["label"]), ("0.3.14", 18, "0.3.14-b18"))
+        self.assertEqual(plan["dmg"], "Scrawl-0.3.14-b18-arm64.dmg")
+
+    def test_the_same_commit_resumes(self):
+        self.assertIs(release.plan(Args(), self.xml, [self.built], "a" * 40, {}), self.built)
+        with self.assertRaisesRegex(ValueError, "already build 17"):
+            release.plan(Args(version="0.3.15"), self.xml, [self.built], "a" * 40, {})
+
+    def test_promotion_needs_a_finished_build_and_one_stable_build_per_version(self):
+        self.assertIs(release.plan(Args("promote", build=17), self.xml, [self.built], "c" * 40, {}), self.built)
+        with self.assertRaisesRegex(ValueError, "No finished"):
+            release.plan(Args("promote", build=18), self.xml, [self.built], "c" * 40, {})
+        with self.assertRaisesRegex(ValueError, "already stable"):
+            release.plan(Args("promote", build=17), self.xml, [self.built], "c" * 40, {"v0.3.14": "d" * 40})
+
+
+class CaskTests(unittest.TestCase):
+    stable = '''cask "scrawl" do
+  version "0.3.13"
+  sha256 "old"
+
+  livecheck do
+    url "https://scrawl.kitlangton.com/appcast.xml"
+    strategy :sparkle, &:short_version
+  end
+end
+'''
+
+    def test_stable_cask_skips_beta_items(self):
+        text = release.cask_text(self.stable, "scrawl", "0.3.14", "new")
+        self.assertIn('version "0.3.14"', text)
+        self.assertIn('sha256 "new"', text)
+        self.assertIn("item.channel.nil?", text)
+        self.assertEqual(release.cask_text(text, "scrawl", "0.3.14", "new"), text)
+
+    def test_beta_cask_takes_the_label(self):
+        text = release.cask_text(self.stable.replace('"scrawl"', '"scrawl@beta"'), "scrawl@beta", "0.3.14-b18", "new")
+        self.assertIn('version "0.3.14-b18"', text)
+        self.assertNotIn("item.channel.nil?", text)
+
+
+class JobTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.store = Path(self.directory.name)
+        (self.store / "updates").mkdir()
+        self.feed = self.store / "updates/appcast.xml"
+        self.manifest = {"version": "0.3.14", "build": 18, "zip": "Scrawl-0.3.14-b18-arm64.zip"}
+        (self.store / "updates" / self.manifest["zip"]).write_bytes(b"zip")
+        self.patch = patch.object(release, "STORE", self.store)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        self.directory.cleanup()
+
+    def request(self, action):
+        result = self.store / "result.json"
+        (self.store / "appcast-request.json").write_text(
+            json.dumps({"manifest": self.manifest, "action": action, "result": str(result)}))
+        return result
+
+    def test_beta_inserts_only_this_build_on_the_beta_channel(self):
+        self.feed.write_text(feed(item(16, "0.3.13")))
+        result = self.request("beta")
+
+        def fake(*args, **kwargs):
+            if args[0] == "security":
+                return "private-key"
+            if args[1] == "--help":
+                return "--channel"
+            if str(args[0]).endswith("generate_appcast"):
+                self.assertEqual(kwargs["input"], "private-key")
+                self.assertEqual(args[1:9], ("--ed-key-file", "-", "--versions", 18, "--channel", "beta", "--maximum-versions", "0"))
+                self.feed.write_text(feed(item(18, "0.3.14", "beta"), item(16, "0.3.13")))
+            return ""
+
+        with patch.object(release, "run", side_effect=fake) as run:
+            release.appcast_job()
+            self.assertTrue(str(run.call_args.args[0]).endswith("sign_update"))
+        self.assertEqual(json.loads(result.read_text()), {})
+
+    def test_a_bad_generation_restores_the_feed(self):
+        original = feed(item(16, "0.3.13"))
+        self.feed.write_text(original)
+        result = self.request("beta")
+
+        def fake(*args, **kwargs):
+            if str(args[0]).endswith("generate_appcast") and args[1] != "--help":
+                # A key mismatch: generate_appcast writes the item without a signature.
+                self.feed.write_text(feed(item(18, "0.3.14", "beta"), item(16, "0.3.13")).replace('sparkle:edSignature="sig-18"', ""))
+            return "--channel"
+
+        with patch.object(release, "run", side_effect=fake):
+            with self.assertRaises(RuntimeError):
+                release.appcast_job()
+        self.assertEqual(self.feed.read_text(), original)
+        self.assertIn("signed enclosure", json.loads(result.read_text())["error"])
+
+    def test_promotion_edits_the_feed_without_regenerating(self):
+        self.feed.write_text(feed(item(18, "0.3.14", "beta"), item(16, "0.3.13")))
+        result = self.request("promote")
+        with patch.object(release, "run", return_value="") as run:
+            release.appcast_job()
+            self.assertFalse(any(str(c.args[0]).endswith("generate_appcast") for c in run.call_args_list))
+        self.assertEqual(release.item_channels(self.feed.read_text()), {18: None, 16: None})
+        self.assertEqual(json.loads(result.read_text()), {})
+
+    def test_an_interrupted_submission_resumes_the_same_request(self):
+        result = self.store / "result.json"
+        request = {"manifest": self.manifest, "action": "beta", "result": str(result)}
+        (self.store / "appcast-request.json").write_text(json.dumps(request))
+        with patch.object(release, "run") as run, patch.object(release, "wait_for", side_effect=lambda p: p.write_text("{}")):
+            release.appcast(self.manifest, "beta")
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[:2], ("launchctl", "kickstart"))
+        self.assertEqual(json.loads((self.store / "appcast-request.json").read_text()), request)
+
+
+class FileTests(unittest.TestCase):
     def test_immutable_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             a, b = Path(directory) / "a", Path(directory) / "b"
@@ -71,56 +225,14 @@ class ReleaseTests(unittest.TestCase):
                 release.immutable_copy(a, b)
             self.assertEqual(b.read_bytes(), b"signed original")
 
-    def test_job_only_inserts_requested_build_on_beta_channel(self):
-        import json
-        with tempfile.TemporaryDirectory() as directory, patch.object(release, "STORE", Path(directory)):
-            store = Path(directory)
-            (store / "updates").mkdir()
-            (store / "updates/appcast.xml").write_text(feed(item(16, "0.3.13"), item(18, "0.3.14-beta.2", "beta")))
-            request = {"manifest": {"build": 18, "zip": "Scrawl-0.3.14-beta.2-arm64.zip"},
-                       "channel": "beta", "result": str(store / "result.json")}
-            (store / "appcast-request.json").write_text(json.dumps(request))
-            with patch.object(release, "run", side_effect=["--channel", release.PUBLIC_KEY, "", ""]) as run:
-                release.appcast_job()
-                args = run.call_args_list[2].args
-                self.assertEqual(args[1:7], ("--versions", 18, "--channel", "beta", "--maximum-versions", "0"))
-            self.assertEqual(json.loads((store / "result.json").read_text()), {})
-
     def test_completed_signing_is_reused_after_an_interrupted_upload(self):
-        import json
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
-            (folder / "build-result.json").write_text(json.dumps({}))
+            (folder / "build-result.json").write_text("{}")
             with patch.object(release.subprocess, "run") as process, patch.object(release, "run") as run:
                 process.return_value.returncode = 1  # No leftover launchd job.
-                release.gui_build({"build": 18}, folder)
+                release.gui_build({"version": "0.3.14", "build": 18}, folder)
                 run.assert_not_called()
-
-    def test_wrong_signing_key_stops_before_mutating_feed(self):
-        import json
-        with tempfile.TemporaryDirectory() as directory, patch.object(release, "STORE", Path(directory)):
-            store = Path(directory)
-            request = {"manifest": {"build": 18}, "channel": "beta", "result": str(store / "result.json")}
-            (store / "appcast-request.json").write_text(json.dumps(request))
-            with patch.object(release, "run", side_effect=["--channel", "wrong-key"]):
-                with self.assertRaisesRegex(RuntimeError, "SUPublicEDKey"):
-                    release.appcast_job()
-            self.assertIn("SUPublicEDKey", json.loads((store / "result.json").read_text())["error"])
-            self.assertFalse((store / "updates").exists())
-
-    def test_interrupted_appcast_submission_resumes_the_same_request(self):
-        import json
-        with tempfile.TemporaryDirectory() as directory, patch.object(release, "STORE", Path(directory)):
-            store = Path(directory)
-            manifest = {"build": 18}
-            result = store / "result.json"
-            request = {"manifest": manifest, "channel": "beta", "result": str(result)}
-            (store / "appcast-request.json").write_text(json.dumps(request))
-            with patch.object(release, "run") as run, patch.object(release, "wait_file", side_effect=lambda p: p.write_text("{}")):
-                release.appcast(manifest, "beta")
-                self.assertEqual(run.call_count, 1)
-                self.assertEqual(run.call_args.args[:2], ("launchctl", "kickstart"))
-            self.assertEqual(json.loads((store / "appcast-request.json").read_text()), request)
 
 
 if __name__ == "__main__":

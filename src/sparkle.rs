@@ -42,12 +42,11 @@ objc2::define_class!(
 
     unsafe impl SPUUpdaterDelegate for SparkleDelegate {
         // Sparkle always includes unchannelled (stable) items. Read the config at each check
-        // so Settings takes effect without a restart. Sparkle compares CFBundleVersion and
-        // never offers an older stable build when beta is switched off.
+        // so Settings takes effect without a restart. Sparkle only offers a CFBundleVersion
+        // newer than this one, so switching beta off never downgrades.
         #[unsafe(method_id(allowedChannelsForUpdater:))]
         fn allowed_channels(&self, _updater: &AnyObject) -> Retained<NSSet<NSString>> {
-            let config = crate::handoff::load_config_from(&crate::handoff::default_config_path());
-            if crate::updates::beta_enabled(config.update_channel.as_deref()) {
+            if crate::updates::beta_updates() {
                 NSSet::from_slice(&[&*NSString::from_str("beta")])
             } else {
                 NSSet::new()

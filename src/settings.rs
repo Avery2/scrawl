@@ -1305,6 +1305,7 @@ impl Panel {
 
     pub fn view(&self, host: &dyn Host) -> View {
         let config = crate::handoff::load_config_from(&host.config_path());
+        let beta_updates = crate::updates::beta_enabled(config.update_channel.as_deref());
         let shortcuts = host.shortcuts();
         let hex = crate::hex::cached_status();
         let engine = config
@@ -1331,8 +1332,8 @@ impl Panel {
             ]
         };
         View {
-            version: crate::updates::display_version(),
-            beta_updates: crate::updates::beta_enabled(config.update_channel.as_deref()),
+            version: crate::updates::display(beta_updates),
+            beta_updates,
             login: LoginView {
                 on: matches!(login, LoginItem::On | LoginItem::NeedsApproval),
                 available: login != LoginItem::Unavailable,

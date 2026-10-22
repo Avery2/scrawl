@@ -1,9 +1,9 @@
 name: Release (Windows)
 
-# Builds the Windows zip for a version tag and attaches it to that tag's GitHub release
-# (creating the release if the Mac side hasn't yet). A release/** branch only builds it, as a
-# dry run. Run it by hand with a tag to rebuild one, or without a tag to only build the zip and
-# keep it as a workflow artifact.
+# Builds the Windows zip for a beta build tag (v0.3.14-b18, pushed by scripts/release-beta.sh) and
+# attaches it to that tag's prerelease. Stable tags (v0.3.14) are promotions: promote.sh copies the
+# beta's zip, so they never rebuild. A release/** branch only builds the zip, as a dry run. Run it
+# by hand with a build tag to retry one, or without a tag to keep the zip as a workflow artifact.
 
 on:
   push:
@@ -27,7 +27,7 @@ jobs:
   windows:
     name: Windows x64
     # Stable tags are promotions of already tested bytes. Never rebuild/overwrite those zips.
-    if: github.ref_type != 'tag' || contains(github.ref_name, '-beta.')
+    if: github.ref_type != 'tag' || contains(github.ref_name, '-b')
     runs-on: windows-latest
     timeout-minutes: 90
     env:
@@ -48,8 +48,11 @@ jobs:
         shell: bash
         run: |
           if [[ -n "$TAG" ]]; then
-            [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[1-9][0-9]*$ ]] || { echo "Only beta tags build new artifacts"; exit 1; }
-            echo "SCRAWL_VERSION=${TAG#v}" >> "$GITHUB_ENV"
+            [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-b([1-9][0-9]*)$ ]] || { echo "Only build tags (v0.3.14-b18) build new artifacts"; exit 1; }
+            # The app is a plain version and build number; the zip is named for the build.
+            echo "SCRAWL_VERSION=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+            echo "SCRAWL_BUILD_NUMBER=${BASH_REMATCH[2]}" >> "$GITHUB_ENV"
+            echo "SCRAWL_LABEL=${TAG#v}" >> "$GITHUB_ENV"
           fi
 
       - run: cargo build ${{ env.BUILD }}
@@ -140,8 +143,9 @@ jobs:
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-          if ($env:SCRAWL_VERSION) { $version = $env:SCRAWL_VERSION }
-          $name = "Scrawl-$version-windows-x64.zip"
+          $label = $version
+          if ($env:SCRAWL_LABEL) { $version = $env:SCRAWL_VERSION; $label = $env:SCRAWL_LABEL }
+          $name = "Scrawl-$label-windows-x64.zip"
           $dir = "dist\Scrawl"
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item $env:EXE "$dir\scrawl.exe"
