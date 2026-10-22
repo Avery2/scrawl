@@ -51,7 +51,10 @@ pub struct SpeechModelLine {
 
 /// Linux transcribes with Parakeet (`speech`): Hex's installed model, else Scrawl's own copy,
 /// downloaded and checked here.
-pub fn install_speech_model(line: impl FnMut(SpeechModelLine)) -> Result<()> {
+pub fn install_speech_model(
+    _stop: &dyn Fn() -> bool,
+    line: impl FnMut(SpeechModelLine),
+) -> Result<()> {
     crate::speech::install(line)
 }
 

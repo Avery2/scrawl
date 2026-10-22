@@ -238,6 +238,7 @@ pub fn install(mut line: impl FnMut(SpeechModelLine)) -> Result<()> {
         status: status.into(),
         engine: Some("Parakeet".into()),
         locale: Some("en".into()),
+        locales: None,
         progress,
         error,
     };
@@ -430,6 +431,11 @@ mod tests {
         let model = download(&PARAKEET, &dir, &mut |done| last = done).unwrap();
         if fresh {
             assert_eq!(last, 1.0);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::env::var_os("SCRAWL_TEST_NO_AVX512").is_some() {
+            // Under SDE: proves the emulated CPU is the one without AVX-512 (#58).
+            assert!(!std::arch::is_x86_feature_detected!("avx512f"));
         }
         #[cfg(target_arch = "x86_64")]
         if std::env::var_os("SCRAWL_TEST_NO_AVX_VNNI").is_some() {

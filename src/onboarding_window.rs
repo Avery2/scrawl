@@ -335,9 +335,7 @@ fn set_visible(window: Option<&mut Window>, visible: bool) {
 #[cfg(target_os = "macos")]
 fn set_visible(_window: Option<&mut Window>, _visible: bool) {}
 
-fn ease_out_cubic(t: f32) -> f32 {
-    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
-}
+use crate::ui::ease_out_cubic;
 
 fn number_word(n: usize) -> String {
     ["zero", "one", "two", "three", "four", "five"]
@@ -726,6 +724,11 @@ impl OnboardingWindow {
                 crate::icons::IPHONE,
                 "Camera",
                 "Show and record a cabled iPhone".to_owned(),
+            ),
+            Permission::SpeechRecognition => (
+                crate::icons::MIC,
+                "Speech Recognition",
+                "Write down what you say, on this computer".to_owned(),
             ),
         };
         let granted = row.status == Status::Granted;

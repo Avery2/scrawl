@@ -11,6 +11,7 @@
 //! [`look`] gathers (`docs/routing.md`).
 
 pub mod look;
+pub mod served;
 pub mod smart;
 
 /// The experiment that routes Mac captures with [`smart`] (`handoff::experiment`).
@@ -181,16 +182,35 @@ pub fn browser_tab_url(bundle_id: &str) -> Option<String> {
 }
 
 fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<std::process::Output> {
+    use std::io::Read as _;
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
+    // Read as it's written: output larger than a pipe's buffer would otherwise stall the child.
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut out);
+            }
+            out
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(Some(status)) => {
+                return Some(std::process::Output {
+                    status,
+                    stdout: stdout.join().ok()?,
+                    stderr: stderr.join().ok()?,
+                });
+            }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             _ => {
                 let _ = child.kill();
@@ -291,8 +311,7 @@ pub fn session_for_directory(
     whole_tree: bool,
 ) -> Result<Option<OpenCodeSession>> {
     use crate::handoff::{ROOT_SEARCH_PAGES, Scan, find_root_session, query_escape};
-    let home = dirs::home_dir();
-    if root == Path::new("/") || Some(root) == home.as_deref() {
+    if smart::is_home_or_root(root) {
         return Ok(None);
     }
     let directory = format!("&directory={}", query_escape(&root.to_string_lossy()));
@@ -402,12 +421,16 @@ pub fn route(url: &str, hooks: &Hooks) -> std::result::Result<Destination, Strin
     by_directory(&mut api, &dir, "localhost")
 }
 
+fn routing_enabled() -> bool {
+    crate::handoff::auto_send() && std::env::var_os("SCRAWL_NO_OPENCODE").is_none()
+}
+
 /// Decides where a capture that just finished goes; `None` (logged) keeps it on the clipboard.
 pub fn route_capture(
     front_bundle_id: Option<&str>,
     target_bundle_id: Option<&str>,
 ) -> Option<Destination> {
-    if !crate::handoff::auto_send() || std::env::var_os("SCRAWL_NO_OPENCODE").is_some() {
+    if !routing_enabled() {
         return None;
     }
     let url = capture_url(front_bundle_id, target_bundle_id)?;
@@ -432,14 +455,13 @@ pub fn look_capture(
     front_bundle_id: Option<&str>,
     target_bundle_id: Option<&str>,
 ) -> Option<look::Live> {
-    if !crate::handoff::auto_send() || std::env::var_os("SCRAWL_NO_OPENCODE").is_some() {
-        return None;
-    }
-    Some(look::look_live(
-        front_bundle_id,
-        target_bundle_id,
-        &look::Senses::default(),
-    ))
+    routing_enabled().then(|| {
+        look::look_live(
+            front_bundle_id,
+            target_bundle_id,
+            &look::Senses::default(),
+        )
+    })
 }
 
 /// Smart routing's second half, once the bundle is built: decides, saves the evidence beside
@@ -459,7 +481,7 @@ pub fn judge_capture(
         scrawl_log(format!("routing: couldn't save {RECORD}: {err:#}"));
     }
     let outcome = match &judgement.decision {
-        smart::Decision::Send { to } => {
+        smart::Decision::Send { to, .. } => {
             format!("send to {} ({})", to.candidate.label(), to.candidate.id)
         }
         smart::Decision::Offer { choices } => format!(
@@ -509,7 +531,10 @@ pub fn explain_bundle(bundle: &Path, url: Option<&str>) -> Result<String> {
         .map(str::to_owned)
         .or_else(|| loaded.destination.as_ref().and_then(|d| d.url.clone()));
     if replayed {
-        let _ = writeln!(out, "Evidence  saved at capture time ({RECORD})");
+        let _ = writeln!(
+            out,
+            "Evidence  saved at capture time ({RECORD}); the bundle's clues read again with today's rules"
+        );
     } else {
         let _ = writeln!(
             out,
@@ -570,22 +595,9 @@ pub fn record_destination(dir: &Path, bundle: &mut ScrawlBundle, dest: Destinati
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handoff::{OpenCodeSessionLocation, OpenCodeSessionTime};
 
     fn session(id: &str, dir: &str, updated: u64) -> OpenCodeSession {
-        OpenCodeSession {
-            id: id.into(),
-            title: id.to_uppercase(),
-            parent_id: None,
-            time: OpenCodeSessionTime {
-                updated,
-                archived: None,
-            },
-            location: Some(OpenCodeSessionLocation {
-                directory: Some(dir.into()),
-            }),
-            directory: None,
-        }
+        crate::handoff::fake_api::session(id, &id.to_uppercase(), dir, updated)
     }
 
     #[test]

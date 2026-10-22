@@ -1,6 +1,8 @@
 //! Transcription: Apple's SpeechAnalyzer through `scrawl-helper` (measured word and segment
-//! timings), or Hex when `"transcriber": "hex"` is set and Hex is connected (`crate::hex`; word
-//! times estimated). Any Hex trouble falls back to Apple for that recording.
+//! timings), Hex when `"transcriber": "hex"` is set and Hex is connected (`crate::hex`; word
+//! times estimated), or a program of the user's when `"transcriber": "command"`
+//! (`crate::command_transcriber`). Any Hex or command trouble falls back to Apple for that
+//! recording.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -15,6 +17,7 @@ pub enum Engine {
     #[default]
     Apple,
     Hex,
+    Command,
 }
 
 impl Engine {
@@ -22,6 +25,7 @@ impl Engine {
         match name.trim().to_ascii_lowercase().as_str() {
             "apple" => Some(Self::Apple),
             "hex" => Some(Self::Hex),
+            "command" => Some(Self::Command),
             _ => None,
         }
     }
@@ -30,6 +34,7 @@ impl Engine {
         match self {
             Self::Apple => "apple",
             Self::Hex => "hex",
+            Self::Command => "command",
         }
     }
 
@@ -46,6 +51,7 @@ impl Engine {
         match OVERRIDE.load(Ordering::Relaxed) {
             1 => Self::Apple,
             2 => Self::Hex,
+            3 => Self::Command,
             _ => Self::configured(),
         }
     }
@@ -62,12 +68,12 @@ pub const LOCAL_ENGINE_TITLE: &str = "Parakeet (on this computer)";
 
 static OVERRIDE: AtomicU8 = AtomicU8::new(0);
 static LOGGED_NOT_CONNECTED: std::sync::Once = std::sync::Once::new();
+static LOGGED_NO_COMMAND: std::sync::Once = std::sync::Once::new();
 
-/// What the menu's Transcription submenu shows. A Hex preference stays saved while Hex is away,
-/// but the tick follows what recordings would really use.
+/// What the Settings window's Transcription controls show. A Hex preference stays saved while Hex
+/// is away, but the active choice follows what recordings would really use.
 #[derive(Debug, PartialEq, Eq)]
 pub struct MenuState {
-    pub apple_checked: bool,
     pub hex_title: &'static str,
     pub hex_enabled: bool,
     pub hex_checked: bool,
@@ -82,7 +88,6 @@ pub fn menu_state(
 ) -> MenuState {
     let Some(status) = status else {
         return MenuState {
-            apple_checked: true,
             hex_title: "Hex (not running)",
             hex_enabled: false,
             hex_checked: false,
@@ -107,7 +112,6 @@ pub fn menu_state(
         .collect();
     let ready = chosen.is_some();
     MenuState {
-        apple_checked: !(ready && preferred == Engine::Hex),
         hex_title: if ready { "Hex" } else { "Hex (no model ready)" },
         hex_enabled: ready,
         hex_checked: ready && preferred == Engine::Hex,
@@ -121,6 +125,7 @@ pub fn set_override(engine: Engine) {
         match engine {
             Engine::Apple => 1,
             Engine::Hex => 2,
+            Engine::Command => 3,
         },
         Ordering::Relaxed,
     );
@@ -135,9 +140,14 @@ pub fn transcribe(wav: Option<&Path>, audio: Option<&RecordedAudio>) -> Transcri
         };
     };
     let live = audio.live.take();
+    let engine = Engine::preferred();
     run(
-        Engine::preferred(),
-        || try_hex(audio),
+        engine,
+        || match engine {
+            Engine::Apple => Ok(None),
+            Engine::Hex => try_hex(audio),
+            Engine::Command => try_command(wav, audio),
+        },
         || {
             live.and_then(|live| finish_live(live, audio))
                 .unwrap_or_else(|| apple(wav))
@@ -170,23 +180,48 @@ fn finish_live(
     }
 }
 
-/// Hex first when preferred, with Apple as the answer to anything it can't do. `hex` returns
-/// `Ok(None)` when Hex isn't available at all (not connected, model not ready).
+/// The preferred engine when it isn't Apple, with Apple as the answer to anything it can't do.
+/// `other` returns `Ok(None)` when that engine isn't there at all (Hex not connected or without a
+/// ready model, no usable `transcribeCommand`).
 fn run(
     engine: Engine,
-    hex: impl FnOnce() -> Result<Option<TranscriptData>>,
+    other: impl FnOnce() -> Result<Option<TranscriptData>>,
     apple: impl FnOnce() -> TranscriptData,
 ) -> TranscriptData {
-    if engine == Engine::Hex {
-        match hex() {
-            Ok(Some(transcript)) => return transcript,
-            Ok(None) => {}
-            Err(error) => crate::capture::scrawl_log(format!(
-                "Hex transcription failed, using {LOCAL_ENGINE_TITLE}: {error:#}"
-            )),
-        }
+    let name = match engine {
+        Engine::Apple => return apple(),
+        Engine::Hex => "Hex",
+        Engine::Command => "Command",
+    };
+    match other() {
+        Ok(Some(transcript)) => return transcript,
+        Ok(None) => {}
+        Err(error) => crate::capture::scrawl_log(format!(
+            "{name} transcription failed, using {LOCAL_ENGINE_TITLE}: {error:#}"
+        )),
     }
     apple()
+}
+
+/// Runs `transcribeCommand`. Its errors are fixed reasons (`command_transcriber::Failure`),
+/// never what the program printed or was given.
+fn try_command(wav: &Path, audio: &RecordedAudio) -> Result<Option<TranscriptData>> {
+    let program = match crate::handoff::transcribe_command() {
+        Ok(program) => program,
+        Err(unusable) => {
+            LOGGED_NO_COMMAND.call_once(|| {
+                crate::capture::scrawl_log(format!(
+                    "Command transcriber preferred but {unusable}; using {LOCAL_ENGINE_TITLE}"
+                ));
+            });
+            return Ok(None);
+        }
+    };
+    let transcript =
+        crate::command_transcriber::transcribe(&program, wav, audio.sample_count, &mut |line| {
+            crate::capture::scrawl_log(line)
+        })?;
+    Ok(Some(transcript))
 }
 
 fn try_hex(audio: &RecordedAudio) -> Result<Option<TranscriptData>> {
@@ -246,43 +281,44 @@ mod tests {
     fn engine_names_parse_and_unknown_is_not_an_engine() {
         assert_eq!(Engine::parse("hex"), Some(Engine::Hex));
         assert_eq!(Engine::parse(" Apple "), Some(Engine::Apple));
+        assert_eq!(Engine::parse("Command"), Some(Engine::Command));
         assert_eq!(Engine::parse("whisper"), None);
         assert_eq!(Engine::default(), Engine::Apple);
     }
 
     #[test]
-    fn apple_preference_never_touches_hex() {
+    fn apple_preference_never_asks_another_engine() {
         let result = run(
             Engine::Apple,
-            || panic!("Hex must not be asked"),
+            || panic!("no other engine may be asked"),
             || named("speech-analyzer"),
         );
         assert_eq!(result.source, "speech-analyzer");
     }
 
     #[test]
-    fn hex_is_used_when_it_answers() {
-        let result = run(
-            Engine::Hex,
-            || Ok(Some(named("hex:parakeet_v3"))),
-            || panic!("Apple must not be asked"),
-        );
-        assert_eq!(result.source, "hex:parakeet_v3");
+    fn the_preferred_engine_is_used_when_it_answers() {
+        for (engine, source) in [
+            (Engine::Hex, "hex:parakeet_v3"),
+            (Engine::Command, "command:whisper-scrawl"),
+        ] {
+            let result = run(
+                engine,
+                || Ok(Some(named(source))),
+                || panic!("Apple must not be asked"),
+            );
+            assert_eq!(result.source, source);
+        }
     }
 
     #[test]
-    fn unavailable_or_failing_hex_falls_back_to_apple() {
-        let apple = || named("speech-analyzer");
-        assert_eq!(
-            run(Engine::Hex, || Ok(None), apple).source,
-            "speech-analyzer"
-        );
-        let failed = run(
-            Engine::Hex,
-            || Err(anyhow::anyhow!("Hex took too long")),
-            apple,
-        );
-        assert_eq!(failed.source, "speech-analyzer");
+    fn an_unavailable_or_failing_engine_falls_back_to_apple() {
+        for engine in [Engine::Hex, Engine::Command] {
+            let apple = || named("speech-analyzer");
+            assert_eq!(run(engine, || Ok(None), apple).source, "speech-analyzer");
+            let failed = run(engine, || Err(anyhow::anyhow!("took too long")), apple);
+            assert_eq!(failed.source, "speech-analyzer");
+        }
     }
 
     #[test]
@@ -300,7 +336,7 @@ mod tests {
         };
 
         let away = menu_state(Engine::Hex, None, None);
-        assert!(away.apple_checked && !away.hex_checked && !away.hex_enabled);
+        assert!(!away.hex_checked && !away.hex_enabled);
         assert_eq!(away.hex_title, "Hex (not running)");
 
         let up = status(vec![
@@ -308,7 +344,7 @@ mod tests {
             ready("qwen3_asr06_b", ""),
         ]);
         let hex = menu_state(Engine::Hex, Some(&up), Some("qwen3_asr06_b"));
-        assert!(hex.hex_checked && !hex.apple_checked && hex.hex_enabled);
+        assert!(hex.hex_checked && hex.hex_enabled);
         assert_eq!(
             hex.models,
             vec![
@@ -317,7 +353,7 @@ mod tests {
             ]
         );
         let apple = menu_state(Engine::Apple, Some(&up), None);
-        assert!(apple.apple_checked && !apple.hex_checked && apple.hex_enabled);
+        assert!(!apple.hex_checked && apple.hex_enabled);
 
         let empty = status(vec![Model {
             id: "parakeet_v3".into(),
@@ -326,7 +362,7 @@ mod tests {
             verified: false,
         }]);
         let none = menu_state(Engine::Hex, Some(&empty), None);
-        assert!(none.apple_checked && !none.hex_enabled && none.models.is_empty());
+        assert!(!none.hex_checked && !none.hex_enabled && none.models.is_empty());
         assert_eq!(none.hex_title, "Hex (no model ready)");
     }
 

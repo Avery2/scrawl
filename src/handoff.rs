@@ -211,6 +211,13 @@ pub fn copy_png_to_clipboard(png_bytes: &[u8]) -> Result<()> {
 pub fn copy_bundle_to_clipboard(bundle_dir: &Path) -> Result<()> {
     let (directory, bundle) = load_bundle(bundle_dir)?;
     let summary = crate::sketch::summary_markdown(&bundle, &directory);
+    #[cfg(target_os = "windows")]
+    if experiment("clipboardImage")
+        && let Ok(image) = fs::read(directory.join(&bundle.contact_sheet))
+        && crate::win::clipboard::set_png_and_text(&image, Some(&summary)).is_ok()
+    {
+        return Ok(());
+    }
     copy_string_to_clipboard(&summary)
 }
 
@@ -304,6 +311,8 @@ pub struct OpenCodeSessionLocation {
 pub struct OpenCodeSessionTime {
     #[serde(default)]
     pub updated: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewed: Option<u64>,
     #[serde(default)]
     pub archived: Option<u64>,
 }
@@ -385,9 +394,16 @@ pub struct Config {
     /// Feature flag: shows **Export Last Capture as Video…** in the menu (default off).
     #[serde(default)]
     pub video_export: Option<bool>,
-    /// `"apple"` (default) or `"hex"`: which engine transcribes recordings (`transcribe`).
+    /// `"apple"` (default), `"hex"` or `"command"`: which engine transcribes recordings
+    /// (`transcribe`). The command's own keys are read by `transcribe_command`, not here, so a
+    /// malformed one can't reset this struct.
     #[serde(default)]
     pub transcriber: Option<String>,
+    /// Lower the output volume while recording (`playback`) to `playbackLevel` percent of it.
+    #[serde(default)]
+    pub lower_playback: Option<bool>,
+    #[serde(default)]
+    pub playback_level: Option<u8>,
     /// The Hex model to use when `transcriber` is `"hex"` (default: the first ready one of
     /// `hex::PREFERRED_MODELS`).
     #[serde(default)]
@@ -395,6 +411,9 @@ pub struct Config {
     /// Hex language code (`"en"` by default, `"auto"` for model language detection).
     #[serde(default)]
     pub hex_language: Option<String>,
+    /// Apple Speech locale (BCP-47, e.g. "zh-TW"); missing means the Mac's own language.
+    #[serde(default)]
+    pub apple_locale: Option<String>,
     /// Whether to use the native Metal recording pill instead of GPUI's `HudPillWindow` (default `true`).
     #[serde(default)]
     pub native_pill: Option<bool>,
@@ -408,6 +427,30 @@ pub struct Config {
     /// The microphone Mac captures record from (`mic`); absent follows the macOS default.
     #[serde(default)]
     pub microphone: Option<crate::mic::Choice>,
+    /// Smart routing's settings (`routing::look`).
+    #[serde(default)]
+    pub routing: Option<RoutingConfig>,
+}
+
+impl Config {
+    /// The output volume while recording when `lowerPlayback` is on, in percent of what it was.
+    pub fn recording_volume(&self) -> u8 {
+        self.playback_level.unwrap_or(20).min(100)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutingConfig {
+    /// The checkout each app is built from, by bundle ID or a prefix of one
+    /// (`{"ai.opencode.desktop": "~/code/opencode"}`), for apps whose checkout isn't named like
+    /// them.
+    #[serde(default)]
+    pub apps: std::collections::BTreeMap<String, String>,
+    /// The folder a URL prefix serves, for file servers whose pages aren't their own project's
+    /// (`{"https://studio.example.ts.net:8444/raw/": "~/code/home/artifacts"}`).
+    #[serde(default)]
+    pub servers: std::collections::BTreeMap<String, String>,
 }
 
 /// `true`/`false`, `"yes"`/`"on"`/`"1"` and their opposites, or a number (non-zero is on). Other
@@ -625,6 +668,38 @@ pub fn ensure_ingest_token() -> Result<String> {
     ensure_ingest_token_in(&default_config_path())
 }
 
+/// `routing.apps` from config.json, `~` expanded. Tests see none.
+pub fn routing_apps() -> Vec<(String, PathBuf)> {
+    routing_paths(|routing| routing.apps)
+}
+
+/// `routing.servers` in config.json: URL prefixes and the folders they serve, `~` expanded.
+pub fn routing_servers() -> Vec<(String, PathBuf)> {
+    routing_paths(|routing| routing.servers)
+}
+
+fn routing_paths(
+    pick: fn(RoutingConfig) -> std::collections::BTreeMap<String, String>,
+) -> Vec<(String, PathBuf)> {
+    if cfg!(test) {
+        return Vec::new();
+    }
+    let home = dirs::home_dir().unwrap_or_default();
+    config()
+        .routing
+        .map(pick)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, path)| {
+            let path = match path.strip_prefix("~/") {
+                Some(rest) => home.join(rest),
+                None => PathBuf::from(path),
+            };
+            (id, path)
+        })
+        .collect()
+}
+
 /// Whether Mac captures of a dev site go straight to its session (`autoSend`, default on).
 pub fn auto_send() -> bool {
     config().auto_send.unwrap_or(true)
@@ -660,6 +735,25 @@ pub fn hex_language_from(config: &Config) -> String {
         .as_deref()
         .and_then(crate::hex::language_code)
         .unwrap_or_else(|| crate::hex::DEFAULT_LANGUAGE.into())
+}
+
+/// The configured Apple Speech locale, or the Mac's own language when unset.
+pub fn apple_locale() -> Option<String> {
+    apple_locale_from(&config())
+}
+
+pub fn apple_locale_from(config: &Config) -> Option<String> {
+    config
+        .apple_locale
+        .as_deref()
+        .and_then(crate::speech_model::locale_id)
+}
+
+/// The command transcriber's program (`transcribeCommand`, `transcribeTimeoutSeconds`), read
+/// on its own from the config file.
+pub fn transcribe_command()
+-> Result<crate::command_transcriber::Program, crate::command_transcriber::Unusable> {
+    crate::command_transcriber::Program::load_from(&default_config_path())
 }
 
 /// Whether the native AppKit + Metal recording pill is enabled (`SCRAWL_NATIVE_PILL` or
@@ -991,28 +1085,13 @@ fn non_empty(value: Option<&str>) -> Option<String> {
 /// The socket address in `http://127.0.0.1:4096…` when its host is an IP or `localhost` (no
 /// lookups).
 fn server_address(url: &str) -> Option<std::net::SocketAddr> {
-    let rest = url.split_whitespace().next()?;
-    let (scheme, rest) = rest.split_once("://")?;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let default_port = if scheme == "https" { 443 } else { 80 };
-    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
-        let (host, rest) = v6.split_once(']')?;
-        match rest.strip_prefix(':') {
-            Some(port) => (host, port.parse().ok()?),
-            None => (host, default_port),
-        }
-    } else {
-        match authority.rsplit_once(':') {
-            Some((host, port)) => (host, port.parse().ok()?),
-            None => (authority, default_port),
-        }
-    };
-    let ip = if host.eq_ignore_ascii_case("localhost") {
+    let parsed = crate::routing::parse_url(url.split_whitespace().next()?)?;
+    let ip = if parsed.host == "localhost" {
         std::net::IpAddr::from([127, 0, 0, 1])
     } else {
-        host.parse().ok()?
+        parsed.host.parse().ok()?
     };
-    Some(std::net::SocketAddr::new(ip, port))
+    Some(std::net::SocketAddr::new(ip, parsed.port))
 }
 
 fn resolve_server(
@@ -1190,8 +1269,10 @@ pub fn find_root_session(
             .as_array()
             .or_else(|| response.get("data").and_then(|data| data.as_array()))
             .context("Missing OpenCode session list")?;
-        for session in data {
-            let session = serde_json::from_value::<OpenCodeSession>(session.clone())?;
+        for session in data
+            .iter()
+            .filter_map(|s| serde_json::from_value::<OpenCodeSession>(s.clone()).ok())
+        {
             // The API has no archived filter.
             if !session.is_open_root() {
                 continue;
@@ -1217,7 +1298,7 @@ pub fn find_root_session(
     Ok(None)
 }
 
-fn normalize_slug(text: &str) -> String {
+pub(crate) fn normalize_slug(text: &str) -> String {
     text.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
@@ -1760,6 +1841,31 @@ mod tests {
     }
 
     #[test]
+    fn apple_locale_round_trips_and_keeps_other_keys() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("config.json");
+        fs::write(&path, br#"{"ingestToken":"abc","autoSend":false}"#).unwrap();
+        let config = load_config_from(&path);
+        assert_eq!(apple_locale_from(&config), None);
+        assert_eq!(config.auto_send, Some(false));
+
+        for (value, expected) in [
+            ("zh-TW".into(), Some("zh-TW")),
+            ("bad value".into(), None),
+            (5.into(), None),
+            (serde_json::Value::Null, None),
+        ] {
+            set_config_value_in(&path, "appleLocale", value).unwrap();
+            let config = load_config_from(&path);
+            assert_eq!(apple_locale_from(&config).as_deref(), expected);
+            assert_eq!(config.ingest_token.as_deref(), Some("abc"));
+            assert_eq!(config.auto_send, Some(false));
+        }
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(raw.get("appleLocale").is_none());
+    }
+
+    #[test]
     fn transcriber_preference_round_trips_and_keeps_other_keys() {
         let fixture = Fixture::new();
         let path = fixture.0.join("config.json");
@@ -1782,6 +1888,20 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn malformed_command_keys_never_reset_the_rest_of_the_config() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("config.json");
+        fs::write(
+            &path,
+            br#"{"transcriber":"command","autoSend":false,"transcribeCommand":"whisper {audio}","transcribeTimeoutSeconds":"soon"}"#,
+        )
+        .unwrap();
+        let config = load_config_from(&path);
+        assert_eq!(config.transcriber.as_deref(), Some("command"));
+        assert_eq!(config.auto_send, Some(false));
     }
 
     #[test]
@@ -2063,6 +2183,7 @@ pub(crate) mod fake_api {
             parent_id: None,
             time: OpenCodeSessionTime {
                 updated,
+                viewed: None,
                 archived: None,
             },
             location: Some(OpenCodeSessionLocation {
@@ -2072,30 +2193,15 @@ pub(crate) mod fake_api {
         }
     }
 
-    fn decode(text: &str) -> String {
-        let bytes = text.as_bytes();
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%' {
-                out.push(u8::from_str_radix(&text[i + 1..i + 3], 16).unwrap());
-                i += 3;
-            } else {
-                out.push(bytes[i]);
-                i += 1;
-            }
-        }
-        String::from_utf8(out).unwrap()
-    }
-
     /// Answers `GET /api/session/{id}` and `GET /api/session?…` like OpenCode 2: newest first,
     /// `parentID=null`, exact `directory`, `limit` (default 50), and a cursor carrying the filters.
     pub fn serve(sessions: &[OpenCodeSession], path: &str) -> Result<Vec<u8>> {
+        use crate::ax::percent_decode;
         let (route, query) = path.split_once('?').unwrap_or((path, ""));
         if let Some(id) = route.strip_prefix("/api/session/") {
             let session = sessions
                 .iter()
-                .find(|s| s.id == decode(id))
+                .find(|s| s.id == percent_decode(id))
                 .context("404 Not Found")?;
             return Ok(serde_json::to_vec(&serde_json::json!({ "data": session }))?);
         }
@@ -2103,7 +2209,7 @@ pub(crate) mod fake_api {
         let mut params: std::collections::HashMap<String, String> = query
             .split('&')
             .filter_map(|pair| pair.split_once('='))
-            .map(|(k, v)| (k.to_owned(), decode(v)))
+            .map(|(k, v)| (k.to_owned(), percent_decode(v)))
             .collect();
         let mut offset = 0;
         if let Some(cursor) = params.remove("cursor") {
