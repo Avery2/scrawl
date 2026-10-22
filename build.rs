@@ -2,6 +2,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=SCRAWL_VERSION");
+    let version = std::env::var("SCRAWL_VERSION")
+        .unwrap_or_else(|_| std::env::var("CARGO_PKG_VERSION").unwrap());
+    println!("cargo:rustc-env=SCRAWL_RELEASE_VERSION={version}");
     #[cfg(windows)]
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         embed_windows_resources();
@@ -66,7 +70,8 @@ fn embed_windows_resources() {
     let output_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     let icon = manifest_dir.join("assets/Scrawl.ico");
     println!("cargo:rerun-if-changed={}", icon.display());
-    let version = std::env::var("CARGO_PKG_VERSION").unwrap();
+    let version = std::env::var("SCRAWL_VERSION")
+        .unwrap_or_else(|_| std::env::var("CARGO_PKG_VERSION").unwrap());
     let numeric = version
         .split(['.', '-'])
         .take(3)

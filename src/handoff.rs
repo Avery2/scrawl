@@ -404,6 +404,9 @@ pub struct Config {
     /// Lower the output volume while recording (`playback`) to `playbackLevel` percent of it.
     #[serde(default)]
     pub lower_playback: Option<bool>,
+    /// Only "beta" opts in; absent or unknown channels receive stable releases.
+    #[serde(default)]
+    pub update_channel: Option<String>,
     #[serde(default)]
     pub playback_level: Option<u8>,
     /// The Hex model to use when `transcriber` is `"hex"` (default: the first ready one of

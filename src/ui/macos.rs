@@ -403,6 +403,11 @@ objc2::define_class!(
     unsafe impl NSObjectProtocol for ScrawlMenuTarget {}
 
     impl ScrawlMenuTarget {
+        #[unsafe(method(reportProblem:))]
+        fn report_problem(&self, _sender: &AnyObject) {
+            crate::updates::report_problem();
+        }
+
         #[unsafe(method(toggleCapture:))]
         fn toggle_capture(&self, _sender: &AnyObject) {
             let _ = self.ivars().sender.try_send(MenuAction::ToggleCapture);
@@ -635,6 +640,19 @@ pub(super) fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
         item.setKeyEquivalent(&NSString::from_str(","));
     }
     add("Check for Updates…", sel!(checkForUpdates:));
+    if crate::updates::is_beta() {
+        add("Report a Problem…", sel!(reportProblem:));
+    }
+    let version = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(&format!("Scrawl {}", crate::updates::display_version())),
+            None,
+            &NSString::new(),
+        )
+    };
+    version.setEnabled(false);
+    menu.addItem(&version);
     add("Quit Scrawl", sel!(quitApp:));
     if let Some(item) = menu.itemAtIndex(menu.numberOfItems() - 1) {
         item.setKeyEquivalent(&NSString::from_str("q"));

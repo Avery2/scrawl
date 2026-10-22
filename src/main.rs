@@ -41,6 +41,7 @@ mod retention;
 mod routing;
 mod screens;
 mod settings;
+mod updates;
 mod settings_window;
 mod shortcut;
 mod sketch;
@@ -75,7 +76,7 @@ use crate::sketch::{marks_of, summary_markdown};
 #[derive(Parser)]
 #[command(
     name = "scrawl",
-    version,
+    version = env!("SCRAWL_RELEASE_VERSION"),
     about = "Shortcut-triggered screen, voice, and drawing capture for agents"
 )]
 struct Cli {

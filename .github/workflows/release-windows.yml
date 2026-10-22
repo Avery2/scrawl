@@ -26,6 +26,8 @@ concurrency:
 jobs:
   windows:
     name: Windows x64
+    # Stable tags are promotions of already tested bytes. Never rebuild/overwrite those zips.
+    if: github.ref_type != 'tag' || contains(github.ref_name, '-beta.')
     runs-on: windows-latest
     timeout-minutes: 90
     env:
@@ -41,6 +43,14 @@ jobs:
         with:
           key: release
           cache-on-failure: true
+
+      - name: Set the release identity
+        shell: bash
+        run: |
+          if [[ -n "$TAG" ]]; then
+            [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[1-9][0-9]*$ ]] || { echo "Only beta tags build new artifacts"; exit 1; }
+            echo "SCRAWL_VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          fi
 
       - run: cargo build ${{ env.BUILD }}
 
@@ -130,6 +140,7 @@ jobs:
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($env:SCRAWL_VERSION) { $version = $env:SCRAWL_VERSION }
           $name = "Scrawl-$version-windows-x64.zip"
           $dir = "dist\Scrawl"
           New-Item -ItemType Directory -Force $dir | Out-Null
@@ -177,5 +188,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --verify-tag --title "Scrawl ${TAG#v}" --notes "Release notes to follow."
-          gh release upload "$TAG" "dist/${{ steps.package.outputs.name }}" "dist/${{ steps.package.outputs.name }}.sha256" --clobber
+          # The Mac publisher creates the prerelease. A retry must never replace tested bytes.
+          release=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
+          name="${{ steps.package.outputs.name }}"
+          if ! jq -e --arg name "$name" 'any(.assets[]; .name == $name)' <<< "$release" >/dev/null; then
+            gh release upload "$TAG" "dist/$name"
+          fi
+          # If a previous upload succeeded, its bytes win over a new runner's rebuild.
+          release=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
+          digest=$(jq -er --arg name "$name" '.assets[] | select(.name == $name) | .digest | select(startswith("sha256:"))' <<< "$release")
+          printf '%s  %s\n' "${digest#sha256:}" "$name" > "dist/$name.sha256"
+          if ! jq -e --arg name "$name.sha256" 'any(.assets[]; .name == $name)' <<< "$release" >/dev/null; then
+            gh release upload "$TAG" "dist/$name.sha256"
+          fi

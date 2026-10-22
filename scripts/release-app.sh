@@ -4,12 +4,13 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="${1:-prepare}"
 VERSION="${SCRAWL_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "${REPO_DIR}/Cargo.toml" | head -1)}"
-BUILD_NUMBER="${SCRAWL_BUILD_NUMBER:-1}"
+BUILD_NUMBER="${SCRAWL_BUILD_NUMBER:?Set a globally increasing SCRAWL_BUILD_NUMBER}"
+CHANNEL="${SCRAWL_UPDATE_CHANNEL:-stable}"
 BASE_URL="${SCRAWL_RELEASE_BASE_URL:-https://scrawl.kitlangton.com}"
 SIGN_ID="Developer ID Application: Christopher Langton (QC99C9JE59)"
 SPARKLE_PUBLIC_KEY="mIek27lttJe8cIBqVZFhh6reRKjpTx1h9ZY9OKWPtuM="
 
-DIST_DIR="${REPO_DIR}/dist"
+DIST_DIR="${SCRAWL_DIST_DIR:-${REPO_DIR}/dist}"
 UPDATES_DIR="${DIST_DIR}/updates"
 APP_BUNDLE="${DIST_DIR}/Scrawl.app"
 DMG_NAME="Scrawl-${VERSION}-arm64.dmg"
@@ -19,7 +20,7 @@ ZIP_NAME="Scrawl-${VERSION}-arm64.zip"
 cd "${REPO_DIR}"
 SPARKLE_DIR="$("${REPO_DIR}/scripts/setup-sparkle.sh")"
 
-taskpolicy -c utility cargo build --release -j 3 --offline
+hivemind run --kind cargo -- env SCRAWL_VERSION="${VERSION}" cargo +stable build --release -j 2 --locked
 
 rm -rf "${APP_BUNDLE}" "${DIST_DIR}/staging" "${UPDATES_DIR}"
 mkdir -p "${APP_BUNDLE}/Contents/MacOS" "${APP_BUNDLE}/Contents/Resources" "${APP_BUNDLE}/Contents/Frameworks" "${DIST_DIR}/staging" "${UPDATES_DIR}"
@@ -92,15 +93,13 @@ PLIST
 if security find-identity -v -p codesigning 2>/dev/null | grep -q "${SIGN_ID}"; then
   IDENTITY="${SIGN_ID}"
 else
-  IDENTITY="-"
+  echo "Developer ID signing identity is unavailable" >&2
+  exit 1
 fi
 
 ENTITLEMENTS="${REPO_DIR}/scripts/Scrawl.entitlements"
 # Notarization requires the hardened runtime and a secure timestamp on every signed binary.
 SIGN=(codesign --force --options runtime --timestamp --sign "${IDENTITY}")
-if [[ "${IDENTITY}" == "-" ]]; then
-  SIGN=(codesign --force --sign "-")
-fi
 
 SPARKLE_VER="${APP_BUNDLE}/Contents/Frameworks/Sparkle.framework/Versions/B"
 "${SIGN[@]}" "${SPARKLE_VER}/XPCServices/Installer.xpc"
@@ -129,29 +128,35 @@ if [[ "${IDENTITY}" != "-" && -f "${NOTARY_KEY}" ]]; then
   xcrun stapler staple "${APP_BUNDLE}"
   spctl -a -vv -t install "${DIST_DIR}/${DMG_NAME}"
 else
-  echo "warning: not notarized (no Developer ID identity or notary key); downloads will be blocked by Gatekeeper" >&2
+  echo "Notary key is unavailable; refusing to publish" >&2
+  exit 1
 fi
 cp -f "${DIST_DIR}/${DMG_NAME}" "${DIST_DIR}/${LATEST_DMG}"
 
 /usr/bin/ditto -c -k --sequesterRsrc --keepParent "${APP_BUNDLE}" "${DIST_DIR}/${ZIP_NAME}"
 cp -f "${DIST_DIR}/${ZIP_NAME}" "${UPDATES_DIR}/${ZIP_NAME}"
 
-if security find-generic-password -s 'https://sparkle-project.org' -a ed25519 -w >/dev/null 2>&1; then
+if [[ "${SCRAWL_SKIP_APPCAST:-0}" != 1 ]] && security find-generic-password -s 'https://sparkle-project.org' -a ed25519 -w >/dev/null 2>&1; then
+  CHANNEL_ARGS=()
+  if [[ "${CHANNEL}" == beta ]]; then CHANNEL_ARGS=(--channel beta); fi
   security find-generic-password -s 'https://sparkle-project.org' -a ed25519 -w \
     | "${SPARKLE_DIR}/bin/generate_appcast" \
       --ed-key-file - \
       --download-url-prefix "${BASE_URL}/releases/" \
+      "${CHANNEL_ARGS[@]}" \
       "${UPDATES_DIR}"
 fi
 
 echo "Prepared ${DIST_DIR}/${DMG_NAME} and ${DIST_DIR}/${ZIP_NAME}"
 
-if [[ -d "${REPO_DIR}/site/public" ]]; then
+if [[ "${SCRAWL_STAGE_SITE:-1}" == 1 && -d "${REPO_DIR}/site/public" ]]; then
   mkdir -p "${REPO_DIR}/site/public/releases"
   cp -f "${DIST_DIR}/${DMG_NAME}" "${REPO_DIR}/site/public/releases/${DMG_NAME}"
-  cp -f "${DIST_DIR}/${LATEST_DMG}" "${REPO_DIR}/site/public/releases/${LATEST_DMG}"
+  if [[ "${CHANNEL}" == stable ]]; then
+    cp -f "${DIST_DIR}/${LATEST_DMG}" "${REPO_DIR}/site/public/releases/${LATEST_DMG}"
+    cp -f "${DIST_DIR}/${ZIP_NAME}" "${REPO_DIR}/site/public/releases/Scrawl-latest-arm64.zip"
+  fi
   cp -f "${DIST_DIR}/${ZIP_NAME}" "${REPO_DIR}/site/public/releases/${ZIP_NAME}"
-  cp -f "${DIST_DIR}/${ZIP_NAME}" "${REPO_DIR}/site/public/releases/Scrawl-latest-arm64.zip"
   if [[ -f "${UPDATES_DIR}/appcast.xml" ]]; then
     cp -f "${UPDATES_DIR}/appcast.xml" "${REPO_DIR}/site/public/appcast.xml"
   fi
