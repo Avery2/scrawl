@@ -103,7 +103,6 @@ const K_EVENT_PARAM_DIRECT_OBJECT: u32 = u32::from_be_bytes(*b"----");
 const TYPE_EVENT_HOT_KEY_ID: u32 = u32::from_be_bytes(*b"hkid");
 const HOTKEY_SIG: u32 = u32::from_be_bytes(*b"SCRW");
 const HOTKEY_ID_TOGGLE: u32 = 1;
-const HOTKEY_ID_ESCAPE: u32 = 2;
 const HOTKEY_ID_ALT1: u32 = 3;
 const HOTKEY_ID_PASTE_BASE: u32 = 100;
 
@@ -391,18 +390,10 @@ unsafe extern "C" fn carbon_hotkey_handler(
     ));
     if status == 0 && sig == HOTKEY_SIG {
         let telemetry = unsafe { &*user_data.cast::<SharedCaptureTelemetry>() };
-        match id {
-            HOTKEY_ID_ESCAPE => {
-                let _ = telemetry
-                    .ui_sender
-                    .try_send(LiveOverlayEvent::CancelCapture);
-            }
-            id if id >= HOTKEY_ID_PASTE_BASE => {
-                telemetry.emit_paste_shortcut();
-            }
-            _ => {
-                telemetry.emit_capture_shortcut();
-            }
+        if id >= HOTKEY_ID_PASTE_BASE {
+            telemetry.emit_paste_shortcut();
+        } else {
+            telemetry.emit_capture_shortcut();
         }
     }
     0

@@ -27,8 +27,7 @@ use crate::capture::{
     LiveOverlayEvent, ScreenCaptureSession, SharedCaptureTelemetry, current_mouse_screen,
     discover_target, install_global_hotkeys, list_selectable_windows,
     record_external_frontmost_app, region_target, scrawl_log, selectable_window_at,
-    set_escape_hotkey_enabled, shortcut_from_key_and_mods, start_global_input_tap,
-    update_global_shortcut,
+    shortcut_from_key_and_mods, start_global_input_tap, update_global_shortcut,
 };
 use crate::helper::PhoneDevice;
 #[cfg(target_os = "macos")]
@@ -169,7 +168,7 @@ fn with_alpha(color: u32, alpha: f32) -> gpui::Rgba {
     rgba((color << 8) | (alpha.clamp(0.0, 1.0) * 255.0).round() as u32)
 }
 
-fn ease_out_cubic(t: f32) -> f32 {
+pub(crate) fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
 }
 
@@ -219,16 +218,6 @@ fn clock_template(clock: &str) -> String {
         .collect()
 }
 
-#[allow(dead_code)]
-fn completed_meta(_duration_ms: u64, frame_count: usize) -> String {
-    format!(
-        "· {} {} · {}",
-        frame_count,
-        if frame_count == 1 { "frame" } else { "frames" },
-        crate::settings::paste_label()
-    )
-}
-
 /// Lead text of the Completed island: local captures were copied (or sent, as `note` says);
 /// iPhone ones count the inbox.
 fn completed_label(inbox_count: usize, note: Option<&str>) -> String {
@@ -242,17 +231,20 @@ fn completed_label(inbox_count: usize, note: Option<&str>) -> String {
 /// How long a smart-routed capture waits, showing "Sending to …", before it is sent.
 const SMART_SEND_UNDO: Duration = Duration::from_millis(3_000);
 
-/// A session title short enough for the island.
-fn island_title(title: &str) -> String {
-    const MAX: usize = 24;
-    if title.chars().count() > MAX {
+fn truncate_title(title: &str, max: usize) -> String {
+    if title.chars().count() > max {
         format!(
             "{}…",
-            title.chars().take(MAX - 1).collect::<String>().trim_end()
+            title.chars().take(max - 1).collect::<String>().trim_end()
         )
     } else {
         title.to_owned()
     }
+}
+
+/// A session title short enough for the island.
+fn island_title(title: &str) -> String {
+    truncate_title(title, 24)
 }
 
 /// The Completed island's lead once a local capture's send is done.
@@ -1364,7 +1356,6 @@ impl ScrawlCoordinator {
     /// Stops the active recording and deletes its bundle, leaving the island as it is. Returns
     /// its target and overlay.
     fn discard_recording(&mut self) -> Option<(TargetInfo, Option<LaserOverlay>)> {
-        set_escape_hotkey_enabled(false);
         let rec = self.active_recording.take()?;
         let _ = self.telemetry.finish_session();
         match rec.source {
@@ -2536,7 +2527,6 @@ impl ScrawlCoordinator {
 
         self.telemetry.set_capture_mode(target.mode);
         self.telemetry.reset_for_session(target.frame);
-        set_escape_hotkey_enabled(true);
         let stage = Instant::now();
         // Reuse the continuous 120Hz Metal overlay opened in `begin_target_selection` so the
         // cutout and border never swap windows or jump a single pixel when recording starts.
@@ -2708,7 +2698,6 @@ impl ScrawlCoordinator {
         self.telemetry
             .active
             .store(false, std::sync::atomic::Ordering::Release);
-        set_escape_hotkey_enabled(true);
         let session = if let Some(mut preview) = existing_preview {
             preview.begin_recording(&movie_path);
             preview
@@ -2778,7 +2767,6 @@ impl ScrawlCoordinator {
     pub fn finish_recording(&mut self, cx: &mut Context<Self>) {
         self.playback.take();
         scrawl_log("finish_recording invoked");
-        set_escape_hotkey_enabled(false);
         let Some(rec) = self.active_recording.take() else {
             return;
         };
@@ -3041,15 +3029,7 @@ impl RouteChip {
 
 /// A session title short enough for a chip.
 fn chip_title(title: &str) -> String {
-    const MAX: usize = 16;
-    if title.chars().count() > MAX {
-        format!(
-            "{}…",
-            title.chars().take(MAX - 1).collect::<String>().trim_end()
-        )
-    } else {
-        title.to_owned()
-    }
+    truncate_title(title, 16)
 }
 
 enum RouteOutcome {
@@ -4017,7 +3997,6 @@ impl Render for TargetPickerWindow {
         let hovered = coord.hovered_window.clone();
         let anim_rect = coord.animated_window_rect;
         let pointer = coord.selection_pointer;
-        let picker_fade = ease_out_cubic(motion::age(coord.island_phase_since) / 0.15);
 
         let c_down = self.coordinator.clone();
         let c_move = self.coordinator.clone();
@@ -4111,7 +4090,6 @@ impl Render for TargetPickerWindow {
         // and inset border continuously across both `Selecting` and `Recording` so there is zero
         // window swap or border jump on recording start. `TargetPickerWindow` only provides the
         // hit-test surface, cursor style, camera cursor follower, and tabular dimension badge.
-        let _ = picker_fade;
         let mut root = div()
             .id("scrawl-target-picker")
             .track_focus(&self.focus)
@@ -5509,9 +5487,6 @@ pub fn run_app(
                             LiveOverlayEvent::UndoStroke => {
                                 coord.undo_stroke(cx);
                             }
-                            LiveOverlayEvent::CancelCapture => {
-                                coord.cancel_recording(cx);
-                            }
                             LiveOverlayEvent::RequestSnapshot => {
                                 coord.request_immediate_frame();
                                 cx.notify();
@@ -5844,10 +5819,6 @@ mod tests {
     #[test]
     fn clock_template_is_width_stable() {
         assert_eq!(clock_template("12:34"), "00:00");
-        assert_eq!(
-            completed_meta(8_000, 1),
-            format!("· 1 frame · {}", crate::settings::paste_label())
-        );
         assert_eq!(completed_label(0, None), "Copied");
         assert_eq!(completed_label(0, Some("Sent to SCRAWL")), "Sent to SCRAWL");
         assert_eq!(completed_label(1, Some("Sent to SCRAWL")), "From iPhone");
@@ -5856,6 +5827,10 @@ mod tests {
         assert_eq!(
             island_title("Make Mac captures route to the site session"),
             "Make Mac captures route…"
+        );
+        assert_eq!(
+            chip_title("Make Mac captures route to the site session"),
+            "Make Mac captur…"
         );
         let queued = crate::delivery::Delivery::Queued {
             title: "SCRAWL".into(),

@@ -68,11 +68,10 @@ static OVERRIDE: AtomicU8 = AtomicU8::new(0);
 static LOGGED_NOT_CONNECTED: std::sync::Once = std::sync::Once::new();
 static LOGGED_NO_COMMAND: std::sync::Once = std::sync::Once::new();
 
-/// What the menu's Transcription submenu shows. A Hex preference stays saved while Hex is away,
-/// but the tick follows what recordings would really use.
+/// What the Settings window's Transcription controls show. A Hex preference stays saved while Hex
+/// is away, but the active choice follows what recordings would really use.
 #[derive(Debug, PartialEq, Eq)]
 pub struct MenuState {
-    pub apple_checked: bool,
     pub hex_title: &'static str,
     pub hex_enabled: bool,
     pub hex_checked: bool,
@@ -87,7 +86,6 @@ pub fn menu_state(
 ) -> MenuState {
     let Some(status) = status else {
         return MenuState {
-            apple_checked: true,
             hex_title: "Hex (not running)",
             hex_enabled: false,
             hex_checked: false,
@@ -112,7 +110,6 @@ pub fn menu_state(
         .collect();
     let ready = chosen.is_some();
     MenuState {
-        apple_checked: !(ready && preferred == Engine::Hex),
         hex_title: if ready { "Hex" } else { "Hex (no model ready)" },
         hex_enabled: ready,
         hex_checked: ready && preferred == Engine::Hex,
@@ -337,7 +334,7 @@ mod tests {
         };
 
         let away = menu_state(Engine::Hex, None, None);
-        assert!(away.apple_checked && !away.hex_checked && !away.hex_enabled);
+        assert!(!away.hex_checked && !away.hex_enabled);
         assert_eq!(away.hex_title, "Hex (not running)");
 
         let up = status(vec![
@@ -345,7 +342,7 @@ mod tests {
             ready("qwen3_asr06_b", ""),
         ]);
         let hex = menu_state(Engine::Hex, Some(&up), Some("qwen3_asr06_b"));
-        assert!(hex.hex_checked && !hex.apple_checked && hex.hex_enabled);
+        assert!(hex.hex_checked && hex.hex_enabled);
         assert_eq!(
             hex.models,
             vec![
@@ -354,7 +351,7 @@ mod tests {
             ]
         );
         let apple = menu_state(Engine::Apple, Some(&up), None);
-        assert!(apple.apple_checked && !apple.hex_checked && apple.hex_enabled);
+        assert!(!apple.hex_checked && apple.hex_enabled);
 
         let empty = status(vec![Model {
             id: "parakeet_v3".into(),
@@ -363,7 +360,7 @@ mod tests {
             verified: false,
         }]);
         let none = menu_state(Engine::Hex, Some(&empty), None);
-        assert!(none.apple_checked && !none.hex_enabled && none.models.is_empty());
+        assert!(!none.hex_checked && !none.hex_enabled && none.models.is_empty());
         assert_eq!(none.hex_title, "Hex (no model ready)");
     }
 
