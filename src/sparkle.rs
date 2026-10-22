@@ -48,7 +48,7 @@ objc2::define_class!(
         fn allowed_channels(&self, _updater: &AnyObject) -> Retained<NSSet<NSString>> {
             let config = crate::handoff::load_config_from(&crate::handoff::default_config_path());
             if crate::updates::beta_enabled(config.update_channel.as_deref()) {
-                NSSet::from_slice(&[&NSString::from_str("beta")])
+                NSSet::from_slice(&[&*NSString::from_str("beta")])
             } else {
                 NSSet::new()
             }
