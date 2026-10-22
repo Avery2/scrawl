@@ -746,6 +746,8 @@ pub struct ScrawlCoordinator {
     /// A smart-routed capture waiting out its undo window before it's sent; ✕ or Paste on the
     /// Completed island cancels it.
     pending_send: Option<PathBuf>,
+    /// The capture whose send is on its way (`send_completed`), until it lands or fails.
+    sending: Option<PathBuf>,
     /// A local capture copied while its route is still being worked out; ✕ or Paste clears it,
     /// keeping the capture on the clipboard whatever the route says.
     routing: Option<PathBuf>,
@@ -840,6 +842,7 @@ impl ScrawlCoordinator {
             completed_dir: None,
             completed_note: None,
             pending_send: None,
+            sending: None,
             routing: None,
             route_chips: Vec::new(),
             last_local_capture_ms: 0,
@@ -2169,11 +2172,14 @@ impl ScrawlCoordinator {
             self.completed_note = None;
             return;
         }
+        self.sending = Some(dir.clone());
         cx.spawn(async move |entity, cx| {
-            let Ok(delivery) = receiver.recv_async().await else {
-                return;
-            };
+            let delivery = receiver.recv_async().await;
             let _ = entity.update(cx, |coord, cx| {
+                if coord.sending.as_deref() == Some(dir.as_path()) {
+                    coord.sending = None;
+                }
+                let Ok(delivery) = delivery else { return };
                 if coord.completed_dir.as_deref() == Some(dir.as_path()) {
                     coord.completed_note = Some(completed_delivery_note(&delivery, &title));
                 }
@@ -5574,6 +5580,9 @@ pub fn run_app(
                     if loop_coord.read(cx).is_island_visible() {
                         record_external_frontmost_app();
                         loop_coord.update(cx, |coord, cx| coord.island_tick(cx));
+                    } else if loop_coord.read(cx).stack_showing() {
+                        // The cards outlive the capsule; their clicks still need handling.
+                        loop_coord.update(cx, |coord, cx| coord.stack_step(cx));
                     }
                 });
                 if should_quit {

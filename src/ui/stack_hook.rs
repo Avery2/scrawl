@@ -41,8 +41,8 @@ pub(super) fn variant() -> Option<Variant> {
 struct Fold {
     since_completed: Duration,
     pointer_on_pill: bool,
-    /// The route is still being worked out, or a send is waiting out its undo window: chips
-    /// (or "Sending to …") may be about to show or showing.
+    /// The route is still being worked out, a send is waiting out its undo window, or it's on
+    /// its way: chips, "Sending to …" or "Sent to …" may be about to show or showing.
     route_pending: bool,
     /// Route chips are on the capsule; they exist only there, so it stays until one is
     /// clicked or the Completed island's own 25 s timeout.
@@ -69,12 +69,19 @@ impl ScrawlCoordinator {
         });
         if stale {
             self.capture_stack = None;
+            self.set_stack_rects(Vec::new());
         }
         if self.capture_stack.is_none() {
             match stack::open_on(variant, Some([f64::from(centre[0]), f64::from(centre[1])])) {
                 Ok(stack) => {
                     self.telemetry
                         .excluded_window_ids
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(stack.window_number());
+                    // The panel covers the display; only its cards (`scrawl_rects`) are Scrawl's.
+                    self.telemetry
+                        .passthrough_window_ids
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(stack.window_number());
@@ -120,6 +127,22 @@ impl ScrawlCoordinator {
         };
         state.stack.push(spec, from);
         state.cards.push((id, dir.to_path_buf()));
+    }
+
+    /// Cards are up (or a click on one is waiting): the UI loop keeps calling `stack_step` after
+    /// the capsule has gone.
+    pub(super) fn stack_showing(&self) -> bool {
+        self.capture_stack
+            .as_ref()
+            .is_some_and(|s| !s.cards.is_empty() || !s.stack.is_empty())
+    }
+
+    fn set_stack_rects(&self, rects: Vec<[f32; 4]>) {
+        *self
+            .telemetry
+            .scrawl_rects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = rects;
     }
 
     /// Every UI tick: the cards' clicks, the newest card's delivery text, and the capsule
@@ -188,15 +211,15 @@ impl ScrawlCoordinator {
             }
         }
         if let Some(state) = self.capture_stack.as_mut() {
-            let live: Vec<u64> = state
-                .stack
-                .frames_global()
-                .iter()
-                .map(|f| f.id)
-                .collect();
-            state.cards.retain(|(id, _)| live.contains(id));
+            let frames = state.stack.frames_global();
+            state.cards.retain(|(id, _)| frames.iter().any(|f| f.id == *id));
+            self.set_stack_rects(frames.iter().flat_map(|f| [f.rect, f.close]).collect());
         }
-        let pointer_on_pill = self.native_pill.as_ref().is_some_and(|p| p.pointer_on_pill());
+        let pointer_on_pill = self
+            .native_pill
+            .as_ref()
+            .map_or_else(super::pointer_on_hud_pill, |p| p.pointer_on_pill());
+        let sending = self.sending.is_some() && self.sending == self.completed_dir;
         if let IslandPhase::Completed { finished_at, inbox_count, .. } = self.island_phase
             && inbox_count == 0
             && self.completed_dir.is_some()
@@ -207,7 +230,7 @@ impl ScrawlCoordinator {
             && capsule_may_fold(Fold {
                 since_completed: finished_at.elapsed(),
                 pointer_on_pill,
-                route_pending: self.routing.is_some() || self.pending_send.is_some(),
+                route_pending: self.routing.is_some() || self.pending_send.is_some() || sending,
                 route_chips: !self.route_chips.is_empty(),
             })
         {

@@ -717,6 +717,9 @@ pub struct SharedCaptureTelemetry {
     /// Scrawl's windows that let clicks through (the ink overlay), skipped when deciding whether
     /// a click landed on Scrawl itself.
     pub passthrough_window_ids: Mutex<Vec<u32>>,
+    /// The parts of passthrough windows that are Scrawl's own (the capture stack's cards), in
+    /// global top-left points.
+    pub scrawl_rects: Mutex<Vec<[f32; 4]>>,
     /// The `scrawl-helper` whose window is what's being recorded (the iPhone mirror): its clicks
     /// count, unlike those on other helper windows (Settings, onboarding). 0 when none.
     capture_source_pid: AtomicI32,
@@ -783,6 +786,7 @@ impl SharedCaptureTelemetry {
             window_log_request: Arc::new(AtomicBool::new(false)),
             ui_sender,
             passthrough_window_ids: Mutex::new(Vec::new()),
+            scrawl_rects: Mutex::new(Vec::new()),
             capture_source_pid: AtomicI32::new(0),
             scrawl_hit: Mutex::new(None),
             tap_port: AtomicU64::new(0),
@@ -1190,6 +1194,16 @@ impl SharedCaptureTelemetry {
         y: f64,
         is_helper: impl Fn(i32) -> bool,
     ) -> bool {
+        let (px, py) = (x as f32, y as f32);
+        if self
+            .scrawl_rects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|r| px >= r[0] && px < r[0] + r[2] && py >= r[1] && py < r[1] + r[3])
+        {
+            return true;
+        }
         let passthrough = self
             .passthrough_window_ids
             .lock()
@@ -1591,6 +1605,44 @@ mod tests {
         assert!(!at(1000.0, 900.0), "the app under the ink overlay");
         telemetry.set_capture_source_pid(0);
         assert!(at(1400.0, 400.0), "a helper that isn't the source");
+    }
+
+    /// The capture stack's panel covers the display; with cards up while recording, only the
+    /// cards are Scrawl's, and a click anywhere else is the user's.
+    #[test]
+    fn clicks_outside_the_stack_s_cards_are_recorded() {
+        let (sender, _receiver) = flume::unbounded();
+        let telemetry = SharedCaptureTelemetry::new(sender);
+        telemetry.reset_for_session(TargetFrame {
+            x: 0.0,
+            y: 0.0,
+            width: 1728.0,
+            height: 1117.0,
+            scale: 2.0,
+        });
+        let window = |id, pid| crate::windows::RawWindow {
+            id,
+            pid,
+            owner: String::new(),
+            title: String::new(),
+            bounds: [0.0, 0.0, 1728.0, 1117.0],
+            layer: 0,
+            alpha: 1.0,
+        };
+        let own = std::process::id() as i32;
+        let windows = [window(7, own), window(8, own + 1)];
+        telemetry.passthrough_window_ids.lock().unwrap().push(7);
+        *telemetry.scrawl_rects.lock().unwrap() = vec![[1400.0, 900.0, 300.0, 200.0]];
+        let on_scrawl = |x, y| telemetry.scrawl_window_in(&windows, x, y, |_| false);
+        assert!(on_scrawl(1500.0, 1000.0), "a card");
+        let mut prev = [false; 2];
+        for (x, y) in [(400.0, 300.0), (1500.0, 1000.0)] {
+            poll_clicks(&telemetry, &mut prev, [true, false], (x, y), false, on_scrawl);
+            poll_clicks(&telemetry, &mut prev, [false, false], (x, y), false, on_scrawl);
+        }
+        let (events, _) = telemetry.finish_session();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(events[0], InteractionEvent::Click { .. }), "{events:?}");
     }
 
     /// Kit's Screen capture on the Pro: the old listen-only event tap was off (no Input
