@@ -200,8 +200,9 @@ pub fn copy_bundle_to_clipboard(bundle_dir: &Path) -> Result<()> {
     #[cfg(target_os = "windows")]
     if experiment("clipboardImage")
         && let Ok(image) = fs::read(directory.join(&bundle.contact_sheet))
+        && crate::win::clipboard::set_png_and_text(&image, Some(&summary)).is_ok()
     {
-        return crate::win::clipboard::set_png_and_text(&image, Some(&summary));
+        return Ok(());
     }
     copy_string_to_clipboard(&summary)
 }
