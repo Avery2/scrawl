@@ -168,10 +168,10 @@ mod tests {
     fn progressing_body_can_outlive_both_header_and_per_read_timeouts() {
         let (mut server, mut client) = pair();
         server
-            .set_read_timeout(Some(Duration::from_millis(250)))
+            .set_read_timeout(Some(Duration::from_millis(600)))
             .unwrap();
         client
-            .write_all(b"POST /ingest HTTP/1.1\r\nContent-Length: 6\r\n\r\n")
+            .write_all(b"POST /ingest HTTP/1.1\r\nContent-Length: 12\r\n\r\n")
             .unwrap();
         assert!(
             read_header(&mut server, Duration::from_millis(100))
@@ -180,15 +180,15 @@ mod tests {
         );
         let started = Instant::now();
         let writer = std::thread::spawn(move || {
-            for byte in b"abcdef" {
+            for byte in b"abcdefghijkl" {
                 std::thread::sleep(Duration::from_millis(60));
                 client.write_all(&[*byte]).unwrap();
             }
         });
-        let mut body = [0; 6];
+        let mut body = [0; 12];
         server.read_exact(&mut body).unwrap();
-        assert_eq!(&body, b"abcdef");
-        assert!(started.elapsed() > Duration::from_millis(250));
+        assert_eq!(&body, b"abcdefghijkl");
+        assert!(started.elapsed() > Duration::from_millis(600));
         writer.join().unwrap();
     }
 }

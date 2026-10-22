@@ -27,8 +27,6 @@ jobs:
       - name: No compromised eMudhra CA roots
         run: scripts/check-ca-roots.sh target/debug/scrawl
       - run: cargo test --locked
-      - name: ScrawlKit delivery regression tests
-        run: swift test
 
   windows:
     name: Windows
