@@ -33,10 +33,19 @@ export GSTREAMER_INCLUDE_BAD_PLUGINS=1
 export APPIMAGE_EXTRACT_AND_RUN=1
 export PATH="$tools:$PATH"
 
+# These modules are dlopen'd, not DT_NEEDED dependencies: linuxdeploy cannot
+# discover them from scrawl. Stage every tier next to libtranscribe in usr/lib.
+libraries=()
+for library in "$(dirname "$binary")"/libggml-cpu*.so; do
+  [[ -f "$library" ]] || { echo "Missing transcribe runtime: $library" >&2; exit 1; }
+  libraries+=(--library "$library")
+done
+
 cd "$out"
 LDAI_OUTPUT="Scrawl-$arch.AppImage" linuxdeploy \
   --appdir "$appdir" \
   --executable "$binary" \
+  "${libraries[@]}" \
   --executable "$(command -v wl-copy)" \
   --desktop-file "$root/packaging/linux/dev.kitlangton.scrawl.desktop" \
   --icon-file "$root/packaging/linux/dev.kitlangton.scrawl.png" \

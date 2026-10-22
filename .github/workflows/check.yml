@@ -57,7 +57,10 @@ jobs:
           cache-on-failure: true
       - run: cargo build --locked
       - run: cargo test --locked
-      - name: Build the AppImage
+      - name: Check CPU tier instructions
+        # dlopen-only CPU tiers are checked before linuxdeploy strips symbols.
+        run: python3 scripts/linux/check-cpu-tiers.py target/debug
+      - name: Package the AppImage
         run: ./scripts/linux/appimage.sh target/debug/scrawl
       - name: AppImage runs headless without FUSE
         run: APPIMAGE_EXTRACT_AND_RUN=1 target/appimage/Scrawl-x86_64.AppImage --help

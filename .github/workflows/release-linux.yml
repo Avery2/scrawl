@@ -6,6 +6,10 @@ on:
       - .github/workflows/release-linux.yml
       - scripts/linux/**
       - packaging/linux/**
+      - Cargo.toml
+      - build.rs
+      - src/speech.rs
+      - .cargo/config.toml
   push:
     tags: ["v*"]
     branches: ["release/**"]
@@ -49,6 +53,24 @@ jobs:
           key: release-linux-${{ matrix.arch }}
           cache-on-failure: true
       - run: cargo build --release --locked
+      - name: Unit tests and model test executable
+        run: |
+          cargo test --release --locked speech:: -- --nocapture
+          cargo test --release --locked --bin scrawl --no-run --message-format=json > target/test-artifacts.jsonl
+          test=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "scrawl" and .profile.test) | .executable // empty' target/test-artifacts.jsonl)
+          test -f "$test"
+          echo "SPEECH_TEST=$test" >> "$GITHUB_ENV"
+      - name: No build-machine CPU specialization
+        run: |
+          mapfile -t caches < <(jq -r 'select(.reason == "build-script-executed" and (.package_id | contains("transcribe-cpp-sys"))) | .out_dir + "/build/CMakeCache.txt"' target/test-artifacts.jsonl)
+          test "${#caches[@]}" -gt 0
+          for cache in "${caches[@]}"; do
+            grep -x 'GGML_NATIVE:BOOL=OFF' "$cache"
+            grep -x 'GGML_BACKEND_DL:BOOL=ON' "$cache"
+          done
+      - name: CPU tiers contain only their declared instructions
+        if: matrix.arch == 'x86_64'
+        run: python3 scripts/linux/check-cpu-tiers.py target/release
       - name: Package
         id: package
         run: |
@@ -65,6 +87,21 @@ jobs:
           echo "name=$name" >> "$GITHUB_OUTPUT"
       - name: AppImage runs headless without FUSE
         run: APPIMAGE_EXTRACT_AND_RUN=1 "dist/${{ steps.package.outputs.name }}" --help
+      - name: Run two seconds of audio with the packaged CPU backend
+        run: bash scripts/linux/smoke-cpu.sh "dist/${{ steps.package.outputs.name }}" "$SPEECH_TEST"
+      - uses: petarpetrovt/setup-sde@v6.0
+        if: matrix.arch == 'x86_64'
+      - name: Run packaged model on Ice Lake (AVX512-VNNI, no AVX-VNNI)
+        if: matrix.arch == 'x86_64'
+        timeout-minutes: 30
+        env:
+          SCRAWL_TEST_NO_AVX_VNNI: "1"
+        run: |
+          sde=$(find "$SDE_PATH" -type f -name sde64 -print -quit)
+          test -x "$sde"
+          # Pin needs this on Ubuntu 24.04 runners.
+          sudo sysctl -w kernel.yama.ptrace_scope=0
+          bash scripts/linux/smoke-cpu.sh "dist/${{ steps.package.outputs.name }}" "$SPEECH_TEST" "$sde" -icl
       - uses: actions/upload-artifact@v5
         with:
           name: ${{ steps.package.outputs.name }}

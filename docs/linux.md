@@ -63,6 +63,12 @@ The cabled iPhone, video export, `agentContext` lookups (`ax_other.rs`), Sparkle
 
 `.github/workflows/release-linux.yml` builds x86_64 and aarch64 on Ubuntu 24.04 runners. Pull requests and manual dispatches produce artifacts and run packaged `--help` checks; `v*` tags upload versioned AppImages to the matching GitHub release. The site links directly to those versioned assets. Build/deploy the site only after the appcast version is updated and both release assets exist. Flatpak is out of scope.
 
+CPU portability (#82): `transcribe-cpp` uses `dynamic-backends`, which forces `GGML_NATIVE=OFF`. On x86_64 it builds separate `libggml-cpu-<tier>.so` modules (including separate Alder Lake and Zen 4 tiers); on aarch64 it builds a portable CPU module. `.cargo/config.toml` sets the Rust Linux baselines to `x86-64` and `generic`, respectively. `build.rs` stages the runtime and module directories next to binaries/tests with `$ORIGIN` RPATH. AppImage packaging explicitly includes the modules that dependency scanning cannot discover, all beside `libtranscribe` in `usr/lib`; `init_backends_default` resolves that library with `dladdr` and selects a CPU tier there once per process.
+
+Both Linux workflows run `scripts/linux/check-cpu-tiers.py` before stripping symbols. It checks the core libraries and all x86 tiers for EVEX/AVX-512, VEX AVX-VNNI and AMX against their declared features, including baseline-only backend scoring. Release CI checks the actual CMake cache has native compilation off, then runs Parakeet on two seconds of audio with only the extracted AppImage's libraries available. The x86 job repeats it under Intel SDE `-icl`: AVX512-VNNI present, AVX-VNNI absent, as on the Ryzen 8700G in #82. It also generates a demo bundle with the shipped executable under SDE, covering Rust post-processing without a desktop or model installation.
+
+Linux previews are published manually from the checked AppImage artifacts as `linux-preview-N`, with `--prerelease --latest=false` and a combined `SHA256SUMS`. These tags do not trigger the `v*` release jobs, and neither the site nor the Sparkle appcast selects them.
+
 ## Building and testing
 
 Build dependencies (Ubuntu/Debian; CI installs the same):
