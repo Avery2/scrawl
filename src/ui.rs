@@ -2376,6 +2376,7 @@ impl ScrawlCoordinator {
     /// The menu bar's picker, opening on the mode the last recording used.
     pub fn begin_target_selection(&mut self, cx: &mut Context<Self>) {
         if self.ready_to_record() {
+            self.still = false;
             self.open_picker(None, cx);
         }
     }

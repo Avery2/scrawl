@@ -1426,8 +1426,12 @@ impl Host for AppHost<'_> {
     }
 
     fn set_shortcuts(&mut self, shortcuts: &Shortcuts) -> Result<(), ShortcutKind> {
-        if shortcuts.screenshot != self.telemetry.screenshot_shortcut() {
-            crate::capture::set_screenshot_shortcut(self.telemetry, shortcuts.screenshot.clone())?;
+        let screenshot = crate::screenshot::registered(
+            crate::handoff::experiment(crate::screenshot::SCREENSHOTS),
+            &shortcuts.screenshot,
+        );
+        if screenshot != self.telemetry.screenshot_shortcut() {
+            crate::capture::set_screenshot_shortcut(self.telemetry, screenshot)?;
         }
         crate::capture::set_shortcuts(
             self.telemetry,
@@ -2167,6 +2171,33 @@ mod tests {
         );
         assert_eq!(panel.on(Action::Close, &mut host), Effect::Close);
         assert_eq!(host.paused.last(), Some(&false));
+    }
+
+    /// With `screenshots` off, editing Record (with ⌥⇧4 in hand, as `Shortcuts::default` has
+    /// it) registers no screenshot shortcut.
+    #[test]
+    fn shortcut_edits_register_no_screenshot_shortcut_with_its_experiment_off() {
+        let (sender, _receiver) = flume::unbounded();
+        let telemetry = crate::capture::SharedCaptureTelemetry::new(sender);
+        assert!(telemetry.screenshot_shortcut().is_unset());
+        let mut host = AppHost {
+            telemetry: &telemetry,
+        };
+        let record = validate(
+            ShortcutKind::Record,
+            &pressed(R, CARBON_CONTROL_KEY | CARBON_OPTION_KEY, "r"),
+            &ShortcutConfig::unset(),
+        )
+        .unwrap();
+        let shortcuts = Shortcuts {
+            record: record.clone(),
+            ..Shortcuts::default()
+        };
+        assert!(!shortcuts.screenshot.is_unset());
+        assert_eq!(host.set_shortcuts(&shortcuts), Ok(()));
+        assert_eq!(telemetry.shortcuts().0, record);
+        assert!(telemetry.screenshot_shortcut().is_unset());
+        assert!(host.shortcuts().screenshot.is_unset());
     }
 
     #[test]

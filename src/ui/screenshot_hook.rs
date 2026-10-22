@@ -24,7 +24,11 @@ impl ScrawlCoordinator {
             self.cancel_recording(cx);
             return;
         }
-        if self.is_recording() || self.is_processing() || self.is_selecting() {
+        if self.is_recording()
+            || self.is_processing()
+            || self.is_selecting()
+            || self.shortcut.is_pending()
+        {
             return;
         }
         if self.gate.is_pending() || !self.ready_to_record() {

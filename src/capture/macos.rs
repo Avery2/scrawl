@@ -553,9 +553,12 @@ pub fn set_shortcuts(
 ) -> Result<(), ShortcutKind> {
     let (old_record, old_paste) = telemetry.shortcuts();
     let screenshot = telemetry.screenshot_shortcut();
+    // The screenshot one is registered alongside (it's unset with its experiment off), but
+    // macOS refusing it doesn't refuse these two.
     if let Some(state) = CARBON_HOTKEYS.get()
         && !telemetry.shortcuts_paused.load(Ordering::Acquire)
         && let Err(kind) = register_shortcuts(state, &record, &paste, &screenshot)
+        && kind != ShortcutKind::Screenshot
     {
         let _ = register_shortcuts(state, &old_record, &old_paste, &screenshot);
         return Err(kind);
