@@ -102,12 +102,42 @@ class PlanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already build 17"):
             release.plan(Args(version="0.3.15"), self.xml, [self.built], "a" * 40, {})
 
+    def test_a_promoted_commit_stops_instead_of_republishing_its_beta(self):
+        promoted = self.xml.replace("<sparkle:channel>beta</sparkle:channel>", "")
+        with self.assertRaisesRegex(ValueError, r"0.3.14 \(build 17\) is already stable.*--version 0.3.15"):
+            release.plan(Args(), promoted, [self.built], "a" * 40, {})
+        with self.assertRaisesRegex(ValueError, "already stable"):
+            release.plan(Args(), self.xml, [self.built], "a" * 40, {"v0.3.14": "a" * 40})
+
     def test_promotion_needs_a_finished_build_and_one_stable_build_per_version(self):
         self.assertIs(release.plan(Args("promote", build=17), self.xml, [self.built], "c" * 40, {}), self.built)
         with self.assertRaisesRegex(ValueError, "No finished"):
             release.plan(Args("promote", build=18), self.xml, [self.built], "c" * 40, {})
         with self.assertRaisesRegex(ValueError, "already stable"):
             release.plan(Args("promote", build=17), self.xml, [self.built], "c" * 40, {"v0.3.14": "d" * 40})
+
+
+class SiteTests(unittest.TestCase):
+    def test_only_our_mac_and_windows_downloads_are_hydrated(self):
+        def asset(name, sha="sha256:x"):
+            return {"name": name, "browser_download_url": f"https://github.com/dl/{name}", "digest": sha}
+        releases = [
+            {"tag_name": "v0.3.14-b18", "draft": False, "assets": [
+                asset("Scrawl-0.3.14-b18-arm64.dmg"), asset("Scrawl-0.3.14-b18-arm64.zip"),
+                asset("Scrawl-0.3.14-b18-windows-x64.zip"), asset("Scrawl-0.3.14-b18-windows-x64.zip.sha256"),
+                asset("Scrawl-0.3.14-b18-linux-x86_64.AppImage")]},
+            {"tag_name": "v0.3.13", "draft": False, "assets": [
+                asset("Scrawl-0.3.13-arm64.dmg"), asset("Scrawl-0.3.13-windows-x64.zip")]},
+            # Real linux-preview releases reuse these names with different bytes, 81-91 MB each.
+            {"tag_name": "linux-preview-3", "draft": False, "assets": [
+                asset("Scrawl-0.3.13-linux-x86_64.AppImage", "sha256:a"), asset("SHA256SUMS", "sha256:a")]},
+            {"tag_name": "linux-preview-4", "draft": False, "assets": [
+                asset("Scrawl-0.3.13-linux-x86_64.AppImage", "sha256:b"), asset("SHA256SUMS", "sha256:b")]},
+            {"tag_name": "v0.3.15-b20", "draft": True, "assets": [asset("Scrawl-0.3.15-b20-arm64.dmg")]},
+        ]
+        self.assertEqual([name for name, _, _ in release.site_downloads(releases)], [
+            "Scrawl-0.3.14-b18-arm64.dmg", "Scrawl-0.3.14-b18-arm64.zip", "Scrawl-0.3.14-b18-windows-x64.zip",
+            "Scrawl-0.3.13-arm64.dmg", "Scrawl-0.3.13-windows-x64.zip"])
 
 
 class CaskTests(unittest.TestCase):

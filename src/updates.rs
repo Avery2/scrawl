@@ -31,10 +31,20 @@ fn label(version: &str, build: &str, beta: bool) -> String {
     format!("{version} ({build}){suffix}")
 }
 
+/// The bundle's own identity. `install-app.sh` marks dev installs `ScrawlDevBuild`: their bundle
+/// keeps build 1 (so Sparkle offers them any release, as before) but they show Cargo's version
+/// and `(dev)`.
 #[cfg(target_os = "macos")]
 fn bundle_value(key: &str) -> Option<String> {
     use objc2_foundation::{NSBundle, NSString};
-    NSBundle::mainBundle()
+    let bundle = NSBundle::mainBundle();
+    if bundle
+        .objectForInfoDictionaryKey(&NSString::from_str("ScrawlDevBuild"))
+        .is_some()
+    {
+        return None;
+    }
+    bundle
         .objectForInfoDictionaryKey(&NSString::from_str(key))
         .and_then(|value| value.downcast::<NSString>().ok())
         .map(|value| value.to_string())

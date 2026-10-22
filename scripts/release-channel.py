@@ -399,6 +399,24 @@ def cask_pr(manifest, stable):
 
 # The site
 
+# Cloudflare Workers Assets rejects files over 25 MiB.
+ASSET_LIMIT = 25 * 1024 * 1024
+SITE_DOWNLOAD = re.compile(r"Scrawl-\d+\.\d+\.\d+(?:-b[1-9]\d*)?-(?:arm64\.dmg|arm64\.zip|windows-x64\.zip)")
+
+
+def site_downloads(releases):
+    """(name, url, digest) for the GitHub downloads the site serves: Mac DMGs and zips and Windows
+    zips from our own `vX.Y.Z` / `vX.Y.Z-bN` releases. Other releases (linux-preview-N) reuse asset
+    names across tags and ship AppImages over the size limit, so they stay on GitHub."""
+    downloads = []
+    for release in releases:
+        if release["draft"] or not parse_tag(release["tag_name"]):
+            continue
+        for asset in release["assets"]:
+            if SITE_DOWNLOAD.fullmatch(asset["name"]):
+                downloads.append((asset["name"], asset["browser_download_url"], asset.get("digest")))
+    return downloads
+
 
 def deploy(manifest, folder, stable):
     public = ROOT / "site/public"
@@ -410,15 +428,12 @@ def deploy(manifest, folder, stable):
             immutable_copy(folder / name, assets / name.replace(manifest["label"], manifest["version"]))
     # Workers Assets deploys a whole snapshot: hydrate every published download, so a fresh
     # checkout never drops one.
-    for release in paginated(f"repos/{REPO}/releases"):
-        if release["draft"]:
-            continue
-        for asset in release["assets"]:
-            target = assets / asset["name"]
-            if not target.exists():
-                download(asset["browser_download_url"], target)
-            if asset.get("digest") and "sha256:" + digest(target) != asset["digest"]:
-                raise ValueError(f"Asset checksum differs: {target}")
+    for name, url, sha in site_downloads(paginated(f"repos/{REPO}/releases")):
+        target = assets / name
+        if not target.exists():
+            download(url, target)
+        if sha and "sha256:" + digest(target) != sha:
+            raise ValueError(f"Asset checksum differs: {target}")
     feed = STORE / "updates/appcast.xml"
     for enclosure in ET.fromstring(feed.read_text()).iter("enclosure"):
         name = enclosure.get("url").rsplit("/", 1)[1]
@@ -438,6 +453,9 @@ def deploy(manifest, folder, stable):
         if not target.exists():
             download(f"{SITE}/releases/{target.name}", target)
         shutil.copy2(target, assets / f"Scrawl-latest-{suffix}")
+    too_big = [p.name for p in public.rglob("*") if p.is_file() and p.stat().st_size > ASSET_LIMIT]
+    if too_big:
+        raise ValueError(f"Over Workers Assets' 25 MiB limit; remove them from site/public: {too_big}")
     run("skulk", "run", "--slot", "heavy", "--",
         "bash", "-c", "cd site && bun install --frozen-lockfile && bun run build && bunx wrangler@latest deploy", cwd=ROOT)
 
@@ -458,6 +476,10 @@ def plan(args, xml, manifests, commit, tags):
         return manifest
     manifest = next((m for m in manifests if m["commit"] == commit), None)
     if manifest:
+        promoted = tags.get(f"v{manifest['version']}") == commit or item_channels(xml).get(manifest["build"], "beta") is None
+        if promoted:
+            raise ValueError(f"{manifest['version']} (build {manifest['build']}) is already stable; commit something "
+                             f"and cut the next version with --version {bump(manifest['version'])}")
         if args.version and args.version != manifest["version"]:
             raise ValueError(f"{commit[:9]} is already build {manifest['build']} of {manifest['version']}; "
                              "commit something to cut another build")

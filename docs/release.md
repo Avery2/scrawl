@@ -58,7 +58,9 @@ saves the old `appcast.sh` as `appcast-before-channels.sh` and installs `scripts
 and this script; requests go through `appcast-request.json`, the log is `appcast.log`.
 
 Then it deploys the site from Pro (Wrangler's login is there) through skulk's heavy slot, after
-fetching every published download so a fresh checkout drops none. `Scrawl-latest-*` stays on
+fetching the Mac and Windows downloads of every `vX.Y.Z` and `-bN` release, so a fresh checkout
+drops none (other releases, like `linux-preview-N`, stay on GitHub; files over Workers Assets'
+25 MiB limit stop the deploy). `Scrawl-latest-*` stays on
 stable. The `scrawl@beta` cask PR updates (the first beta updates draft PR
 kitlangton/homebrew-tap#39). Kit merges cask PRs.
 
