@@ -13,7 +13,7 @@ import SwiftUI
 //    "options":[{"id":"default","title":"System default (…)","enabled":true},{"id":"-",…},…],
 //    "note":null,"meter":"BuiltInMicrophoneDevice"},"transcriber":{…},"videoExport":false,
 //    "retention":{"preset":"week","options":[{"id":"week","label":"…"}],"note":"…"},
-//    "capturesSize":"1.2 GB","permissions":[{"permission":"microphone","status":"granted",…}],
+//    "capturesSize":"1.2 GB","capturesDir":{"path":"~/Captures","custom":true},"permissions":[{"permission":"microphone","status":"granted",…}],
 //    "updates":true}
 //   {"type":"show","pane":"permissions"}  {"type":"request"|"open-settings","permission":"…"}
 //   {"type":"close"}
@@ -23,6 +23,7 @@ import SwiftUI
 // {"action":"reset-shortcut","kind":"paste"}, {"action":"clear-shortcut","kind":"paste"},
 // {"action":"grant","permission":"camera"},
 // {"action":"reopen"}, {"action":"show-captures"}, {"action":"check-for-updates"},
+// {"action":"set","key":"capturesDir","value":"/Users/me/Captures"} ("" resets),
 // {"action":"tour"}, {"action":"install-cli"}, {"action":"uninstall-cli"}, {"action":"close"}.
 
 // MARK: State
@@ -131,6 +132,12 @@ struct SettingsPermission: Decodable, Equatable, Identifiable {
   var granted: Bool { status == "granted" }
 }
 
+/// Where new captures go: `~`-relative, and whether it was chosen here (Reset shows).
+struct SettingsCapturesDir: Decodable, Equatable {
+  var path = "~/Library/Application Support/scrawl/captures"
+  var custom = false
+}
+
 struct SettingsCommandLine: Decodable, Equatable {
   var path: String?
   /// "install", "uninstall", or none.
@@ -155,6 +162,7 @@ struct SettingsState: Decodable, Equatable {
   var playbackLevel = 20
   var retention = SettingsRetention()
   var capturesSize: String?
+  var capturesDir = SettingsCapturesDir()
   var permissions: [SettingsPermission] = ["screen-recording", "microphone", "accessibility", "camera"]
     .map { SettingsPermission(permission: $0, required: ["screen-recording", "microphone", "accessibility"].contains($0)) }
   var updates = true
@@ -269,6 +277,22 @@ final class SettingsModel: ObservableObject {
 
   func set(_ key: String, _ value: Any) {
     act("set", ["key": key, "value": value])
+  }
+
+  /// Change… under Storage: a folder picker, sent as `capturesDir`.
+  func chooseCapturesFolder() {
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = false
+    panel.canChooseDirectories = true
+    panel.canCreateDirectories = true
+    panel.allowsMultipleSelection = false
+    panel.prompt = "Choose"
+    panel.message = "New captures go to this folder. Captures already made stay where they are."
+    let current = NSString(string: state.capturesDir.path).expandingTildeInPath
+    panel.directoryURL = URL(fileURLWithPath: current).deletingLastPathComponent()
+    NSApp.activate(ignoringOtherApps: true)
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    set("capturesDir", url.path)
   }
 }
 
@@ -1008,7 +1032,25 @@ struct SettingsView: View {
       }
       SettingsHeader("Captures")
       SettingsGroup {
-        SettingsRow(title: "Captures folder") {
+        HStack(spacing: 12) {
+          VStack(alignment: .leading, spacing: 1) {
+            Text("Location").font(.system(size: 14)).foregroundStyle(SettingsTheme(scheme).text)
+            Text(state.capturesDir.path)
+              .font(.system(size: 12, design: .monospaced))
+              .foregroundStyle(SettingsTheme(scheme).secondary)
+              .truncationMode(.head)
+          }
+          .lineLimit(1)
+          Spacer(minLength: 8)
+          if state.capturesDir.custom {
+            SettingsButton(title: "Reset") { model.set("capturesDir", "") }
+          }
+          SettingsButton(title: "Change…") { model.chooseCapturesFolder() }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 52)
+        SettingsSeparator()
+        SettingsRow(title: "Size") {
           Text(state.capturesSize ?? "Measuring…")
             .font(.system(size: 14).monospacedDigit())
             .foregroundStyle(SettingsTheme(scheme).secondary)
@@ -1581,6 +1623,8 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
     missing.permissions[2].requested = true
     var noUpdates = base
     noUpdates.updates = false
+    var storageCustom = base
+    storageCustom.capturesDir = SettingsCapturesDir(path: "~/Documents/Scrawl Captures", custom: true)
     var cliInstalled = base
     cliInstalled.commandLine = SettingsCommandLine(
       path: "/opt/homebrew/bin/scrawl", button: "uninstall",
@@ -1634,6 +1678,7 @@ final class SettingsWindow: NSObject, NSApplicationDelegate, NSWindowDelegate {
       ("recording-language-unsupported", .recording, languageUnsupported),
       ("recording-command", .recording, command),
       ("storage", .storage, base),
+      ("storage-custom", .storage, storageCustom),
       ("permissions", .permissions, base),
       ("permissions-missing", .permissions, missing),
       ("agents", .agents, base),
