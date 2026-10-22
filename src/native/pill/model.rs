@@ -334,10 +334,12 @@ pub enum ElemId {
     /// The Completed island's sessions one click away (smart routing).
     Route0 = 15,
     Route1 = 16,
+    /// The Failed island's lead: the same shape as `DoneLead`, in red, with no chips after it.
+    FailedLead = 17,
 }
 
 impl ElemId {
-    pub const COUNT: usize = 17;
+    pub const COUNT: usize = 18;
     pub const ROUTES: [ElemId; 2] = [Self::Route0, Self::Route1];
     pub const ALL: [ElemId; Self::COUNT] = [
         Self::Lead,
@@ -357,6 +359,7 @@ impl ElemId {
         Self::Inspect,
         Self::Route0,
         Self::Route1,
+        Self::FailedLead,
     ];
 
     pub const fn trace_key(self) -> &'static str {
@@ -378,6 +381,7 @@ impl ElemId {
             Self::Inspect => "inspect",
             Self::Route0 => "route:0",
             Self::Route1 => "route:1",
+            Self::FailedLead => "failed.lead",
         }
     }
 
@@ -423,6 +427,7 @@ impl ElemId {
             Self::Paste => "Paste",
             Self::Inspect => "Inspect",
             Self::Route0 | Self::Route1 => "Send to session",
+            Self::FailedLead => "Capture failed",
         }
     }
 }
@@ -443,6 +448,11 @@ pub enum Pres {
     Completed {
         label: String,
         routes: Vec<String>,
+    },
+    /// The capture couldn't be built or saved. `label` names what was lost ("Couldn't save
+    /// audio"), so the island never claims "Copied" over a bundle that isn't there.
+    Failed {
+        label: String,
     },
 }
 
@@ -482,6 +492,7 @@ impl Pres {
                     routes: rb,
                 },
             ) => a == b && ra == rb,
+            (Self::Failed { label: a }, Self::Failed { label: b }) => a == b,
             _ => false,
         }
     }
@@ -707,6 +718,12 @@ pub fn layout_of(
             ));
             raw.push((ElemId::Close, CHIP_H, CHIP_CORE_ROUND, 0.0, true));
         }
+        Pres::Failed { .. } => {
+            let lead_w = CHIP_H + 8.0 + labels.completed + LEAD_TRAIL;
+            raw.push((ElemId::FailedLead, lead_w, CHIP_CORE_ROUND, 0.0, true));
+            raw.push((ElemId::DividerLead, DIVIDER_W, 0.0, 0.0, false));
+            raw.push((ElemId::Close, CHIP_H, CHIP_CORE_ROUND, 0.0, true));
+        }
     }
 
     let inner_w: f32 =
@@ -810,6 +827,9 @@ pub struct FrameState {
     pub shape: Silhouette,
     pub ghost: Option<Silhouette>,
     pub is_completed: bool,
+    /// The Failed island: red shell tint, so a capture that didn't build never looks like one
+    /// that did.
+    pub is_failed: bool,
     pub content_blur: f32,
     pub content_alpha: f32,
     pub elems: Vec<FrameElem>,
@@ -1088,7 +1108,8 @@ impl PillModel {
         let changed = (self.labels.completed - labels.completed).abs() > 0.5
             || (0..2).any(|i| (self.labels.routes[i] - labels.routes[i]).abs() > 0.5);
         self.labels = labels;
-        if changed && self.pres == *next && matches!(next, Pres::Completed { .. }) {
+        if changed && self.pres == *next && matches!(next, Pres::Completed { .. } | Pres::Failed { .. })
+        {
             self.apply_geometry();
         }
     }
@@ -1579,6 +1600,7 @@ impl PillModel {
             shape,
             ghost,
             is_completed: matches!(self.geo_pres, Pres::Completed { .. }),
+            is_failed: matches!(self.geo_pres, Pres::Failed { .. }),
             content_blur: max_blur,
             content_alpha: max_alpha,
             elems,
@@ -1885,6 +1907,9 @@ mod tests {
             Pres::Completed {
                 label: "Copied".into(),
                 routes: Vec::new(),
+            },
+            Pres::Failed {
+                label: "Couldn't save audio".into(),
             },
         ];
 

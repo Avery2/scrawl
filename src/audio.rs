@@ -15,6 +15,20 @@ pub struct RecordedAudio {
     pub live: crate::live_transcribe::Slot,
 }
 
+/// The recording's narration couldn't be written beside its video. `finalize_capture_bundle`
+/// fails with this so the island can say the audio was lost rather than "Copied", and the
+/// journal it leaves behind still lets `scrawl recover` build the video and the ink.
+#[derive(Debug)]
+pub struct AudioNotSaved;
+
+impl std::fmt::Display for AudioNotSaved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the recording's audio couldn't be saved")
+    }
+}
+
+impl std::error::Error for AudioNotSaved {}
+
 pub struct AudioRecorder {
     worker: Option<std::thread::JoinHandle<Result<()>>>,
     stop_sender: Option<std::sync::mpsc::Sender<()>>,
@@ -386,6 +400,16 @@ pub fn encode_wav_16k(samples_16k: &[f32]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn audio_not_saved_survives_the_context_that_names_the_file() {
+        // The island tells a full disk (AudioNotSaved) from any other build failure by
+        // downcasting the error `finalize_capture_bundle` returns, which carries a context.
+        let error = anyhow::Error::new(AudioNotSaved).context(
+            "couldn't write /tmp/x/audio.wav: No space left on device (os error 28)",
+        );
+        assert!(error.downcast_ref::<AudioNotSaved>().is_some());
+    }
 
     #[test]
     fn stop_joins_worker_before_reading_its_last_samples() {

@@ -874,12 +874,18 @@ pub fn finalize_capture_bundle(
         duration_ms,
         video_offset_ms,
     } = recording;
-    if let Some(ref audio) = recorded_audio {
-        let wav_path = bundle_dir.join("audio.wav");
-        let _ = std::fs::create_dir_all(bundle_dir);
-        let _ = std::fs::write(&wav_path, &audio.wav_bytes);
-    }
+    // The narration goes down before the journal: a bundle that keeps its journal is one
+    // `scrawl recover` can build, and a disk that refuses `audio.wav` fails the capture by name
+    // instead of producing a bundle whose transcript says nothing was said.
     let wav_path = bundle_dir.join("audio.wav");
+    let mut audio_error = None;
+    if let Some(ref audio) = recorded_audio {
+        if let Err(error) = std::fs::create_dir_all(bundle_dir)
+            .and_then(|()| std::fs::write(&wav_path, &audio.wav_bytes))
+        {
+            audio_error = Some(error);
+        }
+    }
     let has_wav = wav_path.exists();
     recover::write(
         bundle_dir,
@@ -901,6 +907,12 @@ pub fn finalize_capture_bundle(
     let crop_settings = (target.mode == CaptureMode::Display)
         .then(autocrop::Settings::configured)
         .flatten();
+    if let Some(error) = audio_error {
+        return Err(anyhow::Error::new(crate::audio::AudioNotSaved).context(format!(
+            "couldn't write {}: {error}",
+            wav_path.display()
+        )));
+    }
     let ((transcript, transcribe_ms), (predecoded, prepared)) = std::thread::scope(|scope| {
         let transcribe_handle = scope.spawn(|| {
             let t0 = std::time::Instant::now();

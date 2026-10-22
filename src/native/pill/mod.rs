@@ -489,19 +489,28 @@ impl NativePill {
                 st.model.set_clock(&snapshot.clock);
                 st.dirty = true;
             }
-            if let Pres::Completed {
-                ref label,
-                ref routes,
-            } = snapshot.pres
-            {
-                let mut labels = st.model.labels;
-                labels.completed = st.pipelines.atlas.update_completed(label).size_pt[0];
-                for (i, width) in labels.routes.iter_mut().enumerate() {
-                    *width = routes.get(i).map_or(0.0, |route| {
-                        st.pipelines.atlas.update_route(i, route).size_pt[0]
-                    });
+            match snapshot.pres {
+                Pres::Completed {
+                    ref label,
+                    ref routes,
+                } => {
+                    let mut labels = st.model.labels;
+                    labels.completed = st.pipelines.atlas.update_completed(label).size_pt[0];
+                    for (i, width) in labels.routes.iter_mut().enumerate() {
+                        *width = routes.get(i).map_or(0.0, |route| {
+                            st.pipelines.atlas.update_route(i, route).size_pt[0]
+                        });
+                    }
+                    st.model.set_label_widths(labels, &snapshot.pres);
                 }
-                st.model.set_label_widths(labels, &snapshot.pres);
+                Pres::Failed { ref label } => {
+                    // The same atlas slot as the Completed lead: only one label shows at a time.
+                    let mut labels = st.model.labels;
+                    labels.completed = st.pipelines.atlas.update_completed(label).size_pt[0];
+                    labels.routes = [0.0; 2];
+                    st.model.set_label_widths(labels, &snapshot.pres);
+                }
+                _ => {}
             }
             if st.model.pres != snapshot.pres {
                 let was_hidden = st.model.is_fully_hidden();
@@ -812,7 +821,7 @@ impl PillRuntimeState {
             ElemId::Cancel => PillAction::Cancel,
             ElemId::Finish => PillAction::Finish,
             ElemId::Close => {
-                if matches!(self.model.pres, Pres::Completed { .. }) {
+                if matches!(self.model.pres, Pres::Completed { .. } | Pres::Failed { .. }) {
                     PillAction::DismissCompleted
                 } else {
                     PillAction::Cancel
@@ -893,7 +902,9 @@ impl PillRuntimeState {
                             msg_send![&**gv, setCornerRadius: f64::from(frame.shape.radius)];
                     }
                     if msg_send![&**gv, respondsToSelector: sel!(setTintColor:)] {
-                        let tint = if frame.is_completed {
+                        let tint = if frame.is_failed {
+                            NSColor::colorWithSRGBRed_green_blue_alpha(0.16, 0.05, 0.06, 0.28)
+                        } else if frame.is_completed {
                             NSColor::colorWithSRGBRed_green_blue_alpha(0.04, 0.14, 0.09, 0.28)
                         } else {
                             NSColor::colorWithSRGBRed_green_blue_alpha(0.06, 0.07, 0.10, 0.22)
@@ -1370,6 +1381,38 @@ fn emit_elem_prims(
                 [0.961, 0.961, 0.969, 1.0],
             );
         }
+        ElemId::FailedLead => {
+            push_shape(
+                out,
+                [ox + 5.0, oy + 5.0, 22.0, 22.0],
+                11.0,
+                [0.996, 0.373, 0.337, 0.22],
+            );
+            let ic = atlas.icon(IconKind::Close);
+            push_sprite(
+                out,
+                [
+                    ox + (CHIP_H - 13.0) * 0.5,
+                    oy + (CHIP_H - 13.0) * 0.5,
+                    13.0,
+                    13.0,
+                ],
+                ic.uv,
+                [0.996, 0.373, 0.337, 1.0],
+            );
+            let tx = atlas.completed_sprite;
+            push_sprite(
+                out,
+                [
+                    ox + CHIP_H + 8.0 - 2.0,
+                    oy + (CHIP_H - tx.size_pt[1]) * 0.5,
+                    tx.size_pt[0],
+                    tx.size_pt[1],
+                ],
+                tx.uv,
+                [0.961, 0.961, 0.969, 1.0],
+            );
+        }
         ElemId::DoneLead => {
             push_shape(
                 out,
@@ -1423,15 +1466,24 @@ mod tests {
         pres: &Pres,
         seconds: f32,
     ) -> crate::model::RgbaFrame {
-        if let Pres::Completed { label, routes } = pres {
-            let mut labels = model.labels;
-            labels.completed = pipelines.atlas.update_completed(label).size_pt[0];
-            for (i, width) in labels.routes.iter_mut().enumerate() {
-                *width = routes.get(i).map_or(0.0, |route| {
-                    pipelines.atlas.update_route(i, route).size_pt[0]
-                });
+        match pres {
+            Pres::Completed { label, routes } => {
+                let mut labels = model.labels;
+                labels.completed = pipelines.atlas.update_completed(label).size_pt[0];
+                for (i, width) in labels.routes.iter_mut().enumerate() {
+                    *width = routes.get(i).map_or(0.0, |route| {
+                        pipelines.atlas.update_route(i, route).size_pt[0]
+                    });
+                }
+                model.set_label_widths(labels, pres);
             }
-            model.set_label_widths(labels, pres);
+            Pres::Failed { label } => {
+                let mut labels = model.labels;
+                labels.completed = pipelines.atlas.update_completed(label).size_pt[0];
+                labels.routes = [0.0; 2];
+                model.set_label_widths(labels, pres);
+            }
+            _ => {}
         }
         model.set_pres(pres.clone());
         let steps = (seconds * 240.0).round() as usize;
@@ -1507,6 +1559,12 @@ mod tests {
                 completed("Sending to DESKTOP…", &["Send to OPENCODE IOS"]),
             ),
             ("4-sent", completed("Sent to OPENCODE IOS", &[])),
+            (
+                "5-failed",
+                Pres::Failed {
+                    label: "Couldn't save audio".into(),
+                },
+            ),
         ];
         let out = std::env::var_os("SCRAWL_PILL_STILLS").map(std::path::PathBuf::from);
         if let Some(dir) = &out {

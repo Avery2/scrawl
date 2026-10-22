@@ -34,6 +34,7 @@ Everything here is either outside the Rust sources or a small, commented patch, 
 | `src/phone.rs`, `src/web.rs` | ingest port from `SCRAWL_INGEST_PORT` (fork: 47778) | the official app owns 47777; a second listener fails with only a log line, and the phone's uploads would go to the other app |
 | `src/handoff.rs` (`state_dir`) + `src/inbox.rs`, `src/ui.rs`, `src/settings.rs` | `inbox.json`, `last-mode` and the 0.3.x config migration follow the captures folder actually in use | they used to sit beside the *built-in* folder, so the fork and the installed app shared (and clobbered) each other's iPhone inbox and picker mode |
 | `src/settings.rs` (`CapturesDirView`) | Storage shows `default_captures_dir()`, the folder captures actually land in | it showed `"capturesDir"` or the built-in folder while sizing the effective one |
+| `src/main.rs`, `src/audio.rs`, `src/ui.rs`, `src/native/pill/` | a capture that fails says so: `Pres::Failed` / `IslandPhase::Failed` shows a red ✕ and "Couldn't save audio" or "Couldn't build capture" instead of a green check and "Copied", and a WAV the disk refuses keeps its journal for `scrawl recover` | before, the `let _ = std::fs::write("audio.wav")` was discarded and a failed build fell through to the Completed island, so the pill claimed a copy that never happened |
 
 The fork's own config is seeded once, on first install, at `~/.config/scrawl-fork/config.json`:
 `"capturesDir"`, record **⌥⇧D** and paste **⌥⇧F** (so the two apps' Carbon hotkeys don't collide —
@@ -81,14 +82,14 @@ Already solved in Scrawl, by a stronger mechanism — don't port:
 
 Cheap, real gaps worth doing first (all in `src/ui.rs` unless noted):
 
-1. A failed bundle build shows the pill as **"Copied"** with an empty clipboard.
-2. A failed `audio.wav` write is discarded (`let _ = std::fs::write` in `src/main.rs`), so a full
-   disk silently produces a bundle with no narration.
-3. A dead microphone still looks like a recording: `AudioRecorder::start().ok()` and no level or
+1. A dead microphone still looks like a recording: `AudioRecorder::start().ok()` and no level or
    state on the pill.
-4. Escape `remove_dir_all`s the bundle (`discard_recording`); Hex's lesson is that cancelling is
+2. Escape `remove_dir_all`s the bundle (`discard_recording`); Hex's lesson is that cancelling is
    about the paste, not keeping the words.
-5. ⌘Q during a recording quits mid-capture and keeps nothing.
+3. ⌘Q during a recording quits mid-capture and keeps nothing.
+
+Done in this fork: a failed build or a WAV the disk refused now shows `Couldn't build capture` /
+`Couldn't save audio` on a red island instead of a green "Copied".
 
 Real work, in value order: durable audio written while recording (Hex's `DurableAudioWriter`
 equivalent) so a crash keeps the narration; the live transcript on the pill (Hex shows the newest

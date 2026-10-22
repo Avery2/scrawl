@@ -256,6 +256,25 @@ fn completed_delivery_note(delivery: &crate::delivery::Delivery, title: &str) ->
     }
 }
 
+/// Why a recording ended without a bundle. The island says it in words; the log has the detail,
+/// and a bundle left behind with its journal is rebuilt by `scrawl recover` on the next launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureReason {
+    /// The narration couldn't be written beside the video (a full or read-only disk).
+    Audio,
+    /// The rest of the build failed: keyframes, frames, or the manifest.
+    Build,
+}
+
+impl FailureReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Audio => "Couldn't save audio",
+            Self::Build => "Couldn't build capture",
+        }
+    }
+}
+
 /// Inner width of the Selecting row: mode segments, an optional Record chip, divider, and ✕.
 fn selecting_row_width(label_widths: &[f32], record_width: Option<f32>) -> f32 {
     let segments: f32 = label_widths
@@ -419,6 +438,15 @@ fn island_content_width(
                 + 3.0 * CHIP_GAP
         }
         IslandPhase::Hidden | IslandPhase::Dismissing => return ISLAND_H,
+        IslandPhase::Failed { reason, .. } => {
+            CHIP_H
+                + 8.0
+                + measure_text(window, reason.label(), HUD_TEXT, FontWeight::SEMIBOLD)
+                + LEAD_TRAIL
+                + divider
+                + CHIP_H
+                + CHIP_GAP
+        }
     };
     inner + 2.0 * ISLAND_INSET
 }
@@ -608,6 +636,12 @@ pub enum IslandPhase {
         /// Unhandled iPhone captures including this one; 0 for a local capture.
         inbox_count: usize,
     },
+    /// The capture ended without a bundle. `at` drives the same auto-dismiss as Completed, and
+    /// there is nothing to paste or inspect, so only the lead and ✕ show.
+    Failed {
+        at: Instant,
+        reason: FailureReason,
+    },
     Dismissing,
 }
 
@@ -619,6 +653,7 @@ impl IslandPhase {
             Self::Recording => "recording",
             Self::Processing => "processing",
             Self::Completed { .. } => "completed",
+            Self::Failed { .. } => "failed",
             Self::Dismissing => "dismissing",
         }
     }
@@ -1667,7 +1702,7 @@ impl ScrawlCoordinator {
             }
             (
                 IslandPhase::Recording | IslandPhase::Processing,
-                IslandPhase::Hidden | IslandPhase::Dismissing,
+                IslandPhase::Hidden | IslandPhase::Dismissing | IslandPhase::Failed { .. },
             ) => Some(Input::CaptureEnded { completed: false }),
             _ => None,
         };
@@ -1875,6 +1910,9 @@ impl ScrawlCoordinator {
             IslandPhase::Completed { inbox_count, .. } => Pres::Completed {
                 label: completed_label(inbox_count, self.completed_note.as_deref()),
                 routes: self.route_chip_labels(),
+            },
+            IslandPhase::Failed { reason, .. } => Pres::Failed {
+                label: reason.label().to_owned(),
             },
         };
         PillSnapshot {
@@ -2197,6 +2235,11 @@ impl ScrawlCoordinator {
         let dt = (real * motion::time_scale()).min(0.025);
         if let IslandPhase::Completed { finished_at, .. } = self.island_phase
             && finished_at.elapsed() >= Duration::from_millis(25_000)
+        {
+            self.set_island_phase(IslandPhase::Dismissing);
+        }
+        if let IslandPhase::Failed { at, .. } = self.island_phase
+            && at.elapsed() >= Duration::from_millis(25_000)
         {
             self.set_island_phase(IslandPhase::Dismissing);
         }
@@ -2893,23 +2936,48 @@ impl ScrawlCoordinator {
                     let (finalized, duration_ms) = result;
                     let mut frame_count = 1;
                     let mut routed = None;
+                    let mut failure = None;
                     coord.completed_dir = None;
-                    if let Ok((dir, bundle, _)) = finalized {
-                        frame_count = bundle.keyframes.len();
-                        let _ = crate::handoff::copy_bundle_to_clipboard(&dir);
-                        coord.completed_dir = Some(dir.clone());
-                        coord.last_local_capture_ms = crate::now_epoch_ms();
-                        if route.is_some() || look.is_some() {
-                            coord.routing = Some(dir.clone());
-                            routed = Some((dir.clone(), look.is_some().then(|| bundle.clone())));
+                    match finalized {
+                        Ok((dir, bundle, _)) => {
+                            frame_count = bundle.keyframes.len();
+                            let _ = crate::handoff::copy_bundle_to_clipboard(&dir);
+                            coord.completed_dir = Some(dir.clone());
+                            coord.last_local_capture_ms = crate::now_epoch_ms();
+                            if route.is_some() || look.is_some() {
+                                coord.routing = Some(dir.clone());
+                                routed =
+                                    Some((dir.clone(), look.is_some().then(|| bundle.clone())));
+                            }
+                            coord.set_review_bundle((dir, bundle), coord.completed_note.clone());
                         }
-                        coord.set_review_bundle((dir, bundle), coord.completed_note.clone());
+                        Err(error) => {
+                            // The island says what was lost; the log says why. Nothing was copied,
+                            // so claiming "Copied" here is the one thing it must not do.
+                            crate::capture::scrawl_log(format!("capture failed: {error:#}"));
+                            failure = Some(
+                                if error
+                                    .downcast_ref::<crate::audio::AudioNotSaved>()
+                                    .is_some()
+                                {
+                                    FailureReason::Audio
+                                } else {
+                                    FailureReason::Build
+                                },
+                            );
+                        }
                     }
-                    coord.set_island_phase(IslandPhase::Completed {
-                        finished_at: Instant::now(),
-                        frame_count,
-                        duration_ms,
-                        inbox_count: 0,
+                    coord.set_island_phase(match failure {
+                        Some(reason) => IslandPhase::Failed {
+                            at: Instant::now(),
+                            reason,
+                        },
+                        None => IslandPhase::Completed {
+                            finished_at: Instant::now(),
+                            frame_count,
+                            duration_ms,
+                            inbox_count: 0,
+                        },
                     });
                     cx.notify();
                     routed
@@ -3471,6 +3539,43 @@ impl Render for HudPillWindow {
             )
             .child(
                 icon_circle_chip("hud-dismiss", "✕").on_click(move |_, _, cx| {
+                    c_dismiss.update(cx, |coord, cx| coord.dismiss_completed_bundle(cx));
+                }),
+            ),
+            IslandPhase::Failed { reason, .. } => traced(
+                row,
+                ["failed.lead", "divider.lead", "close"]
+                    .into_iter()
+                    .map(|name| Some((name.to_owned(), 1.0)))
+                    .collect(),
+            )
+            .child(
+                island_lead()
+                    .child(
+                        div()
+                            .size(px(CHIP_H))
+                            .rounded_full()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(rgba(0xff5f562e))
+                            .text_color(rgb(0xff5f56))
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::BOLD)
+                            .child("✕"),
+                    )
+                    .child(
+                        div()
+                            .ml(px(8.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT_COLOR))
+                            .child(reason.label()),
+                    ),
+            )
+            .child(island_divider())
+            .child(
+                icon_circle_chip("hud-failed-dismiss", "✕").on_click(move |_, _, cx| {
                     c_dismiss.update(cx, |coord, cx| coord.dismiss_completed_bundle(cx));
                 }),
             ),
@@ -5808,6 +5913,13 @@ mod tests {
             Some(SelectionMode::Iphone)
         );
         assert_eq!(SelectionMode::from_key("fullscreen"), None);
+    }
+
+    #[test]
+    fn a_failed_capture_names_what_was_lost() {
+        // The island must never carry the Completed lead's "Copied" for a capture that failed.
+        assert_eq!(FailureReason::Audio.label(), "Couldn't save audio");
+        assert_eq!(FailureReason::Build.label(), "Couldn't build capture");
     }
 
     #[test]
