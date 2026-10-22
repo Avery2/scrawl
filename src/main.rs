@@ -211,6 +211,9 @@ enum LabCommand {
         /// Record the display to this movie (`screencapture -v`).
         #[arg(long)]
         record: Option<PathBuf>,
+        /// The second capture is a screenshot (`"screenshots"` experiment): a PNG card.
+        #[arg(long)]
+        screenshot: bool,
     },
 }
 
@@ -2047,6 +2050,7 @@ fn main() -> Result<()> {
                     time_scale,
                     reduced,
                     record,
+                    screenshot,
                 },
         } => {
             unsafe {
@@ -2063,6 +2067,7 @@ fn main() -> Result<()> {
                 repeat,
                 reduced,
                 record,
+                screenshot,
             });
             Ok(())
         }

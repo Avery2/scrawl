@@ -167,6 +167,58 @@ mod tests {
     }
 
     #[test]
+    fn the_default_is_free_and_clashes_are_refused() {
+        use crate::capture::{CARBON_CMD_KEY, CARBON_OPTION_KEY, CARBON_SHIFT_KEY};
+        use crate::settings::{Pressed, Rejection, validate_against};
+        let shot = ShortcutConfig::default_screenshot();
+        let record = ShortcutConfig::default_record();
+        let paste = ShortcutConfig::default_paste();
+        let others = [
+            (ShortcutKind::Record, &record),
+            (ShortcutKind::Paste, &paste),
+        ];
+        let pressed = |code: u32, modifiers, key: &str| Pressed {
+            key_code: code,
+            modifiers,
+            key: key.into(),
+            reserved: false,
+        };
+        let ok = validate_against(
+            ShortcutKind::Screenshot,
+            &pressed(shot.key_code, CARBON_OPTION_KEY | CARBON_SHIFT_KEY, "4"),
+            &others,
+        );
+        assert_eq!(ok, Ok(shot.clone()));
+        assert!(matches!(
+            validate_against(
+                ShortcutKind::Screenshot,
+                &pressed(shot.key_code, CARBON_CMD_KEY | CARBON_SHIFT_KEY, "4"),
+                &others,
+            ),
+            Err(Rejection::Reserved(_))
+        ));
+        assert_eq!(
+            validate_against(
+                ShortcutKind::Screenshot,
+                &pressed(record.key_code, record.carbon_modifiers, "s"),
+                &others,
+            ),
+            Err(Rejection::Taken(ShortcutKind::Record))
+        );
+        // Turned off, it takes nothing from the others.
+        let off = ShortcutConfig::unset();
+        let with_off = [(ShortcutKind::Screenshot, &off)];
+        assert!(
+            validate_against(
+                ShortcutKind::Paste,
+                &pressed(paste.key_code, paste.carbon_modifiers, "v"),
+                &with_off,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn a_screenshot_is_one_png_in_a_small_bundle() {
         let dir = std::env::temp_dir().join(format!("{}.scrawl", crate::make_bundle_id()));
         let png = crate::render::encode_png(&crate::model::RgbaFrame::new(
@@ -182,7 +234,7 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         files.sort();
-        assert_eq!(files, ["screenshot.png", "scrawl.json", "summary.md"]);
+        assert_eq!(files, ["scrawl.json", "screenshot.png", "summary.md"]);
         let (_, loaded) = crate::handoff::load_bundle(&dir).unwrap();
         assert_eq!(loaded, bundle);
         assert!(is_screenshot(&loaded));

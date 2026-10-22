@@ -11,7 +11,10 @@ use gpui::{App, Application, prelude::*};
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{AnyThread, MainThreadMarker};
-use objc2_app_kit::{NSBackingStoreType, NSColor, NSImage, NSPanel, NSScreen, NSStatusWindowLevel, NSView, NSWindowCollectionBehavior, NSWindowStyleMask};
+use objc2_app_kit::{
+    NSBackingStoreType, NSColor, NSImage, NSPanel, NSScreen, NSStatusWindowLevel, NSView,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
+};
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use objc2_quartz_core::CALayer;
 
@@ -45,6 +48,8 @@ pub struct Options {
     /// Record the display to this movie with `screencapture -v` (a child of the lab, so it runs
     /// under the lab app's Screen Recording grant when the lab is launched as an app).
     pub record: Option<PathBuf>,
+    /// The second capture is a screenshot bundle (`crate::screenshot`).
+    pub screenshot: bool,
 }
 
 #[repr(C)]
@@ -110,7 +115,11 @@ fn steps(scene: Scene, variant: LabVariant) -> Vec<(f32, Step)> {
         out.push((t, Step::Tap));
         out.push((t + TAP_TO_FINISH_S, Step::Finish(k)));
         let completed = t + TAP_TO_FINISH_S + super::lab::PROCESSING_S;
-        let dismiss = if variant == LabVariant::None { 1.4 } else { 0.9 };
+        let dismiss = if variant == LabVariant::None {
+            1.4
+        } else {
+            0.9
+        };
         out.push((completed + dismiss, Step::Dismiss));
         t += CAPTURE_GAP_S;
     }
@@ -161,9 +170,9 @@ struct LabCapture {
 
 /// Three bundles made from Scrawl's synthetic app screen, each a little different, sized to the
 /// display so the last keyframe lifts off exactly where the screen showed it.
-fn make_captures(dir: &Path, size: [u32; 2]) -> anyhow::Result<Vec<LabCapture>> {
+fn make_captures(dir: &Path, size: [u32; 2], screenshot: bool) -> anyhow::Result<Vec<LabCapture>> {
     use crate::model::{
-        CaptureMode, InteractionEvent, Stroke, TargetFrame, TargetInfo, TranscriptData, SCALE,
+        CaptureMode, InteractionEvent, SCALE, Stroke, TargetFrame, TargetInfo, TranscriptData,
     };
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir)?;
@@ -238,18 +247,27 @@ fn make_captures(dir: &Path, size: [u32; 2]) -> anyhow::Result<Vec<LabCapture>> 
             estimated: false,
             missing: None,
         };
-        crate::build_bundle_from_parts(
-            &bundle,
-            target,
-            duration,
-            frames,
-            strokes,
-            events,
-            transcript,
-            None,
-            None,
-            crate::SourceExtras::default(),
-        )?;
+        if screenshot && k == 1 {
+            let target = TargetInfo {
+                mode: CaptureMode::Display,
+                window_id: None,
+                ..target
+            };
+            crate::screenshot::write_bundle(&bundle, target, &crate::render::encode_png(&screen)?)?;
+        } else {
+            crate::build_bundle_from_parts(
+                &bundle,
+                target,
+                duration,
+                frames,
+                strokes,
+                events,
+                transcript,
+                None,
+                None,
+                crate::SourceExtras::default(),
+            )?;
+        }
         let screen_path = bundle.join("lab-screen.png");
         crate::render::save_png(&screen, &screen_path)?;
         let mut card = stack::card_for_bundle(k as u64 + 1, &bundle, duration, destinations[k])
@@ -343,7 +361,7 @@ pub fn run(options: Options) {
             (display[3] * screen.scale as f32).round() as u32,
         ];
         let lab_dir = std::env::temp_dir().join("scrawl-lab-stack");
-        let captures = match make_captures(&lab_dir, size) {
+        let captures = match make_captures(&lab_dir, size, options.screenshot) {
             Ok(c) => c,
             Err(err) => {
                 eprintln!("couldn't make the lab captures: {err:#}");
@@ -383,7 +401,10 @@ pub fn run(options: Options) {
             s.set_reduced_motion(options.reduced);
         }
         // For `perf/stack/record.sh`: the whole display.
-        let region = format!("{},{},{},{}", display[0], display[1], display[2], display[3]);
+        let region = format!(
+            "{},{},{},{}",
+            display[0], display[1], display[2], display[3]
+        );
         println!("region {region}");
         let record_path = options.record.clone();
         let start_recorder = move || {
@@ -420,7 +441,9 @@ pub fn run(options: Options) {
         let loop_pointer = pointer.clone();
         cx.spawn(async move |cx| {
             loop {
-                cx.background_executor().timer(Duration::from_millis(8)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(8))
+                    .await;
                 let alive = cx.update(|cx| {
                     motion::poll_tune();
                     loop_coord.update(cx, |coord, cx| coord.island_tick(cx));
@@ -456,10 +479,14 @@ pub fn run(options: Options) {
         cx.spawn(async move |cx| {
             // Start recording only once the backdrop has drawn, so no desktop frame leaks in,
             // and give the recorder a moment before the scene starts.
-            cx.background_executor().timer(Duration::from_millis(250)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(250))
+                .await;
             let recorder = start_recorder();
             if recorder.is_some() {
-                cx.background_executor().timer(Duration::from_millis(700)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(700))
+                    .await;
             }
             let mut run = 0;
             loop {
@@ -503,11 +530,8 @@ pub fn run(options: Options) {
                         Step::Point(target, secs) => {
                             if let Some(s) = stack.as_ref() {
                                 let to = pointer_target(s, target);
-                                let from = pointer
-                                    .borrow()
-                                    .as_ref()
-                                    .map(|p| current(p))
-                                    .unwrap_or(to);
+                                let from =
+                                    pointer.borrow().as_ref().map(|p| current(p)).unwrap_or(to);
                                 *pointer.borrow_mut() = Some(PointerPath {
                                     from,
                                     to,
