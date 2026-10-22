@@ -21,7 +21,23 @@ pub fn default_captures_dir() -> PathBuf {
     configured
         .as_deref()
         .and_then(configured_captures_dir)
+        .filter(|dir| usable_captures_dir(dir))
         .unwrap_or_else(builtin_captures_dir)
+}
+
+/// A chosen folder that exists (or can be made) and takes writes; otherwise it's logged once and the
+/// built-in folder is used, so a capture is never lost to a missing or unplugged drive.
+fn usable_captures_dir(dir: &Path) -> bool {
+    let usable = fs::create_dir_all(dir).is_ok()
+        && fs::metadata(dir).is_ok_and(|meta| meta.is_dir() && !meta.permissions().readonly());
+    if !usable {
+        log_config_once(format!(
+            "config.json: \"capturesDir\" {} can't be used (missing or not writable); captures go to {}",
+            dir.display(),
+            builtin_captures_dir().display()
+        ));
+    }
+    usable
 }
 
 /// A `"capturesDir"` value as a folder: `~` is the home folder, and only an absolute path counts
@@ -1985,6 +2001,17 @@ mod tests {
         let cfg_after = load_config_from(&missing);
         assert_eq!(cfg_after.ingest_token.as_deref(), Some(token.as_str()));
         assert!(cfg_after.usb_apps.is_empty());
+    }
+
+    #[test]
+    fn an_unusable_captures_folder_is_refused() {
+        let root = std::env::temp_dir().join(format!("scrawl-usable-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("file");
+        fs::write(&file, "x").unwrap();
+        assert!(!usable_captures_dir(&file.join("inside")));
+        assert!(usable_captures_dir(&root.join("new folder")));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
