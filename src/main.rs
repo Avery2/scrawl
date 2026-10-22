@@ -14,6 +14,8 @@ mod command_line;
 mod command_transcriber;
 mod delivery;
 mod export;
+#[cfg(test)]
+mod feature_map;
 mod handoff;
 #[cfg_attr(target_os = "windows", path = "win/helper.rs")]
 mod helper;
