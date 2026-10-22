@@ -20,6 +20,7 @@ mod helper;
 mod hex;
 mod icons;
 mod inbox;
+mod ingest_http;
 mod keyframes;
 #[cfg(target_os = "macos")]
 mod laser_overlay;
