@@ -358,7 +358,7 @@ struct PillRoot: View {
     let capsule = Capsule()
       .frame(width: model.shell.width, height: model.shell.height)
     Group {
-      if model.glass {
+      if model.glass, #available(macOS 26.0, *) {
         capsule
           .foregroundStyle(.clear)
           .glassEffect(.regular.tint(PillColor.smoke.opacity(0.22)), in: Capsule())
